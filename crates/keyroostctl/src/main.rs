@@ -4019,6 +4019,12 @@ enum NotPresentReason {
 /// error of the two. So a mismatch is claimed only when *every* visible key
 /// names itself and none of the names is the pinned one; an empty serial
 /// anywhere (including nothing connected at all) means unidentified.
+///
+/// `serials` must already be narrowed to devices that expose a FIDO interface.
+/// Anything without one cannot be the key being waited for, so its (absent)
+/// serial says nothing about whether that key came back — counting it would
+/// turn every verdict into "unidentified" whenever an unrelated smart-card
+/// token happened to be plugged in elsewhere.
 fn not_present_reason(serials: &[&str]) -> NotPresentReason {
     if !serials.is_empty() && serials.iter().all(|s| !s.is_empty()) {
         NotPresentReason::DifferentKey
@@ -4256,7 +4262,17 @@ fn fido_reset_after_replug(
         present = keyroost_resolve::enumerate()?;
         (found, settled) = match_reinsert(expected_serial, expected_model, expected_ids, &present);
     }
-    let serials: Vec<&str> = present.iter().map(|d| d.serial.as_str()).collect();
+    // Only keys that expose a FIDO interface can be the one we are waiting for,
+    // so only their serials decide whether this is a swap or a key that has not
+    // identified itself yet. A CCID-only device — a Molto2 sitting in another
+    // port — reports no serial here and would otherwise drag every verdict to
+    // "unidentified", telling the user "that is not a different key" while a
+    // different key is plainly connected. Observed on hardware.
+    let serials: Vec<&str> = present
+        .iter()
+        .filter(|d| d.hid_path.is_some())
+        .map(|d| d.serial.as_str())
+        .collect();
 
     let i = match found {
         ReinsertMatch::Found(i) => i,
@@ -8323,6 +8339,19 @@ mod cli_tests {
         );
         // Nothing back in the port yet — also not an accusation.
         assert_eq!(not_present_reason(&[]), NotPresentReason::Unidentified);
+
+        // Regression, found on hardware 2026-07-28: a CCID-only token (a Molto2
+        // in another port) reports no serial and has no FIDO interface, so it
+        // can never be the key being waited for. Its serial must not reach this
+        // function — the caller filters on `hid_path` — or a genuine swap gets
+        // reported as "that is not a different key" while the different key is
+        // sitting right there. The list below is what the caller now passes for
+        // {Solo 2 present, Molto2 present, YubiKey pinned and absent}.
+        assert_eq!(
+            not_present_reason(&["07A9568FBE31AD5DAD1F2298476CF0D4"]),
+            NotPresentReason::DifferentKey,
+            "a serial-less non-FIDO device must not mask a real mismatch"
+        );
         // Every visible key names itself and none of them is the pinned one:
         // now, and only now, is a mismatch a fact.
         assert_eq!(
