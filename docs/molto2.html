@@ -178,10 +178,8 @@
 
     <h3>The token isn't detected / doesn't show up</h3>
     <p>The Molto2's card interface sometimes fails to initialize on first contact,
-      so the token is present on USB but no smart-card reader ever appears. The
-      smart-card service only attempts initialization at the moment the token is
-      plugged in — so waiting doesn't help, and neither does restarting the
-      service. Each replug is a fresh attempt:</p>
+      so the token is present on USB but no smart-card reader ever appears. Each
+      initialization attempt is a fresh roll of the dice:</p>
     <ul>
       <li><strong>Power the token off</strong> (unplug and leave it unplugged for
         ~10 seconds — a failed session can leave its card interface wedged, and
@@ -190,8 +188,45 @@
         with <code>keyroostctl list</code> (the app's device list updates by
         itself).</li>
       <li>Still missing? <strong>Just replug again.</strong> It can take two or
-        three cycles; no service restart is needed in between.</li>
+        three cycles.</li>
     </ul>
+    <p>First, rule the token out — these two checks are quick and, if both pass,
+      the hardware and the driver are fine and the problem is the service:</p>
+    <ul>
+      <li><strong>Is it on USB at all?</strong> <code>lsusb</code> should list
+        <code>349e:0300 TOKEN2 Molto2</code>. If it doesn't, that's a cable, port
+        or power problem, not a smart-card one.</li>
+      <li><strong>Does the CCID driver claim it?</strong> The token must appear in
+        the driver's device list — on Linux,
+        <code>grep -A1 0x0300 /usr/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist</code>
+        alongside vendor <code>0x349E</code>. Recent libccid ships it as
+        <em>TOKEN2 Molto2</em>.</li>
+    </ul>
+
+    <h3>It's on USB and the driver supports it, but no reader ever appears</h3>
+    <p>Then the smart-card service is very likely not running long enough to keep
+      trying. Debian, Ubuntu and Fedora all start <code>pcscd</code>
+      <strong>on demand</strong> (<code>pcscd --foreground --auto-exit</code>,
+      launched by <code>pcscd.socket</code>): it wakes when a program asks for a
+      reader and exits again shortly after. That interacts badly with a token that
+      needs more than one attempt:</p>
+    <ul>
+      <li>While the service is stopped, <strong>replugging achieves nothing</strong>
+        — there is no running service to notice the token, so the retry you think
+        you're triggering never happens.</li>
+      <li>Every command you run <strong>cold-starts</strong> the service, and that
+        cold start is exactly the first-contact attempt most likely to time out.</li>
+    </ul>
+    <p>The result is a token that can sit unnoticed for days through any number of
+      power-cycles. Give the service a longer life and it gets the retries it
+      needs:</p>
+<pre><code>sudo systemctl disable --now pcscd.socket
+sudo systemctl enable --now pcscd.service</code></pre>
+    <p class="kr-muted">To go back to on-demand starting, swap the two:
+      <code>sudo systemctl disable --now pcscd.service &amp;&amp; sudo systemctl enable
+      --now pcscd.socket</code>. This is a property of how your distribution starts
+      the smart-card service, not of keyroost — every smart-card program on the
+      machine is affected the same way.</p>
     <div class="kr-callout danger">
       <div class="kr-callout-title danger">Don't restart the smart-card service to fix detection</div>
       <p>Restarting <code>pcscd</code> can't help here — it only retries a token's
