@@ -100,6 +100,34 @@ pub mod sw {
     pub const NOT_ENOUGH_SPACE: u16 = 0x6A84;
     pub const HID_NOT_SUPPORTED: u16 = 0x6A86;
     pub const BUTTON_TIMEOUT: u16 = 0x6FF9;
+    /// `6A81` — the device does not support this operation *in its current
+    /// state*. Not the same as "this model can't do it": it is what a key
+    /// answers when the function exists but the current configuration or
+    /// channel does not offer it.
+    pub const FUNCTION_NOT_SUPPORTED: u16 = 0x6A81;
+    /// `6985` — PIN conditions not satisfied: no session established, or a
+    /// read/verify was attempted out of order. **Does not mean "no PIN set"**;
+    /// the vendor client keeps `PinNotSet` only as a backwards-compatible
+    /// alias and says so in a comment.
+    pub const PIN_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
+    /// `6982` — wrong OTP PIN, or an authentication-tag mismatch.
+    pub const PIN_INVALID: u16 = 0x6982;
+    /// `6983` — OTP PIN locked after too many wrong attempts; recovering it
+    /// needs a global OTP reset.
+    pub const PIN_LOCKED: u16 = 0x6983;
+
+    /// True for a status word inside the range the OTP applet can emit.
+    ///
+    /// Every status word in Token2's published applet firmware is `0x6xxx` or
+    /// `0x9000`. A value outside that space did not come from the applet — it
+    /// was produced by a layer in front of it, which is what a key returns when
+    /// the OTP applet is not reachable on the channel the command arrived on.
+    /// Issue #95 saw `0105` this way, over a HID channel that the model ships
+    /// with disabled.
+    #[must_use]
+    pub fn is_applet_status(sw: u16) -> bool {
+        sw == OK || (0x6000..=0x6FFF).contains(&sw)
+    }
 }
 
 /// An expected, surface-to-the-user error from the applet, mirroring the
@@ -117,6 +145,16 @@ pub enum OtpError {
     ButtonPressRequired,
     /// `6A86` — this model does not expose HOTP-over-HID (older PIN+ revisions).
     HidNotSupported,
+    /// `6A81` — the operation is not supported in the device's current state.
+    FunctionNotSupported,
+    /// `6985` — PIN conditions not satisfied: no session, or a read/verify out
+    /// of order. Despite the vendor's legacy `PinNotSet` alias, this does *not*
+    /// mean the key has no PIN.
+    PinConditionsNotSatisfied,
+    /// `6982` — wrong OTP PIN, or an authentication-tag mismatch.
+    PinInvalid,
+    /// `6983` — OTP PIN locked; a global OTP reset is required to recover it.
+    PinLocked,
     /// Any other non-`9000` status word.
     BadStatusCode(u16),
 }
@@ -130,6 +168,10 @@ impl OtpError {
             sw::NOT_ENOUGH_SPACE => Err(OtpError::NotEnoughSpace),
             sw::BUTTON_TIMEOUT => Err(OtpError::ButtonPressRequired),
             sw::HID_NOT_SUPPORTED => Err(OtpError::HidNotSupported),
+            sw::FUNCTION_NOT_SUPPORTED => Err(OtpError::FunctionNotSupported),
+            sw::PIN_CONDITIONS_NOT_SATISFIED => Err(OtpError::PinConditionsNotSatisfied),
+            sw::PIN_INVALID => Err(OtpError::PinInvalid),
+            sw::PIN_LOCKED => Err(OtpError::PinLocked),
             other => Err(OtpError::BadStatusCode(other)),
         }
     }
@@ -160,6 +202,10 @@ impl OtpError {
             OtpError::NotEnoughSpace => sw::NOT_ENOUGH_SPACE,
             OtpError::ButtonPressRequired => sw::BUTTON_TIMEOUT,
             OtpError::HidNotSupported => sw::HID_NOT_SUPPORTED,
+            OtpError::FunctionNotSupported => sw::FUNCTION_NOT_SUPPORTED,
+            OtpError::PinConditionsNotSatisfied => sw::PIN_CONDITIONS_NOT_SATISFIED,
+            OtpError::PinInvalid => sw::PIN_INVALID,
+            OtpError::PinLocked => sw::PIN_LOCKED,
             OtpError::BadStatusCode(sw) => *sw,
         }
     }
@@ -176,6 +222,23 @@ impl std::fmt::Display for OtpError {
             OtpError::HidNotSupported => {
                 write!(f, "HOTP-over-HID is not supported on this model")
             }
+            OtpError::FunctionNotSupported => write!(
+                f,
+                "the device does not support this operation in its current state"
+            ),
+            OtpError::PinConditionsNotSatisfied => write!(
+                f,
+                "PIN conditions not satisfied (no session established, or a \
+                 read/verify was attempted out of order)"
+            ),
+            OtpError::PinInvalid => {
+                write!(f, "wrong OTP PIN (or authentication tag mismatch)")
+            }
+            OtpError::PinLocked => write!(
+                f,
+                "the OTP PIN is locked after too many wrong attempts; a global \
+                 OTP reset is required to recover it"
+            ),
             OtpError::BadStatusCode(sw) => write!(f, "unexpected status word {:#06X}", sw),
         }
     }
@@ -582,9 +645,21 @@ mod tests {
         assert_eq!(OtpError::check(0x6A84), Err(OtpError::NotEnoughSpace));
         assert_eq!(OtpError::check(0x6A86), Err(OtpError::HidNotSupported));
         assert_eq!(OtpError::check(0x6FF9), Err(OtpError::ButtonPressRequired));
+        // 6985 was BadStatusCode until 2026-08-04, when Token2's own client was
+        // checked directly and turned out to handle four codes the published
+        // §3.1 table omits — a wrong PIN and a locked PIN were both surfacing
+        // as "unexpected status word".
         assert_eq!(
             OtpError::check(0x6985),
-            Err(OtpError::BadStatusCode(0x6985))
+            Err(OtpError::PinConditionsNotSatisfied)
+        );
+        assert_eq!(OtpError::check(0x6982), Err(OtpError::PinInvalid));
+        assert_eq!(OtpError::check(0x6983), Err(OtpError::PinLocked));
+        assert_eq!(OtpError::check(0x6A81), Err(OtpError::FunctionNotSupported));
+        // Genuinely unknown codes must still fall through.
+        assert_eq!(
+            OtpError::check(0x0105),
+            Err(OtpError::BadStatusCode(0x0105))
         );
         assert!(OtpError::check(0x6A80).unwrap_err().is_empty_token());
     }
@@ -656,5 +731,83 @@ mod tests {
         // lower-case + stripped padding should still decode (spec §9 forgiving rule).
         let seed = decode_base32_seed("jbswy3dp").unwrap();
         assert_eq!(&seed[..], b"Hello");
+    }
+}
+
+/// Token2 publishes both the protocol spec and the applet firmware, so the
+/// status-word table can be checked against the vendor's own sources rather
+/// than inferred. These pin what was verified on 2026-08-04 while working
+/// issue #95, against `token2/token2-otp-cli` (`token2/errors.py`,
+/// `token2/exc.py`) and `token2/token2-otp-applet`.
+#[cfg(test)]
+mod vendor_status_words {
+    use super::*;
+
+    #[test]
+    fn the_four_codes_the_spec_table_omits_are_mapped() {
+        // §3.1 of the published spec lists only 9000/6A80/6A83/6A84/6A86/6FF9,
+        // but the vendor's own client handles four more. Missing them meant a
+        // wrong PIN and a locked PIN both surfaced as "unexpected status word".
+        assert_eq!(
+            OtpError::check(sw::FUNCTION_NOT_SUPPORTED),
+            Err(OtpError::FunctionNotSupported)
+        );
+        assert_eq!(
+            OtpError::check(sw::PIN_CONDITIONS_NOT_SATISFIED),
+            Err(OtpError::PinConditionsNotSatisfied)
+        );
+        assert_eq!(OtpError::check(sw::PIN_INVALID), Err(OtpError::PinInvalid));
+        assert_eq!(OtpError::check(sw::PIN_LOCKED), Err(OtpError::PinLocked));
+    }
+
+    #[test]
+    fn pin_conditions_message_does_not_claim_the_pin_is_unset() {
+        // The vendor kept `PinNotSet` as an alias but annotates it "6985 does
+        // NOT mean 'no PIN set'". Repeating that mistake would send a user to
+        // set a PIN that already exists.
+        let msg = OtpError::PinConditionsNotSatisfied.to_string();
+        assert!(
+            !msg.contains("not set") && !msg.contains("no PIN"),
+            "6985 is an ordering/session fault, not a missing PIN: {msg}"
+        );
+    }
+
+    #[test]
+    fn status_word_round_trips_through_check_for_every_named_code() {
+        for sw in [
+            sw::ENTRY_NOT_FOUND,
+            sw::NOT_ENOUGH_SPACE,
+            sw::BUTTON_TIMEOUT,
+            sw::HID_NOT_SUPPORTED,
+            sw::FUNCTION_NOT_SUPPORTED,
+            sw::PIN_CONDITIONS_NOT_SATISFIED,
+            sw::PIN_INVALID,
+            sw::PIN_LOCKED,
+        ] {
+            let e = OtpError::check(sw).expect_err("non-9000 must map to an error");
+            assert_eq!(e.status_word(), sw, "{sw:#06X} must survive the round trip");
+        }
+    }
+
+    #[test]
+    fn a_status_word_outside_the_applet_space_is_recognised_as_foreign() {
+        // Every status word in Token2's published applet firmware is 0x6xxx or
+        // 0x9000; `0105` from issue #95 appears nowhere in it. So it cannot
+        // have come from the applet, and callers must not report it as the
+        // applet's answer.
+        assert!(
+            !sw::is_applet_status(0x0105),
+            "0105 is not an applet status"
+        );
+        assert!(sw::is_applet_status(sw::OK));
+        for sw_ in [
+            sw::ENTRY_NOT_FOUND,
+            sw::HID_NOT_SUPPORTED,
+            sw::FUNCTION_NOT_SUPPORTED,
+            sw::PIN_LOCKED,
+            sw::BUTTON_TIMEOUT,
+        ] {
+            assert!(sw::is_applet_status(sw_), "{sw_:#06X} is an applet status");
+        }
     }
 }

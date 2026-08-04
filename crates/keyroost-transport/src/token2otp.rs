@@ -117,14 +117,23 @@ impl std::fmt::Display for OtpTransportError {
             ),
             OtpTransportError::HidDeclinedAndNoCcid { sw, ccid } => write!(
                 f,
-                "the key declined the OTP applet over USB-HID (status word {:#06X}), \
-                 which is normal on Token2 models without HOTP-over-HID: they ship with \
-                 the HID channel disabled and carry OTP over CCID instead, so there is \
-                 nothing to enable on the key. The CCID path is the one that failed: \
-                 {}. Start the smart-card service (pcscd on Linux; the Smart Card \
-                 service on Windows; built in on macOS) or place the key on a \
-                 contact/NFC reader, then retry — `--transport ccid` forces it",
-                sw, ccid
+                "{} over USB-HID (status word {:#06X}). Token2 models without \
+                 HOTP-over-HID ship with the HID channel disabled, so there is nothing \
+                 to enable on the key — OTP is carried over CCID instead, and that is \
+                 the path that failed: {}. Start the smart-card service (pcscd on \
+                 Linux; the Smart Card service on Windows; built in on macOS) or place \
+                 the key on a contact/NFC reader, then retry — `--transport ccid` \
+                 forces it",
+                if keyroost_token2otp::sw::is_applet_status(*sw) {
+                    "the OTP applet declined the request"
+                } else {
+                    // Outside 0x6xxx/0x9000 the applet was never reached: the
+                    // answer came from a layer in front of it. Saying "the
+                    // applet declined" would misattribute it (issue #95).
+                    "the key answered, but not from the OTP applet"
+                },
+                sw,
+                ccid
             ),
         }
     }
