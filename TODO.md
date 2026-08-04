@@ -8,7 +8,8 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.7.7** (workspace bumped; the release run is under way).
+Current work: **v0.7.8** — a patch release backing out the v0.7.7 OTP
+capability regression (see #95).
 
 ---
 
@@ -28,7 +29,37 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Ready to pick up
 
-- **Run the mandatory packaging probe before the v0.7.7 bump.**
+- **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
+  capability is either present or absent and there is no way to say "we could
+  not check". That gap caused the v0.7.7 OTP regression: on a USB-HID-only
+  enumeration nothing has been sent to the device, so the only evidence is the
+  USB PID, and "no evidence" got recorded as "no feature". Hiding a capability
+  is not cosmetic — it removes the GUI tab and makes `--key <name>` fail to find
+  the device.
+  What already exists to build on: `keyroost-transport` (`src/lib.rs`, the
+  `answers(...)` block) probes for real over a reader, `SELECT`ing each applet
+  AID, and that is ground truth. The CLI already models the third state
+  correctly elsewhere — `otp_feature_supported` returns `Option<bool>` where
+  `None` means "can't tell, so go ahead". The device list never got the same
+  treatment.
+  Why it is not just "always probe": a HID probe costs an open plus up to a 3 s
+  wait per key on a listing meant to be instant, it can collide with another
+  process holding the hidraw node, and it answers the wrong question anyway —
+  it reports whether the applet is reachable *over HID*, and Token2's Bio3
+  carries OTP over CCID with HID disabled, so a HID probe would have produced
+  the same wrong answer more slowly.
+  Shape to aim for: carry present / absent / unverified per capability, drive
+  the surfaces off it, and render the difference (an "OTP — not verified, no
+  reader available" tab rather than no tab). Unverified must always behave as
+  "offer it"; the attempt then produces a real answer, which is now a decent
+  message rather than a raw protocol error.
+  **Do not start this before Token2 answers on
+  [#95](https://github.com/framefilter/keyroost/issues/95)** — whether a
+  `FIDO + PGP` PID can carry OTP over CCID decides whether the PID table is
+  usable as *evidence* at all, or only ever as a hint in a message. Not a patch
+  release; this is a data-model change across resolve, the CLI and the GUI.
+
+- **Run the mandatory packaging probe before any version bump.**
   `gh workflow run linux-bundles.yml --ref <ref>` with no tag input = build-only;
   both the flatpak and AppImage jobs must go green *before* any version bump or
   tag. Packaging pulls from upstreams that drift independently (the v0.7.3
@@ -87,15 +118,21 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Blocked / needs someone else
 
-- **[#95] — awaiting the reporter.** Needs their keyroost version, `keyroostctl
-  list` output and a `--debug` trace before anything can be diagnosed.
-
-- **[#82] follow-up: native support for the no-status-word HID dialect —
-  blocked on Token2.** v0.7.6 ships the same-device HID→CCID fallback, which
-  unbreaks the affected keys; the underlying firmware answers GET_INFO over HID
-  with `80 bf 00 01 05` and no trailing `90 00`. Once the reporter names the
-  model, ask Token2 what that dialect is and whether the HID path should
-  recognize it directly. **Vendor input first, no empirical probing** — the
+- **[#82]/[#95]: native support for the no-status-word HID dialect — blocked on
+  Token2.** The same defect under two numbers; both are titled "unexpected
+  status word 0x0105". The affected firmware answers over HID with
+  `80 bf 00 01 05` and no trailing `90 00`, and our parser slices the last two
+  bytes as a status word because every other dialect has one — which is why
+  `0105` shows up as a status word that appears nowhere in Token2's published
+  applet source, where every real one is `6xxx`/`9000`. It is most likely the
+  tail of the response body, not a status word at all.
+  v0.7.6 ships the same-device HID→CCID fallback, which unbreaks these keys
+  whenever a reader is available; #95 got the bad path because the reporter's
+  smart-card service was not running, so there was nothing to fall back to.
+  v0.7.8 makes that failure say so.
+  Still to settle with Token2, in one question rather than several: what is
+  this response format, is there a status word at all, and should the HID path
+  recognize it natively? **Vendor input first, no empirical probing** — the
   Solo 2 HOTP lesson.
 
 - **[#37] OnlyKey support — blocked on hardware** (units ordered). Teach

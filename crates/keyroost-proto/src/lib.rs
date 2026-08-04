@@ -348,8 +348,22 @@ pub fn token2_functions(pid: u16) -> Option<Token2Functions> {
 /// `token2_functions(pid).is_some_and(|f| f.otp)`**, which would silently drop
 /// OTP from every key Token2 ships after this table was captured.
 ///
-/// The narrow thing this settles: a `FIDO + PGP` or `PGP`-only unit stops being
-/// offered an OTP surface that can only fail on it (issue #82).
+/// # Do not use this to withhold a capability
+///
+/// v0.7.7 wired this into the device list, so a PID whose function set omits
+/// OTP lost the capability bit — which also removes the GUI's OTP tab and makes
+/// `--key <name>` fail to find the device. Token2 then reported on issue #95
+/// that a key can carry OTP over **CCID** while its function set reads
+/// `FIDO + PGP`, because the model has no HOTP-over-HID and ships with the HID
+/// channel disabled. A function set therefore says what is switched on, not
+/// which channel serves it, and never that an applet is absent —
+/// [`TOKEN2_PRODUCTS`] says exactly that in its own docs.
+///
+/// The reliable answer comes from `SELECT`ing the applet over a reader, which
+/// `keyroost-transport`'s probe already does. Where that probe cannot run (a
+/// HID-only enumeration, or no smart-card service) the honest state is
+/// *unknown*, and unknown must resolve to "offer it" — not to a guess from the
+/// PID. Use this only to *inform* a message, never to deny a surface.
 #[must_use]
 pub fn token2_pid_may_have_otp(pid: u16) -> bool {
     token2_functions(pid).is_none_or(|f| f.otp)
