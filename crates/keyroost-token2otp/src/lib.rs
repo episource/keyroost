@@ -140,6 +140,29 @@ impl OtpError {
     pub fn is_empty_token(&self) -> bool {
         matches!(self, OtpError::EntryNotFound)
     }
+
+    /// The status word this error was mapped from — the inverse of
+    /// [`check`](OtpError::check).
+    ///
+    /// Every variant here came from one, but only `BadStatusCode` kept it, so
+    /// callers that needed the raw value had to discard the typed error. The
+    /// transport needs it to tell "the applet answered and declined" apart from
+    /// "the interface never worked": a key that returns a status word has a
+    /// working interface, and blaming the transport sends the user off to
+    /// enable something that is already on (issue #95).
+    ///
+    /// `EntryNotFound` reports the primary `6A80`; it is also produced by the
+    /// `6A83` alias, so this is a lossy inverse for that one variant.
+    #[must_use]
+    pub fn status_word(&self) -> u16 {
+        match self {
+            OtpError::EntryNotFound => sw::ENTRY_NOT_FOUND,
+            OtpError::NotEnoughSpace => sw::NOT_ENOUGH_SPACE,
+            OtpError::ButtonPressRequired => sw::BUTTON_TIMEOUT,
+            OtpError::HidNotSupported => sw::HID_NOT_SUPPORTED,
+            OtpError::BadStatusCode(sw) => *sw,
+        }
+    }
 }
 
 impl std::fmt::Display for OtpError {
