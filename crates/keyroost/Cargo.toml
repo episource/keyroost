@@ -53,7 +53,7 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # tree; png is a small, focused decoder (no full `image` crate pulled in).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 png = "0.18"
 # Native file-chooser dialogs (Browse… / Save…) for the path inputs in the
 # PIV and OpenPGP panes. The xdg-portal backend talks to the desktop portal
@@ -64,7 +64,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "w
 # Tiny pure-Rust executor used only to drive rfd's async portal dialogs to
 # completion on a throwaway helper thread. Already in the tree via rfd; declared
 # directly so `pollster::block_on` is callable.
-pollster = "0.4"
+pollster = "1.0"
 
 # QR-from-screen (optional; `--features qr`): a lightweight, STILL-only screen
 # grab that keeps the one-click UX without a video-capture stack. Decoding
@@ -80,7 +80,7 @@ pollster = "0.4"
 # single frame. (ashpd needs Rust 1.92 — but so does this GUI crate via egui 0.35,
 # so `qr` adds no MSRV burden beyond the crate's own rust-version above.)
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", optional = true }
+x11rb = { version = "0.14", optional = true }
 # `screenshot` is the portal we use; `async-io` drives it on zbus's async-io
 # runtime (no tokio), which `pollster::block_on` can run. `trash` is only here to
 # work around an ashpd 0.13.12 bug: its `screenshot` feature references
