@@ -161,7 +161,11 @@ impl Slot {
             Slot::Signature => "signature (9C)".into(),
             Slot::KeyManagement => "key management (9D)".into(),
             Slot::CardAuthentication => "card authentication (9E)".into(),
-            Slot::Retired(n) => format!("retired {n} ({:02X})", 0x81 + n),
+            // "retired key 1 (82)" rather than "retired 1 (82)": the bare
+            // ordinal reads as part of the slot number, leaving the user to
+            // guess whether "1" or "82" identifies the slot. Same shape as the
+            // standard slots above — a name, then its hex address.
+            Slot::Retired(n) => format!("retired key {n} ({:02X})", 0x81 + n),
         }
     }
 
@@ -1045,8 +1049,8 @@ mod tests {
 
     #[test]
     fn retired_label_is_stable() {
-        assert_eq!(Slot::retired(1).unwrap().label(), "retired 1 (82)");
-        assert_eq!(Slot::retired(20).unwrap().label(), "retired 20 (95)");
+        assert_eq!(Slot::retired(1).unwrap().label(), "retired key 1 (82)");
+        assert_eq!(Slot::retired(20).unwrap().label(), "retired key 20 (95)");
     }
 
     #[test]

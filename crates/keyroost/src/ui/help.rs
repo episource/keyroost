@@ -117,6 +117,16 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             body: "Saves this slot's certificate to a file on your computer. It's public information, so no PIN is needed.",
             slug: "/piv#export",
         },
+        "piv-move" => &Help {
+            title: "Move a key",
+            body: "Relocates this slot's private key into another slot without it ever leaving the card — useful for retiring a decryption key so old mail stays readable while a fresh key takes over. Nothing is destroyed: keyroost refuses if the destination already holds a key, and the certificate stays behind in the original slot. Needs the management key and a YubiKey 5.7 or newer.",
+            slug: "/piv#move-key",
+        },
+        "piv-retired" => &Help {
+            title: "Retired slots",
+            body: "Twenty extra slots (82–95) that hold decryption keys you've rotated out, so mail and files encrypted to an old key can still be opened. They work like the four main slots but are read only when you open this section, because checking them means asking the card about each one in turn.",
+            slug: "/piv#retired",
+        },
         "piv-delete" => &Help {
             title: "Delete from the slot",
             body: "Clearing the certificate leaves the key in place; erasing the private key removes it for good (and needs a YubiKey 5.7 or newer). Both are permanent and can't be undone.",

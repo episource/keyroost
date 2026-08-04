@@ -1401,8 +1401,6 @@ struct PivState {
     /// Chosen destination slot for the Move-key flow (empty until the user picks
     /// one in the modal's destination combo). Reset when the modal closes.
     move_dest: Option<keyroost_piv::Slot>,
-    /// Whether the collapsible "Retired slots" section is expanded.
-    retired_expanded: bool,
     /// Lazily-read occupancy of the 20 retired slots (`slot -> has_key`), cached
     /// so expanding the section only probes the card once. `None` until read;
     /// invalidated after a move so the section re-reads on its next expand.
@@ -1465,7 +1463,6 @@ impl Default for PivState {
             confirm_reset: None,
             cred_modal: None,
             move_dest: None,
-            retired_expanded: false,
             retired_occupancy: None,
         }
     }
@@ -6092,13 +6089,12 @@ impl App {
                 // touched) reflect the new state without a manual Refresh.
                 app.load_piv_status();
                 // Any successful PIV write (delete, reset, move, ...) can change
-                // retired-slot occupancy; drop the cache and collapse the section
-                // so it re-reads fresh on the next expand instead of showing
-                // stale occupancy (see piv_move_key for the same invalidation).
+                // retired-slot occupancy; drop the cache so the retired tab
+                // re-reads fresh on its next open instead of showing stale
+                // occupancy (see piv_move_key for the same invalidation).
                 app.piv.retired_occupancy = None;
-                app.piv.retired_expanded = false;
                 // A retired-slot selection is stale once its occupancy cache is
-                // dropped (the section also collapses); snapping back to a
+                // dropped; snapping back to a
                 // standard slot prevents acting on it with unknown occupancy —
                 // notably the Generate overwrite guard, which would otherwise
                 // see "unknown" as "empty" and skip its warning on a still-
@@ -6462,12 +6458,11 @@ impl App {
                     result,
                     format!("Key moved from {} to {}.", src.label(), dest.label()),
                 );
-                // Retired occupancy changed (source and/or destination); drop the
-                // cache and collapse the section so it re-reads on the next open.
+                // Retired occupancy changed (source and/or destination); drop
+                // the cache so the retired tab re-reads on its next open.
                 app.piv.retired_occupancy = None;
-                app.piv.retired_expanded = false;
                 // A retired-slot selection is stale once its occupancy cache is
-                // dropped (the section also collapses); snapping back to a
+                // dropped; snapping back to a
                 // standard slot prevents acting on it with unknown occupancy —
                 // notably the Generate overwrite guard, which would otherwise
                 // see "unknown" as "empty" and skip its warning on a still-
@@ -12592,7 +12587,7 @@ impl App {
         let mut open_delete_cert = false;
         let mut open_delete_key = false;
         let mut open_move_key = false;
-        let mut toggle_retired = false;
+        let mut click_retired_tab = false;
         let mut arm_reset = false;
         let mut copy_pem: Option<String> = None;
         // Slot the user clicked in the status card this frame (applied after the
@@ -12827,18 +12822,12 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
-            for slot in [
-                PivSlotSel::Auth,
-                PivSlotSel::Sign,
-                PivSlotSel::KeyMgmt,
-                PivSlotSel::CardAuth,
-            ] {
-                let active = selected == slot;
+            let tab = |ui: &mut egui::Ui, label: String, active: bool| -> bool {
                 let color = if active { p.txt } else { p.txt3 };
                 let resp = ui
                     .add(
                         egui::Label::new(
-                            egui::RichText::new(slot.label())
+                            egui::RichText::new(label)
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
@@ -12855,86 +12844,122 @@ impl App {
                         egui::Stroke::new(2.0, p.accent),
                     );
                 }
-                if resp.clicked() {
+                resp.clicked()
+            };
+            for slot in [
+                PivSlotSel::Auth,
+                PivSlotSel::Sign,
+                PivSlotSel::KeyMgmt,
+                PivSlotSel::CardAuth,
+            ] {
+                if tab(ui, slot.label(), selected == slot) {
                     clicked_slot = Some(slot);
                 }
             }
-        });
-        // --- Retired slots (collapsible) -----------------------------------
-        // Yubico firmware 5.7+ exposes 20 retired key-management slots. They're
-        // read lazily (they matter mainly as a move destination / archive), so
-        // they sit behind a collapsing header rather than in the tab strip.
-        ui.add_space(10.0);
-        {
-            let expanded = self.piv.retired_expanded;
-            let caret = if expanded { "\u{25BE}" } else { "\u{25B8}" };
-            let hdr = ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("{caret} Retired slots"))
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt2),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if hdr.clicked() {
-                toggle_retired = true;
+            // The twenty retired slots are a peer of the four standard ones, so
+            // they get a tab of their own rather than a section wedged between
+            // this strip and the cards it heads. Their own pane then has room to
+            // list all twenty — a wrapped row of chips here would have swamped
+            // the strip the moment more than a couple held keys.
+            let retired_active = matches!(selected, PivSlotSel::Retired(_));
+            if tab(
+                ui,
+                "retired keys (82\u{2013}95)".to_string(),
+                retired_active,
+            ) {
+                click_retired_tab = true;
             }
-            if expanded {
-                ui.add_space(6.0);
-                match self.piv.retired_occupancy.clone() {
-                    Some(occ) => {
-                        // While the move modal is up, show empty slots too so the
-                        // full retired map is visible; otherwise only the occupied
-                        // (selectable) slots appear.
-                        let move_open = matches!(
-                            self.piv.cred_modal.as_ref().map(|m| m.kind),
-                            Some(PivCredKind::MoveKey)
-                        );
-                        if !occ.iter().any(|(_, has)| *has) && !move_open {
-                            note(ui, "No retired slots hold a key.");
-                        }
-                        for (slot, has_key) in occ {
-                            if !has_key && !move_open {
-                                continue;
-                            }
-                            let keyroost_piv::Slot::Retired(n) = slot else {
-                                continue;
-                            };
-                            let sel_variant = PivSlotSel::Retired(n);
-                            let active = selected == sel_variant;
-                            let color = if active {
-                                p.txt
-                            } else if has_key {
-                                p.txt2
-                            } else {
-                                p.txt3
-                            };
-                            let text = if has_key {
-                                slot.label()
-                            } else {
-                                format!("{} \u{00B7} empty", slot.label())
-                            };
-                            let resp = ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(text)
-                                        .font(theme::f_reg(12.5))
-                                        .color(color),
-                                )
-                                .sense(egui::Sense::click()),
-                            );
-                            if has_key
-                                && resp
+            // Anchored to the tab rather than a line of prose above the list:
+            // the list's own dots already say what is occupied, so a sentence
+            // there was only restating them. Shown while the tab is active so
+            // the strip stays clean the rest of the time.
+            if retired_active {
+                ui.add_space(2.0);
+                self.help_dot(ui, p, "piv-retired");
+            }
+        });
+        // --- Retired-slot rail (only on the retired tab) --------------------
+        // All twenty slots, listed the way the Molto2 view lists its profiles:
+        // one row each, a filled dot on the right for the ones holding a key,
+        // the selected row filled with the soft accent. Occupancy is read
+        // lazily the first time this tab is opened — checking it means asking
+        // the card about each of the twenty in turn, which is not worth doing
+        // on every status refresh.
+        if matches!(selected, PivSlotSel::Retired(_)) {
+            ui.add_space(14.0);
+            match self.piv.retired_occupancy.clone() {
+                Some(occ) => {
+                    // Show as many rows as the pane can spare before the action
+                    // cards below, then scroll. Twenty rows fit outright on a
+                    // reasonably tall window.
+                    let rail_h = (ui.available_height() - 300.0).clamp(150.0, 20.0 * 30.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("piv-retired-rail")
+                        .auto_shrink([false, false])
+                        .max_height(rail_h)
+                        .show(ui, |ui| {
+                            ui.set_width(300.0);
+                            for (slot, has_key) in occ {
+                                let keyroost_piv::Slot::Retired(n) = slot else {
+                                    continue;
+                                };
+                                let sel_variant = PivSlotSel::Retired(n);
+                                let active = selected == sel_variant;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 30.0),
+                                    egui::Sense::click(),
+                                );
+                                let bg = if active {
+                                    p.accent_soft()
+                                } else if resp.hovered() {
+                                    p.line_soft
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                ui.painter().rect(
+                                    rect,
+                                    egui::CornerRadius::same(8),
+                                    bg,
+                                    egui::Stroke::NONE,
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.painter().text(
+                                    rect.left_center() + egui::vec2(12.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("Slot {:02X} \u{00B7} retired key {n}", 0x81 + n),
+                                    theme::f_mono(12.5),
+                                    if active {
+                                        p.accent
+                                    } else if has_key {
+                                        p.txt
+                                    } else {
+                                        p.txt3
+                                    },
+                                );
+                                // Same affordance as the Molto2 rail's seed dot:
+                                // presence is a mark on the row, not a word.
+                                if has_key {
+                                    ui.painter().circle_filled(
+                                        egui::pos2(rect.right() - 12.0, rect.center().y),
+                                        3.0,
+                                        if active { p.accent } else { p.ok },
+                                    );
+                                }
+                                let resp = resp.on_hover_text(if has_key {
+                                    format!("{} \u{00B7} holds a key", slot.label())
+                                } else {
+                                    format!("{} \u{00B7} empty", slot.label())
+                                });
+                                if resp
                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
-                            {
-                                clicked_slot = Some(sel_variant);
+                                {
+                                    clicked_slot = Some(sel_variant);
+                                }
                             }
-                        }
-                    }
-                    None => note(ui, "Reading retired slots\u{2026}"),
+                        });
                 }
+                None => note(ui, "Reading retired slots\u{2026}"),
             }
         }
         // --- Selected slot content (single column under the strip) ----------
@@ -13138,6 +13163,28 @@ impl App {
             }
 
             ui.add_space(12.0);
+            // --- Move key: its own row, above Delete. It used to be a button
+            // inside the Delete row, which put a deliberately non-destructive
+            // action under a destructive heading and left it sharing the delete
+            // help text — the one place a user checking "is this safe?" would
+            // look. Same 5.7+ gate as delete, plus a key in the active slot.
+            if can_delete_key && selected_has_key {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Move key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-move");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
+                            open_move_key = true;
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+            }
             // --- Delete: bold label + help left, the two delete
             // actions right-aligned (Delete key is Danger, gated 5.7+).
             ui.horizontal(|ui| {
@@ -13149,14 +13196,6 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-delete");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Move key: relocate the slot's key to an empty slot. Needs
-                    // 5.7+ (same gate as delete) and a key in the active slot.
-                    if can_delete_key && selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
-                            open_move_key = true;
-                        }
-                        ui.add_space(6.0);
-                    }
                     if can_delete_key {
                         if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
                             open_delete_key = true;
@@ -13283,16 +13322,30 @@ impl App {
                 let _ = self.load_piv_retired_occupancy();
             }
         }
-        if toggle_retired {
-            self.piv.retired_expanded = !self.piv.retired_expanded;
-            if self.piv.retired_expanded
-                && self.piv.retired_occupancy.is_none()
-                && !self.load_piv_retired_occupancy()
-            {
-                // Job didn't queue (worker busy): collapse again so a later
-                // click retries instead of getting stuck showing "Reading
-                // retired slots…" forever with no read in flight.
-                self.piv.retired_expanded = false;
+        if click_retired_tab {
+            // Opening the tab has to land on a concrete slot, because every
+            // action card below targets one. Prefer the first slot that holds a
+            // key — the reason to come here is usually an existing archived key
+            // — and fall back to retired key 1 when none does or occupancy has
+            // not been read yet.
+            let first_used = self
+                .piv
+                .retired_occupancy
+                .as_ref()
+                .and_then(|occ| {
+                    occ.iter()
+                        .find(|(_, has)| *has)
+                        .and_then(|(slot, _)| match slot {
+                            keyroost_piv::Slot::Retired(n) => Some(*n),
+                            _ => None,
+                        })
+                })
+                .unwrap_or(1);
+            self.piv.selected_slot = PivSlotSel::Retired(first_used);
+            if self.piv.retired_occupancy.is_none() {
+                // Nothing to undo if this doesn't queue: the pane shows
+                // "Reading retired slots…" and the next click retries.
+                let _ = self.load_piv_retired_occupancy();
             }
         }
         if arm_reset {
@@ -15565,7 +15618,6 @@ mod tests {
         let mut app = App::default();
         app.piv.selected_slot = PivSlotSel::Retired(3);
         app.piv.retired_occupancy = Some(vec![(keyroost_piv::Slot::Retired(3), true)]);
-        app.piv.retired_expanded = true;
         let status = keyroost_transport::PivStatus {
             version: None,
             serial: None,
@@ -15579,7 +15631,6 @@ mod tests {
             "a retired-slot selection must not survive its occupancy cache clearing"
         );
         assert!(app.piv.retired_occupancy.is_none());
-        assert!(!app.piv.retired_expanded);
     }
 
     /// A standard-slot selection is left untouched by the same invalidation —

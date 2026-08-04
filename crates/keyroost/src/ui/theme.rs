@@ -258,14 +258,35 @@ pub fn install_fonts(ctx: &egui::Context) {
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "jb".into());
-    f.families.insert(
-        FontFamily::Name("semibold".into()),
-        vec!["plex_sb".into(), "plex".into()],
-    );
-    f.families.insert(
-        FontFamily::Name("bold".into()),
-        vec!["plex_b".into(), "plex".into()],
-    );
+    // JetBrains Mono is the only bundled face carrying the geometric glyphs the
+    // UI draws — the ▸/▾ disclosure carets and the ▲ naming the Molto2's own
+    // confirm button. IBM Plex has none of them, and neither do egui's built-in
+    // fallbacks, so until it is reachable from proportional text those render as
+    // tofu: the caret shipped looking like a literal "?" next to "Retired slots".
+    // Appended last, so it only ever supplies what Plex is missing.
+    f.families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("jb".into());
+    // The named weights are built from the proportional chain rather than a bare
+    // pair, so they inherit the same fallbacks. Spelled `plex_sb`/`plex_b` first,
+    // then everything Proportional resolves to — previously these two families
+    // had no fallback at all, so any glyph missing from one Plex face was tofu in
+    // every semibold or bold string.
+    let proportional = f
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let weighted = |face: &str| {
+        let mut chain = vec![face.to_string()];
+        chain.extend(proportional.iter().cloned());
+        chain
+    };
+    f.families
+        .insert(FontFamily::Name("semibold".into()), weighted("plex_sb"));
+    f.families
+        .insert(FontFamily::Name("bold".into()), weighted("plex_b"));
     ctx.set_fonts(f);
 }
 
