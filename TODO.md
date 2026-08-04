@@ -29,76 +29,33 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Ready to pick up
 
-- **UNDECIDED: should the PID gate on `Caps::OTP` come back, narrowed?**
-  Needs a decision before the third-state work below; parked deliberately, not
-  forgotten.
-  *What is true today:* the gate is gone — `keyroost-resolve/src/device.rs`
-  sets `has_otp = is_token2`, so every Token2 key is offered the OTP surface.
-  *What the panic was about, and why it was wrong:* v0.7.7 gated that bit on
-  the vendor function set, and it was reported as a regression that removed
-  OTP from nine PIDs. It was not. Capabilities are **insert-only** — there is
-  no `remove` anywhere in `device.rs`. A key on a working reader gets
-  `Caps::OTP` from an actual `SELECT` of the applet AID in
-  `keyroost-transport`, and the HID merge can only `insert`, never clear it.
-  Token2 confirmed on #95 that a `0204` works on v0.7.7, which is exactly
-  this path. The PID had a say only on a **HID-only row** — no reader bound,
-  or no smart-card service — where CCID-carried OTP is unreachable regardless.
-  So the released behaviour was very nearly harmless, and the revert was a
-  larger swing than the evidence warranted.
-  *What is genuinely unresolved:* Token2 states a `0204` has OTP, while their
-  own published PID matrix lists `0204` as FIDO + PGP. One of those is wrong,
-  and we do not know which. Nothing is known either way about the other eight
-  (`0010`, `0014`, `0015`, `0020`, `0024`, `0025`, `0200`, `0205`).
-  *The three options, and the case for each:*
-  1. **Leave it fail-open** (status quo). Costs nothing when a reader is
-     present, since the probe wins anyway. On a HID-only view it offers a
-     surface that may fail — but the failure is now an actionable message
-     rather than a raw protocol error, which is what made the original #82
-     complaint sting.
-  2. **Restore the gate and correct the table** for whichever PIDs Token2
-     confirms. Keeps the #82 improvement (no OTP pane on a key that truly
-     lacks the applet) and fixes the one entry known to be wrong. Assumes the
-     table is right for the seven PIDs nobody has tested, which is the
-     assumption that just failed once.
-  3. **Restore the gate but only for a `SELECT`-verified absence** — i.e.
-     never infer from the PID at all, and let the third-state work below carry
-     the whole load. Cleanest, and the most work.
-  *Deciding needs:* Token2's answer on #95 question 3. Do not re-litigate this
-  from the PID table alone — that is what produced two wrong turns in one day.
-
 - **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
-  capability is either present or absent and there is no way to say "we could
-  not check". On a USB-HID-only enumeration nothing has been sent to the device,
-  so the only evidence is the USB PID — and with nowhere to record "unknown",
-  absence of evidence has to be written down as absence of the feature.
-  This is the gap the v0.7.7 OTP argument was really about. It did *not* cause a
-  user-facing regression (see the undecided item above: capabilities are
-  insert-only, so a probe always wins), but it is why a guess had to be made at
-  all, and why the guess had authority it should never have had. Where it does
-  bite, it bites hard: a missing capability removes the GUI tab and makes
-  `--key <name>` fail to find the device.
-  What already exists to build on: `keyroost-transport` (`src/lib.rs`, the
-  `answers(...)` block) probes for real over a reader, `SELECT`ing each applet
-  AID, and that is ground truth. The CLI already models the third state
-  correctly elsewhere — `otp_feature_supported` returns `Option<bool>` where
-  `None` means "can't tell, so go ahead". The device list never got the same
-  treatment.
-  Why it is not just "always probe": a HID probe costs an open plus up to a 3 s
+  capability is either present or absent and there is nowhere to record "we
+  could not check". On a USB-HID-only enumeration nothing has been sent to the
+  device, so with no way to say *unknown*, absence of evidence gets written down
+  as absence of the feature — and something has to invent that answer.
+  That is the whole of the v0.7.7 OTP argument. It did not cause a user-facing
+  regression (capabilities are insert-only, so a real probe always wins), but it
+  is why a guess was needed at all. Where a capability does go missing it bites
+  hard: no GUI tab, and `--key <name>` cannot find the device.
+  What exists to build on: `keyroost-transport` (`src/lib.rs`, the `answers(...)`
+  block) `SELECT`s each applet AID over a reader — ground truth. The CLI already
+  models the third state elsewhere: `otp_feature_supported` returns
+  `Option<bool>` with `None` meaning "can't tell, so go ahead". The device list
+  never got the same treatment.
+  Shape to aim for: present / absent / unverified per capability, surfaces
+  driven off it, and the difference rendered — "OTP — not verified, no reader
+  available" rather than no tab at all. Unverified always behaves as "offer it";
+  the attempt then produces a real answer, which is now a decent message rather
+  than a raw protocol error.
+  Note a HID probe is not the fix on its own: it costs an open plus up to a 3 s
   wait per key on a listing meant to be instant, it can collide with another
-  process holding the hidraw node, and it answers the wrong question anyway —
-  it reports whether the applet is reachable *over HID*, and Token2's Bio3
-  carries OTP over CCID with HID disabled, so a HID probe would have produced
-  the same wrong answer more slowly.
-  Shape to aim for: carry present / absent / unverified per capability, drive
-  the surfaces off it, and render the difference (an "OTP — not verified, no
-  reader available" tab rather than no tab). Unverified must always behave as
-  "offer it"; the attempt then produces a real answer, which is now a decent
-  message rather than a raw protocol error.
-  **Do not start this before Token2 answers on
-  [#95](https://github.com/framefilter/keyroost/issues/95)** — whether a
-  `FIDO + PGP` PID can carry OTP over CCID decides whether the PID table is
-  usable as *evidence* at all, or only ever as a hint in a message. Not a patch
-  release; this is a data-model change across resolve, the CLI and the GUI.
+  process holding the hidraw node, and it only answers whether the applet is
+  reachable *over HID* — Token2's Bio3 carries OTP over CCID with HID disabled,
+  so a HID probe returns the same wrong answer more slowly. Unverified is the
+  honest result there, not a second guess.
+  Not blocked on anyone. A data-model change across resolve, the CLI and the
+  GUI.
 
 - **Run the mandatory packaging probe before any version bump.**
   `gh workflow run linux-bundles.yml --ref <ref>` with no tag input = build-only;
@@ -273,6 +230,25 @@ plan's two-key manual steps were never executed):
 ## Standing decisions
 
 Not tasks. Kept so they are not re-litigated or re-researched.
+
+- **No device→capability matrix. Ever.** keyroost does not decide what a device
+  can do by looking its USB product id up in a table. Capabilities come from
+  asking the device — `SELECT` the applet and see what answers — or they are
+  *unknown*, and unknown means offer the surface and let the attempt report the
+  truth.
+  A matrix cannot be maintained: it drifts every time a vendor ships a new
+  configuration, we have no way to test entries against hardware we do not own,
+  and keeping it current would mean asking the vendor to confirm rows forever.
+  v0.7.7 proved the failure mode in a single day — an entry was wrong, the wrong
+  entry silently removed a feature, and the only way to find out was a user
+  reporting it.
+  This settles the v0.7.7 `Caps::OTP` question: the product-id gate is **not**
+  coming back, not narrowed, not with a corrected table. Nothing here is blocked
+  on a vendor answer.
+  What a product id is still good for: **labelling** ("Bio3 Dual (FIDO + PGP)")
+  and colouring an error message. Never for granting or withholding a surface.
+  `TOKEN2_PRODUCTS` says as much in its own docs — "nothing here may be treated
+  as proof that an applet is present" — and the inverse is no safer.
 
 - **Windows signing: keep signing with Token2; winget always waits for the
   signed zip.** No own signing identity for now — Azure Artifact Signing /
