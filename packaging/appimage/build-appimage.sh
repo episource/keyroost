@@ -97,7 +97,7 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 #    this AppImage. Step 3b-2 below wraps the launcher so that failure is a clear,
 #    actionable message rather than a cryptic linker error, but the app still
 #    can't run without the library. The real fix — dlopen pcsc at runtime and
-#    degrade gracefully when it is absent — is tracked in TODO-v0.7.5.md; it
+#    degrade gracefully when it is absent — is tracked in TODO.md; it
 #    removes this limitation and fixes the mismatch for every channel, not just
 #    the AppImage.
 #

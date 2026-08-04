@@ -12,9 +12,14 @@ credential is touched.
 
 ## crates.io (no stored secret)
 
-1. First publish is manual, in dependency order (see the runbook in
-   `TODO-hardening.md`): `cargo login`, then `cargo publish -p <crate>
-   --locked` tier by tier.
+1. First publish is manual, in dependency order: `cargo login`, then
+   `cargo publish -p <crate> --locked` tier by tier, waiting ~a minute
+   between tiers for index propagation.
+   1. `keyroost-proto`, `keyroost-hid`, `keyroost-keyring`, `keyroost-rsakey`
+   2. `keyroost-ctap`, `keyroost-oath`, `keyroost-openpgp`, `keyroost-piv`,
+      `keyroost-token2otp`, `keyroost-import` (leaf byte layers)
+   3. `keyroost-transport`, then `keyroost-resolve` and `keyroost-qr`
+   4. `keyroostctl`, `keyroost`
 2. On crates.io, for **each** crate: Settings → Trusted Publishing → add
    GitHub repository `framefilter/keyroost`, workflow `publish.yml`,
    environment `release-publish`.
