@@ -73,8 +73,45 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ceiling checked before any decompression runs.
 - **Per-credential largeBlob keys are wiped from memory** after use, in all
   three places they were held.
+- **keyroost no longer claims a Token2 key has the on-device OTP applet just
+  because it is a Token2.** Capability was decided from the USB *vendor* id, so
+  every Token2 key was offered the On-device OTP pane — including the
+  configurations supplied without that applet, which then failed with a raw
+  protocol error. The vendor's product id says which functions a unit actually
+  has, so nine configurations (the FIDO-only, PGP-only and FIDO+PGP variants of
+  PIN+ Mini, PIN+ Series and Bio3 Dual) no longer advertise OTP. A product id
+  keyroost does not recognise still gets the feature offered, deliberately:
+  hiding a function your key really has would be the worse mistake.
 
 ### Fixed
+- **A key that has no on-device OTP now says so.** Where the key reports the
+  function as absent, both the app and the CLI say it was supplied without it —
+  and that Token2 keys cannot be upgraded after purchase, so it is not something
+  to switch on — instead of surfacing a protocol error. `keyroostctl otp config`
+  is never gated on this and now reports the capability explicitly, including
+  "unknown" when the key answers with a short config block.
+- **Security-key communication errors are explained rather than numbered.** A
+  busy key reported only `CTAPHID_ERROR code 0x06`; each of the nine codes now
+  carries a plain-language explanation with the specification's name alongside
+  it. A busy channel is also retried briefly before being reported, which the
+  specification asks clients to do and keyroost did not — that alone accounted
+  for failures that cleared on their own moments later.
+- **The retired PIV slots are a tab of their own.** They previously sat between
+  the slot headings and the panes those headings introduce, listed as bare text
+  under a heading whose caret rendered as a missing-glyph box. They now list all
+  twenty in their own pane, marking which hold a key, and `Move key` has its own
+  row and its own help rather than sharing the Delete heading — it is
+  deliberately non-destructive and was filed under a destructive action.
+- **A refusal to reset the wrong key names the right reason.** With an
+  unrelated smart-card token also connected, refusing to wipe a key that was not
+  the one confirmed reported that it "is not a different key" while a different
+  key was plainly attached — a token with no security-key interface was being
+  counted among the candidates.
+- **The Molto2 troubleshooting guide names the real cause of "the token is
+  never detected".** On distributions that start the smart-card service on
+  demand, the service is usually not running between commands, so replugging
+  notifies nothing and each command cold-starts it into the one attempt most
+  likely to fail. Documented with the two checks that rule the token out first.
 - **`cargo install keyroost` on Windows.** The Windows icon lived outside the
   published crate, so it was absent from the crates.io package and the build
   aborted. Nothing already released was affected — this would have first
