@@ -15,10 +15,27 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       pinned-inputs check).
 - [ ] `cargo audit` green (the audit workflow runs on pushes; check the last
       run) and the deps-outdated report reviewed.
-- [ ] **New-crate check:** any crate added to the workspace since the last
-      release needs a one-time manual `cargo publish` and a crates.io
-      Trusted Publishing entry BEFORE the release run — the OIDC job cannot
-      create a brand-new crate.
+- [ ] **Publish-readiness check** (one command):
+      `packaging/check-publish-readiness.sh v<prev>`
+      Proves the crates.io fanout can actually run. Three failure modes, none
+      of which any other gate catches and all of which surface only once the
+      fanout is already half done:
+      (a) a crate added since the last release — Trusted Publishing over OIDC
+      cannot CREATE a crate name, so its first publish must be manual, with a
+      crates.io Trusted Publishing entry added after;
+      (b) a member missing from `publish.yml`'s list, which then silently
+      never publishes;
+      (c) a NEW inter-crate dependency edge that the publish order does not
+      respect — cargo refuses to publish a crate whose path-dep sibling is not
+      yet on crates.io at the pinned version, and the run dies with half the
+      workspace released.
+      (c) is the subtle one: every crate can already be published and the
+      release still breaks, because what changed is the ORDER requirement, not
+      the set. v0.7.7 added `keyroost-resolve -> keyroost-openpgp` and happened
+      to be ordered correctly; nothing would have caught it if it had not been.
+      The script cannot see Trusted Publishing config (no API exposes it) — for
+      a newly-added crate, confirm that by hand in the crate's crates.io
+      settings.
 - [ ] **Packaging probe** (mandatory, one command):
       `gh workflow run linux-bundles.yml --ref main`
       No tag input = build-only; approve the gate (probe-safe). Both bundle
@@ -90,6 +107,21 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
     (`master -> master` to aur.archlinux.org); the RPC
     (`https://aur.archlinux.org/rpc/v5/info?arg[]=keyroost-bin`) lags a few
     minutes behind and reads stale right after the push.
+    **`The AUR is down due to maintenance. We will be back soon.` is not
+    our bug and not worth retrying.** It comes from `aurweb/git/serve.py`
+    *after* our deploy key authenticates, and has exactly one trigger: an
+    operator set the maintenance flag and our source IP is not in the
+    exception list. An IP ban would say something else ("The SSH interface
+    is disabled for your IP address"), so this message never means we were
+    blocked. The AUR froze *all* pushes on 2026-08-01 during a supply-chain
+    malware incident and v0.7.7 shipped without it.
+    Two traps: the freeze is announced **only on the aur-general mailing
+    list** (not archlinux.org/news, no web banner), and the web UI, RPC and
+    git-over-HTTPS reads all stay up throughout — so "the site works" tells
+    you nothing about whether pushes do. Check
+    <https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/>
+    before assuming it is transient. AUR is independent of every other
+    channel and can land late.
   - Flatpak remote (a machine with the remote configured):
     `flatpak update --appstream && flatpak remote-info keyroost io.github.framefilter.keyroost`
     must show the new version.
@@ -101,11 +133,37 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 ## 5. Signed Windows build (out-of-band, Token2)
 
 - [ ] Ask Token2 to sign the **current** release's Windows build (never an
-      older version — it would predate shipped fixes).
+      older version — it would predate shipped fixes). They deliver into
+      issue #77 as `signed_keyroost-vX.Y.Z-*.zip` attachments; macOS may
+      arrive separately from Windows, so check for both.
+- [ ] **Sync the winget-pkgs fork BEFORE dispatching** — this is the one
+      step that has to happen outside CI:
+      `gh repo sync framefilter/winget-pkgs --source microsoft/winget-pkgs`
+      wingetcreate submits its PR from that fork and cannot fast-forward it
+      itself: `WINGET_TOKEN` is a classic PAT with `public_repo` scope, and
+      pushing upstream commits that touch `.github/workflows/` needs the
+      `workflow` scope. Left alone the fork drifts thousands of commits
+      behind and the job fails at the very end with "The forked repository
+      could not be synced with the upstream commits" — *after* Authenticode
+      verification passed and the manifests were generated, so the failure
+      looks like a signing problem and is not one. Syncing is lossless while
+      the fork is 0 ahead. Granting `workflow` scope to `WINGET_TOKEN` would
+      retire this step.
 - [ ] When it arrives: attach as **NEW** assets
-      `keyroost-vX.Y.Z-windows-x86_64-signed.zip` + `.sha256`. **Never
-      replace the CI-built assets** — that invalidates `SHA256SUMS`,
-      provenance attestations, and any open winget PR's hash.
+      `keyroost-vX.Y.Z-windows-x86_64-signed.zip` + `.sha256` (and
+      `keyroost-vX.Y.Z-macos-universal2-signed.pkg` + `.sha256`, unwrapped
+      from its transport zip). Names are built from the tag by the job and
+      matched literally — a near-miss reads as "not attached" and it holds
+      again. **Never replace the CI-built assets** — that invalidates
+      `SHA256SUMS`, provenance attestations, and any open winget PR's hash.
+- [ ] Worth verifying the signed bytes are *our* build before attaching.
+      Authenticode appends a certificate table, so stripping it (and zeroing
+      the PE checksum + cert directory entry) must reproduce the CI binary
+      byte-for-byte; at v0.7.7 it did. macOS cannot be checked this way —
+      `codesign` rewrites the Mach-O in place — so there, confirm the Apple
+      chain, the Developer ID signer, and universal2 slices instead.
+      Note the `.pkg` is signed but **not notarization-stapled** (true since
+      at least v0.7.6): Gatekeeper validates online, which fails offline.
 - [ ] `gh workflow run publish.yml -f tag=vX.Y.Z` and approve the gate.
       Every channel no-ops (idempotent); the winget job Authenticode-verifies
       every PE in the signed zip (signer logged in the run) and submits the
@@ -113,6 +171,9 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       Defender validation false positives on fresh binaries do happen; the
       documented remedies are a pipeline re-run (~18h cycles) or a WDSI
       false-positive report, not resigning.
+      Judge this run by the **winget job's own conclusion**, not the run's
+      overall status: any other channel that is failing for its own reasons
+      (a frozen AUR, say) reds the whole run while winget is fine.
 - [ ] Manual fallback from Linux if wingetcreate misbehaves:
       `komac update Framefilter.Keyroost --version X.Y.Z --urls <signed-asset-url> --submit`
 
