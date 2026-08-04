@@ -157,7 +157,25 @@ jobs:
           ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
 
-          git clone ssh://aur@aur.archlinux.org/keyroost-bin.git aur-repo
+          # The AUR freezes ALL pushes during security incidents (it did so on
+          # 2026-08-01, mid-v0.7.7, over a supply-chain malware campaign) and
+          # announces it only on the aur-general mailing list — the website,
+          # the RPC and git-over-HTTPS reads all stay up, so nothing else shows
+          # it. A frozen AUR is not our failure and must not red-X a release in
+          # which every other channel published, so tolerate exactly that
+          # message and nothing else: any other clone failure is still fatal.
+          if ! clone_log="$(git clone ssh://aur@aur.archlinux.org/keyroost-bin.git aur-repo 2>&1)"; then
+            printf '%s\n' "$clone_log"
+            if printf '%s' "$clone_log" | grep -qi 'down due to maintenance'; then
+              echo "::warning::AUR pushes are frozen upstream — keyroost-bin was NOT updated. \
+          This is an AUR-wide freeze, not a packaging fault; watch \
+          https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/ \
+          for the all-clear, then re-run this job. Every other channel is unaffected."
+              exit 0
+            fi
+            echo "::error::AUR clone failed for a reason other than the upstream freeze" >&2
+            exit 1
+          fi
           for t in PKGBUILD .SRCINFO; do
             sed -e "s/@VERSION@/${version}/g" \
                 -e "s/@SHA_LINUX@/${sha_linux}/g" \
@@ -315,6 +333,37 @@ jobs:
           if ($bad -gt 0) {
             Write-Host "::error::$bad file(s) in the '-signed' zip lack a Valid Authenticode signature - refusing to submit unsigned bytes under the signed name"
             exit 1
+          }
+
+      # wingetcreate submits its PR from a fork of microsoft/winget-pkgs and
+      # cannot fast-forward that fork itself unless the PAT may push commits
+      # touching .github/workflows/ — i.e. unless it carries the `workflow`
+      # scope. With a `public_repo`-only PAT the fork silently falls thousands
+      # of commits behind and the run dies at the very last step with "The
+      # forked repository could not be synced with the upstream commits",
+      # AFTER Authenticode verification passed and the manifests were built —
+      # so it reads as a signing problem and is not one (v0.7.7).
+      #
+      # Sync it here instead, and never fail the job on it: if the PAT lacks
+      # the scope the sync 403s, which is worth reporting but not worth losing
+      # a release over — wingetcreate may still succeed if the drift is small.
+      # A failure here prints the exact one-line remedy rather than leaving it
+      # to be rediscovered.
+      - name: Sync the winget-pkgs fork
+        if: steps.resolve.outputs.submit == 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $fork = "$($Env:GITHUB_REPOSITORY_OWNER)/winget-pkgs"
+          Write-Host "syncing $fork from microsoft/winget-pkgs"
+          $out = gh api -X POST "repos/$fork/merge-upstream" -f branch=master 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "fork synced: $out"
+          } else {
+            Write-Host "::warning::could not sync $fork automatically: $out"
+            Write-Host "::warning::If the winget step below fails with 'The forked repository could not be synced', run this once and re-run the job:  gh repo sync $fork --source microsoft/winget-pkgs   -- or grant the WINGET_TOKEN PAT the 'workflow' scope so this step can do it unattended."
           }
 
       # wingetcreate is Microsoft's official manifest tool; it updates the

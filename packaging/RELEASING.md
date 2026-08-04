@@ -107,6 +107,11 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
     (`master -> master` to aur.archlinux.org); the RPC
     (`https://aur.archlinux.org/rpc/v5/info?arg[]=keyroost-bin`) lags a few
     minutes behind and reads stale right after the push.
+    The job now **tolerates the upstream freeze specifically**: that one
+    message logs a `::warning` and exits 0, so a frozen AUR no longer reds a
+    release in which every other channel published. Any other clone failure
+    is still fatal. A warning here means `keyroost-bin` was NOT updated —
+    re-run the job once pushes reopen.
     **`The AUR is down due to maintenance. We will be back soon.` is not
     our bug and not worth retrying.** It comes from `aurweb/git/serve.py`
     *after* our deploy key authenticates, and has exactly one trigger: an
@@ -136,19 +141,22 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       older version — it would predate shipped fixes). They deliver into
       issue #77 as `signed_keyroost-vX.Y.Z-*.zip` attachments; macOS may
       arrive separately from Windows, so check for both.
-- [ ] **Sync the winget-pkgs fork BEFORE dispatching** — this is the one
-      step that has to happen outside CI:
+- [ ] **The winget-pkgs fork sync now runs in CI** (`Sync the winget-pkgs
+      fork`, non-fatal). wingetcreate submits its PR from that fork and
+      cannot fast-forward it itself: `WINGET_TOKEN` is a classic PAT with
+      `public_repo` scope, and pushing upstream commits that touch
+      `.github/workflows/` needs the `workflow` scope. Left alone the fork
+      drifts thousands of commits behind and the job dies at the very end
+      with "The forked repository could not be synced with the upstream
+      commits" — *after* Authenticode verification passed and the manifests
+      were generated, so it reads as a signing problem and is not one
+      (v0.7.7).
+      If that sync step logs a warning, do it once by hand and re-run the
+      job — the warning prints the command:
       `gh repo sync framefilter/winget-pkgs --source microsoft/winget-pkgs`
-      wingetcreate submits its PR from that fork and cannot fast-forward it
-      itself: `WINGET_TOKEN` is a classic PAT with `public_repo` scope, and
-      pushing upstream commits that touch `.github/workflows/` needs the
-      `workflow` scope. Left alone the fork drifts thousands of commits
-      behind and the job fails at the very end with "The forked repository
-      could not be synced with the upstream commits" — *after* Authenticode
-      verification passed and the manifests were generated, so the failure
-      looks like a signing problem and is not one. Syncing is lossless while
-      the fork is 0 ahead. Granting `workflow` scope to `WINGET_TOKEN` would
-      retire this step.
+      Syncing is lossless while the fork is 0 ahead. **Granting `workflow`
+      scope to `WINGET_TOKEN` retires the manual path for good** — the CI
+      step then succeeds unattended.
 - [ ] When it arrives: attach as **NEW** assets
       `keyroost-vX.Y.Z-windows-x86_64-signed.zip` + `.sha256` (and
       `keyroost-vX.Y.Z-macos-universal2-signed.pkg` + `.sha256`, unwrapped
