@@ -58,15 +58,24 @@ BIN="${REPO_ROOT}/target/release/keyroost"
 #    resolved from the release asset's recorded digest and re-verified on
 #    every build. A changed upstream binary fails the build closed rather
 #    than silently shipping unreviewed code into an official AppImage.
+#
+#    When it does fail closed, that is the control working — do NOT paste in
+#    whatever hash the build just computed, which would verify the artifact
+#    against itself. Re-resolve from the release asset's recorded digest
+#    (`gh api repos/linuxdeploy/linuxdeploy/releases/tags/continuous`), then
+#    confirm the bytes actually served hash to that same value before pinning.
+#    Pins last moved 2026-08-04, after upstream rebuilt both tools on
+#    2026-08-01 (linuxdeploy at commit 07333c6, plugin at 536b0687); computed
+#    and recorded digests agreed for both.
 # ---------------------------------------------------------------------------
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 LD_BASE="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous"
 LDP_BASE="https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous"
 # pinned-verified: sha256 checked below before chmod +x / execution
-LD_SHA256="e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf"
+LD_SHA256="421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e"
 # pinned-verified: sha256 checked below before chmod +x / execution
-LDP_SHA256="1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a"
+LDP_SHA256="a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79"
 fetch() { # url dest sha256
   [ -f "$2" ] || curl -fsSL -o "$2" "$1"
   echo "$3  $2" | sha256sum -c -
