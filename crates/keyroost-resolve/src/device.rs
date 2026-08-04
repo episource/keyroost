@@ -463,19 +463,29 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
     for (i, hid) in hids.iter().enumerate() {
         let serial = serials.get(i).cloned().flatten().unwrap_or_default();
         let is_token2 = hid.vendor_id == keyroost_proto::USB_VID;
-        // Token2's on-device OTP applet is a *configuration*, not a property of
-        // the vendor: the same hardware ships as FIDO-only, PGP-only, FIDO+PGP
-        // and so on, and the USB product id names which applets are switched on.
-        // Claiming OTP for the whole VID offered the OTP surface to keys that
-        // have no such applet, where it could only fail with a raw protocol
-        // error (issue #82).
+        // Every Token2 key is offered the OTP surface, on purpose.
         //
-        // Fail open, deliberately: an id missing from the vendor table still
-        // gets OTP. Token2 adds product ids for new configurations, and hiding
-        // an applet a key really has is worse than showing one that turns out to
-        // be absent. Only a *positively known* OTP-less id suppresses it — this
-        // must not be tightened into "known to have OTP".
-        let has_otp = is_token2 && keyroost_proto::token2_pid_may_have_otp(hid.product_id);
+        // v0.7.7 narrowed this to product ids whose vendor function set lists
+        // OTP, to stop offering it to keys that have no such applet (issue
+        // #82). Token2 then corrected the premise in issue #95: Bio3 (0x0204)
+        // **has** OTP — carried over CCID — even though its function set reads
+        // FIDO+PGP, because the key has no HOTP-over-HID and ships with the HID
+        // channel disabled. So a function set that omits OTP does not mean the
+        // applet is absent; it may simply live on a channel this enumeration
+        // cannot see. `TOKEN2_PRODUCTS` says as much itself: "nothing here may
+        // be treated as proof that an applet is present" — and the inverse is
+        // no safer.
+        //
+        // The v0.7.7 gate therefore hid OTP from Bio3 keys that have it, which
+        // is the failure this comment already warned against: hiding an applet
+        // a key really has is worse than showing one that turns out to be
+        // absent. That trade is now cheaper still, because a key without the
+        // applet no longer dead-ends in a raw protocol error — it reports which
+        // channel declined and what to do about it.
+        //
+        // Do not re-narrow this on the PID table without Token2 confirming what
+        // a function set actually asserts about applet presence per channel.
+        let has_otp = is_token2;
         let reader_name: Option<String> = bound.get(i).cloned().flatten();
 
         let existing = devices.iter_mut().find(|d| {
@@ -900,12 +910,17 @@ mod tests {
     }
 
     #[test]
-    fn token2_pid_without_otp_does_not_claim_the_applet() {
-        // Token2 ships the same hardware in several configurations and the PID
-        // says which applets are on. A FIDO+PGP or PGP-only unit has no OTP
-        // applet, so it must not be offered the on-device OTP surface, where it
-        // could only fail with a raw protocol error (#82).
-        for pid in [0x0024u16, 0x0025, 0x0014, 0x0015, 0x0204, 0x0205] {
+    fn a_pid_function_set_never_hides_the_otp_surface() {
+        // v0.7.7 suppressed OTP for product ids whose vendor function set omits
+        // it (#82). Token2 corrected the premise in #95: Bio3 (0x0204) HAS OTP,
+        // over CCID, despite reading FIDO+PGP — it has no HOTP-over-HID and so
+        // ships with the HID channel disabled. A function set that omits OTP
+        // therefore does not mean the applet is absent, only that it may live
+        // on a channel this enumeration cannot see.
+        //
+        // 0x0204 is the vendor-confirmed case; the rest share the same shape
+        // and the same unverified premise, so none may be denied the surface.
+        for pid in [0x0024u16, 0x0025, 0x0014, 0x0015, 0x0200, 0x0204, 0x0205] {
             let hids = [hid(
                 keyroost_proto::USB_VID,
                 pid,
@@ -916,19 +931,20 @@ mod tests {
             )];
             let devs = correlate(&hids, &[], &Keyring::default());
             assert_eq!(devs.len(), 1);
-            assert!(devs[0].caps.has(Caps::FIDO2));
             assert!(
-                !devs[0].caps.has(Caps::OTP),
-                "PID {pid:#06x} must not claim OTP"
+                devs[0].caps.has(Caps::OTP),
+                "PID {pid:#06x} must keep the OTP surface: hiding an applet a key \
+                 really has (Bio3, #95) is worse than offering one that turns out \
+                 to be absent, which now fails with an actionable message"
             );
-            assert!(!devs[0].cap_badges().contains(&"OTP"));
         }
     }
 
     #[test]
-    fn token2_pid_without_otp_does_not_claim_it_on_a_merged_row_either() {
-        // Same rule where the HID node merges into a card row rather than
-        // creating one — the OTP bit is set in two places and both must agree.
+    fn the_otp_surface_survives_a_merge_into_a_card_row() {
+        // The OTP bit is set in two places and both must agree — this is the
+        // path where the HID node merges into an existing card row rather than
+        // creating one.
         let probes = [probe(
             "Token2 PIN+ 00 00",
             false,
@@ -950,7 +966,7 @@ mod tests {
         let devs = correlate(&hids, &probes, &Keyring::default());
         assert_eq!(devs.len(), 1);
         assert!(devs[0].caps.has(Caps::FIDO2) && devs[0].caps.has(Caps::PGP));
-        assert!(!devs[0].caps.has(Caps::OTP));
+        assert!(devs[0].caps.has(Caps::OTP));
     }
 
     #[test]
@@ -958,8 +974,9 @@ mod tests {
         // FAIL OPEN. Token2 keeps adding product ids for new configurations; an
         // id we have not captured must keep the pre-table behaviour and still be
         // offered OTP. Hiding an applet a user's key really has is a worse
-        // failure than showing a surface that turns out to be absent. Only a
-        // *known* OTP-less id suppresses the capability.
+        // failure than showing a surface that turns out to be absent. Since #95
+        // no id suppresses the capability at all — this pins the unknown-id half
+        // of that rule specifically, so it survives any future re-narrowing.
         for pid in [0x0099u16, 0x0031, 0x0500] {
             assert_eq!(keyroost_proto::token2_functions(pid), None);
             let hids = [hid(

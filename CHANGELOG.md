@@ -8,16 +8,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - **A key that answers is no longer reported as a key that can't be reached.**
-  Running an OTP command against a Token2 key supplied *without* the on-device
-  OTP function said "the OTP applet is not reachable over HID or CCID — HID may
-  be disabled on the key", which sent people to enable an interface that was
-  already working: the key had completed a full USB-HID exchange and simply
-  declined. keyroost now distinguishes the two — an applet that answers with a
-  status word means the interface works and the *key* refused, and the message
-  says so and quotes the status word. Where the USB product id already
-  identifies a configuration with no OTP function, the command is refused up
-  front, naming the real reason, without sending an APDU that could only fail.
-  Unrecognised product ids are still probed. ([#95])
+  Running an OTP command against a Token2 model that carries OTP over CCID said
+  "the OTP applet is not reachable over HID or CCID — HID may be disabled on the
+  key", which sent people to enable an interface that was already working: the
+  key had completed a full USB-HID exchange and simply declined. These models
+  ship with the HID channel disabled *by design*, because they have no
+  HOTP-over-HID, so there was nothing on the key to enable. keyroost now tells
+  the two apart — an applet that answers with a status word means the interface
+  works and the key declined — and reports the failure that can actually be
+  acted on: why the CCID path was unavailable (a stopped smart-card service, in
+  the reported case), with the status word quoted and `--transport ccid`
+  named. ([#95])
+- **Token2 keys show the OTP capability again.** v0.7.7 stopped listing OTP for
+  product ids whose vendor function set omits it. Token2 has since confirmed
+  that a function set which omits OTP does not mean the applet is absent — a key
+  can carry OTP over CCID while reporting FIDO+PGP — so that check hid the
+  capability from keys that have it. Every Token2 key is offered the OTP surface
+  once more; a key that genuinely lacks the applet now says which channel
+  declined and what to do, rather than failing with a raw protocol error. ([#95])
 
 ## [0.7.7] - 2026-08-04
 

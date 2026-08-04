@@ -74,22 +74,19 @@ pub enum OtpTransportError {
     /// flag must never drive unbounded host work (audit KEY-009), so this is
     /// treated as a buggy or hostile token rather than looped on forever.
     EnumerationCapExceeded,
-    /// The connected key's USB product id identifies a Token2 product
-    /// configuration supplied *without* the on-device OTP function, so no OTP
-    /// command can succeed on it. Refused before any APDU is sent so the user
-    /// gets the real reason rather than a transport error (issue #95).
-    OtpFunctionNotFitted {
-        pid: u16,
-        model: Option<&'static str>,
-    },
-    /// The OTP applet answered over HID but declined the read-only detect
-    /// probe with a non-`9000` status word, and no CCID fallback was
-    /// available. Distinct from [`NoUsableInterface`](Self::NoUsableInterface)
-    /// on purpose: a status word proves the interface carried a full
-    /// request/response, so this is the key refusing rather than a connection
-    /// problem, and telling the user to enable HID would send them the wrong
-    /// way (issue #95).
-    HidProbeDeclined { sw: u16 },
+    /// The key declined the OTP applet over HID with a status word, *and* the
+    /// CCID fallback was unavailable — carrying why, because on these models
+    /// the CCID failure is the one the user can act on.
+    ///
+    /// Distinct from [`NoUsableInterface`](Self::NoUsableInterface) on purpose.
+    /// A status word proves HID carried a full request and response, so the
+    /// interface plainly works and "HID may be disabled; enable it" is wrong
+    /// advice. Token2 explained the real shape in issue #95: models with no
+    /// HOTP-over-HID ship with the HID channel disabled *by design* and carry
+    /// OTP over CCID, so a declined HID probe is expected and the actionable
+    /// fault is whatever stopped CCID — for the reporter, a smart-card service
+    /// that was not running.
+    HidDeclinedAndNoCcid { sw: u16, ccid: String },
 }
 
 impl std::fmt::Display for OtpTransportError {
@@ -118,26 +115,16 @@ impl std::fmt::Display for OtpTransportError {
                 "the device kept reporting more OTP entries than any supported \
                  token stores; aborting enumeration"
             ),
-            OtpTransportError::OtpFunctionNotFitted { pid, model } => write!(
+            OtpTransportError::HidDeclinedAndNoCcid { sw, ccid } => write!(
                 f,
-                "this key does not have the on-device OTP function: USB product id \
-                 {:#06X}{} is a Token2 configuration supplied without it. Token2 keys \
-                 aren't upgradable after purchase — OTP is a separate product \
-                 configuration, not something that can be switched on later",
-                pid,
-                match model {
-                    Some(m) => format!(" ({})", m),
-                    None => String::new(),
-                }
-            ),
-            OtpTransportError::HidProbeDeclined { sw } => write!(
-                f,
-                "the key answered over USB-HID but declined the OTP applet with status \
-                 word {:#06X}. The interface is working — this is the key refusing, not \
-                 a connection problem — most often because it was supplied without the \
-                 on-device OTP function, which cannot be enabled after purchase. Run \
-                 `keyroostctl list` to see what this key reports",
-                sw
+                "the key declined the OTP applet over USB-HID (status word {:#06X}), \
+                 which is normal on Token2 models without HOTP-over-HID: they ship with \
+                 the HID channel disabled and carry OTP over CCID instead, so there is \
+                 nothing to enable on the key. The CCID path is the one that failed: \
+                 {}. Start the smart-card service (pcscd on Linux; the Smart Card \
+                 service on Windows; built in on macOS) or place the key on a \
+                 contact/NFC reader, then retry — `--transport ccid` forces it",
+                sw, ccid
             ),
         }
     }
@@ -288,19 +275,12 @@ impl HidOtpTransport {
                     || d.product_id == t2::USB_PID)
         });
         let dev = found.ok_or(OtpTransportError::TokenNotDetected)?;
-        // The PID encodes which function set the key was supplied with. On a
-        // configuration that has no OTP function, every OTP command is doomed,
-        // and probing anyway produces a transport-shaped error that blames the
-        // interface for the key's own product configuration (issue #95). Refuse
-        // here, before a single APDU, so the message names the real reason.
-        // Fail-open: an unrecognised PID is still probed (`token2_pid_may_have_otp`
-        // returns true when the table has no entry).
-        if !keyroost_proto::token2_pid_may_have_otp(dev.product_id) {
-            return Err(OtpTransportError::OtpFunctionNotFitted {
-                pid: dev.product_id,
-                model: keyroost_proto::token2_pid_label(dev.product_id),
-            });
-        }
+        // Deliberately NOT gated on the PID's function set. A PID names an
+        // enabled function set, not proof that an applet is absent, and OTP
+        // may live on a channel this opener does not speak: Token2 confirmed
+        // in issue #95 that Bio3 (0x0204) carries OTP over CCID while shipping
+        // with HID disabled, because it has no HOTP-over-HID. Refusing here on
+        // the table would deny OTP to a key that has it.
         Self::open_path(&dev.path)
     }
 
@@ -821,12 +801,18 @@ fn probe_hid_owned(
 /// Pure and total so the classification is unit-testable without hardware —
 /// the original defect was a `_ =>` arm in an inline match that no test could
 /// reach.
-fn detect_failure_from(probe_err: OtpTransportError) -> OtpTransportError {
+fn detect_failure_from(
+    probe_err: OtpTransportError,
+    ccid_err: OtpTransportError,
+) -> OtpTransportError {
     match probe_err {
-        // The applet spoke. Carry the status word so the message can say what
-        // the key actually answered.
-        OtpTransportError::Applet(e) => OtpTransportError::HidProbeDeclined {
+        // The applet spoke, so HID demonstrably works and the key declined —
+        // expected on a model that carries OTP over CCID only. Report the
+        // status word AND why CCID failed, because CCID is the channel the
+        // user can actually do something about.
+        OtpTransportError::Applet(e) => OtpTransportError::HidDeclinedAndNoCcid {
             sw: e.status_word(),
+            ccid: ccid_err.to_string(),
         },
         // Silence, framing damage, or the interface never opening: these are
         // genuinely about the transport.
@@ -882,9 +868,10 @@ impl Token2OtpSession {
                                 transport: Box::new(p),
                                 is_pcsc: true,
                             }),
-                            // No CCID either, so the probe outcome is all we
-                            // know — and it matters which kind it was.
-                            Err(_) => Err(detect_failure_from(probe_err)),
+                            // No CCID either. Both outcomes matter now: which
+                            // kind of HID failure it was, and why CCID could
+                            // not stand in for it.
+                            Err(ccid_err) => Err(detect_failure_from(probe_err, ccid_err)),
                         }
                     }
                 }
@@ -1500,20 +1487,39 @@ mod hidraw_bounded_read_tests {
 }
 
 /// Issue #95: a key that answers must not be reported as a key that cannot be
-/// reached. The reporter's Bio3 Dual (FIDO + PGP) completed a full HID exchange
-/// and returned `0105`, and keyroost told them "HID may be disabled on the key"
-/// — advice that could not have helped, because HID was working.
+/// reached. The reporter's Bio3 completed a full HID exchange and returned
+/// `0105`, and keyroost told them "HID may be disabled on the key" — advice
+/// that could not have helped, because HID was working.
+///
+/// Token2 then explained the shape (same thread): Bio3 **has** OTP, carried
+/// over CCID, and ships with HID disabled precisely because it has no
+/// HOTP-over-HID. So a declined HID probe is the expected state, not a fault,
+/// and the actionable failure is whatever stopped CCID — for the reporter, a
+/// smart-card service that was not running.
 #[cfg(test)]
 mod declined_probe_is_not_an_unusable_interface {
     use super::*;
     use keyroost_token2otp::sw;
 
+    /// Stand-in for the reporter's CCID failure: pcscd was not running.
+    fn no_pcsc() -> OtpTransportError {
+        OtpTransportError::TransportUnavailable(
+            "PC/SC service is unavailable (The Smart card resource manager is not running)".into(),
+        )
+    }
+
     #[test]
     fn an_applet_status_word_reports_the_key_declining() {
         // Exactly the reporter's case.
-        let err = detect_failure_from(OtpTransportError::Applet(OtpError::BadStatusCode(0x0105)));
+        let err = detect_failure_from(
+            OtpTransportError::Applet(OtpError::BadStatusCode(0x0105)),
+            no_pcsc(),
+        );
         assert!(
-            matches!(err, OtpTransportError::HidProbeDeclined { sw: 0x0105 }),
+            matches!(
+                err,
+                OtpTransportError::HidDeclinedAndNoCcid { sw: 0x0105, .. }
+            ),
             "an answering applet must not be classified as an unusable interface, got {err:?}"
         );
         let msg = err.to_string();
@@ -1521,10 +1527,35 @@ mod declined_probe_is_not_an_unusable_interface {
             msg.contains("0x0105"),
             "the status word belongs in the message: {msg}"
         );
+        // The specific wrong advice that was reported.
         assert!(
-            !msg.contains("disabled"),
+            !msg.contains("HID may be disabled"),
             "must not tell the user to enable an interface that just carried a \
              full request and response: {msg}"
+        );
+        assert!(
+            !msg.contains("does not have"),
+            "must not claim the key lacks OTP — Token2 confirmed Bio3 has it \
+             over CCID: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_actionable_ccid_reason_reaches_the_user() {
+        // The reporter's real blocker was pcscd, and it must not be swallowed:
+        // CCID is the channel these models actually carry OTP on.
+        let err = detect_failure_from(
+            OtpTransportError::Applet(OtpError::BadStatusCode(0x0105)),
+            no_pcsc(),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Smart card resource manager is not running"),
+            "the CCID failure is the one the user can act on: {msg}"
+        );
+        assert!(
+            msg.contains("pcscd") || msg.contains("smart-card service"),
+            "say what to start: {msg}"
         );
     }
 
@@ -1541,11 +1572,11 @@ mod declined_probe_is_not_an_unusable_interface {
             0x6A80,
         ] {
             let e = OtpError::check(sw).expect_err("non-9000 must map to an error");
-            match detect_failure_from(OtpTransportError::Applet(e)) {
-                OtpTransportError::HidProbeDeclined { sw: got } => {
+            match detect_failure_from(OtpTransportError::Applet(e), no_pcsc()) {
+                OtpTransportError::HidDeclinedAndNoCcid { sw: got, .. } => {
                     assert_eq!(got, sw, "status word must survive the round trip");
                 }
-                other => panic!("expected HidProbeDeclined for {sw:#06X}, got {other:?}"),
+                other => panic!("expected HidDeclinedAndNoCcid for {sw:#06X}, got {other:?}"),
             }
         }
     }
@@ -1561,39 +1592,11 @@ mod declined_probe_is_not_an_unusable_interface {
         ] {
             assert!(
                 matches!(
-                    detect_failure_from(probe_err),
+                    detect_failure_from(probe_err, no_pcsc()),
                     OtpTransportError::NoUsableInterface
                 ),
                 "a probe that got no answer is evidence about the interface"
             );
         }
-    }
-
-    #[test]
-    fn the_reporters_product_id_is_refused_before_any_apdu() {
-        // 0x0204 is Bio3 Dual (FIDO + PGP) — supplied without OTP.
-        assert!(
-            !keyroost_proto::token2_pid_may_have_otp(0x0204),
-            "0x0204 has no OTP function and must not be probed"
-        );
-        let err = OtpTransportError::OtpFunctionNotFitted {
-            pid: 0x0204,
-            model: keyroost_proto::token2_pid_label(0x0204),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("0x0204"), "name the product id: {msg}");
-        assert!(
-            msg.contains("does not have the on-device OTP function"),
-            "state the real reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn an_unknown_product_id_is_still_probed() {
-        // Fail-open: a PID we have never seen must not be refused offline.
-        assert!(
-            keyroost_proto::token2_pid_may_have_otp(0xFFFF),
-            "an unrecognised PID must fall through to a live probe"
-        );
     }
 }
