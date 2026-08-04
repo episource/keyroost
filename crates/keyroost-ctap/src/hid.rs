@@ -57,6 +57,35 @@ pub const CTAPHID_CANCEL: u8 = 0x91;
 pub const CTAPHID_KEEPALIVE: u8 = 0xBB;
 pub const CTAPHID_ERROR: u8 = 0xBF;
 
+/// CTAPHID transport error codes carried in the one-byte `CTAPHID_ERROR`
+/// payload. These are transport-level faults and are a different namespace
+/// from the CTAP2 status bytes decoded in `cmd.rs`.
+pub const CTAPHID_ERR_INVALID_CMD: u8 = 0x01;
+pub const CTAPHID_ERR_INVALID_PAR: u8 = 0x02;
+pub const CTAPHID_ERR_INVALID_LEN: u8 = 0x03;
+pub const CTAPHID_ERR_INVALID_SEQ: u8 = 0x04;
+pub const CTAPHID_ERR_MSG_TIMEOUT: u8 = 0x05;
+pub const CTAPHID_ERR_CHANNEL_BUSY: u8 = 0x06;
+pub const CTAPHID_ERR_LOCK_REQUIRED: u8 = 0x0A;
+pub const CTAPHID_ERR_INVALID_CHANNEL: u8 = 0x0B;
+pub const CTAPHID_ERR_OTHER: u8 = 0x7F;
+
+/// Retry budget for `ERR_CHANNEL_BUSY`, the one CTAPHID error the spec tells
+/// clients to retry ("the client SHOULD retry the request after a short
+/// delay"). Everything else in the table is a protocol fault where retrying
+/// only delays the error, so the policy below is deliberately narrow.
+///
+/// Four attempts (the first plus three retries) 200 ms apart: 200 ms is long
+/// enough for another client's in-flight transaction to finish and release the
+/// device, short enough that a retry that is not going to help costs almost
+/// nothing. The wall-clock cap is the backstop for a device that answers busy
+/// slowly or forever — it bounds the whole loop below the ordinary
+/// [`DEFAULT_READ_TIMEOUT`], so a busy key never makes a command sit longer
+/// than a silent one already does.
+const CHANNEL_BUSY_MAX_ATTEMPTS: u32 = 4;
+const CHANNEL_BUSY_RETRY_DELAY: Duration = Duration::from_millis(200);
+const CHANNEL_BUSY_TOTAL_BUDGET: Duration = Duration::from_millis(1500);
+
 /// Capability flags reported in byte 16 of the INIT response.
 pub const CAPABILITY_WINK: u8 = 0x01;
 pub const CAPABILITY_CBOR: u8 = 0x04;
@@ -106,9 +135,13 @@ impl std::fmt::Display for HidTransportError {
                 "continuation frame out of sequence: expected SEQ={}, got SEQ={}",
                 expected, got
             ),
-            HidTransportError::DeviceError(c) => {
-                write!(f, "device reported CTAPHID_ERROR code 0x{:02X}", c)
-            }
+            HidTransportError::DeviceError(c) => match ctaphid_error_meaning(*c) {
+                // Lead with a plain-English explanation, keeping the spec name
+                // + hex so a bug report stays diagnosable — the same shape the
+                // CTAP2 status codes are rendered in (see `cmd.rs`).
+                Some((name, hint)) => write!(f, "{} (CTAPHID error 0x{:02X} {})", hint, c, name),
+                None => write!(f, "device reported CTAPHID_ERROR code 0x{:02X}", c),
+            },
             HidTransportError::NonceMismatch => {
                 write!(f, "CTAPHID_INIT response carried the wrong nonce")
             }
@@ -116,6 +149,75 @@ impl std::fmt::Display for HidTransportError {
             HidTransportError::Backend(s) => write!(f, "HID backend error: {}", s),
         }
     }
+}
+
+/// Spec name and plain-language explanation for a `CTAPHID_ERROR` code, as
+/// defined by the FIDO CTAP HID spec's error-code table. Returns `None` for
+/// codes outside that table — reserved or vendor behaviour — so the caller can
+/// still print the raw hex rather than inventing a meaning for it.
+fn ctaphid_error_meaning(code: u8) -> Option<(&'static str, &'static str)> {
+    Some(match code {
+        CTAPHID_ERR_INVALID_CMD => (
+            "ERR_INVALID_CMD",
+            "the key did not recognise the command \u{2014} its firmware may not support this feature",
+        ),
+        CTAPHID_ERR_INVALID_PAR => (
+            "ERR_INVALID_PAR",
+            "the key rejected a parameter in the request as invalid",
+        ),
+        CTAPHID_ERR_INVALID_LEN => (
+            "ERR_INVALID_LEN",
+            "the key rejected the request's declared message length",
+        ),
+        CTAPHID_ERR_INVALID_SEQ => (
+            "ERR_INVALID_SEQ",
+            "the key saw the message's frames arrive out of order",
+        ),
+        CTAPHID_ERR_MSG_TIMEOUT => (
+            "ERR_MSG_TIMEOUT",
+            "the key gave up waiting for the rest of the message",
+        ),
+        CTAPHID_ERR_CHANNEL_BUSY => (
+            "ERR_CHANNEL_BUSY",
+            "the key's HID channel was busy and stayed busy after retrying \u{2014} \
+             close anything else using the key (a browser sign-in prompt, an \
+             agent) and try again",
+        ),
+        CTAPHID_ERR_LOCK_REQUIRED => (
+            "ERR_LOCK_REQUIRED",
+            "the command needs an exclusive channel lock this client does not hold",
+        ),
+        CTAPHID_ERR_INVALID_CHANNEL => (
+            "ERR_INVALID_CHANNEL",
+            "the key no longer recognises this channel \u{2014} remove and re-insert the key",
+        ),
+        CTAPHID_ERR_OTHER => (
+            "ERR_OTHER",
+            "the key reported an unspecified internal error",
+        ),
+        _ => return None,
+    })
+}
+
+/// Whether a `CTAPHID_ERROR` warrants another attempt, and how long to wait
+/// first. `attempt` counts from 1 for the attempt that just failed; `elapsed`
+/// is the time since the *first* attempt started, so it covers the earlier
+/// round trips and delays, not just the sleeps.
+///
+/// Only `ERR_CHANNEL_BUSY` is retryable (see [`CHANNEL_BUSY_MAX_ATTEMPTS`]);
+/// every other code reports a protocol fault that a retry cannot clear. Two
+/// independent bounds apply, so a device that answers busy forever terminates
+/// either way: the attempt count caps how many re-sends happen, and the
+/// wall-clock budget caps how long the loop may take even if each attempt is
+/// slow. Kept pure so the policy is testable without a device.
+fn busy_retry_delay(code: u8, attempt: u32, elapsed: Duration) -> Option<Duration> {
+    if code != CTAPHID_ERR_CHANNEL_BUSY || attempt >= CHANNEL_BUSY_MAX_ATTEMPTS {
+        return None;
+    }
+    if elapsed.saturating_add(CHANNEL_BUSY_RETRY_DELAY) >= CHANNEL_BUSY_TOTAL_BUDGET {
+        return None;
+    }
+    Some(CHANNEL_BUSY_RETRY_DELAY)
 }
 
 impl std::error::Error for HidTransportError {}
@@ -304,25 +406,84 @@ impl CtapHidDevice {
     }
 
     /// Send a CTAPHID command and read the response.
+    ///
+    /// A device that answers `ERR_CHANNEL_BUSY` is retried transparently under
+    /// the budget in [`busy_retry_delay`]; every other CTAPHID error code is
+    /// returned to the caller on the spot. A retry re-enters `send`/`recv`
+    /// unchanged — the sensitivity of the exchange is classified once, up
+    /// front, so every attempt's trace line is redacted identically, and the
+    /// request frame is rebuilt from the caller's borrowed `payload` rather
+    /// than held across attempts. `recv` derives its own deadline per call, so
+    /// retrying adds bounded attempts rather than extending any one deadline.
+    ///
+    /// The retry covers command traffic only; channel allocation in `do_init`
+    /// is left to fail fast so opening a device can't stall.
     pub fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, HidTransportError> {
         let sensitive = exchange_is_sensitive(cmd, payload);
-        if ctap_trace_enabled() {
-            eprintln!(
-                "CTAP > cmd=0x{cmd:02x} len={} {}",
-                payload.len(),
-                trace_payload(payload, sensitive)
-            );
+        let started = Instant::now();
+        let mut attempt: u32 = 1;
+        loop {
+            if ctap_trace_enabled() {
+                eprintln!(
+                    "CTAP > cmd=0x{cmd:02x} len={} {}",
+                    payload.len(),
+                    trace_payload(payload, sensitive)
+                );
+            }
+            let outcome = self
+                .send(self.channel_id, cmd, payload)
+                .and_then(|()| self.recv(self.channel_id, cmd));
+            match outcome {
+                Ok(resp) => {
+                    if ctap_trace_enabled() {
+                        eprintln!(
+                            "CTAP < len={} {}",
+                            resp.len(),
+                            trace_payload(&resp, sensitive)
+                        );
+                    }
+                    return Ok(resp);
+                }
+                Err(HidTransportError::DeviceError(code)) => {
+                    let Some(delay) = busy_retry_delay(code, attempt, started.elapsed()) else {
+                        return Err(HidTransportError::DeviceError(code));
+                    };
+                    if ctap_trace_enabled() {
+                        // Framing metadata only — no payload, so this line
+                        // can't leak what the redacted trace withheld.
+                        eprintln!(
+                            "CTAP ! cmd=0x{cmd:02x} error=0x{code:02x} busy, retry {attempt} in {}ms",
+                            delay.as_millis()
+                        );
+                    }
+                    self.sleep_between_attempts(delay)?;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        self.send(self.channel_id, cmd, payload)?;
-        let resp = self.recv(self.channel_id, cmd)?;
-        if ctap_trace_enabled() {
-            eprintln!(
-                "CTAP < len={} {}",
-                resp.len(),
-                trace_payload(&resp, sensitive)
-            );
+    }
+
+    /// Pause between retry attempts without swallowing a cooperative cancel:
+    /// the flag is honored on entry and again on wake, so a caller aborting
+    /// mid-retry waits at most one delay slice.
+    fn sleep_between_attempts(&self, delay: Duration) -> Result<(), HidTransportError> {
+        if self.cancel_requested() {
+            return Err(HidTransportError::Cancelled);
         }
-        Ok(resp)
+        std::thread::sleep(delay);
+        if self.cancel_requested() {
+            return Err(HidTransportError::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// True when a cooperative cancel has been requested (see
+    /// [`Self::set_cancel_flag`]); false when no flag was installed.
+    fn cancel_requested(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn do_init(&mut self) -> Result<InitResponse, HidTransportError> {
@@ -396,10 +557,8 @@ impl CtapHidDevice {
         if Instant::now() >= deadline {
             return Err(HidTransportError::Timeout);
         }
-        if let Some(flag) = &self.cancel {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(HidTransportError::Cancelled);
-            }
+        if self.cancel_requested() {
+            return Err(HidTransportError::Cancelled);
         }
         self.read_report(buf)
     }
@@ -423,10 +582,8 @@ impl CtapHidDevice {
                 // presence check). This is the point to honour a cooperative
                 // cancel: a caller waiting on a touch can abort here without
                 // unplugging the key, since KEEPALIVEs arrive ≈ every 100 ms.
-                if let Some(flag) = &self.cancel {
-                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Err(HidTransportError::Cancelled);
-                    }
+                if self.cancel_requested() {
+                    return Err(HidTransportError::Cancelled);
                 }
                 // Push the deadline out so the timeout bounds device *silence*,
                 // not how long the user takes to respond.
@@ -600,6 +757,300 @@ mod tests {
         );
         // One 500 ms read budget + the 300 ms deadline, with generous slack.
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Every code in the CTAP HID spec's `CTAPHID_ERROR` table must render as
+    /// its spec name plus an explanation a non-specialist can act on — a bare
+    /// `0x06` told the user nothing.
+    #[test]
+    fn ctaphid_error_codes_map_to_spec_names_and_explanations() {
+        let expected = [
+            (0x01u8, "ERR_INVALID_CMD"),
+            (0x02, "ERR_INVALID_PAR"),
+            (0x03, "ERR_INVALID_LEN"),
+            (0x04, "ERR_INVALID_SEQ"),
+            (0x05, "ERR_MSG_TIMEOUT"),
+            (0x06, "ERR_CHANNEL_BUSY"),
+            (0x0A, "ERR_LOCK_REQUIRED"),
+            (0x0B, "ERR_INVALID_CHANNEL"),
+            (0x7F, "ERR_OTHER"),
+        ];
+        for (code, name) in expected {
+            let (got_name, hint) =
+                ctaphid_error_meaning(code).unwrap_or_else(|| panic!("0x{code:02X} unmapped"));
+            assert_eq!(got_name, name, "0x{code:02X} spec name");
+            assert!(!hint.is_empty(), "0x{code:02X} needs an explanation");
+            // The rendered error leads with the explanation and keeps the
+            // numeric code + spec name so a bug report stays diagnosable.
+            let shown = HidTransportError::DeviceError(code).to_string();
+            assert!(shown.starts_with(hint), "0x{code:02X} shows: {shown}");
+            assert!(shown.contains(&format!("CTAPHID error 0x{code:02X} {name}")));
+        }
+    }
+
+    /// Codes outside the spec table keep the old raw-hex rendering rather than
+    /// having a meaning invented for them.
+    #[test]
+    fn unknown_ctaphid_error_codes_fall_back_to_raw_hex() {
+        for code in [0x00u8, 0x07, 0x09, 0x0C, 0x42, 0xFF] {
+            assert!(ctaphid_error_meaning(code).is_none(), "0x{code:02X}");
+            assert_eq!(
+                HidTransportError::DeviceError(code).to_string(),
+                format!("device reported CTAPHID_ERROR code 0x{code:02X}")
+            );
+        }
+    }
+
+    /// The regression this file exists to fix: a user who hit `0x06` had no way
+    /// to know it meant "busy, try again".
+    #[test]
+    fn channel_busy_explains_itself_to_the_user() {
+        let shown = HidTransportError::DeviceError(CTAPHID_ERR_CHANNEL_BUSY).to_string();
+        assert_eq!(
+            shown,
+            "the key's HID channel was busy and stayed busy after retrying \u{2014} \
+             close anything else using the key (a browser sign-in prompt, an \
+             agent) and try again (CTAPHID error 0x06 ERR_CHANNEL_BUSY)"
+        );
+    }
+
+    /// Only `ERR_CHANNEL_BUSY` is retryable; the rest of the table reports a
+    /// protocol fault where a retry would only delay the error.
+    #[test]
+    fn only_channel_busy_is_retried() {
+        for code in 0u8..=0xFF {
+            let decision = busy_retry_delay(code, 1, Duration::ZERO);
+            if code == CTAPHID_ERR_CHANNEL_BUSY {
+                assert_eq!(decision, Some(CHANNEL_BUSY_RETRY_DELAY));
+            } else {
+                assert_eq!(decision, None, "0x{code:02X} must not be retried");
+            }
+        }
+    }
+
+    /// The attempt counter bounds the number of re-sends even when every
+    /// attempt returns instantly.
+    #[test]
+    fn busy_retry_is_bounded_by_attempt_count() {
+        for attempt in 1..CHANNEL_BUSY_MAX_ATTEMPTS {
+            assert_eq!(
+                busy_retry_delay(CTAPHID_ERR_CHANNEL_BUSY, attempt, Duration::ZERO),
+                Some(CHANNEL_BUSY_RETRY_DELAY),
+                "attempt {attempt} should still retry"
+            );
+        }
+        for attempt in [
+            CHANNEL_BUSY_MAX_ATTEMPTS,
+            CHANNEL_BUSY_MAX_ATTEMPTS + 1,
+            1000,
+        ] {
+            assert_eq!(
+                busy_retry_delay(CTAPHID_ERR_CHANNEL_BUSY, attempt, Duration::ZERO),
+                None,
+                "attempt {attempt} is past the cap"
+            );
+        }
+    }
+
+    /// The wall-clock budget is the backstop for a device that answers busy
+    /// slowly: even on the first attempt, no retry is scheduled that would run
+    /// past the budget.
+    #[test]
+    fn busy_retry_is_bounded_by_wall_clock() {
+        assert_eq!(
+            busy_retry_delay(CTAPHID_ERR_CHANNEL_BUSY, 1, CHANNEL_BUSY_TOTAL_BUDGET),
+            None
+        );
+        assert_eq!(
+            busy_retry_delay(
+                CTAPHID_ERR_CHANNEL_BUSY,
+                1,
+                CHANNEL_BUSY_TOTAL_BUDGET - CHANNEL_BUSY_RETRY_DELAY
+            ),
+            None,
+            "a retry that would land exactly on the budget is not scheduled"
+        );
+        assert!(busy_retry_delay(
+            CTAPHID_ERR_CHANNEL_BUSY,
+            1,
+            CHANNEL_BUSY_TOTAL_BUDGET - CHANNEL_BUSY_RETRY_DELAY - Duration::from_millis(1)
+        )
+        .is_some());
+        // Absurd elapsed values must not overflow the budget comparison.
+        assert_eq!(
+            busy_retry_delay(CTAPHID_ERR_CHANNEL_BUSY, 1, Duration::MAX),
+            None
+        );
+    }
+
+    /// A device answering busy forever must terminate the loop, by whichever
+    /// bound trips first, with the total delay inside the budget.
+    #[test]
+    fn busy_retry_loop_terminates_against_a_permanently_busy_device() {
+        for per_attempt in [
+            Duration::ZERO,
+            Duration::from_millis(50),
+            Duration::from_millis(700),
+            Duration::from_secs(5),
+        ] {
+            let mut elapsed = Duration::ZERO;
+            let mut attempt = 1u32;
+            let mut slept = Duration::ZERO;
+            while let Some(delay) = busy_retry_delay(CTAPHID_ERR_CHANNEL_BUSY, attempt, elapsed) {
+                slept += delay;
+                elapsed += delay + per_attempt;
+                attempt += 1;
+                assert!(
+                    attempt <= CHANNEL_BUSY_MAX_ATTEMPTS,
+                    "loop did not terminate"
+                );
+            }
+            assert!(slept < CHANNEL_BUSY_TOTAL_BUDGET, "slept {slept:?}");
+        }
+    }
+
+    /// End-to-end over a socketpair standing in for the hidraw node: a device
+    /// that answers busy is re-sent to through the ordinary `send`/`recv` path,
+    /// and a busy state that clears is invisible to the caller.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn channel_busy_is_retried_and_a_clearing_device_succeeds() {
+        // Two busy answers then a real response: the caller sees only the
+        // success, and the device saw three identical requests.
+        let (mut dev, mut peer) = paired_device(Duration::from_millis(300));
+        queue_frames(
+            &mut peer,
+            &[
+                error_frame(CTAPHID_ERR_CHANNEL_BUSY),
+                error_frame(CTAPHID_ERR_CHANNEL_BUSY),
+                ok_frame(),
+            ],
+        );
+        let resp = dev.transact(CTAPHID_CBOR, &[0x04]).expect("busy cleared");
+        assert_eq!(resp, vec![0x00]);
+        assert_eq!(
+            sent_requests(&mut peer),
+            3,
+            "each retry re-sends the request"
+        );
+    }
+
+    /// A device that answers busy forever surfaces the busy error instead of
+    /// looping, and does so within the retry budget.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn a_permanently_busy_device_surfaces_the_error_within_the_budget() {
+        let (mut dev, mut peer) = paired_device(Duration::from_millis(300));
+        let busy: Vec<[u8; CTAPHID_REPORT_SIZE]> = (0..CHANNEL_BUSY_MAX_ATTEMPTS + 2)
+            .map(|_| error_frame(CTAPHID_ERR_CHANNEL_BUSY))
+            .collect();
+        queue_frames(&mut peer, &busy);
+        let start = Instant::now();
+        let res = dev.transact(CTAPHID_CBOR, &[0x04]);
+        assert!(
+            matches!(
+                res,
+                Err(HidTransportError::DeviceError(CTAPHID_ERR_CHANNEL_BUSY))
+            ),
+            "expected the busy error to surface, got {res:?}"
+        );
+        assert_eq!(
+            sent_requests(&mut peer) as u32,
+            CHANNEL_BUSY_MAX_ATTEMPTS,
+            "retries must stop at the attempt cap"
+        );
+        assert!(
+            start.elapsed() < CHANNEL_BUSY_TOTAL_BUDGET + Duration::from_secs(2),
+            "loop overran its budget: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Errors other than busy are surfaced on the first attempt — retrying a
+    /// protocol fault would only delay the error.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn other_ctaphid_errors_are_not_retried() {
+        for code in [
+            CTAPHID_ERR_INVALID_CMD,
+            CTAPHID_ERR_INVALID_LEN,
+            CTAPHID_ERR_INVALID_CHANNEL,
+            CTAPHID_ERR_OTHER,
+        ] {
+            let (mut dev, mut peer) = paired_device(Duration::from_millis(300));
+            queue_frames(&mut peer, &[error_frame(code), ok_frame()]);
+            let res = dev.transact(CTAPHID_CBOR, &[0x04]);
+            assert!(
+                matches!(res, Err(HidTransportError::DeviceError(c)) if c == code),
+                "0x{code:02X} should surface immediately, got {res:?}"
+            );
+            assert_eq!(sent_requests(&mut peer), 1, "0x{code:02X} must not retry");
+        }
+    }
+
+    /// A `CtapHidDevice` on one end of a socketpair (channel 1) and the raw
+    /// peer end the test drives as a make-believe authenticator.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn paired_device(timeout: Duration) -> (CtapHidDevice, std::os::unix::net::UnixStream) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap(); // same fd state open_io sets
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(a));
+        let dev = CtapHidDevice {
+            io: HidIo::Hidraw(file),
+            channel_id: 1,
+            timeout,
+            cancel: None,
+        };
+        (dev, b)
+    }
+
+    /// One `CTAPHID_ERROR` initiation frame on channel 1 carrying `code`.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn error_frame(code: u8) -> [u8; CTAPHID_REPORT_SIZE] {
+        let mut f = [0u8; CTAPHID_REPORT_SIZE];
+        f[3] = 0x01; // CID = 1
+        f[4] = CTAPHID_ERROR;
+        f[6] = 0x01; // BCNT = 1
+        f[7] = code;
+        f
+    }
+
+    /// A one-byte `CTAPHID_CBOR` response carrying CTAP2_OK.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn ok_frame() -> [u8; CTAPHID_REPORT_SIZE] {
+        let mut f = [0u8; CTAPHID_REPORT_SIZE];
+        f[3] = 0x01;
+        f[4] = CTAPHID_CBOR;
+        f[6] = 0x01;
+        f[7] = 0x00; // CTAP2_OK, empty body
+        f
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn queue_frames(
+        peer: &mut std::os::unix::net::UnixStream,
+        frames: &[[u8; CTAPHID_REPORT_SIZE]],
+    ) {
+        for frame in frames {
+            peer.write_all(frame).unwrap();
+        }
+    }
+
+    /// How many 65-byte output reports the device wrote to the peer. Every
+    /// attempt sends exactly one here (the test payload fits one frame).
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn sent_requests(peer: &mut std::os::unix::net::UnixStream) -> usize {
+        use std::io::Read;
+        peer.set_nonblocking(true).unwrap();
+        let mut seen = 0;
+        let mut buf = [0u8; CTAPHID_REPORT_SIZE + 1];
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen += n;
+        }
+        seen / (CTAPHID_REPORT_SIZE + 1)
     }
 
     #[test]
