@@ -463,6 +463,19 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
     for (i, hid) in hids.iter().enumerate() {
         let serial = serials.get(i).cloned().flatten().unwrap_or_default();
         let is_token2 = hid.vendor_id == keyroost_proto::USB_VID;
+        // Token2's on-device OTP applet is a *configuration*, not a property of
+        // the vendor: the same hardware ships as FIDO-only, PGP-only, FIDO+PGP
+        // and so on, and the USB product id names which applets are switched on.
+        // Claiming OTP for the whole VID offered the OTP surface to keys that
+        // have no such applet, where it could only fail with a raw protocol
+        // error (issue #82).
+        //
+        // Fail open, deliberately: an id missing from the vendor table still
+        // gets OTP. Token2 adds product ids for new configurations, and hiding
+        // an applet a key really has is worse than showing one that turns out to
+        // be absent. Only a *positively known* OTP-less id suppresses it — this
+        // must not be tightened into "known to have OTP".
+        let has_otp = is_token2 && keyroost_proto::token2_pid_may_have_otp(hid.product_id);
         let reader_name: Option<String> = bound.get(i).cloned().flatten();
 
         let existing = devices.iter_mut().find(|d| {
@@ -472,7 +485,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         });
         if let Some(dev) = existing {
             dev.caps.insert(Caps::FIDO2);
-            if is_token2 {
+            if has_otp {
                 dev.caps.insert(Caps::OTP);
             }
             dev.hid_path = Some(hid.path.clone());
@@ -491,7 +504,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
             };
             let mut caps = Caps::default();
             caps.insert(Caps::FIDO2);
-            if is_token2 {
+            if has_otp {
                 caps.insert(Caps::OTP);
             }
             let vendor = vendor_name(hid.vendor_id).to_string();
@@ -884,6 +897,108 @@ mod tests {
         let devs = correlate(&hids, &probes, &Keyring::default());
         assert_eq!(devs.len(), 1);
         assert!(devs[0].caps.has(Caps::FIDO2) && devs[0].caps.has(Caps::OTP));
+    }
+
+    #[test]
+    fn token2_pid_without_otp_does_not_claim_the_applet() {
+        // Token2 ships the same hardware in several configurations and the PID
+        // says which applets are on. A FIDO+PGP or PGP-only unit has no OTP
+        // applet, so it must not be offered the on-device OTP surface, where it
+        // could only fail with a raw protocol error (#82).
+        for pid in [0x0024u16, 0x0025, 0x0014, 0x0015, 0x0204, 0x0205] {
+            let hids = [hid(
+                keyroost_proto::USB_VID,
+                pid,
+                "/dev/hidraw9",
+                Some("S1"),
+                Some(9),
+                Some(4),
+            )];
+            let devs = correlate(&hids, &[], &Keyring::default());
+            assert_eq!(devs.len(), 1);
+            assert!(devs[0].caps.has(Caps::FIDO2));
+            assert!(
+                !devs[0].caps.has(Caps::OTP),
+                "PID {pid:#06x} must not claim OTP"
+            );
+            assert!(!devs[0].cap_badges().contains(&"OTP"));
+        }
+    }
+
+    #[test]
+    fn token2_pid_without_otp_does_not_claim_it_on_a_merged_row_either() {
+        // Same rule where the HID node merges into a card row rather than
+        // creating one — the OTP bit is set in two places and both must agree.
+        let probes = [probe(
+            "Token2 PIN+ 00 00",
+            false,
+            false,
+            true,
+            false,
+            None,
+            Some(1),
+            Some(2),
+        )];
+        let hids = [hid(
+            keyroost_proto::USB_VID,
+            0x0025,
+            "/dev/hidraw1",
+            Some("S2"),
+            Some(1),
+            Some(2),
+        )];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        assert!(devs[0].caps.has(Caps::FIDO2) && devs[0].caps.has(Caps::PGP));
+        assert!(!devs[0].caps.has(Caps::OTP));
+    }
+
+    #[test]
+    fn unknown_token2_pid_still_gets_otp_cap() {
+        // FAIL OPEN. Token2 keeps adding product ids for new configurations; an
+        // id we have not captured must keep the pre-table behaviour and still be
+        // offered OTP. Hiding an applet a user's key really has is a worse
+        // failure than showing a surface that turns out to be absent. Only a
+        // *known* OTP-less id suppresses the capability.
+        for pid in [0x0099u16, 0x0031, 0x0500] {
+            assert_eq!(keyroost_proto::token2_functions(pid), None);
+            let hids = [hid(
+                keyroost_proto::USB_VID,
+                pid,
+                "/dev/hidraw9",
+                Some("S1"),
+                Some(9),
+                Some(4),
+            )];
+            let devs = correlate(&hids, &[], &Keyring::default());
+            assert_eq!(devs.len(), 1);
+            assert!(
+                devs[0].caps.has(Caps::OTP),
+                "unknown PID {pid:#06x} must keep OTP"
+            );
+        }
+    }
+
+    #[test]
+    fn otp_suppression_is_scoped_to_the_token2_vid() {
+        // The PID table is Token2's; another vendor's key that happens to use a
+        // colliding product id is untouched by it — no OTP either way, since OTP
+        // is a Token2-only applet here.
+        for pid in [0x0025u16, 0x0026] {
+            let hids = [hid(
+                0x1209,
+                pid,
+                "/dev/hidraw3",
+                Some("SK"),
+                Some(9),
+                Some(7),
+            )];
+            let devs = correlate(&hids, &[], &Keyring::default());
+            assert_eq!(devs.len(), 1);
+            assert_eq!(devs[0].vendor, "SoloKeys");
+            assert!(devs[0].caps.has(Caps::FIDO2));
+            assert!(!devs[0].caps.has(Caps::OTP));
+        }
     }
 
     #[test]
