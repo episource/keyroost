@@ -8,8 +8,7 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.7.7** (workspace still at 0.7.6 — the bump is part of the
-release run below).
+Current work: **v0.7.7** (workspace bumped; the release run is under way).
 
 ---
 

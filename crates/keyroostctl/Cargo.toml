@@ -15,23 +15,23 @@ name = "keyroostctl"
 path = "src/main.rs"
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.6" }
-keyroost-transport = { path = "../keyroost-transport", version = "0.7.6" }
-keyroost-piv = { path = "../keyroost-piv", version = "0.7.6" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.7.6" }
-keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.6" }
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.6" }
-keyroost-resolve = { path = "../keyroost-resolve", version = "0.7.6" }
-keyroost-oath = { path = "../keyroost-oath", version = "0.7.6" }
-keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.6" }
-keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.6" }
-keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.6" }
-keyroost-qr = { path = "../keyroost-qr", version = "0.7.6" }
-keyroost-import = { path = "../keyroost-import", version = "0.7.6", features = ["bulk", "encrypted"] }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.7" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.7.7" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.7.7" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.7" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.7" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.7" }
+keyroost-resolve = { path = "../keyroost-resolve", version = "0.7.7" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.7.7" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.7" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.7" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.7" }
+keyroost-qr = { path = "../keyroost-qr", version = "0.7.7" }
+keyroost-import = { path = "../keyroost-import", version = "0.7.7", features = ["bulk", "encrypted"] }
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import. Shared with
 # keyroost; owns the workspace's scoped `rsa` dependency exception so the protocol
 # crates stay dependency-free (see that crate's Cargo.toml).
-keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.6" }
+keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.7" }
 clap = { version = "4", features = ["derive"] }
 # Same project family as clap; generate shell completions / a man page at
 # runtime (`completions` / `manpage` subcommands) rather than from a build

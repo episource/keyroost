@@ -11,9 +11,9 @@ description = "Shared security-key identity resolution (USB + CCID serials) over
 workspace = true
 
 [dependencies]
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.6" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.7.6" }
-keyroost-transport = { path = "../keyroost-transport", version = "0.7.6" }
-keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.6" }
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.6" }
-keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.6" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.7" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.7" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.7.7" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.7" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.7" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.7" }

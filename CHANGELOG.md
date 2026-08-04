@@ -4,7 +4,7 @@ All notable changes to keyroost are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.7] - 2026-08-04
 
 ### Added
 - **PIV move-key:** relocate a private key between slots (`keyroostctl piv
@@ -783,7 +783,8 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#81]: https://github.com/framefilter/keyroost/issues/81
 [#82]: https://github.com/framefilter/keyroost/issues/82
 [#83]: https://github.com/framefilter/keyroost/issues/83
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/framefilter/keyroost/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/framefilter/keyroost/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/framefilter/keyroost/compare/v0.7.3...v0.7.4
