@@ -268,6 +268,9 @@ struct OtpLoad {
     /// Whether the key MODEL supports HOTP-on-touch at all (distinct from the
     /// keyboard interface merely being disabled). `None` if config unreadable.
     hotp_supported: Option<bool>,
+    /// Whether the key MODEL has the on-device OTP function. `None` when the
+    /// config couldn't be read (or was too short to say); see [`totp_capability`].
+    totp_supported: Option<bool>,
     iface: Option<IfaceState>,
     button_hotp_status: Option<ButtonHotpStatus>,
 }
@@ -297,6 +300,10 @@ pub struct OtpState {
     /// keyboard interface being toggled off). Gates the "Enable HID-HOTP" item.
     /// `None` until known.
     pub hotp_supported: Option<bool>,
+    /// Whether the key was supplied WITH the on-device OTP function. `Some(false)`
+    /// replaces the entry list and the add control with a plain explanation.
+    /// `None` (unknown) leaves the pane exactly as it behaves today.
+    pub totp_supported: Option<bool>,
     /// Current interface enabled-states (fido, keyboard-HID, ccid), read from the
     /// device config on load. `None` until known.
     pub iface: Option<IfaceState>,
@@ -319,6 +326,38 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// What the key's own config block says about the on-device OTP (TOTP) function.
+///
+/// Token2 keys are supplied in configurations that differ by which functions are
+/// enabled, and the set is fixed at manufacture — a key made without on-device
+/// OTP can't gain it later. The device advertises the function in the capability
+/// bits of its config block, so the pane can say "this key doesn't have it"
+/// instead of offering controls whose first command comes back as a protocol
+/// error.
+///
+/// * `Some(true)`  — the key advertises the function.
+/// * `Some(false)` — the key answered with a full config block and the bit is
+///   clear: it was supplied without the on-device OTP function.
+/// * `None` — we can't tell. Either no config was read, or the key answered with
+///   a block too short to reach the capability byte. Callers must treat `None` as
+///   "offer the feature anyway": hiding it because a read failed would be worse
+///   than letting the attempt report its own error.
+///
+/// This only helps when the config read SUCCEEDS. A key whose config exchange
+/// itself fails never yields a capability byte, and that failure is reported
+/// unchanged.
+fn totp_capability(info: Option<&keyroost_token2otp::DeviceInfo>) -> Option<bool> {
+    let info = info?;
+    // The capability bits live in byte 9. Some firmware answers READ_CONFIG with
+    // only the leading interface-state byte(s); the parser zero-fills the rest,
+    // which would read back as a confident "unsupported". Require a block long
+    // enough to actually contain byte 9 before believing a clear bit.
+    if info.raw_len < 10 {
+        return None;
+    }
+    Some(info.totp_supported())
 }
 
 impl App {
@@ -388,19 +427,37 @@ impl App {
                     // Reading codes first means any config trouble can only cost
                     // the (secondary) interface toggle, never the codes.
                     let now = unix_now();
-                    let entries = session.enumerate(now)?;
-                    let rows = entries
-                        .into_iter()
-                        .map(|e| OtpRow {
-                            app_name: e.app_name,
-                            account_name: e.account_name,
-                            type_str: keyroost_transport::otp_type_str(e.otp_type),
-                            algo_str: otp_algo_str(e.algorithm),
-                            button_required: e.button_required,
-                            code: e.code,
-                            period: e.timestep,
-                        })
-                        .collect();
+                    // Carries the config read across both arms below so a failed
+                    // enumerate doesn't cost a second READ_CONFIG.
+                    let mut dev_info: Option<keyroost_token2otp::DeviceInfo> = None;
+                    let rows: Vec<OtpRow> = match session.enumerate(now) {
+                        Ok(entries) => entries
+                            .into_iter()
+                            .map(|e| OtpRow {
+                                app_name: e.app_name,
+                                account_name: e.account_name,
+                                type_str: keyroost_transport::otp_type_str(e.otp_type),
+                                algo_str: otp_algo_str(e.algorithm),
+                                button_required: e.button_required,
+                                code: e.code,
+                                period: e.timestep,
+                            })
+                            .collect(),
+                        Err(e) => {
+                            // Enumeration failed. Before showing a raw protocol
+                            // error, ask the key whether it has the on-device OTP
+                            // function at all: keys supplied without it answer the
+                            // config read fine and simply advertise the function as
+                            // absent, which deserves a plain explanation rather than
+                            // a status word. Anything else (including a config read
+                            // that fails in its own right) keeps the original error.
+                            dev_info = session.read_device_info().ok();
+                            if totp_capability(dev_info.as_ref()) != Some(false) {
+                                return Err(e);
+                            }
+                            Vec::new()
+                        }
+                    };
 
                     // Now read the device config for the interface states (which
                     // drive the keyboard-HID / HID-HOTP toggle) and touch-HOTP
@@ -416,12 +473,14 @@ impl App {
                     // block (verified on hardware), so the toggle appears. Over a
                     // genuine T=0 contact reader it may stall; that costs the
                     // toggle and the wait, not the codes.
-                    let dev_info = session.read_device_info().ok();
+                    if dev_info.is_none() {
+                        dev_info = session.read_device_info().ok();
+                    }
                     let (touch_ok, touch_why): (Option<bool>, Option<&'static str>) =
                         match &dev_info {
                             Some(info) => {
                                 if !info.button_hotp_supported() {
-                                    (Some(false), Some("this key model does not support HOTP-on-touch"))
+                                    (Some(false), Some("this key was supplied without the HOTP-on-touch function; keys aren't upgradable after purchase, so it can't be enabled here"))
                                 } else if info.hotp_keystroke_disabled() {
                                     (Some(false), Some("the keyboard-HID interface is disabled on this key; enable it to use HOTP-on-touch"))
                                 } else {
@@ -441,6 +500,7 @@ impl App {
                     // the UI can disable "Enable HID-HOTP" on keys that lack the
                     // feature entirely (vs merely having the interface off).
                     let hotp_supported = dev_info.as_ref().map(|i| i.button_hotp_supported());
+                    let totp_supported = totp_capability(dev_info.as_ref());
                     let button_hotp_status = dev_info.as_ref().and_then(|info| {
                         // The seed bit lives in byte 1; over a short CCID stub
                         // (byte 0 only) we can't tell, so report unknown rather
@@ -462,6 +522,7 @@ impl App {
                         touch_ok,
                         touch_why,
                         hotp_supported,
+                        totp_supported,
                         iface,
                         button_hotp_status,
                     })
@@ -479,6 +540,7 @@ impl App {
                         app.otp.touch_hotp_ok = load.touch_ok;
                         app.otp.touch_hotp_why = load.touch_why;
                         app.otp.hotp_supported = load.hotp_supported;
+                        app.otp.totp_supported = load.totp_supported;
                         app.otp.iface = load.iface;
                         app.otp.button_hotp_status = load.button_hotp_status;
                         // Codes read on touch are tied to the old time-window;
@@ -963,7 +1025,9 @@ impl App {
                                 let r = ui.selectable_label(false, label);
                                 let r = if unsupported {
                                     r.on_disabled_hover_text(
-                                        "this key model does not support HOTP-on-touch",
+                                        "this key was supplied without the HOTP-on-touch \
+                                         function; keys aren't upgradable after purchase, so \
+                                         it can't be enabled here",
                                     )
                                 } else if would_underflow {
                                     r.on_disabled_hover_text(
@@ -1008,8 +1072,13 @@ impl App {
 
                 // Primary actions, to the left of the overflow menu (added after
                 // it so they sit left of it in this right-to-left layout).
+                // "+ Add entry" is dropped entirely on a key that told us it has
+                // no on-device OTP function — there is nothing to add it to.
+                // Refresh stays, so the read can be retried.
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Primary, "+ Add entry").clicked() {
+                if self.otp.totp_supported != Some(false)
+                    && theme::button(ui, p, BtnKind::Primary, "+ Add entry").clicked()
+                {
                     // OtpAddDialog has a Drop impl (wipes the typed seed), so
                     // `..Default` struct-update isn't allowed; build via default()
                     // then flip `open`.
@@ -1066,6 +1135,34 @@ impl App {
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
+            return;
+        }
+        // The key answered the config read and reported no on-device OTP
+        // function. Say so plainly, in place of a list and an "Erase all" button
+        // that could only produce a protocol error. This is the quiet case where
+        // the key talks to us correctly and simply lacks the feature; a key whose
+        // config exchange itself fails leaves this `None` and still shows the
+        // transport error above.
+        if self.otp.totp_supported == Some(false) {
+            theme::card_frame(p).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("This key does not have on-device OTP.")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The key reports that it was supplied without the on-device OTP \
+                         function, so it can't store TOTP or HOTP entries. Token2 keys \
+                         aren't upgradable after purchase \u{2014} the functions a key has \
+                         are fixed when it is made, and OTP is a separate product \
+                         configuration. Your other features on this key are unaffected.",
+                    )
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+                );
+            });
             return;
         }
         if self.otp.rows.is_empty() && self.otp.error.is_none() {
@@ -1600,6 +1697,42 @@ fn otp_algo_str(a: keyroost_token2otp::Algorithm) -> &'static str {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// A config block of `len` bytes whose capability byte (9) is `ext`.
+    fn config_block(len: usize, ext: u8) -> keyroost_token2otp::DeviceInfo {
+        let mut raw = vec![0u8; len];
+        if len > 9 {
+            raw[9] = ext;
+        }
+        keyroost_token2otp::DeviceInfo::parse(&raw).expect("non-empty block parses")
+    }
+
+    #[test]
+    fn a_full_config_block_decides_the_totp_gate_both_ways() {
+        // Bit 1 of byte 9 is the advertised TOTP function.
+        assert_eq!(totp_capability(Some(&config_block(10, 0x01))), Some(true));
+        assert_eq!(totp_capability(Some(&config_block(10, 0x00))), Some(false));
+        // Other capability bits must not be mistaken for it.
+        assert_eq!(totp_capability(Some(&config_block(10, 0x1a))), Some(false));
+        assert_eq!(totp_capability(Some(&config_block(64, 0x1b))), Some(true));
+    }
+
+    #[test]
+    fn a_short_config_block_is_unknown_not_unsupported() {
+        // Byte 9 is absent; the parser zero-fills it, which must NOT be read as
+        // a key that lacks the function — that would hide the feature over any
+        // transport whose firmware answers with a stub block.
+        for len in 1..=9 {
+            assert_eq!(totp_capability(Some(&config_block(len, 0))), None, "{len}");
+        }
+    }
+
+    #[test]
+    fn no_config_read_leaves_the_feature_offered() {
+        // Hiding on a failed read would be worse than letting the attempt
+        // report its own error, so an absent config means "unknown".
+        assert_eq!(totp_capability(None), None);
+    }
 
     #[test]
     fn auto_with_both_interfaces_keeps_the_reader_as_fallback() {

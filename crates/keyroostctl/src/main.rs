@@ -2555,7 +2555,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         let info = session.read_info()?;
         // A mid-sweep failure keeps the slots already read; the table below
         // prints them plus an error row instead of discarding everything a
-        // flaky read had already produced (TODO-v0.7.5 hygiene item).
+        // flaky read had already produced.
         let (slots, sweep_err) =
             sweep_until_error((0..=99u8).map(|p| (p, session.read_public_data(p))));
         if json_output() {
@@ -4757,6 +4757,81 @@ fn open_otp(
     Ok(session)
 }
 
+/// A Token2 OTP function that ships as a separate product configuration. Which
+/// functions a key has is fixed when it is made — a key supplied without one
+/// can't gain it later — so a command that needs a missing function should say
+/// that plainly rather than surface the protocol error its first APDU produces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OtpFeature {
+    /// The on-device OTP store (`otp list` / `get` / `add` / `delete` / `erase-all`).
+    OnDevice,
+    /// The single HOTP-on-touch keystroke slot (`otp button-hotp`).
+    ButtonHotp,
+}
+
+impl OtpFeature {
+    fn missing_message(self) -> &'static str {
+        match self {
+            OtpFeature::OnDevice => {
+                "this key does not have the on-device OTP function: it reports that it was \
+                 supplied without it, so it cannot store TOTP or HOTP entries. Token2 keys \
+                 aren't upgradable after purchase — OTP is a separate product configuration, \
+                 not something that can be switched on later. Run `keyroostctl otp config` to \
+                 see the capabilities the key reports."
+            }
+            OtpFeature::ButtonHotp => {
+                "this key does not have the HOTP-on-touch function: it reports that it was \
+                 supplied without it. Token2 keys aren't upgradable after purchase — the \
+                 keystroke slot is a separate product configuration, not something that can \
+                 be switched on later. Run `keyroostctl otp config` to see the capabilities \
+                 the key reports."
+            }
+        }
+    }
+}
+
+/// What the key's config block says about `feature`.
+///
+/// * `Some(true)`  — the key advertises it.
+/// * `Some(false)` — the key answered with a full config block and says it does not
+///   have it.
+/// * `None` — we can't tell: no config was read, or the block was too short to
+///   reach the capability byte. Callers must treat `None` as "go ahead": refusing
+///   a command because a read failed would be worse than letting it run and
+///   report its own error.
+fn otp_feature_capability(
+    info: Option<&keyroost_token2otp::DeviceInfo>,
+    feature: OtpFeature,
+) -> Option<bool> {
+    let info = info?;
+    // The capability bits live in byte 9. Some firmware answers READ_CONFIG with
+    // only the leading interface-state byte(s); the parser zero-fills the rest,
+    // which would read back as a confident "unsupported".
+    if info.raw_len < 10 {
+        return None;
+    }
+    Some(match feature {
+        OtpFeature::OnDevice => info.totp_supported(),
+        OtpFeature::ButtonHotp => info.button_hotp_supported(),
+    })
+}
+
+/// Stop before the operation when the key's own config says it lacks `feature`.
+///
+/// Best-effort by design: this only helps when the config read SUCCEEDS. A key
+/// whose exchange fails outright never yields a capability byte, and the command
+/// proceeds exactly as before so that failure is reported unchanged.
+fn ensure_otp_feature(
+    session: &mut keyroost_transport::Token2OtpSession,
+    feature: OtpFeature,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = session.read_device_info().ok();
+    if otp_feature_capability(info.as_ref(), feature) == Some(false) {
+        return Err(feature.missing_message().into());
+    }
+    Ok(())
+}
+
 fn run_otp(
     cmd: &OtpCmd,
     transport: OtpTransportArg,
@@ -4765,6 +4840,7 @@ fn run_otp(
     match cmd {
         OtpCmd::List => {
             let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             let entries = session.enumerate(now)?;
             if json_output() {
@@ -4806,6 +4882,7 @@ fn run_otp(
         }
         OtpCmd::Get { app, account } => {
             let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             let entry = session.read_entry(now, app, account)?;
             match entry.code {
@@ -4841,6 +4918,7 @@ fn run_otp(
             let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
             let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let entry = keyroost_token2otp::WriteEntry {
                 otp_type: otp_type.to_t2(),
                 algorithm: algorithm.to_t2(),
@@ -4861,6 +4939,7 @@ fn run_otp(
         }
         OtpCmd::Delete { app, account } => {
             let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.delete_entry(app, account)?;
             let label = if app.is_empty() {
                 account.clone()
@@ -4874,6 +4953,9 @@ fn run_otp(
                 return Err("refusing to erase all OTP entries without --yes".into());
             }
             let mut session = open_otp(transport, debug)?;
+            // Checked before the touch prompt: no point asking for a physical
+            // touch on a key that has nothing to erase.
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             eprintln!("touch your key to confirm the erase\u{2026}");
             session.erase_all()?;
             println!("Erased all OTP entries.");
@@ -4903,11 +4985,13 @@ fn run_otp(
             let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
             let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::ButtonHotp)?;
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
             println!("Configured the HOTP-on-button keystroke slot.");
         }
         OtpCmd::DeleteButtonHotp => {
             let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::ButtonHotp)?;
             session.delete_button_hotp()?;
             println!("Deleted the HOTP-on-button keystroke slot.");
         }
@@ -4950,14 +5034,15 @@ fn run_otp(
                     "enabled"
                 }
             );
-            println!(
-                "  HOTP-on-touch support:  {}",
-                if info.button_hotp_supported() {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
+            // Capability bits live in byte 9, so a short block can't answer these;
+            // say "unknown" rather than report a zero-fill as a hard "no".
+            let cap = |feature| match otp_feature_capability(Some(&info), feature) {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown (device returned a short config block)",
+            };
+            println!("  on-device OTP support:  {}", cap(OtpFeature::OnDevice));
+            println!("  HOTP-on-touch support:  {}", cap(OtpFeature::ButtonHotp));
             println!(
                 "  HOTP-on-touch slot:     {}",
                 if !info.has_config_byte() {
@@ -7920,7 +8005,7 @@ fn print_info(info: &keyroost_transport::DeviceInfo) {
 ///
 /// Detection is by the panic *message* (see [`is_broken_pipe_panic`]). When
 /// `-Zon-broken-pipe` (or the `unix_sigpipe` attribute) reaches stable, delete
-/// this whole dance and adopt the built-in — see TODO-v0.7.5.md.
+/// this whole dance and adopt the built-in — see `TODO.md`.
 fn install_broken_pipe_guard() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -7987,6 +8072,98 @@ fn main() -> ExitCode {
         Err(_) => {
             eprintln!("error: worker thread panicked");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod otp_capability_tests {
+    use super::*;
+
+    /// A config block of `len` bytes whose capability byte (9) is `ext`.
+    fn config_block(len: usize, ext: u8) -> keyroost_token2otp::DeviceInfo {
+        let mut raw = vec![0u8; len];
+        if len > 9 {
+            raw[9] = ext;
+        }
+        keyroost_token2otp::DeviceInfo::parse(&raw).expect("non-empty block parses")
+    }
+
+    #[test]
+    fn a_full_config_block_decides_both_features() {
+        // Byte 9: bit 1 sets TOTP support; bit 6 is inverted (set = NO button HOTP).
+        let both = config_block(10, 0x01);
+        assert_eq!(
+            otp_feature_capability(Some(&both), OtpFeature::OnDevice),
+            Some(true)
+        );
+        assert_eq!(
+            otp_feature_capability(Some(&both), OtpFeature::ButtonHotp),
+            Some(true)
+        );
+
+        let neither = config_block(10, 0x20);
+        assert_eq!(
+            otp_feature_capability(Some(&neither), OtpFeature::OnDevice),
+            Some(false)
+        );
+        assert_eq!(
+            otp_feature_capability(Some(&neither), OtpFeature::ButtonHotp),
+            Some(false)
+        );
+
+        // The two are independent: a key can have the keystroke slot and no store.
+        let hotp_only = config_block(64, 0x10);
+        assert_eq!(
+            otp_feature_capability(Some(&hotp_only), OtpFeature::OnDevice),
+            Some(false)
+        );
+        assert_eq!(
+            otp_feature_capability(Some(&hotp_only), OtpFeature::ButtonHotp),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_short_config_block_is_unknown_not_unsupported() {
+        // Byte 9 is absent; the parser zero-fills it. Reading that as "no" would
+        // refuse commands on keys whose firmware answers with a stub block.
+        for len in 1..=9 {
+            assert_eq!(
+                otp_feature_capability(Some(&config_block(len, 0)), OtpFeature::OnDevice),
+                None,
+                "{len}"
+            );
+            assert_eq!(
+                otp_feature_capability(Some(&config_block(len, 0)), OtpFeature::ButtonHotp),
+                None,
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_config_read_never_blocks_a_command() {
+        // `ensure_otp_feature` passes `None` when the read fails; that must leave
+        // the command running exactly as it did before this gate existed.
+        assert_eq!(otp_feature_capability(None, OtpFeature::OnDevice), None);
+        assert_eq!(otp_feature_capability(None, OtpFeature::ButtonHotp), None);
+    }
+
+    #[test]
+    fn the_missing_feature_messages_name_the_feature() {
+        // The wording is what a user with a non-OTP key actually sees, so keep it
+        // specific to the function that is absent.
+        assert!(OtpFeature::OnDevice
+            .missing_message()
+            .contains("on-device OTP function"));
+        assert!(OtpFeature::ButtonHotp
+            .missing_message()
+            .contains("HOTP-on-touch function"));
+        for f in [OtpFeature::OnDevice, OtpFeature::ButtonHotp] {
+            assert!(f
+                .missing_message()
+                .contains("aren't upgradable after purchase"));
         }
     }
 }
