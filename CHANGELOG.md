@@ -19,13 +19,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   acted on: why the CCID path was unavailable (a stopped smart-card service, in
   the reported case), with the status word quoted and `--transport ccid`
   named. ([#95])
-- **Token2 keys show the OTP capability again.** v0.7.7 stopped listing OTP for
-  product ids whose vendor function set omits it. Token2 has since confirmed
-  that a function set which omits OTP does not mean the applet is absent — a key
-  can carry OTP over CCID while reporting FIDO+PGP — so that check hid the
-  capability from keys that have it. Every Token2 key is offered the OTP surface
-  once more; a key that genuinely lacks the applet now says which channel
-  declined and what to do, rather than failing with a raw protocol error. ([#95])
+- **Token2 keys are offered the OTP surface again, whatever their product id.**
+  v0.7.7 stopped listing OTP for product ids whose vendor function set omits it.
+  Token2 has since confirmed that a function set omitting OTP does not mean the
+  applet is absent: a key can carry OTP over CCID while its id reads FIDO+PGP.
+  In practice v0.7.7 rarely got this wrong — when a card reader is present the
+  capability comes from actually selecting the applet on the device, and that
+  answer always wins — but with no reader, or no smart-card service running, the
+  product id was the only evidence and a key could be shown without OTP it may
+  well have. The guess is gone. A key that genuinely lacks the applet now
+  reports which channel declined and what to do about it, instead of failing
+  with a raw protocol error. ([#95])
 
 ## [0.7.7] - 2026-08-04
 

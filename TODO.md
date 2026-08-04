@@ -29,13 +29,54 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Ready to pick up
 
+- **UNDECIDED: should the PID gate on `Caps::OTP` come back, narrowed?**
+  Needs a decision before the third-state work below; parked deliberately, not
+  forgotten.
+  *What is true today:* the gate is gone — `keyroost-resolve/src/device.rs`
+  sets `has_otp = is_token2`, so every Token2 key is offered the OTP surface.
+  *What the panic was about, and why it was wrong:* v0.7.7 gated that bit on
+  the vendor function set, and it was reported as a regression that removed
+  OTP from nine PIDs. It was not. Capabilities are **insert-only** — there is
+  no `remove` anywhere in `device.rs`. A key on a working reader gets
+  `Caps::OTP` from an actual `SELECT` of the applet AID in
+  `keyroost-transport`, and the HID merge can only `insert`, never clear it.
+  Token2 confirmed on #95 that a `0204` works on v0.7.7, which is exactly
+  this path. The PID had a say only on a **HID-only row** — no reader bound,
+  or no smart-card service — where CCID-carried OTP is unreachable regardless.
+  So the released behaviour was very nearly harmless, and the revert was a
+  larger swing than the evidence warranted.
+  *What is genuinely unresolved:* Token2 states a `0204` has OTP, while their
+  own published PID matrix lists `0204` as FIDO + PGP. One of those is wrong,
+  and we do not know which. Nothing is known either way about the other eight
+  (`0010`, `0014`, `0015`, `0020`, `0024`, `0025`, `0200`, `0205`).
+  *The three options, and the case for each:*
+  1. **Leave it fail-open** (status quo). Costs nothing when a reader is
+     present, since the probe wins anyway. On a HID-only view it offers a
+     surface that may fail — but the failure is now an actionable message
+     rather than a raw protocol error, which is what made the original #82
+     complaint sting.
+  2. **Restore the gate and correct the table** for whichever PIDs Token2
+     confirms. Keeps the #82 improvement (no OTP pane on a key that truly
+     lacks the applet) and fixes the one entry known to be wrong. Assumes the
+     table is right for the seven PIDs nobody has tested, which is the
+     assumption that just failed once.
+  3. **Restore the gate but only for a `SELECT`-verified absence** — i.e.
+     never infer from the PID at all, and let the third-state work below carry
+     the whole load. Cleanest, and the most work.
+  *Deciding needs:* Token2's answer on #95 question 3. Do not re-litigate this
+  from the PID table alone — that is what produced two wrong turns in one day.
+
 - **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
   capability is either present or absent and there is no way to say "we could
-  not check". That gap caused the v0.7.7 OTP regression: on a USB-HID-only
-  enumeration nothing has been sent to the device, so the only evidence is the
-  USB PID, and "no evidence" got recorded as "no feature". Hiding a capability
-  is not cosmetic — it removes the GUI tab and makes `--key <name>` fail to find
-  the device.
+  not check". On a USB-HID-only enumeration nothing has been sent to the device,
+  so the only evidence is the USB PID — and with nowhere to record "unknown",
+  absence of evidence has to be written down as absence of the feature.
+  This is the gap the v0.7.7 OTP argument was really about. It did *not* cause a
+  user-facing regression (see the undecided item above: capabilities are
+  insert-only, so a probe always wins), but it is why a guess had to be made at
+  all, and why the guess had authority it should never have had. Where it does
+  bite, it bites hard: a missing capability removes the GUI tab and makes
+  `--key <name>` fail to find the device.
   What already exists to build on: `keyroost-transport` (`src/lib.rs`, the
   `answers(...)` block) probes for real over a reader, `SELECT`ing each applet
   AID, and that is ground truth. The CLI already models the third state
