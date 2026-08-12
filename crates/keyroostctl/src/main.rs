@@ -1658,13 +1658,22 @@ enum FidoCmd {
     ///
     /// Most authenticators only accept Reset within ~10s of plug-in and
     /// require a physical touch. If `--yes` is missing this is a no-op.
+    ///
+    /// For a card in a smart-card reader (no USB interface), use `--reader`:
+    /// the card is power-cycled in place — which starts the same
+    /// just-after-power-up window a replug would — and the reset sent
+    /// immediately. No touch is involved.
     Reset {
         /// Confirm you really want to wipe credentials.
         #[arg(long)]
         yes: bool,
         /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "reader")]
         path: Option<std::path::PathBuf>,
+        /// Substring of the PC/SC reader holding the card to reset. Routes the
+        /// reset over the smart-card interface instead of USB-HID.
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
     },
     /// Print the current PIN retry counter.
     PinRetries {
@@ -3926,11 +3935,29 @@ fn run_factory_reset(
     for step in &plan {
         let outcome = match step {
             ResetStep::Fido => {
-                // Interactive replug + touch; on its own so a card-step
-                // failure above never skips the FIDO offer.
-                match fido_reset_after_replug(&expected_serial, &expected_model, expected_ids) {
-                    Ok(()) => StepOutcome::Wiped,
-                    Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
+                if dev.hid_path.is_none() {
+                    // A card in a reader: no replug exists and no touch surface
+                    // — the replug prompt below could never be satisfied
+                    // (issue #84). Power-cycle the card in place instead,
+                    // which starts the same post-power-up window. The target
+                    // cannot have been swapped mid-flow: the card never left
+                    // the reader we have been talking to all along.
+                    match dev
+                        .reader
+                        .as_deref()
+                        .ok_or_else(|| "no reader holds this card any more".to_string())
+                        .and_then(|r| run_fido_reset_reader(r).map_err(|e| e.to_string()))
+                    {
+                        Ok(()) => StepOutcome::Wiped,
+                        Err(e) => StepOutcome::Failed(sanitize_terminal(&e)),
+                    }
+                } else {
+                    // Interactive replug + touch; on its own so a card-step
+                    // failure above never skips the FIDO offer.
+                    match fido_reset_after_replug(&expected_serial, &expected_model, expected_ids) {
+                        Ok(()) => StepOutcome::Wiped,
+                        Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
+                    }
                 }
             }
             other => reset_one_card_applet(*other, reader, debug),
@@ -6248,7 +6275,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             run_fido_info(path.as_deref())?;
             Ok(())
         }
-        FidoCmd::Reset { yes, path } => {
+        FidoCmd::Reset { yes, path, reader } => {
             if !*yes {
                 return Err(format!(
                     "refusing to reset FIDO key without --yes (this wipes credentials){}",
@@ -6256,7 +6283,10 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 )
                 .into());
             }
-            run_fido_reset(path.as_deref())?;
+            match reader {
+                Some(substr) => run_fido_reset_reader(substr)?,
+                None => run_fido_reset(path.as_deref())?,
+            }
             Ok(())
         }
         FidoCmd::PinRetries { path } => {
@@ -7354,6 +7384,33 @@ fn fido_reset_at(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     let (mut dev, _init) = keyroost_ctap::CtapHidDevice::open(path)?;
     println!("Resetting {} — touch the key now…", path.display());
     keyroost_ctap::reset(&mut dev)?;
+    println!("Reset complete. All credentials wiped, PIN cleared.");
+    Ok(())
+}
+
+/// Reset the FIDO2 applet of a card in the PC/SC reader matching `substr`.
+///
+/// A card has no replug and no touch surface, so the "reset within ~10 s of
+/// power-up" window is opened another way: PC/SC power-cycles the card in the
+/// reader and the reset is sent the moment the applet answers (issue #84 —
+/// the replug ceremony can never complete for a card).
+fn run_fido_reset_reader(substr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let readers = keyroost_transport::CtapPcscDevice::list_fido_readers()?;
+    let name = resolve_reader(readers, Some(substr), "FIDO")?;
+    eprintln!("\u{2192} FIDO on {}", sanitize_terminal(&name));
+    println!("Power-cycling the card and sending the reset\u{2026}");
+    let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(&name)?;
+    keyroost_ctap::reset(&mut dev).map_err(|e| -> Box<dyn std::error::Error> {
+        let s = e.to_string();
+        if s.contains("NOT_ALLOWED") || s.contains("0x30") {
+            "the card refused the reset even straight after a power cycle. Some cards \
+             only accept a FIDO reset over NFC (contactless) rather than a contact \
+             reader — try a contactless reader or the vendor's mobile app."
+                .into()
+        } else {
+            Box::new(e)
+        }
+    })?;
     println!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
 }

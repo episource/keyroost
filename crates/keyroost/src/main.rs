@@ -828,8 +828,12 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
     use keyroost_resolve::StepOutcome;
     match row {
         FactoryResetRow::FidoPending => (
+            // Route-neutral on purpose: a USB key finishes via the replug +
+            // touch ceremony, a card in a reader resets in place after a
+            // power cycle — the open reset dialog carries the specific
+            // instructions for whichever this is.
             format!(
-                "{}  not wiped yet \u{2014} waiting for the unplug, replug, and touch",
+                "{}  not wiped yet \u{2014} finish the confirmation in the reset window",
                 keyroost_resolve::ResetStep::Fido.label()
             ),
             RowTone::Waiting,
@@ -3981,6 +3985,29 @@ impl App {
         self.selected_device().and_then(|d| d.hid_path.clone())
     }
 
+    /// The reader to run an in-place card reset against — `Some` only for a
+    /// FIDO2 device that is a card in a PC/SC reader with no USB-HID interface.
+    ///
+    /// The replug ceremony cannot work for such a device: there is nothing to
+    /// unplug, no touch surface, and the arm's removal detector keys on a HID
+    /// path the device does not have, so before this route existed the dialog
+    /// simply polled forever (issue #84). A card gets the equivalent another
+    /// way — PC/SC power-cycles it in the reader, which starts the same
+    /// post-power-up window `authenticatorReset` must land in.
+    ///
+    /// A USB key that *also* exposes a CCID reader returns `None`: it has a
+    /// real replug, and that ceremony's proof-of-possession is stronger than
+    /// an in-place cycle, so it must not be bypassed just because a reader
+    /// name is available.
+    fn card_reset_reader(dev: Option<&keyroost_resolve::Device>) -> Option<String> {
+        let d = dev?;
+        if d.hid_path.is_none() && d.caps.has(Caps::FIDO2) {
+            d.reader.clone()
+        } else {
+            None
+        }
+    }
+
     /// Fold a finished FIDO reset into the app, bound to the key the reset was
     /// dispatched for. Lifted out of `submit_reset_path`'s apply closure so the
     /// device-binding rule is exercisable without a key in hand; the guard is
@@ -4078,6 +4105,42 @@ impl App {
                 }
                 let mut dev = dev.ok_or_else(|| "could not open key".to_string())?;
                 keyroost_ctap::reset(&mut dev).map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| {
+                App::apply_reset_path_outcome(app, for_device.as_ref(), result)
+            })
+        })
+    }
+
+    /// Wipe the FIDO applet of a card sitting in `reader` (authenticatorReset,
+    /// in place). The card analogue of [`Self::submit_reset_path`]: PC/SC
+    /// power-cycles the card, which starts the post-power-up window the reset
+    /// must land in, and the wipe is sent the moment the applet answers — no
+    /// replug, no touch. Outcome lands through the same completion handler as
+    /// the replug flow, so the factory-reset report and the FIDO2 pane both
+    /// hear about it.
+    fn submit_card_reset(&mut self, reader: String) -> bool {
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Resetting card\u{2026}", move || {
+            let result = (|| -> Result<(), String> {
+                let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(&reader)
+                    .map_err(|e| e.to_string())?;
+                keyroost_ctap::reset(&mut dev).map_err(|e| {
+                    let s = e.to_string();
+                    // Rewrite the refusal here, not in the shared handler: its
+                    // NOT_ALLOWED advice ("unplug the key, plug it back in")
+                    // is USB advice, and following it would eject the card
+                    // for nothing.
+                    if s.contains("NOT_ALLOWED") || s.contains("0x30") {
+                        "the card refused the reset even straight after a power \
+                         cycle. Some cards only accept a FIDO reset over NFC \
+                         (contactless) rather than a contact reader \u{2014} \
+                         try a contactless reader or the vendor's mobile app."
+                            .to_string()
+                    } else {
+                        s
+                    }
+                })
             })();
             Box::new(move |app: &mut App| {
                 App::apply_reset_path_outcome(app, for_device.as_ref(), result)
@@ -4831,6 +4894,10 @@ impl App {
         let mut window_open = true;
         let mut arm = false;
         let mut cancel = false;
+        // A card in a reader takes the in-place route: power-cycle + immediate
+        // reset, no replug and no touch. `None` for USB keys, which keep the
+        // armed replug ceremony.
+        let card_reader = Self::card_reset_reader(self.selected_device());
         // Device-scoped, not app-global: this dialog may belong to a different
         // key than the armed one, and telling the user to "unplug the key, then
         // plug it back in" under the wrong key's name invites a replug that
@@ -4880,8 +4947,15 @@ impl App {
                         cancel = true;
                     }
                 } else {
-                    ui.label("A key only accepts a reset within ~10 seconds of being");
-                    ui.label("plugged in, so after you confirm you'll re-insert it.");
+                    if card_reader.is_some() {
+                        ui.label("A key only accepts a reset just after power-up. This one");
+                        ui.label("sits in a card reader, so there is nothing to unplug \u{2014}");
+                        ui.label("the card is power-cycled in place and the wipe sent");
+                        ui.label("immediately. Keep the card on the reader.");
+                    } else {
+                        ui.label("A key only accepts a reset within ~10 seconds of being");
+                        ui.label("plugged in, so after you confirm you'll re-insert it.");
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("Type \u{201c}reset\u{201d} to confirm:");
@@ -4892,11 +4966,13 @@ impl App {
                     });
                     ui.add_space(6.0);
                     let ready = self.security_keys.reset.confirm_input.trim() == "reset";
+                    let go_label = if card_reader.is_some() {
+                        "Reset card"
+                    } else {
+                        "Arm reset"
+                    };
                     ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(ready, egui::Button::new("Arm reset"))
-                            .clicked()
-                        {
+                        if ui.add_enabled(ready, egui::Button::new(go_label)).clicked() {
                             arm = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -4906,7 +4982,28 @@ impl App {
                 }
             });
         if arm {
-            self.arm_fido_reset();
+            if let Some(reader) = card_reader {
+                // In-place card route: the wipe runs now, on the worker, and
+                // its outcome lands through the same completion handler the
+                // replug flow uses. The dialog's job is done.
+                self.security_keys.reset = ResetDialog::default();
+                if !self.submit_card_reset(reader) {
+                    // Worker busy — nothing was submitted, and the dialog just
+                    // closed. A pending report row must not sit there implying
+                    // a wipe is coming.
+                    let msg = "not started \u{2014} another device operation is in \
+                               progress. Retry from the FIDO2 pane once it finishes; \
+                               the card was not touched."
+                        .to_string();
+                    resolve_pending_fido_reset_row(
+                        &mut self.factory_reset_report,
+                        keyroost_resolve::StepOutcome::Failed(msg.clone()),
+                    );
+                    self.security_keys.error = Some(msg);
+                }
+            } else {
+                self.arm_fido_reset();
+            }
         } else if cancel || !window_open {
             // Cancel button, or the window's [x] close.
             self.security_keys.reset = ResetDialog::default();
@@ -4966,7 +5063,10 @@ impl App {
             self.reset_arm = None;
             let msg = "not armed \u{2014} this key exposes no serial to re-identify it by after \
                        a replug, so the armed reset can't safely target it. Run `keyroostctl \
-                       fido reset --yes` within ~10 s of plugging the key in instead."
+                       fido reset --yes` within ~10 s of plugging the key in instead. If this \
+                       is a card reached through a virtual FIDO device, skip the bridge: \
+                       select the card's reader row and reset there \u{2014} a card resets in \
+                       place, no replug."
                 .to_string();
             self.log(Severity::Err, msg.clone());
             // The dialog just vanished and the log panel is collapsed by
@@ -16017,6 +16117,45 @@ mod tests {
             hid_path: None,
             reader: None,
         }
+    }
+
+    /// Issue #84: a FIDO2 card in a reader must take the in-place reset route,
+    /// and nothing else may. The replug ceremony physically cannot complete
+    /// for a card (nothing to unplug, no touch surface, and the arm's removal
+    /// detector keys on a HID path the card does not have), so routing it
+    /// there hangs the dialog forever — which is exactly what was reported.
+    #[test]
+    fn card_reset_route_is_reader_only_devices_exactly() {
+        // A card: FIDO2 over a reader, no HID interface -> in-place route.
+        let mut card = test_key("reader:acs", "T2CARD01", None);
+        card.caps.insert(Caps::FIDO2);
+        card.reader = Some("ACS ACR122U 00 00".into());
+        assert_eq!(
+            App::card_reset_reader(Some(&card)).as_deref(),
+            Some("ACS ACR122U 00 00")
+        );
+
+        // A USB key that ALSO exposes a CCID reader keeps the replug ceremony:
+        // it has a real replug, whose proof-of-possession must not be bypassed
+        // just because a reader name is available.
+        let mut usb_both = card.clone();
+        usb_both.hid_path = Some(std::path::PathBuf::from("/dev/hidraw9"));
+        assert_eq!(App::card_reset_reader(Some(&usb_both)), None);
+
+        // A plain USB key: no reader, no route.
+        let mut usb = test_key("serial:U", "USB01", None);
+        usb.caps.insert(Caps::FIDO2);
+        usb.hid_path = Some(std::path::PathBuf::from("/dev/hidraw9"));
+        assert_eq!(App::card_reset_reader(Some(&usb)), None);
+
+        // A card without the FIDO applet (OATH/PIV-only) has nothing to reset
+        // over CTAP; the reader alone must not create the route.
+        let mut no_fido = test_key("reader:x", "NOFIDO", None);
+        no_fido.reader = Some("Some Reader 00 00".into());
+        assert_eq!(App::card_reset_reader(Some(&no_fido)), None);
+
+        // No selection at all.
+        assert_eq!(App::card_reset_reader(None), None);
     }
 
     #[test]

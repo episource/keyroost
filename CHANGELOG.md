@@ -7,6 +7,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **A FIDO2 card in a smart-card reader can now actually be reset.** The reset
+  flow assumed a USB key: it waited for an unplug, a replug, and a touch — none
+  of which exist for a card sitting in a reader, so the dialog polled forever
+  and the only way out was Cancel. A card now resets *in place*: keyroost
+  power-cycles it in the reader (which opens the same brief after-power-up
+  window a replug does) and sends the wipe immediately — no replug, no touch.
+  The CLI gains the same route: `keyroostctl fido reset --yes --reader <name>`,
+  and `keyroostctl factory-reset` picks it automatically for a card. USB keys
+  keep the replug ceremony unchanged. ([#84])
 - **A key that answers is no longer reported as a key that can't be reached.**
   Running an OTP command against a Token2 model that carries OTP over CCID said
   "the OTP applet is not reachable over HID or CCID — HID may be disabled on the
@@ -810,6 +819,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#81]: https://github.com/framefilter/keyroost/issues/81
 [#82]: https://github.com/framefilter/keyroost/issues/82
 [#83]: https://github.com/framefilter/keyroost/issues/83
+[#84]: https://github.com/framefilter/keyroost/issues/84
 [#95]: https://github.com/framefilter/keyroost/issues/95
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.7...HEAD
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7

@@ -147,6 +147,40 @@ mod tests {
         }
     }
 
+    /// `reset` must stay transport-generic: the in-place card reset (issue
+    /// #84) sends it over a PC/SC transport, and any drift toward a HID-only
+    /// assumption in the command layer would sever that path. Pins the exact
+    /// wire shape: one CTAPHID_CBOR transact carrying the bare CTAP2_RESET
+    /// byte, success on a 0x00 status.
+    #[test]
+    fn reset_is_one_bare_cbor_transact_on_any_transport() {
+        struct Recorder {
+            timeout: Duration,
+            calls: Vec<(u8, Vec<u8>)>,
+        }
+        impl CtapTransport for Recorder {
+            fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+                self.calls.push((cmd, payload.to_vec()));
+                Ok(vec![0x00])
+            }
+            fn set_timeout(&mut self, timeout: Duration) {
+                self.timeout = timeout;
+            }
+            fn read_timeout(&self) -> Duration {
+                self.timeout
+            }
+        }
+        let mut dev = Recorder {
+            timeout: Duration::from_secs(1),
+            calls: Vec::new(),
+        };
+        crate::cmd::reset(&mut dev).expect("0x00 status is success");
+        assert_eq!(
+            dev.calls,
+            vec![(crate::hid::CTAPHID_CBOR, vec![crate::cmd::CTAP2_RESET])]
+        );
+    }
+
     #[test]
     fn with_timeout_restores_callers_deadline_on_ok() {
         // The restore target is the *caller's* value (7s here), not the

@@ -99,6 +99,72 @@ impl CtapPcscDevice {
         Ok(dev)
     }
 
+    /// As [`open`](Self::open), but power-cycle the card first.
+    ///
+    /// This is the card analogue of "unplug the key and plug it back in":
+    /// authenticators accept `authenticatorReset` only within ~10 s of
+    /// power-up (CTAP §6.6), and a card sitting in a contact reader was
+    /// powered up whenever it was inserted — usually long ago. A USB key gets
+    /// its power cycle from the replug ceremony; a card has no replug, but
+    /// PC/SC can reset it in place, which starts the same window. The FIDO
+    /// applet is re-selected immediately after, so the caller should send the
+    /// reset right away.
+    ///
+    /// Only for the reset flow. Everything else in this module deliberately
+    /// avoids resetting the card (see the `Drop` impl) because a power cycle
+    /// tears down other sessions on the same card.
+    pub fn open_after_power_cycle(reader_name: &str) -> Result<Self, CtapError> {
+        let ctx = Context::establish(Scope::User)
+            .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
+        let cname = std::ffi::CString::new(reader_name)
+            .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
+        let mut card = ctx
+            .connect(&cname, ShareMode::Shared, Protocols::ANY)
+            .map_err(|e| CtapError::Transport(format!("connect to reader failed: {e}")))?;
+        card.reconnect(
+            ShareMode::Shared,
+            Protocols::ANY,
+            pcsc::Disposition::ResetCard,
+        )
+        .map_err(|e| CtapError::Transport(format!("card power-cycle failed: {e}")))?;
+        let mut dev = CtapPcscDevice {
+            card: Some(card),
+            selected_version: Vec::new(),
+        };
+        dev.select_fido_applet()?;
+        Ok(dev)
+    }
+
+    /// Names of connected readers whose card answers the FIDO applet `SELECT`.
+    /// Cards without the applet (an OATH-only or PIV-only card, say) are
+    /// skipped, so a front-end can auto-pick a lone FIDO card or list the
+    /// choices — the same shape as the OATH/OpenPGP/PIV listers.
+    pub fn list_fido_readers() -> Result<Vec<String>, CtapError> {
+        let ctx = Context::establish(Scope::User)
+            .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
+        let mut buf = [0u8; 4096];
+        let names: Vec<std::ffi::CString> = ctx
+            .list_readers(&mut buf)
+            .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?
+            .map(|r| r.to_owned())
+            .collect();
+        let mut out = Vec::new();
+        for name in names {
+            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+                let mut dev = CtapPcscDevice {
+                    card: Some(card),
+                    selected_version: Vec::new(),
+                };
+                if dev.select_fido_applet().is_ok() {
+                    out.push(name.to_string_lossy().into_owned());
+                }
+                // `dev` drops here with LeaveCard — the probe must not disturb
+                // the card for whoever opens it next.
+            }
+        }
+        Ok(out)
+    }
+
     /// The applet-select answer string (`U2F_V2` or `FIDO_2_0`).
     pub fn selected_version(&self) -> &[u8] {
         &self.selected_version
