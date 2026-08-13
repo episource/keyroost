@@ -8,8 +8,9 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.7.8** — a patch release backing out the v0.7.7 OTP
-capability regression (see #95).
+Current work: **v0.7.8** — a bug-fix release: the #84 card reset, the #95
+error-message and capability fixes, and the #96 replug fixes (first external
+contribution). The release run is under way.
 
 ---
 

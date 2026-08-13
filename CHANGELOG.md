@@ -4,9 +4,28 @@ All notable changes to keyroost are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.8] - 2026-08-13
 
 ### Fixed
+- **The armed FIDO reset now survives Linux reusing the device path on
+  replug.** The kernel hands a freed `/dev/hidrawN` name straight to the next
+  device, so unplugging and replugging a key could bring it back on the exact
+  path it had before — which the replug detector read as "never left", and the
+  reset waited forever at the touch prompt. Reinsertion is now recognised by
+  the USB attach itself (bus and device number, which advance on every plug),
+  with the path kept as the fallback on macOS and Windows. Found, fixed and
+  hardware-verified by first-time contributor @Algoritter — thank you! ([#96])
+- **A replugged key identified by its card serial can re-match again.** The
+  reinsertion check could only recognise a key by its USB serial or a YubiKey's
+  CCID serial, so a key whose identity comes from a card applet (a Token2
+  FIDO+PGP key, for instance) could arm the reset but never be recognised when
+  it came back. The check now re-reads identity the same way it was captured
+  when arming. Also part of [#96], same contributor.
+- **A wrong OTP PIN now says so.** Four documented Token2 OTP status words were
+  missing from keyroost's table, so a wrong PIN, a locked PIN, a
+  function-not-available answer and a session-ordering fault all surfaced as
+  "unexpected status word 0x…". All four are now named, with the locked-PIN
+  message saying what recovery requires (a full OTP reset). ([#95])
 - **A FIDO2 card in a smart-card reader can now actually be reset.** The reset
   flow assumed a USB key: it waited for an unplug, a replug, and a touch — none
   of which exist for a card sitting in a reader, so the dialog polled forever
@@ -821,7 +840,9 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#83]: https://github.com/framefilter/keyroost/issues/83
 [#84]: https://github.com/framefilter/keyroost/issues/84
 [#95]: https://github.com/framefilter/keyroost/issues/95
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.7...HEAD
+[#96]: https://github.com/framefilter/keyroost/pull/96
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.8...HEAD
+[0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/framefilter/keyroost/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/framefilter/keyroost/compare/v0.7.4...v0.7.5
