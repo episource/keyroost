@@ -23,7 +23,8 @@ no Qt.
 > -developed work — see the Contributors section.) Since the AI I use learned
 > from the vast commons of free and open-source software people have generously
 > shared, releasing keyroost as FOSS isn't really a choice; it's giving back to
-> what made it possible. Issues, review, and contributions are warmly welcome.
+> what made it possible. Issues, review, and contributions are warmly welcome —
+> see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **New to hardware keys?** Read the companion guide —
 [*"So you bought a hardware security key… now what?"*](https://framefilter.github.io/keyroost/) —
