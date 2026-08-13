@@ -85,9 +85,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
 - **One-shot factory reset** — `keyroostctl factory-reset --yes` (and a card on
   the GUI device Overview tab) resets every resettable applet on a key in turn:
-  OATH, OpenPGP, PIV, Token2 OTP, then FIDO2 (which needs an unplug/replug and a
-  touch at the end). Only manufacturer-intended resets are used, and each step
-  reports its own outcome rather than being folded into one "done".
+  OATH, OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
+  with an unplug/replug and a touch; a card in a smart-card reader is instead
+  reset in place (no replug, no touch — the card is power-cycled in the
+  reader). Only manufacturer-intended resets are used, and each step reports
+  its own outcome rather than being folded into one "done".
 - **Friendly device names** — an opt-in `keys.json` registry to target a specific
   physical key by name when several are connected, instead of by a reshuffling
   `/dev/hidrawN` path. Destructive operations always resolve to an explicit

@@ -453,10 +453,11 @@ enum Cmd {
         cmd: OtpCmd,
     },
     /// Factory-reset EVERY resettable applet on the selected key: OATH,
-    /// OpenPGP, PIV, Token2 OTP, then FIDO2 (which needs an unplug/replug +
-    /// touch at the end). Wipes all credentials, codes, keys, and PINs; each
-    /// applet that completes comes back in factory condition, and every step
-    /// reports its own outcome. Irreversible.
+    /// OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
+    /// with an unplug/replug + touch; a card in a smart-card reader is reset
+    /// in place instead (no replug, no touch). Wipes all credentials, codes,
+    /// keys, and PINs; each applet that completes comes back in factory
+    /// condition, and every step reports its own outcome. Irreversible.
     FactoryReset {
         /// Substring of the PC/SC reader name (skips auto-detection for the
         /// smart-card applets).
