@@ -17,13 +17,7 @@ capability regression (see #95).
 
 Being worked on right now — check with whoever holds it before starting.
 
-- **CTAPHID error codes are shown raw.** `crates/keyroost-ctap/src/hid.rs:110`
-  prints `device reported CTAPHID_ERROR code 0x06` instead of naming
-  `ERR_CHANNEL_BUSY`. `0x06` is spec-retryable and keyroost does not retry it.
-- **Token2 product table corrections** — the "Supported devices" table in
-  `README.md` (Molto2 / Molto2v2 / PIN+ rows).
-- **Gate the OTP UI on the device's advertised TOTP capability** — the GUI OTP
-  surface currently shows regardless of what the key says it supports.
+(Nothing at the moment.)
 
 ---
 
@@ -115,23 +109,6 @@ Being worked on right now — check with whoever holds it before starting.
 ---
 
 ## Blocked / needs someone else
-
-- **[#82]/[#95]: native support for the no-status-word HID dialect — blocked on
-  Token2.** The same defect under two numbers; both are titled "unexpected
-  status word 0x0105". The affected firmware answers over HID with
-  `80 bf 00 01 05` and no trailing `90 00`, and our parser slices the last two
-  bytes as a status word because every other dialect has one — which is why
-  `0105` shows up as a status word that appears nowhere in Token2's published
-  applet source, where every real one is `6xxx`/`9000`. It is most likely the
-  tail of the response body, not a status word at all.
-  v0.7.6 ships the same-device HID→CCID fallback, which unbreaks these keys
-  whenever a reader is available; #95 got the bad path because the reporter's
-  smart-card service was not running, so there was nothing to fall back to.
-  v0.7.8 makes that failure say so.
-  Still to settle with Token2, in one question rather than several: what is
-  this response format, is there a status word at all, and should the HID path
-  recognize it natively? **Vendor input first, no empirical probing** — the
-  Solo 2 HOTP lesson.
 
 - **[#37] OnlyKey support — blocked on hardware** (units ordered). Teach
   `keyroost-resolve` to recognize `1d50:60fc` / product `ONLYKEY`, label it
@@ -230,6 +207,17 @@ plan's two-key manual steps were never executed):
 ## Standing decisions
 
 Not tasks. Kept so they are not re-litigated or re-researched.
+
+- **No HID workarounds for Token2 R3.2+/R3.3+ keys — the channel is off by
+  design.** The "no-status-word HID dialect" that #82 and #95 were both filed
+  about (the `80 bf 00 01 05` / "status word 0x0105" response) is not a dialect
+  to support: Token2 confirmed on #95 that HID-HOTP is absent on these models
+  and the HID channel ships disabled on purpose (an active HID channel makes
+  the OS treat the key as a keyboard, and on Windows it needs admin rights).
+  CCID is the intended path, auto-transport prefers it, and the error for a
+  declined HID probe now points at the CCID fix. Do not resurrect "teach the
+  HID path to speak this format" — there is nothing to speak to, and what the
+  dead channel echoes when poked is not worth settling.
 
 - **No device→capability matrix. Ever.** keyroost does not decide what a device
   can do by looking its USB product id up in a table. Capabilities come from
