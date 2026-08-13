@@ -63,7 +63,9 @@
     <h2>v0.7.8</h2>
     <p class="kr-muted">Bug-fix release &mdash; no breaking changes for scripts or library
       consumers. One addition: <code>keyroostctl fido reset --reader &lt;substring&gt;</code>
-      resets a FIDO2 card in a smart-card reader in place (no replug, no touch).</p>
+      resets a FIDO2 card in a smart-card reader in place (no replug, no touch). Also
+      restores behaviour v0.7.7 narrowed: every Token2 key is offered the on-device OTP
+      surface again, regardless of USB product id.</p>
   </section>
 
   <section class="kr-section" id="v0-7-7">

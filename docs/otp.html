@@ -113,6 +113,12 @@ keyroostctl otp get --account &lt;name&gt;   # read a live code
 keyroostctl otp config                 # interface states &amp; slot status
 keyroostctl otp button-hotp --seed-stdin --digits 6   # provision HID-HOTP (seed via stdin)
 keyroostctl otp interface --fido --ccid --keyboard    # enable interfaces (re-plug after)</code></pre>
+    <p class="kr-muted">Every <code>otp</code> subcommand accepts
+      <code>--transport auto|hid|ccid</code> (default <code>auto</code>: USB-HID first,
+      CCID/NFC fallback). Recent Token2 models ship with the HID channel disabled by
+      design and carry OTP over CCID — if a command reports the key declining over
+      USB-HID, <code>--transport ccid</code> is the path, with the smart-card service
+      (pcscd) running or the key on a reader.</p>
   </section>
 
   <section class="kr-section kr-res-section">

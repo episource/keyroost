@@ -35,7 +35,7 @@ Being worked on right now — check with whoever holds it before starting.
   hard: no GUI tab, and `--key <name>` cannot find the device.
   What exists to build on: `keyroost-transport` (`src/lib.rs`, the `answers(...)`
   block) `SELECT`s each applet AID over a reader — ground truth. The CLI already
-  models the third state elsewhere: `otp_feature_supported` returns
+  models the third state elsewhere: `otp_feature_capability` returns
   `Option<bool>` with `None` meaning "can't tell, so go ahead". The device list
   never got the same treatment.
   Shape to aim for: present / absent / unverified per capability, surfaces
@@ -70,11 +70,6 @@ Being worked on right now — check with whoever holds it before starting.
   check whether it exposes a dynamic-load path or whether we wrap libpcsclite in
   a thin FFI loader ourselves. Design first; verify on a host with and without
   the library.
-
-- **CTAP-over-NFC chaining: second GET RESPONSE sends a fixed `Le = 00`.**
-  `crates/keyroost-ctap/src/ctap_pcsc.rs:193` ignores the `61xx` length hint —
-  the same shape as the transport bug fixed in the v0.7.7 security round, left
-  out of scope there because it is pre-existing.
 
 - **README + Learn site: point the Windows download at the signed asset.**
   Signed zips now exist (Token2 signs out-of-band on a hardware token), but
@@ -111,17 +106,24 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Blocked / needs someone else
 
-- **[#37] OnlyKey support — blocked on hardware** (units ordered). Teach
-  `keyroost-resolve` to recognize `1d50:60fc` / product `ONLYKEY`, label it
+- **OnlyKey recognition
+  ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
+  number detection on hardware keys") — blocked on hardware** (units ordered).
+  Teach `keyroost-resolve` to recognize `1d50:60fc` / product `ONLYKEY`, label it
   "OnlyKey", and treat serial `1000000000` as a non-unique placeholder (fall
   back to the hidraw path). Today OnlyKey appears only in the GUI AAGUID table.
-  **Must be done as part of this work, not after:** the post-replug reinsert
-  matcher identifies a key by serial, and every OnlyKey ships the *same* serial,
-  so it would currently accept a different OnlyKey as "the same key".
+  **Must be done as part of this work, not after:** on macOS/Windows the
+  post-replug reinsert matcher still falls back to serial identity, and every
+  OnlyKey ships the *same* serial, so it would accept a different OnlyKey as
+  "the same key" there. (On Linux, #96 moved freshness to USB bus/address, which
+  narrows but does not remove the hazard — the *identity* match is still the
+  serial.)
 
-- **Lift the "experimental" label on the Token2 PIN+ standards applets ([#23])
-  — needs PIN+ hardware.** Verify OATH / OpenPGP / PIV over CCID on a real PIN+
-  key. Token2 may be able to help, given the collaboration.
+- **Lift the "experimental" label on the Token2 PIN+ standards applets — needs
+  PIN+ hardware.** Verify OATH / OpenPGP / PIV over CCID on a real PIN+ key.
+  (Grew out of [#23](https://github.com/framefilter/keyroost/issues/23), now
+  closed; no live issue tracks this.) Token2 may be able to help, given the
+  collaboration.
 
 ---
 
@@ -170,14 +172,14 @@ plan's two-key manual steps were never executed):
   which wrote ZLIB-wrapped (RFC 1950) largeBlob data rather than raw DEFLATE:
   keyroost's `inflate_raw` accepts raw only, so an old-format blob will not
   extract. Decide whether to also accept zlib, as libfido2's reader does.
-- **Card-content identity ([#83])** *(no hardware)*: with a Token2 PIN+
+- **Card-content identity ([#83](https://github.com/framefilter/keyroost/issues/83))** *(no hardware)*: with a Token2 PIN+
   smartcard in a GENERIC reader (Alcor / SCM / Realtek), confirm keyroost shows
   vendor "Token2" and the FULL serial (not the 8-digit one); that it still does
   in the Token2 dual reader; that a non-Token2 OpenPGP card (e.g. Nitrokey)
   shows its correct registry vendor; and that a model rejecting GET_INFO over
   contact falls back to the 8-digit serial with no error.
 - **v0.7.6 field fixes** *(no hardware)*: the Settings tab + Reset on a CTAP
-  2.0-only key ([#81] — the reporter's device class), and the standalone Reset
+  2.0-only key ([#81](https://github.com/framefilter/keyroost/issues/81) — the reporter's device class), and the standalone Reset
   card on a key with a blocked or absent PIN. (#82's HID→CCID fallback only
   engages on the quirky firmware; reporter confirmation stands in.)
 - **Windows GUI icon** *(no hardware — needs a Windows machine)*: confirm the
@@ -266,12 +268,13 @@ Not tasks. Kept so they are not re-litigated or re-researched.
   `.flatpak` bundle.
 - **crates.io first publishes are manual and ordered.** The OIDC job cannot
   create a brand-new crate, so any crate added since the last release needs a
-  one-time `cargo publish` plus a Trusted Publishing entry first. Order (wait
-  ~a minute between tiers for index propagation): (1) `keyroost-proto`,
-  `keyroost-hid`, `keyroost-keyring`, `keyroost-rsakey`; (2) `keyroost-ctap`,
-  `keyroost-oath`, `keyroost-openpgp`, `keyroost-piv`, `keyroost-token2otp`,
-  `keyroost-import`; (3) `keyroost-transport`, then `keyroost-resolve` and
-  `keyroost-qr`; (4) `keyroostctl`, `keyroost`.
+  one-time `cargo publish` plus a Trusted Publishing entry first. The publish
+  order lives in ONE place — the `for crate in …` list in
+  `.github/workflows/publish.yml`, validated by
+  `packaging/check-publish-readiness.sh` — publish new crates in that order
+  (wait ~a minute between dependents for index propagation). Copies of the
+  list in prose drift: one here and one in `packaging/README.md` both went
+  stale at 15 of 18 crates before being caught.
 - **Release verification is per-channel, not per-job.** The crates.io / Homebrew
   / winget / AUR jobs skip-with-a-notice and still exit `success` when their
   secret is absent, so a green check can mask a no-op. Confirm the version

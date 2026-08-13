@@ -33,7 +33,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 
 - **FIDO2 / CTAP2** — enumerate authenticators, read `authenticatorGetInfo`,
   manage resident credentials (list / metadata / delete), set / change / verify
-  the PIN, reset a key. PIN protocols v1 and v2. CTAP 2.1 security policy over
+  the PIN, reset a key (USB replug ceremony, or in place for a card in a
+  reader). Fingerprint (bio) enrollment — list / enroll / rename / delete — and
+  FIDO Metadata Service (MDS) authenticator identification in the GUI. PIN
+  protocols v1 and v2. CTAP 2.1 security policy over
   `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
   change, enterprise attestation) and a `large-blob` store for plaintext notes
   over `authenticatorLargeBlobs`. Works over USB-HID and over a PC/SC reader —
@@ -106,7 +109,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 |---|---|---|
 | **Token2 Molto2 / Molto2v2** | TOTP slot programming, bulk import | Hardware-verified. Programmed over the vendor-specific SM4-MAC protocol ([docs/PROTOCOL.md](docs/PROTOCOL.md)); supports bulk import from Aegis / 2FAS / otpauth-list, clock sync, and customer-key rotation. |
 | **Token2 single-profile tokens** (OTPC-P1-i / P2-i, miniOTP-2-i / 3-i, C301-i, C302-i) | Single-account TOTP seed + config programming | Programmed over the vendor-specific SM4-MAC protocol with a fixed device key ([docs/PROTOCOL-token2prog.md](docs/PROTOCOL-token2prog.md)); writes the seed and the TOTP algorithm / time-step / display-timeout over a contact or contactless PC/SC reader. The model is recognized from the device serial. |
-| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP, incl. HID/keyboard HOTP) over USB-HID / NFC / CCID — all validated on PIN+ hardware. Contributed by [@token2](https://github.com/token2). The OATH / OpenPGP / PIV smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
+| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Contributed by [@token2](https://github.com/token2). The OATH / OpenPGP / PIV smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
 | **Nitrokey 3** | FIDO2, OATH | Shares the Solo 2 / Trussed stack. |
@@ -124,8 +127,8 @@ Planned hardware support, not yet shipped:
   apply, but it exposes no smart-card interface (no OATH / OpenPGP / PIV) and its
   firmware reports a fixed, non-unique serial that needs placeholder handling
   before it's first-class
-  ([#37](https://github.com/framefilter/keyroost/issues/37)). Pending test
-  hardware.
+  ([#37](https://github.com/framefilter/keyroost/issues/37)). Test hardware
+  ordered; support lands once it arrives.
 
 Want a different key supported? Open an issue requesting it — hardware-support
 requests are tracked here and added to this roadmap.
@@ -162,13 +165,28 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   ([#24](https://github.com/framefilter/keyroost/pull/24)). Followed up with
   fingerprint/bio enrollment, FIDO Metadata Service (MDS) display, and a
   rounding-out of the on-device OTP support — all validated on real PIN+
-  hardware ([#29](https://github.com/framefilter/keyroost/pull/29),
+  hardware ([#29](https://github.com/framefilter/keyroost/issues/29),
   [#30](https://github.com/framefilter/keyroost/pull/30)). Also added CTAP 2.1
   authenticator-config (security policy) and large-blob storage management,
   with a FIDO2 tab redesign
-  ([#38](https://github.com/framefilter/keyroost/pull/38)).
+  ([#38](https://github.com/framefilter/keyroost/pull/38)); T=0 contact-reader
+  fixes, the single-profile programmable-token support (`keyroost-token2prog`)
+  and QR-from-screen import ([#50](https://github.com/framefilter/keyroost/pull/50));
+  and the OTP secret-reveal toggle plus a Windows key-naming / anti-spoofing
+  fix ([#52](https://github.com/framefilter/keyroost/pull/52),
+  [#56](https://github.com/framefilter/keyroost/pull/56)). Signs the Windows
+  and macOS release builds out-of-band.
+- **[@Algoritter](https://github.com/Algoritter)** — the project's first
+  external code contribution: found, fixed and hardware-verified two
+  armed-reset replug bugs (a recycled `/dev/hidrawN` path reading as "never
+  left", and card-serial keys failing to re-match after reinsertion)
+  ([#96](https://github.com/framefilter/keyroost/pull/96)).
+- **[@errant253](https://github.com/errant253)** — README improvements: the
+  distro-neutrality disclaimer, install-command corrections and an intro
+  rewrite ([#35](https://github.com/framefilter/keyroost/issues/35),
+  [#45](https://github.com/framefilter/keyroost/issues/45)).
 
-(This credits their contribution to the codebase; it does not change keyroost's
+(This credits their contributions to the codebase; it does not change keyroost's
 independent status described above.)
 
 ## Standards & protocols
@@ -285,10 +303,17 @@ No toolchain needed. Download from the
 | Linux x86_64 | `keyroost-vX.Y.Z-linux-x86_64.tar.gz` |
 | macOS (Apple Silicon + Intel) | `keyroost-vX.Y.Z-macos-universal2.tar.gz` |
 | Windows x86_64 | `keyroost-vX.Y.Z-windows-x86_64.zip` |
+| Windows x86_64, **code-signed** | `keyroost-vX.Y.Z-windows-x86_64-signed.zip` |
+| macOS installer, **code-signed** | `keyroost-vX.Y.Z-macos-universal2-signed.pkg` |
+
+The signed builds carry the same binaries as the CI archives, signed
+out-of-band by Token2 (Authenticode on Windows; an Apple Developer ID
+installer on macOS, signed but not notarization-stapled). They may trail a
+release by a few days — winget always waits for the signed zip. The CI
+archives are covered by `SHA256SUMS` and build-provenance attestation instead.
 
 Each archive carries both `keyroost` and `keyroostctl`; unpack it and move the
-two executables onto your `PATH`. Every release also publishes `SHA256SUMS` and
-build-provenance attestation. For example, on Linux x86_64:
+two executables onto your `PATH`. For example, on Linux x86_64:
 
 ```bash
 curl -L https://github.com/framefilter/keyroost/releases/download/vX.Y.Z/keyroost-vX.Y.Z-linux-x86_64.tar.gz \

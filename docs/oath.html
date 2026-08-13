@@ -108,8 +108,10 @@
     </div>
 <pre><code>keyroostctl oath list --reader yubikey
 keyroostctl oath code &lt;name&gt; --reader yubikey</code></pre>
-    <p class="kr-muted">Credentials can be added from an <code>otpauth://</code> URI (the same
-      format behind setup QR codes). This works on any card exposing the OATH applet —
+    <p class="kr-muted">In the desktop app, credentials can be added from an
+      <code>otpauth://</code> URI (the same format behind setup QR codes); on the CLI the
+      secret is supplied to <code>oath add</code> via <code>--secret-stdin</code> /
+      <code>--secret-env</code>. This works on any card exposing the OATH applet —
       YubiKey, Nitrokey, SoloKeys, Feitian, Token2, OpenSK and others — over USB or an
       NFC / PC-SC reader; <code>--reader yubikey</code> above is just an example reader-name
       filter, not a vendor requirement.</p>

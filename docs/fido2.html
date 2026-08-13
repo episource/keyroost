@@ -138,14 +138,17 @@
       same operations work, so a key with no USB plug (or one you'd rather not insert) can
       still be inspected and managed.</p>
     <p>In the app, the <strong>FIDO2</strong> tab gates everything behind one unlock. Once
-      you enter the PIN, sub-view tabs appear for whatever the key advertises:
-      <strong>Passkeys</strong> (resident credentials), <strong>Fingerprints</strong> on
-      biometric keys (<a href="fingerprint.html">see Fingerprints</a>),
-      <strong>Settings</strong> for security policy such as always-require-UV and minimum
-      PIN length (<a href="settings.html">see Settings</a>), and <strong>Storage</strong> for
-      the key's large-blob area (<a href="storage.html">see Storage</a>). A key that doesn't
-      advertise a capability simply gets no tab for it. Locking returns to the gate and
-      clears the session for all of them.</p>
+      you enter the PIN, capability-gated sub-view tabs appear for whatever the key
+      advertises: <strong>Passkeys</strong> (resident credentials),
+      <strong>Fingerprints</strong> on biometric keys
+      (<a href="fingerprint.html">see Fingerprints</a>), and <strong>Storage</strong> for
+      the key's large-blob area (<a href="storage.html">see Storage</a>) — a key that
+      doesn't advertise one of those simply gets no tab for it.
+      <strong>Settings</strong> is always present on a CTAP2 key: it carries the FIDO2
+      reset (a baseline CTAP2 command) as well as the security-policy controls such as
+      always-require-UV and minimum PIN length, which do gate on the key advertising
+      <code>authnrCfg</code> (<a href="settings.html">see Settings</a>). Locking returns to
+      the gate and clears the session for all of them.</p>
 <pre><code>keyroostctl fido info
 keyroostctl fido pin-retries
 keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv</code></pre>

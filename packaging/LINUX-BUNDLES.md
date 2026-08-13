@@ -353,9 +353,10 @@ flatpak build-update-repo --update-appstream --gpg-sign=<KEYID> ../repo
 # then upload ../repo to GitHub Pages / static host (rsync, gh-pages action, etc.)
 ```
 
-> **Do NOT auto-publish from CI in this draft.** A future workflow could run the
-> build on tag, but per the task this is intentionally left as a manual runbook
-> only. When/if automated, it should be a *separate* workflow file, not an edit
+> **Publishing IS automated now.** `.github/workflows/linux-bundles.yml` builds
+> both bundles, and its `flatpak-publish` job ("Flatpak (attach bundle + publish
+> to keyroost-flatpak)") pushes the OSTree remote on tag, behind the
+> `release-publish` environment gate. It is a *separate* workflow file, not an edit
 > to `release.yml`/`publish.yml`.
 
 ### Known limitations
@@ -365,8 +366,8 @@ flatpak build-update-repo --update-appstream --gpg-sign=<KEYID> ../repo
   signing key, unrelated to commit-signing keys).
 - The sandbox cannot run `pcscd`; if the host has no pcscd running, the
   smart-card applets fail (FIDO HID still works). Document this for users.
-- First end-to-end run is **unverified on hardware** — every "TODO verify"
-  above needs a real Molto2 + FIDO key test before this ships.
+- Verified in production since v0.7.3 — both bundles ship on every release and
+  the mandatory pre-release probe rebuilds them from main before any tag.
 
 ---
 
@@ -390,7 +391,7 @@ tarballs.
   `linuxdeploy-plugin-appimage-x86_64.AppImage`.
 - **appimagetool** — what the appimage plugin calls under the hood; can be used
   directly if you prefer to assemble the AppDir by hand.
-- The build script is `packaging/appimage/build-appimage.sh` (draft).
+- The build script is `packaging/appimage/build-appimage.sh`.
 
 ### FUSE requirement
 

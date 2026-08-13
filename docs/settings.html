@@ -77,8 +77,10 @@
     <p>Open the <strong>FIDO2</strong> tab and unlock with your PIN. Once unlocked, choose the
       <strong>Settings</strong> tab. Unlocking is a key-level action — it gates passkeys,
       fingerprints, and settings alike — so it lives above the tabs rather than inside any one
-      panel. The Settings tab appears only when the key reports
-      <code>authnrCfg</code> support in its <code>getInfo</code> options.</p>
+      panel. The Settings tab appears on <em>any</em> CTAP2 key — it also hosts the FIDO2
+      reset, which every CTAP2 key supports. The individual policy controls inside it are
+      gated on the key reporting <code>authnrCfg</code> support in its
+      <code>getInfo</code> options.</p>
   </section>
 
   <section class="kr-section">
