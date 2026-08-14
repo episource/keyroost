@@ -1434,6 +1434,14 @@ struct PivState {
     selected_slot: PivSlotSel,
     /// Key-generation algorithm selector.
     gen_alg: PivKeyAlgSel,
+    /// PIN/touch policy selectors in the Generate key modal. `Default`/
+    /// `Default` (the initial selection) sends the plain PIV GENERATE
+    /// ASYMMETRIC KEY PAIR APDU, with no policy tags, which is what every PIV
+    /// card accepts; selecting anything else appends the Yubico extended
+    /// policy tags (0xAA/0xAB), which only a YubiKey or compatible token
+    /// honors. Reset per modal open.
+    gen_pin_policy: keyroost_piv::PinPolicy,
+    gen_touch_policy: keyroost_piv::TouchPolicy,
     /// PEM of the most recently generated public key, shown for copying.
     gen_pubkey_pem: Option<String>,
     /// Certificate import file path.
@@ -1508,6 +1516,8 @@ impl Default for PivState {
             retries_pin_auth: String::new(),
             selected_slot: PivSlotSel::default(),
             gen_alg: PivKeyAlgSel::default(),
+            gen_pin_policy: keyroost_piv::PinPolicy::Default,
+            gen_touch_policy: keyroost_piv::TouchPolicy::Default,
             gen_pubkey_pem: None,
             cert_path: String::new(),
             export_path: String::new(),
@@ -6451,6 +6461,7 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         let alg = self.piv.gen_alg.to_alg();
+        let (pin_policy, touch_policy) = (self.piv.gen_pin_policy, self.piv.gen_touch_policy);
         self.piv.notice = None;
         self.piv.gen_pubkey_pem = None;
         self.spawn_job("Generating key\u{2026} (touch if it blinks)", move || {
@@ -6461,12 +6472,7 @@ impl App {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 let mgmt_alg = s.management_key_algorithm();
                 s.authenticate_management(mgmt_alg, &mgmt)?;
-                let pubkey = s.generate_key(
-                    slot,
-                    alg,
-                    keyroost_piv::PinPolicy::Default,
-                    keyroost_piv::TouchPolicy::Default,
-                )?;
+                let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
                 Ok((pubkey, s.status()?))
             })();
             Box::new(move |app: &mut App| {
@@ -7370,6 +7376,53 @@ fn piv_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivKeyAlgSel) {
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             for opt in PivKeyAlgSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
+/// A PIV PIN/touch policy value selectable in the Generate key modal's combo
+/// boxes: its display label and the full set of choices, in menu order.
+/// `Default` is always first — it's the initial selection, and the plain PIV
+/// APDU every card accepts. Also used for the slot state line's "pin: …,
+/// touch: …" display.
+trait PivPolicyOption: Copy + PartialEq + 'static {
+    const ALL: &'static [Self];
+    fn label(self) -> &'static str;
+}
+
+impl PivPolicyOption for keyroost_piv::PinPolicy {
+    const ALL: &'static [Self] = &[Self::Default, Self::Never, Self::Once, Self::Always];
+    fn label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Once => "once",
+            Self::Always => "always",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl PivPolicyOption for keyroost_piv::TouchPolicy {
+    const ALL: &'static [Self] = &[Self::Default, Self::Never, Self::Cached, Self::Always];
+    fn label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Cached => "cached",
+            Self::Always => "always",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// PIN/Touch Policy picker combo (Generate key modal). Generic over
+/// [`PivPolicyOption`] — the type of `sel` alone picks the right option list
+/// and labels.
+fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for &opt in T::ALL {
                 ui.selectable_value(sel, opt, opt.label());
             }
         });
@@ -11720,6 +11773,40 @@ impl App {
                             }
                             self.piv_modal_mgmt_field(ui, p, kind);
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Pin Policy")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                                ui.add_space(8.0);
+                                piv_policy_combo(
+                                    ui,
+                                    "piv-gen-pin-policy",
+                                    &mut self.piv.gen_pin_policy,
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Touch Policy")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                                ui.add_space(8.0);
+                                piv_policy_combo(
+                                    ui,
+                                    "piv-gen-touch-policy",
+                                    &mut self.piv.gen_touch_policy,
+                                );
+                            });
+                            card_note(
+                                ui,
+                                p,
+                                "Policy other than `default` requires YubiKey or compatible \
+                                 token.",
+                            );
                         }
                         PivCredKind::ImportCert => {
                             self.piv_modal_mgmt_field(ui, p, kind);
@@ -11961,6 +12048,8 @@ impl App {
         wipe(&mut self.piv.retries_pin_auth);
         self.piv.use_default_mgmt = false;
         self.piv.move_dest = None;
+        self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
+        self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
         self.piv.cred_modal = None;
     }
 
@@ -15764,6 +15853,23 @@ mod tests {
         piv.unblock_puk = "12345678".into();
         piv.unblock_new_pin = "1234".into();
         assert_eq!(piv_cred_mismatch(&piv, PivCredKind::UnblockPin), None);
+    }
+
+    /// The Pin Policy / Touch Policy dropdowns' initial selection, both on a
+    /// fresh `PivState` and after the modal-close reset: `default` / `default`
+    /// — the plain PIV APDU every card accepts.
+    #[test]
+    fn piv_gen_policy_dropdowns_default_to_default() {
+        let fresh = PivState::default();
+        assert_eq!(fresh.gen_pin_policy, keyroost_piv::PinPolicy::Default);
+        assert_eq!(fresh.gen_touch_policy, keyroost_piv::TouchPolicy::Default);
+
+        let mut app = App::default();
+        app.piv.gen_pin_policy = keyroost_piv::PinPolicy::Never;
+        app.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Always;
+        app.piv_cred_modal_close();
+        assert_eq!(app.piv.gen_pin_policy, keyroost_piv::PinPolicy::Default);
+        assert_eq!(app.piv.gen_touch_policy, keyroost_piv::TouchPolicy::Default);
     }
 
     /// Each flow maps to its own title, busy caption, and success text.
