@@ -6234,7 +6234,9 @@ impl App {
             // Alongside the status, probe each slot's key algorithm via GET
             // METADATA. This surfaces an algorithm (and confirms a key exists)
             // even for a slot with no certificate; `None` covers an empty slot
-            // or firmware without the metadata extension.
+            // or firmware without the metadata extension — unless a
+            // certificate is present, in which case its own SPKI fills the
+            // algorithm back in (see the fallback below).
             let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
                 let status = s.status();
                 let mut slot_keys = Vec::with_capacity(4);
@@ -6244,16 +6246,25 @@ impl App {
                         .metadata(slot.key_ref())
                         .and_then(|m| m.algorithm)
                         .and_then(keyroost_piv::KeyAlg::from_id);
-                    // Pull the slot's certificate (if any) and extract its
-                    // Subject DN for display. Any failure — no cert, read
-                    // error, or unparseable DER — degrades to `None` so the
-                    // pane never breaks on a malformed certificate.
-                    let subject = s
-                        .read_certificate(slot)
-                        .ok()
-                        .flatten()
-                        .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
+                    // Pull the slot's certificate (if any); any failure — no
+                    // cert, read error, or unparseable DER — degrades to
+                    // `None` so the pane never breaks on a malformed
+                    // certificate.
+                    let cert = s.read_certificate(slot).ok().flatten();
+                    let subject = cert
+                        .as_deref()
+                        .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(der).ok())
                         .map(|dn| dn.to_string());
+                    // Cards without GET METADATA (pre-5.3 firmware, or
+                    // non-Yubico PIV) leave `alg` empty even when the slot
+                    // holds a key — fall back to the algorithm recorded in
+                    // the certificate's own subjectPublicKeyInfo, which was
+                    // built (or imported) over that same key.
+                    let alg = alg.or_else(|| {
+                        cert.as_deref()
+                            .and_then(|der| keyroost_piv::x509_parse::parse_spki_key_alg(der).ok())
+                            .flatten()
+                    });
                     slot_keys.push((slot, alg, subject));
                     // PIN/touch policy for display — GET VERSION, then GET
                     // METADATA (fw 5.3+) or the ATTEST certificate's
