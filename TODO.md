@@ -24,6 +24,59 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Ready to pick up
 
+- **Rework the contribution model: PRs should land without manual rebases.**
+  Decision made 2026-08-14, after the second external PR in a week; the
+  maintainer wants a contributor-friendly flow and more efficient CI/CD, with
+  the security thinking done properly rather than dropped.
+  *Why the current model exists:* the `main` ruleset requires a verified
+  signature on every commit and forbids merge commits, and the maintainer
+  signs with a touch-required hardware key. So external PRs cannot use the
+  merge button at all — each one is fetched, rebased and re-signed locally
+  (one hardware touch per commit), pushed to main, and the PR closes as
+  "closed", not "merged". Both #96 and #97 hit mid-rebase signing failures
+  that needed manual unsticking; contributors lose the merged badge; nothing
+  about it scales.
+  *What to work through, not assume:*
+  - **What per-commit signatures actually protect here, and what could
+    replace them.** Release integrity already has independent guarantees:
+    signed `v*` tags (admin-only by ruleset), build-provenance attestation on
+    release assets, SHA256SUMS, and Trusted Publishing to crates.io. If those
+    carry the trust, main could accept reviewed-but-unsigned contributor
+    commits, or GitHub's own web-flow signature on squash-merges (GitHub
+    signs those; they show verified).
+  - **Ruleset changes:** require PRs + passing status checks + maintainer
+    review instead of the all-commits-signed rule; keep linear history via
+    squash or rebase-merge; keep `v*` tags admin-only and the anti-rewrite
+    rules exactly as they are.
+  - **Account security becomes the perimeter** once the merge button works:
+    the maintainer account's own protections (passkeys/2FA, no PAT sprawl)
+    and required review are then what stands between a compromised
+    contributor account and main.
+  - **CI on fork PRs:** the container jobs currently wait for approval;
+    decide what runs automatically for first-time contributors vs what stays
+    gated (secrets exposure is the constraint).
+  - What CONTRIBUTING.md and the branch-protection standing decision
+    ([[branch-protection-light-applied]] in the agent memory; "full PR-required
+    protection deferred until stable") need to say afterwards — this work IS
+    that deferred protection, arriving from the friendlier direction.
+
+- **`piv generate-key` CLI parity for PIN/touch policy (#97 follow-up).** The
+  GUI can set the policy at key generation; the CLI cannot — add
+  `--pin-policy` / `--touch-policy` (values as in the GUI, `default` omitted
+  from the wire exactly as `keyroost_piv::generate_key` already does).
+
+- **Fuzz target for the new certificate parser (#97 follow-up).**
+  `keyroost-piv::x509_parse` (`parse_key_policy_extension`,
+  `parse_spki_key_alg`, `parse_subject_dn`) parses DER handed to us by the
+  card; the house pattern fuzzes every parser of untrusted input (15 targets
+  today). One target feeding arbitrary bytes to all three entry points.
+
+- **Migration note at the next release:** `keyroost-piv::generate_key` and
+  `PivSession::generate_key` grew `pin_policy`/`touch_policy` parameters in
+  #97 — a breaking signature change for library consumers. One line in
+  `docs/migration.html`'s library-API table when the next version's section
+  is written (house precedent: the v0.7.5 API table).
+
 - **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
   capability is either present or absent and there is nowhere to record "we
   could not check". On a USB-HID-only enumeration nothing has been sent to the
