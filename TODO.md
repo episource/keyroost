@@ -60,11 +60,6 @@ Being worked on right now — check with whoever holds it before starting.
     protection deferred until stable") need to say afterwards — this work IS
     that deferred protection, arriving from the friendlier direction.
 
-- **`piv generate-key` CLI parity for PIN/touch policy (#97 follow-up).** The
-  GUI can set the policy at key generation; the CLI cannot — add
-  `--pin-policy` / `--touch-policy` (values as in the GUI, `default` omitted
-  from the wire exactly as `keyroost_piv::generate_key` already does).
-
 - **Fuzz target for the new certificate parser (#97 follow-up).**
   `keyroost-piv::x509_parse` (`parse_key_policy_extension`,
   `parse_spki_key_alg`, `parse_subject_dn`) parses DER handed to us by the

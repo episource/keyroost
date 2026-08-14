@@ -4,6 +4,17 @@ All notable changes to keyroost are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **`piv generate-key --pin-policy` / `--touch-policy` now explain
+  themselves.** The flags have chosen the key-generation PIN/touch policy
+  since PIV management landed, but `--help` never said what the values mean.
+  It now spells out that `default` sends the standard PIV command every card
+  accepts, and that the other values are a Yubico extension
+  (firmware-dependent). Settles the CLI half of the [#97] review follow-ups —
+  the GUI/CLI parity itself turned out to already exist. ([#97])
+
 ## [0.7.8] - 2026-08-13
 
 ### Fixed
@@ -841,6 +852,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#84]: https://github.com/framefilter/keyroost/issues/84
 [#95]: https://github.com/framefilter/keyroost/issues/95
 [#96]: https://github.com/framefilter/keyroost/pull/96
+[#97]: https://github.com/framefilter/keyroost/pull/97
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.8...HEAD
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7

@@ -768,8 +768,14 @@ enum PivCmd {
         slot: CliPivSlot,
         #[arg(long, value_enum, default_value = "eccp256")]
         algorithm: CliPivKeyAlg,
+        /// When the new key's private key may be used. `default` sends the
+        /// standard PIV command every card accepts; the other values are a
+        /// Yubico extension (firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         pin_policy: CliPinPolicy,
+        /// Whether using the new key requires a physical touch. Same caveat:
+        /// only `default` is standard PIV, the rest are a Yubico extension
+        /// (firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         touch_policy: CliTouchPolicy,
         #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
@@ -9206,6 +9212,82 @@ mod cli_tests {
                 assert_eq!(to.to_slot().key_ref(), 0x82);
             }
             _ => panic!("expected piv move-key"),
+        }
+    }
+
+    #[test]
+    fn piv_generate_key_policies_default_to_the_plain_piv_wire_format() {
+        // Omitting both flags must decode to Default/Default — the byte layer
+        // then leaves the 0xAA/0xAB policy tags out of the APDU entirely, the
+        // standard PIV command every card accepts. A drifted default would
+        // silently switch every scripted generate-key to the Yubico extended
+        // APDU, which non-Yubico cards reject.
+        match parse(&["keyroostctl", "piv", "generate-key", "--slot", "9a"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::GenerateKey {
+                        pin_policy,
+                        touch_policy,
+                        ..
+                    },
+            }) => {
+                assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Default);
+                assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Default);
+            }
+            _ => panic!("expected piv generate-key"),
+        }
+
+        // Explicit values must land in their own fields, not each other's.
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "generate-key",
+            "--slot",
+            "9a",
+            "--pin-policy",
+            "once",
+            "--touch-policy",
+            "cached",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::GenerateKey {
+                        pin_policy,
+                        touch_policy,
+                        ..
+                    },
+            }) => {
+                assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Once);
+                assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Cached);
+            }
+            _ => panic!("expected piv generate-key"),
+        }
+    }
+
+    #[test]
+    fn piv_policy_values_map_one_to_one_onto_the_byte_layer() {
+        use keyroost_piv::{PinPolicy, TouchPolicy};
+        for (cli, lib) in [
+            (CliPinPolicy::Default, PinPolicy::Default),
+            (CliPinPolicy::Never, PinPolicy::Never),
+            (CliPinPolicy::Once, PinPolicy::Once),
+            (CliPinPolicy::Always, PinPolicy::Always),
+        ] {
+            assert_eq!(cli.to_policy(), lib);
+        }
+        for (cli, lib) in [
+            (CliTouchPolicy::Default, TouchPolicy::Default),
+            (CliTouchPolicy::Never, TouchPolicy::Never),
+            (CliTouchPolicy::Always, TouchPolicy::Always),
+            (CliTouchPolicy::Cached, TouchPolicy::Cached),
+        ] {
+            assert_eq!(cli.to_policy(), lib);
         }
     }
 
