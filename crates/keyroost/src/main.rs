@@ -1389,11 +1389,12 @@ impl PivCredModal {
 struct PivState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::PivStatus>,
-    /// Per-slot detail, in canonical slot order, gathered on each refresh:
-    /// the key algorithm from GET METADATA (`None` if the slot holds no key or
-    /// the firmware lacks the metadata extension), and the certificate's
-    /// Subject DN (`None` if the slot has no certificate or its DN failed to
-    /// parse — degraded silently).
+    /// Per-slot detail, in canonical slot order, gathered on each refresh: the
+    /// key algorithm (see [`keyroost_transport::PivSession::slot_key_algorithm`]
+    /// — GET METADATA where authoritative, else the slot certificate's
+    /// SubjectPublicKeyInfo; `None` means no key in the slot, on any PIV
+    /// card), and the certificate's Subject DN (`None` if the slot has no
+    /// certificate or its DN failed to parse — degraded silently).
     slot_keys: Vec<(
         keyroost_piv::Slot,
         Option<keyroost_piv::KeyAlg>,
@@ -1480,6 +1481,22 @@ struct PivState {
     /// so expanding the section only probes the card once. `None` until read;
     /// invalidated after a move so the section re-reads on its next expand.
     retired_occupancy: Option<Vec<(keyroost_piv::Slot, bool)>>,
+    /// Algorithm + public key of any slot generated on the selected device
+    /// during this app run, keyed by PIV key reference. In-memory only —
+    /// there is no on-disk or cross-process cache — and it lives exactly as
+    /// long as `PivState` does (reset on device switch or PIV reset, same as
+    /// every other field here). Each `PivSession` this pane opens is fresh
+    /// per action (a new `PivSession::open` per generate/CSR/self-sign job,
+    /// not one session kept alive across them), so its own in-session cache
+    /// ([`keyroost_transport::PivSession::remember_pubkey`]) can't bridge
+    /// "generate" to "sign a CSR with it" on its own; this map is what lets
+    /// this pane still do that within one running app, on cards that don't
+    /// answer GET METADATA. Populated by `piv_generate_key`, consumed (via
+    /// `remember_pubkey`, seeded into a freshly-opened session before it needs
+    /// the key) by `load_piv_status`, `piv_self_sign`, and
+    /// `piv_request_csr`; invalidated by `piv_delete_key`, carried across by
+    /// `piv_move_key`, and cleared wholesale by `piv_reset`.
+    pubkey_cache: std::collections::HashMap<u8, (keyroost_piv::KeyAlg, keyroost_piv::PublicKey)>,
 }
 
 // The pane is replaced wholesale on device switch (`self.piv =
@@ -1542,6 +1559,7 @@ impl Default for PivState {
             cred_modal: None,
             move_dest: None,
             retired_occupancy: None,
+            pubkey_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -6230,41 +6248,38 @@ impl App {
             return;
         };
         let for_device = self.selected_device.clone();
+        // Snapshot before crossing the thread boundary: the job below opens a
+        // fresh `PivSession`, whose own in-session cache starts empty, so a
+        // slot generated earlier this app run needs to be handed back in via
+        // `remember_pubkey` — see `PivState::pubkey_cache`.
+        let pubkey_cache = self.piv.pubkey_cache.clone();
         self.spawn_job("Reading PIV status\u{2026}", move || {
-            // Alongside the status, probe each slot's key algorithm via GET
-            // METADATA. This surfaces an algorithm (and confirms a key exists)
-            // even for a slot with no certificate; `None` covers an empty slot
-            // or firmware without the metadata extension — unless a
-            // certificate is present, in which case its own SPKI fills the
-            // algorithm back in (see the fallback below).
+            // Alongside the status, probe each slot's key algorithm —
+            // `PivSession::slot_key_algorithm` prefers GET METADATA (firmware
+            // 5.3+), then this session's key cache (seeded below from
+            // `pubkey_cache` on metadata-less firmware), and finally falls
+            // back to parsing the algorithm out of the slot certificate's
+            // SubjectPublicKeyInfo, so this works on any PIV card, not just a
+            // recent-enough YubiKey.
             let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
                 let status = s.status();
                 let mut slot_keys = Vec::with_capacity(4);
                 let mut slot_policies = Vec::with_capacity(4);
                 for slot in keyroost_piv::Slot::all() {
-                    let alg = s
-                        .metadata(slot.key_ref())
-                        .and_then(|m| m.algorithm)
-                        .and_then(keyroost_piv::KeyAlg::from_id);
-                    // Pull the slot's certificate (if any); any failure — no
-                    // cert, read error, or unparseable DER — degrades to
-                    // `None` so the pane never breaks on a malformed
-                    // certificate.
-                    let cert = s.read_certificate(slot).ok().flatten();
-                    let subject = cert
-                        .as_deref()
-                        .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(der).ok())
+                    if let Some((alg, key)) = pubkey_cache.get(&slot.key_ref()) {
+                        s.remember_pubkey(slot, *alg, key.clone());
+                    }
+                    let alg = s.slot_key_algorithm(slot);
+                    // Pull the slot's certificate (if any) and extract its
+                    // Subject DN for display. Any failure — no cert, read
+                    // error, or unparseable DER — degrades to `None` so the
+                    // pane never breaks on a malformed certificate.
+                    let subject = s
+                        .read_certificate(slot)
+                        .ok()
+                        .flatten()
+                        .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
                         .map(|dn| dn.to_string());
-                    // Cards without GET METADATA (pre-5.3 firmware, or
-                    // non-Yubico PIV) leave `alg` empty even when the slot
-                    // holds a key — fall back to the algorithm recorded in
-                    // the certificate's own subjectPublicKeyInfo, which was
-                    // built (or imported) over that same key.
-                    let alg = alg.or_else(|| {
-                        cert.as_deref()
-                            .and_then(|der| keyroost_piv::x509_parse::parse_spki_key_alg(der).ok())
-                            .flatten()
-                    });
                     slot_keys.push((slot, alg, subject));
                     // PIN/touch policy for display — GET VERSION, then GET
                     // METADATA (fw 5.3+) or the ATTEST certificate's
@@ -6508,6 +6523,13 @@ impl App {
                     Ok((pubkey, status)) => {
                         app.piv.status = Some(status);
                         app.piv.error = None;
+                        // Remember it for this app run so a later self-sign/CSR
+                        // (a fresh `PivSession` — see `PivState::pubkey_cache`)
+                        // and this same status refresh below can name the key
+                        // on cards that don't answer GET METADATA.
+                        app.piv
+                            .pubkey_cache
+                            .insert(slot.key_ref(), (alg, pubkey.clone()));
                         match keyroost_piv::spki::subject_public_key_info(&pubkey, alg) {
                             Ok(der) => {
                                 app.piv.gen_pubkey_pem = Some(keyroost_piv::spki::to_pem(&der));
@@ -6521,6 +6543,25 @@ impl App {
                                 ));
                             }
                         }
+                        // Re-read so the slot's "State:" line picks up the new
+                        // key's algorithm immediately, same as every other PIV
+                        // write (`apply_piv_write`) already does. This matters
+                        // even more here than there: on firmware without GET
+                        // METADATA, `slot_key_algorithm` has no certificate to
+                        // fall back to yet (this slot didn't have one before
+                        // generating and still doesn't), so without this
+                        // refresh the pane would keep showing "empty" until
+                        // some *other* write happened to trigger one.
+                        app.load_piv_status();
+                        // A retired slot's occupancy cache may now be stale
+                        // (generation can target a retired slot); drop it so
+                        // it re-reads fresh rather than keeping a cached
+                        // "empty" for the slot just written to. Unlike
+                        // `apply_piv_write`'s reset path, the selection itself
+                        // stays put — the user is almost certainly about to
+                        // look at (or self-sign/CSR) exactly the slot they
+                        // just generated into.
+                        app.piv.retired_occupancy = None;
                     }
                     Err(e) => {
                         app.piv.notice = None;
@@ -6631,6 +6672,9 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
+                if result.is_ok() {
+                    app.piv.pubkey_cache.remove(&slot.key_ref());
+                }
                 Self::apply_piv_write(app, result, format!("Key erased from {}.", slot.label()));
                 Self::apply_piv_cred_result(app);
             })
@@ -6667,6 +6711,14 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
+                // The key itself relocated, not just its reference — carry a
+                // cached entry along with it, same as `PivSession::move_key`
+                // does for its own in-session cache.
+                if result.is_ok() {
+                    if let Some(v) = app.piv.pubkey_cache.remove(&src.key_ref()) {
+                        app.piv.pubkey_cache.insert(dest.key_ref(), v);
+                    }
+                }
                 Self::apply_piv_write(
                     app,
                     result,
@@ -6765,6 +6817,9 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
         let days = i64::from(self.piv.cert_days.max(1));
+        // See `load_piv_status`: this job opens its own fresh `PivSession`, so
+        // a key generated earlier this app run has to be handed back in.
+        let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
         self.spawn_job(
             "Creating self-signed certificate\u{2026} (touch if it blinks)",
@@ -6774,6 +6829,9 @@ impl App {
                     let mgmt_alg = s.management_key_algorithm();
                     s.authenticate_management(mgmt_alg, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
+                    if let Some((alg, key)) = known_key {
+                        s.remember_pubkey(slot, alg, key);
+                    }
                     let now = i64::from(unix_now());
                     s.self_signed_certificate(slot, &subject, now, now + days * 86_400)?;
                     s.status()
@@ -6814,6 +6872,9 @@ impl App {
         }
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
+        // See `load_piv_status`: this job opens its own fresh `PivSession`, so
+        // a key generated earlier this app run has to be handed back in.
+        let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
         self.spawn_job(
             "Signing certificate request\u{2026} (touch if it blinks)",
@@ -6821,6 +6882,9 @@ impl App {
                 let result = (|| -> Result<(), TransportError> {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
                     s.verify_pin(pin.as_bytes())?;
+                    if let Some((alg, key)) = known_key {
+                        s.remember_pubkey(slot, alg, key);
+                    }
                     let pem = s.generate_csr(slot, &subject)?;
                     std::fs::write(&path, pem.as_bytes()).map_err(|_| {
                         TransportError::MalformedResponse("cannot write destination file")
@@ -6954,6 +7018,12 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
+                if result.is_ok() {
+                    // Wipes every slot; nothing cached survives it — same
+                    // invalidation `PivSession::reset` applies to its own
+                    // in-session cache.
+                    app.piv.pubkey_cache.clear();
+                }
                 Self::apply_piv_write(
                     app,
                     result,
