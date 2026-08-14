@@ -74,6 +74,24 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       flag, moves a command, or changes a library signature, add its section
       (exact before → after) — the README points users there as the canonical
       record, and the Pages deploy rides on the `docs/**` change.
+- [ ] **Full documentation audit — EVERYTHING, not a diff review.** Audit all
+      of it against the code as it will ship: every `docs/*.html` Learn page,
+      `README.md` top to bottom, and the meta-docs (`SECURITY.md`,
+      `CONTRIBUTING.md`, `TODO.md`, `packaging/*.md`, `docs/*.md`,
+      `CHANGELOG.md` link integrity). Reviewing only what changed since last
+      time is exactly how the v0.7.8 audit's findings accumulated: pages
+      claiming the inverse of shipped behavior (the Settings-tab gating),
+      contributor credit trailing by five PRs, a binaries table missing the
+      signed assets for three releases, and TODO items describing defects
+      already fixed. Documentation drifts wherever code changed *around* it,
+      so the untouched files are the ones that rot.
+      The mechanical core: verify every CLI invocation in every page against
+      the release binary's real `--help` tree (not the source); check
+      contributor credit against `git log --format='%an' | sort -u` and the
+      PRs since the last release; confirm every claim a page makes about GUI
+      gating/behavior against the code. Parallel audit agents (Learn pages /
+      README / meta-docs) cover this in one pass; findings are fixed on the
+      prep branch so the release ships accurate docs.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
 - [ ] Land on main via the signing flow (rebase over origin/main re-creates
       the commit signed; push `HEAD:main`).
