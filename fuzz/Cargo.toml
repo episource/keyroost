@@ -137,3 +137,10 @@ path = "fuzz_targets/otp_apdu_retry.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "piv_x509_parse"
+path = "fuzz_targets/piv_x509_parse.rs"
+test = false
+doc = false
+bench = false
