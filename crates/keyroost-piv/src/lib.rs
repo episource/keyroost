@@ -90,6 +90,11 @@ pub enum Instruction {
     SetPinRetries = 0xFA,
     /// Yubico extension: RESET the PIV application (only when PIN and PUK blocked).
     Reset = 0xFB,
+    /// Yubico extension: ATTEST — a self-signed certificate for a slot's key,
+    /// proving on-card generation (fw 4.3+). On firmware older than 5.3 (GET
+    /// METADATA's policy support), this certificate's key-policy extension is
+    /// also the only source for the slot's PIN/touch policy.
+    Attest = 0xF9,
 }
 
 impl Instruction {
@@ -356,6 +361,19 @@ impl PinPolicy {
             PinPolicy::Always => 0x03,
         }
     }
+
+    /// Resolve a PIN policy byte, as reported by GET METADATA (tag `0x02`'s
+    /// first byte) or the ATTEST certificate's key-policy extension.
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0x00 => Some(PinPolicy::Default),
+            0x01 => Some(PinPolicy::Never),
+            0x02 => Some(PinPolicy::Once),
+            0x03 => Some(PinPolicy::Always),
+            _ => None,
+        }
+    }
 }
 
 /// Touch policy for a generated key (whether the key requires a physical touch).
@@ -375,6 +393,19 @@ impl TouchPolicy {
             TouchPolicy::Never => 0x01,
             TouchPolicy::Always => 0x02,
             TouchPolicy::Cached => 0x03,
+        }
+    }
+
+    /// Resolve a touch policy byte, as reported by GET METADATA (tag `0x02`'s
+    /// second byte) or the ATTEST certificate's key-policy extension.
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0x00 => Some(TouchPolicy::Default),
+            0x01 => Some(TouchPolicy::Never),
+            0x02 => Some(TouchPolicy::Always),
+            0x03 => Some(TouchPolicy::Cached),
+            _ => None,
         }
     }
 }
@@ -806,6 +837,16 @@ pub fn get_metadata(key_ref: u8) -> Vec<u8> {
 #[must_use]
 pub fn reset() -> Vec<u8> {
     vec![0x00, Instruction::Reset.code(), 0x00, 0x00]
+}
+
+/// Yubico ATTEST (case 2): request the self-signed attestation certificate for
+/// the key in `key_ref`'s slot. `P1` is the slot's key reference, `P2` is
+/// `0x00`; no data field. Requires firmware 4.3+. The certificate can exceed
+/// 256 bytes, so the reply chains through `61xx`/GET RESPONSE the same way a
+/// GET DATA certificate read does.
+#[must_use]
+pub fn attest(key_ref: u8) -> Vec<u8> {
+    build_apdu_get(0x00, Instruction::Attest.code(), key_ref, 0x00, 0x00)
 }
 
 /// Yubico extension: DELETE a slot's private key by issuing MOVE KEY with the
@@ -1244,6 +1285,37 @@ mod tests {
         assert_eq!(set_pin_retries(5, 3), vec![0x00, 0xFA, 0x05, 0x03]);
         assert_eq!(reset(), vec![0x00, 0xFB, 0x00, 0x00]);
         assert_eq!(get_metadata(0x9B), vec![0x00, 0xF7, 0x00, 0x9B]);
+    }
+
+    #[test]
+    fn attest_apdu_bytes() {
+        // 00 F9 <slot key ref> 00 00 — P1 is the slot, P2 is 0x00, Le=0x00 (256,
+        // chained via GET RESPONSE for the certificate's full length).
+        assert_eq!(attest(0x9A), vec![0x00, 0xF9, 0x9A, 0x00, 0x00]);
+        assert_eq!(attest(0x9C), vec![0x00, 0xF9, 0x9C, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn pin_touch_policy_id_round_trips() {
+        for p in [
+            PinPolicy::Default,
+            PinPolicy::Never,
+            PinPolicy::Once,
+            PinPolicy::Always,
+        ] {
+            assert_eq!(PinPolicy::from_id(p.id()), Some(p));
+        }
+        assert_eq!(PinPolicy::from_id(0x04), None);
+
+        for t in [
+            TouchPolicy::Default,
+            TouchPolicy::Never,
+            TouchPolicy::Always,
+            TouchPolicy::Cached,
+        ] {
+            assert_eq!(TouchPolicy::from_id(t.id()), Some(t));
+        }
+        assert_eq!(TouchPolicy::from_id(0x04), None);
     }
 
     #[test]

@@ -1399,6 +1399,16 @@ struct PivState {
         Option<keyroost_piv::KeyAlg>,
         Option<String>,
     )>,
+    /// Per-slot PIN/touch policy, gathered alongside `slot_keys` on each
+    /// refresh (GET VERSION, then GET METADATA on firmware 5.3+ or the
+    /// ATTEST certificate's key-policy extension on older firmware — see
+    /// [`keyroost_transport::PivSession::slot_policy`]). `None` per-slot means
+    /// unavailable: no YubiKey-compatible extensions answered, not
+    /// necessarily an empty slot.
+    slot_policies: Vec<(
+        keyroost_piv::Slot,
+        Option<(keyroost_piv::PinPolicy, keyroost_piv::TouchPolicy)>,
+    )>,
     /// User-facing error from the last read/write.
     error: Option<String>,
     /// Success/info line from the last write operation.
@@ -1498,6 +1508,7 @@ impl Default for PivState {
         PivState {
             status: None,
             slot_keys: Vec::new(),
+            slot_policies: Vec::new(),
             error: None,
             notice: None,
             loaded: false,
@@ -6226,39 +6237,44 @@ impl App {
             // or firmware without the metadata extension.
             let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
                 let status = s.status();
-                let slot_keys: Vec<_> = keyroost_piv::Slot::all()
-                    .into_iter()
-                    .map(|slot| {
-                        let alg = s
-                            .metadata(slot.key_ref())
-                            .and_then(|m| m.algorithm)
-                            .and_then(keyroost_piv::KeyAlg::from_id);
-                        // Pull the slot's certificate (if any) and extract its
-                        // Subject DN for display. Any failure — no cert, read
-                        // error, or unparseable DER — degrades to `None` so the
-                        // pane never breaks on a malformed certificate.
-                        let subject = s
-                            .read_certificate(slot)
-                            .ok()
-                            .flatten()
-                            .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
-                            .map(|dn| dn.to_string());
-                        (slot, alg, subject)
-                    })
-                    .collect();
-                (status, slot_keys)
+                let mut slot_keys = Vec::with_capacity(4);
+                let mut slot_policies = Vec::with_capacity(4);
+                for slot in keyroost_piv::Slot::all() {
+                    let alg = s
+                        .metadata(slot.key_ref())
+                        .and_then(|m| m.algorithm)
+                        .and_then(keyroost_piv::KeyAlg::from_id);
+                    // Pull the slot's certificate (if any) and extract its
+                    // Subject DN for display. Any failure — no cert, read
+                    // error, or unparseable DER — degrades to `None` so the
+                    // pane never breaks on a malformed certificate.
+                    let subject = s
+                        .read_certificate(slot)
+                        .ok()
+                        .flatten()
+                        .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
+                        .map(|dn| dn.to_string());
+                    slot_keys.push((slot, alg, subject));
+                    // PIN/touch policy for display — GET VERSION, then GET
+                    // METADATA (fw 5.3+) or the ATTEST certificate's
+                    // key-policy extension (older fw). `None` means
+                    // unavailable, not necessarily an empty slot.
+                    slot_policies.push((slot, s.slot_policy(slot)));
+                }
+                (status, slot_keys, slot_policies)
             });
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok((Ok(status), slot_keys)) => {
+                    Ok((Ok(status), slot_keys, slot_policies)) => {
                         app.piv.status = Some(status);
                         app.piv.slot_keys = slot_keys;
+                        app.piv.slot_policies = slot_policies;
                         app.piv.loaded = true;
                     }
-                    Ok((Err(e), _)) | Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok((Err(e), _, _)) | Err(e) => app.piv.error = Some(e.to_string()),
                 }
             })
         });
@@ -13037,17 +13053,38 @@ impl App {
             let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == sel_slot);
             let alg = entry.and_then(|(_, a, _)| *a);
             let dn = entry.and_then(|(_, _, d)| d.as_deref());
-            let base = if cert_present {
-                "certificate present"
-            } else if alg.is_some() {
-                "key present, no certificate"
-            } else {
-                "empty"
+            // "key present" and "certificate present" both get the algorithm
+            // parenthesized right after the state word they describe — for
+            // the no-certificate case that's "key present (…), no
+            // certificate", not "…, no certificate (…)": the algorithm
+            // belongs to the key, and there's no certificate for it to
+            // trail.
+            let mut s = match (cert_present, alg) {
+                (true, Some(a)) => format!("certificate present ({})", a.label()),
+                (true, None) => "certificate present".to_string(),
+                (false, Some(a)) => format!("key present ({}), no certificate", a.label()),
+                (false, None) => "empty".to_string(),
             };
-            let mut s = base.to_string();
-            if let Some(a) = alg {
+            // PIN/touch policy, only alongside an actual key — an empty slot
+            // has no policy to report, and showing "not available" there
+            // would read as a hardware problem rather than just "no key yet".
+            if cert_present || alg.is_some() {
+                let policy = self
+                    .piv
+                    .slot_policies
+                    .iter()
+                    .find(|(s, _)| *s == sel_slot)
+                    .and_then(|(_, p)| *p);
                 s.push_str(" \u{00B7} ");
-                s.push_str(a.label());
+                match policy {
+                    Some((pin, touch)) => {
+                        s.push_str("pin: ");
+                        s.push_str(pin.label());
+                        s.push_str(", touch: ");
+                        s.push_str(touch.label());
+                    }
+                    None => s.push_str("pin/touch policy not available"),
+                }
             }
             if let Some(dn) = dn {
                 s.push_str(" \u{00B7} ");
