@@ -462,6 +462,47 @@ impl PivSession {
         Ok(piv::find_tlv(inner, 0x70).map(<[u8]>::to_vec))
     }
 
+    /// Yubico ATTEST: the self-signed attestation certificate for `slot`'s key
+    /// (DER), proving it was generated on-card. Firmware 4.3+ (older firmware,
+    /// and non-Yubico PIV cards, refuse this instruction). No PIN required.
+    pub fn attest(&mut self, slot: Slot) -> Result<Vec<u8>, TransportError> {
+        let (data, sw) = self.transmit_full(&piv::attest(slot.key_ref()))?;
+        ok_or_write("piv attest", sw)?;
+        Ok(data)
+    }
+
+    /// Read `slot`'s PIN/touch policy for display:
+    ///
+    /// 1. GET METADATA, tried unconditionally — cards that don't support it
+    ///    (pre-5.3 firmware, or non-Yubico PIV) simply answer with something
+    ///    other than `9000`/no policy, which falls through to step 2.
+    /// 2. The ATTEST certificate's Yubico key-policy extension
+    ///    (`1.3.6.1.4.1.41482.3.8`) — GET METADATA predates policy reporting,
+    ///    but ATTEST itself has existed since 4.3. ATTEST is itself a Yubico
+    ///    vendor instruction, so a non-Yubico PIV card refuses it too; that
+    ///    refusal is handled the same as everything else here, not specially.
+    ///
+    /// `None` throughout means "not available for display", not a wire
+    /// error — this is an informational read, not a precondition for a write,
+    /// so every failure mode (missing extension, unparsable metadata, ATTEST
+    /// itself being unsupported) collapses to the same answer.
+    pub fn slot_policy(&mut self, slot: Slot) -> Option<(PinPolicy, TouchPolicy)> {
+        let (pin, touch) =
+            if let Some(policy) = self.metadata(slot.key_ref()).and_then(|m| m.policy) {
+                policy
+            } else {
+                // Non-Yubico PIV cards refuse this vendor instruction outright
+                // (a status word, not `9000`) — `.ok()?` turns that refusal
+                // into the same "no policy available" `None` as every other
+                // failure mode here.
+                let cert = self.attest(slot).ok()?;
+                keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
+                    .ok()
+                    .flatten()?
+            };
+        Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?))
+    }
+
     /// Ask `slot`'s private key to sign a *prepared* block via GENERAL
     /// AUTHENTICATE: a full PKCS#1 v1.5 padded block for RSA, the raw hash for
     /// ECDSA, or the raw message for Ed25519 (see

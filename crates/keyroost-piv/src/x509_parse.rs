@@ -320,6 +320,96 @@ fn parse_name(mut input: &[u8]) -> Result<SubjectDn, X509ParseError> {
     Ok(SubjectDn { rdns })
 }
 
+// ---------------------------------------------------------------------------
+// Yubico key-policy extension (ATTEST certificates)
+// ---------------------------------------------------------------------------
+
+/// Yubico PIV key-policy extension OID `1.3.6.1.4.1.41482.3.8`, as DER OBJECT
+/// IDENTIFIER content (tag/length stripped). Carried on a slot's ATTEST
+/// certificate; its `extnValue` is exactly 2 raw bytes, `[pin_policy,
+/// touch_policy]`, using the same byte values as [`crate::PinPolicy::id`] /
+/// [`crate::TouchPolicy::id`] (never/once/always = 1/2/3 for PIN;
+/// never/always/cached = 1/2/3 for touch).
+const KEY_POLICY_EXT_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xC4, 0x0A, 0x03, 0x08];
+
+/// Parse the PIN/touch policy bytes out of a slot's ATTEST certificate, if the
+/// Yubico key-policy extension is present. Returns `Ok(None)` — not an error —
+/// when the extension is simply absent: a certificate that predates it, or
+/// isn't a Yubico attestation cert at all, is a normal case for a caller that
+/// is only using this as a fallback source (GET METADATA firmware < 5.3).
+///
+/// Navigates `Certificate -> tbsCertificate -> extensions` per RFC 5280,
+/// continuing past where [`parse_subject_dn`] stops: `subject Name,
+/// subjectPublicKeyInfo SEQUENCE, issuerUniqueID [1] OPTIONAL, subjectUniqueID
+/// [2] OPTIONAL, extensions [3] EXPLICIT SEQUENCE OF Extension OPTIONAL`.
+pub fn parse_key_policy_extension(cert_der: &[u8]) -> Result<Option<(u8, u8)>, X509ParseError> {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let (cert, _) = expect_tag(cert_der, 0x30)?;
+    // tbsCertificate ::= SEQUENCE { ... }
+    let (tbs, _) = expect_tag(cert.content, 0x30)?;
+    let mut rest = tbs.content;
+
+    // Optional version [0] (context-specific constructed tag 0xA0): skip it.
+    {
+        let (peek, after) = read_tlv(rest)?;
+        if peek.tag == 0xA0 {
+            rest = after;
+        }
+    }
+    // serialNumber INTEGER, signature SEQUENCE, issuer Name, validity SEQUENCE,
+    // subject Name, subjectPublicKeyInfo SEQUENCE: skip each in turn.
+    let (_, rest) = expect_tag(rest, 0x02)?;
+    let (_, rest) = expect_tag(rest, 0x30)?;
+    let (_, rest) = expect_tag(rest, 0x30)?;
+    let (_, rest) = expect_tag(rest, 0x30)?;
+    let (_, rest) = expect_tag(rest, 0x30)?;
+    let (_, mut rest) = expect_tag(rest, 0x30)?;
+
+    // issuerUniqueID [1] (0x81) / subjectUniqueID [2] (0x82) are optional and,
+    // if present, precede extensions [3] (0xA3). Anything else here (nothing
+    // left, or a tag that isn't one of these three) means no extensions block
+    // — a normal, not malformed, shape for an older or non-Yubico cert.
+    loop {
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let (peek, after) = read_tlv(rest)?;
+        match peek.tag {
+            0x81 | 0x82 => rest = after,
+            0xA3 => {
+                // extensions [3] EXPLICIT SEQUENCE OF Extension
+                let (exts, _) = expect_tag(peek.content, 0x30)?;
+                return find_key_policy(exts.content);
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Scan a `SEQUENCE OF Extension` for the Yubico key-policy extension and
+/// return its 2 policy bytes, if found.
+fn find_key_policy(mut input: &[u8]) -> Result<Option<(u8, u8)>, X509ParseError> {
+    while !input.is_empty() {
+        // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }
+        let (seq, after_seq) = expect_tag(input, 0x30)?;
+        input = after_seq;
+        let (oid_tlv, after_oid) = expect_tag(seq.content, 0x06)?;
+        // Optional `critical` BOOLEAN (0x01): skip if present.
+        let after_oid = match read_tlv(after_oid) {
+            Ok((peek, after)) if peek.tag == 0x01 => after,
+            _ => after_oid,
+        };
+        let (val_tlv, _) = expect_tag(after_oid, 0x04)?;
+        if oid_tlv.content == KEY_POLICY_EXT_OID {
+            return match val_tlv.content {
+                [pin, touch] => Ok(Some((*pin, *touch))),
+                _ => Err(X509ParseError::Malformed),
+            };
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +553,110 @@ mod tests {
         assert_eq!(
             read_tlv(&[0x30, 0x80]).err(),
             Some(X509ParseError::LengthTooLarge)
+        );
+    }
+
+    /// Build a minimal-but-well-formed `Certificate` DER, with an optional
+    /// `extensions [3]` field containing the given already-DER-encoded
+    /// `Extension` SEQUENCEs. Every field before `extensions` is an empty
+    /// placeholder (`parse_key_policy_extension` only needs to walk past
+    /// them, not read them), so lengths stay in short form throughout.
+    fn build_cert(extension_seqs: &[Vec<u8>]) -> Vec<u8> {
+        let serial = [0x02u8, 0x01, 0x01]; // INTEGER 1
+        let sig_alg = [0x30u8, 0x00]; // empty SEQUENCE
+        let issuer = [0x30u8, 0x00]; // empty Name SEQUENCE
+        let validity = [0x30u8, 0x00]; // empty SEQUENCE
+        let subject = [0x30u8, 0x00]; // empty Name SEQUENCE
+        let spki = [0x30u8, 0x00]; // empty SubjectPublicKeyInfo SEQUENCE
+
+        let mut tbs_content = Vec::new();
+        tbs_content.extend_from_slice(&serial);
+        tbs_content.extend_from_slice(&sig_alg);
+        tbs_content.extend_from_slice(&issuer);
+        tbs_content.extend_from_slice(&validity);
+        tbs_content.extend_from_slice(&subject);
+        tbs_content.extend_from_slice(&spki);
+
+        if !extension_seqs.is_empty() {
+            let exts_content: Vec<u8> = extension_seqs.iter().flatten().copied().collect();
+            let mut exts_seq = vec![0x30, exts_content.len() as u8];
+            exts_seq.extend_from_slice(&exts_content);
+            tbs_content.push(0xA3); // extensions [3] EXPLICIT
+            tbs_content.push(exts_seq.len() as u8);
+            tbs_content.extend_from_slice(&exts_seq);
+        }
+
+        let mut tbs = vec![0x30, tbs_content.len() as u8];
+        tbs.extend_from_slice(&tbs_content);
+        let mut cert = vec![0x30, tbs.len() as u8];
+        cert.extend_from_slice(&tbs);
+        cert
+    }
+
+    /// `Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }`
+    /// (`critical` omitted — it's DEFAULT FALSE and optional).
+    fn build_extension(oid_content: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut oid = vec![0x06, oid_content.len() as u8];
+        oid.extend_from_slice(oid_content);
+        let mut octets = vec![0x04, value.len() as u8];
+        octets.extend_from_slice(value);
+        let mut content = oid;
+        content.extend_from_slice(&octets);
+        let mut seq = vec![0x30, content.len() as u8];
+        seq.extend_from_slice(&content);
+        seq
+    }
+
+    #[test]
+    fn key_policy_extension_absent_is_none_not_an_error() {
+        // No extensions field at all (older/non-attestation cert shape).
+        assert_eq!(parse_key_policy_extension(&build_cert(&[])), Ok(None));
+    }
+
+    #[test]
+    fn key_policy_extension_ignores_unrelated_extensions() {
+        let other = build_extension(&[0x55, 0x1D, 0x0F], &[0x03, 0x02, 0x05, 0xA0]); // keyUsage, unrelated
+        assert_eq!(
+            parse_key_policy_extension(&build_cert(&[other])),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn key_policy_extension_decodes_pin_and_touch_bytes() {
+        // PinPolicy::Always (0x03), TouchPolicy::Never (0x01).
+        let policy_ext = build_extension(KEY_POLICY_EXT_OID, &[0x03, 0x01]);
+        let other = build_extension(&[0x55, 0x1D, 0x0F], &[0x03, 0x02, 0x05, 0xA0]);
+        assert_eq!(
+            parse_key_policy_extension(&build_cert(&[other, policy_ext])),
+            Ok(Some((0x03, 0x01)))
+        );
+    }
+
+    #[test]
+    fn key_policy_extension_rejects_wrong_length_value() {
+        // A key-policy extension whose value isn't exactly 2 bytes is
+        // malformed, not merely "policy unknown" — this OID is only ever
+        // meant to carry 2 bytes, so anything else is a corrupt certificate.
+        let bad = build_extension(KEY_POLICY_EXT_OID, &[0x03]);
+        assert_eq!(
+            parse_key_policy_extension(&build_cert(&[bad])),
+            Err(X509ParseError::Malformed)
+        );
+    }
+
+    #[test]
+    fn key_policy_extension_survives_critical_flag() {
+        // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN TRUE, extnValue OCTET STRING }
+        let mut content = vec![0x06, KEY_POLICY_EXT_OID.len() as u8];
+        content.extend_from_slice(KEY_POLICY_EXT_OID);
+        content.extend_from_slice(&[0x01, 0x01, 0xFF]); // BOOLEAN TRUE
+        content.extend_from_slice(&[0x04, 0x02, 0x02, 0x03]); // OCTET STRING [once, cached]
+        let mut seq = vec![0x30, content.len() as u8];
+        seq.extend_from_slice(&content);
+        assert_eq!(
+            parse_key_policy_extension(&build_cert(&[seq])),
+            Ok(Some((0x02, 0x03)))
         );
     }
 }
