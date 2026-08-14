@@ -730,10 +730,7 @@ mod tests {
     #[test]
     fn key_policy_extension_ignores_unrelated_extensions() {
         let other = build_extension(&[0x55, 0x1D, 0x0F], &[0x03, 0x02, 0x05, 0xA0]); // keyUsage, unrelated
-        assert_eq!(
-            parse_key_policy_extension(&build_cert(&[other])),
-            Ok(None)
-        );
+        assert_eq!(parse_key_policy_extension(&build_cert(&[other])), Ok(None));
     }
 
     #[test]
@@ -833,12 +830,7 @@ mod tests {
                     point: eddsa_point.clone(),
                 },
             ),
-            (
-                KeyAlg::X25519,
-                crate::PublicKey::Ecc {
-                    point: eddsa_point,
-                },
-            ),
+            (KeyAlg::X25519, crate::PublicKey::Ecc { point: eddsa_point }),
         ];
         for (alg, key) in cases {
             let spki = crate::spki::subject_public_key_info(&key, alg).unwrap();
@@ -886,7 +878,10 @@ mod tests {
         use crate::spki::{der_seq, der_tlv};
         // secp256k1 (1.3.132.0.10) — a real EC curve, but not one PIV supports.
         let secp256k1 = [0x2B, 0x81, 0x04, 0x00, 0x0A];
-        let alg_id = der_seq(&[&der_tlv(0x06, OID_EC_PUBLIC_KEY), &der_tlv(0x06, &secp256k1)]);
+        let alg_id = der_seq(&[
+            &der_tlv(0x06, OID_EC_PUBLIC_KEY),
+            &der_tlv(0x06, &secp256k1),
+        ]);
         let spk = der_seq(&[&alg_id, &[0x03, 0x02, 0x00, 0x04]]);
         let cert = build_cert_with_spki(&spk);
         assert_eq!(parse_spki_key_alg(&cert), Ok(None));
