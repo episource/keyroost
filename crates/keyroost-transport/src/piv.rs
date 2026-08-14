@@ -13,6 +13,7 @@ use crate::TransportError;
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use std::collections::HashMap;
 use zeroize::Zeroizing;
 
 /// How many wrong-credential attempts to make when intentionally blocking a
@@ -151,6 +152,20 @@ pub struct PivSlotStatus {
 pub struct PivSession {
     card: Card,
     debug: bool,
+    /// Algorithm + public key of any slot this session itself generated a key
+    /// in, keyed by key reference. This is a fallback source only, for cards
+    /// that don't answer GET METADATA (pre-5.3 firmware, or non-Yubico PIV):
+    /// `slot_key` (the shared source for CSR/self-sign) falls back to this
+    /// when metadata comes back empty. It's populated by `generate_key`, or
+    /// explicitly by a caller via [`Self::remember_pubkey`] — never by reading a
+    /// card back, so it's exactly as trustworthy as whoever put it there. It
+    /// lives only as long as this session (a fresh `open()` on reconnect
+    /// starts empty, and there is deliberately no on-disk or cross-process
+    /// persistence — see [`Self::remember_pubkey`] for how a caller bridges
+    /// that) and any operation that changes what's in a slot (`delete_key`,
+    /// `move_key`, `reset`) invalidates the corresponding entries — see
+    /// [`PivSession::slot_key`].
+    pubkey_cache: HashMap<u8, (KeyAlg, PublicKey)>,
 }
 
 /// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
@@ -171,7 +186,11 @@ impl PivSession {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
-        let mut session = Self { card, debug: false };
+        let mut session = Self {
+            card,
+            debug: false,
+            pubkey_cache: HashMap::new(),
+        };
         session.select()?;
         Ok(session)
     }
@@ -193,7 +212,11 @@ impl PivSession {
         let mut out = Vec::new();
         for name in names {
             if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
-                let mut session = PivSession { card, debug: false };
+                let mut session = PivSession {
+                    card,
+                    debug: false,
+                    pubkey_cache: HashMap::new(),
+                };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
                 }
@@ -400,6 +423,18 @@ impl PivSession {
     /// Generate a fresh asymmetric key pair in `slot`, returning its public key.
     /// Requires prior management-key auth. Overwrites any existing key in the
     /// slot. May require a touch if the slot's touch policy demands it.
+    ///
+    /// On success, also caches `(alg, public key)` for `slot` in this
+    /// session's in-memory key cache, since [`Self::slot_key`] and
+    /// [`Self::slot_key_algorithm`]'s only other source for a key this fresh
+    /// (the slot's certificate) doesn't exist yet on cards that don't answer
+    /// GET METADATA. That only covers later calls *within this same
+    /// session* — a caller that needs the key material to outlive this
+    /// session (a separate `keyroostctl` invocation, or the GUI's
+    /// fresh-session-per-action pattern) has to carry it forward itself and
+    /// hand it to a later session via [`Self::remember_pubkey`]; see that
+    /// method's doc comment for why this deliberately doesn't do that on its
+    /// own.
     pub fn generate_key(
         &mut self,
         slot: Slot,
@@ -410,7 +445,34 @@ impl PivSession {
         let (data, sw) =
             self.transmit_full(&piv::generate_key(slot, alg, pin_policy, touch_policy))?;
         ok_or_write("piv generate key", sw)?;
-        piv::parse_public_key(&data).map_err(TransportError::PivParse)
+        let key = piv::parse_public_key(&data).map_err(TransportError::PivParse)?;
+        self.pubkey_cache.insert(slot.key_ref(), (alg, key.clone()));
+        Ok(key)
+    }
+
+    /// Seed this session's in-memory key cache for `slot` with `(alg, key)`
+    /// directly, without a card round-trip — the same cache
+    /// [`Self::generate_key`] populates, and the same one [`Self::slot_key`] /
+    /// [`Self::slot_key_algorithm`] fall back to when GET METADATA doesn't
+    /// cover the slot.
+    ///
+    /// This is the deliberately-explicit replacement for what used to be an
+    /// automatic on-disk cache: `PivSession` itself keeps no persistence
+    /// (no file, nothing cross-process) — a fresh `open()` always starts
+    /// empty, by design, so key material a caller isn't actively using never
+    /// sits on disk. A caller that needs a metadata-less card's freshly
+    /// generated key to survive past this session (a later `keyroostctl`
+    /// invocation, or the GUI reopening a session for a later action) has to
+    /// hold onto `(alg, key)` itself — in its own process-lifetime state, or
+    /// wherever the user chose to put it — and call this before the call that
+    /// needs it (`generate_csr`, `self_signed_certificate`, or checking
+    /// `slot_key_algorithm` for display). Not verified against the card in
+    /// any way: what's remembered here is exactly what's trusted later, so a
+    /// caller handing over the wrong slot's key gets a CSR/self-signed
+    /// certificate whose SPKI doesn't match the private key that actually
+    /// signed it.
+    pub fn remember_pubkey(&mut self, slot: Slot, alg: KeyAlg, key: PublicKey) {
+        self.pubkey_cache.insert(slot.key_ref(), (alg, key));
     }
 
     /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
@@ -447,7 +509,9 @@ impl PivSession {
             ));
         }
         let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
-        ok_or_write("piv delete key", sw)
+        ok_or_write("piv delete key", sw)?;
+        self.pubkey_cache.remove(&slot.key_ref());
+        Ok(())
     }
 
     /// Read the DER-encoded certificate stored in `slot`, or `None` when the
@@ -503,6 +567,47 @@ impl PivSession {
         Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?))
     }
 
+    /// Read `slot`'s key algorithm for display, compatible with any PIV
+    /// token — not just a YubiKey new enough for GET METADATA (5.3+):
+    ///
+    /// 1. GET METADATA. When it names an algorithm, that's authoritative —
+    ///    return it.
+    /// 2. This session's in-memory key cache (populated by
+    ///    [`Self::generate_key`], or seeded explicitly via
+    ///    [`Self::remember_pubkey`]). This is what makes a freshly generated key
+    ///    show up immediately on metadata-less firmware: there's no
+    ///    certificate yet for step 3 to read (self-sign/import hasn't run),
+    ///    and GET METADATA's silence on such firmware doesn't mean "empty" —
+    ///    it means "doesn't exist", so without this step a slot that was
+    ///    *just* populated would still display as empty. A caller reading
+    ///    status in a fresh session has to `remember_pubkey` first if it wants
+    ///    this step to see anything.
+    /// 3. Otherwise, fall back to the slot's certificate (a standard PIV data
+    ///    object every card serves) and parse the algorithm out of its
+    ///    SubjectPublicKeyInfo directly.
+    ///
+    /// Unlike [`Self::slot_key`] — which this does *not* replace — this never
+    /// needs the actual public key bytes, only the algorithm, so the
+    /// certificate fallback is enough; `slot_key`'s callers (CSR/self-sign)
+    /// need the raw key material GET METADATA carries and stay
+    /// metadata-only.
+    pub fn slot_key_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
+        let alg_from_metadata = self
+            .metadata(slot.key_ref())
+            .and_then(|m| m.algorithm)
+            .and_then(KeyAlg::from_id);
+        if alg_from_metadata.is_some() {
+            return alg_from_metadata;
+        }
+        if let Some((alg, _)) = self.pubkey_cache.get(&slot.key_ref()) {
+            return Some(*alg);
+        }
+        self.read_certificate(slot)
+            .ok()
+            .flatten()
+            .and_then(|der| piv::x509_parse::parse_key_algorithm(&der).ok().flatten())
+    }
+
     /// Ask `slot`'s private key to sign a *prepared* block via GENERAL
     /// AUTHENTICATE: a full PKCS#1 v1.5 padded block for RSA, the raw hash for
     /// ECDSA, or the raw message for Ed25519 (see
@@ -525,26 +630,47 @@ impl PivSession {
             .map_err(TransportError::PivParse)
     }
 
-    /// The algorithm and public key of the key stored in `slot`, from GET
-    /// METADATA (firmware 5.3+). Errors when the slot is empty or the
-    /// firmware predates the extension.
+    /// The algorithm and public key of the key stored in `slot`: from GET
+    /// METADATA (firmware 5.3+) when the card answers it, else from this
+    /// session's in-memory key cache. That cache is populated only by a prior
+    /// [`Self::generate_key`] on `slot` in *this* session, or by a caller
+    /// explicitly carrying the key material forward via [`Self::remember_pubkey`]
+    /// — that's what lets CSR/self-sign work right after generation on cards
+    /// that don't support GET METADATA (older YubiKeys, non-Yubico PIV
+    /// tokens): the card refuses to name the key material any other way, so
+    /// the cache is the only source left once GENERATE ASYMMETRIC has already
+    /// told us what it made, and this crate keeps no on-disk or
+    /// cross-process copy of that on its own (see [`Self::remember_pubkey`]).
+    ///
+    /// Errors when the slot is empty, the firmware predates GET METADATA
+    /// *and* nothing was generated into `slot` in this session (nor handed to
+    /// it via `remember_pubkey`), or a cached entry was invalidated by a later
+    /// delete/move/reset.
     pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
-        let md = self
-            .metadata(slot.key_ref())
-            .ok_or(TransportError::MalformedResponse(
-                "slot has no key (or the firmware lacks GET METADATA)",
+        let key_ref = slot.key_ref();
+        if let Some(md) = self.metadata(key_ref) {
+            let alg =
+                md.algorithm
+                    .and_then(KeyAlg::from_id)
+                    .ok_or(TransportError::MalformedResponse(
+                        "slot metadata carries no key algorithm",
+                    ))?;
+            let raw = md.public_key.ok_or(TransportError::MalformedResponse(
+                "slot metadata carries no public key",
             ))?;
-        let alg =
-            md.algorithm
-                .and_then(KeyAlg::from_id)
-                .ok_or(TransportError::MalformedResponse(
-                    "slot metadata carries no key algorithm",
-                ))?;
-        let raw = md.public_key.ok_or(TransportError::MalformedResponse(
-            "slot metadata carries no public key",
-        ))?;
-        let key = public_key_from_metadata(&raw).map_err(TransportError::PivParse)?;
-        Ok((alg, key))
+            let key = public_key_from_metadata(&raw).map_err(TransportError::PivParse)?;
+            return Ok((alg, key));
+        }
+        if let Some(cached) = self.pubkey_cache.get(&key_ref).cloned() {
+            return Ok(cached);
+        }
+        Err(TransportError::MalformedResponse(
+            "slot has no key, or the firmware lacks GET METADATA and the key \
+             material wasn't handed to this session — run `piv generate-key` \
+             on this slot in this same session, or pass its previously saved \
+             key material to this command, so it can be cached for \
+             CSR/self-sign",
+        ))
     }
 
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
@@ -614,7 +740,14 @@ impl PivSession {
             return Err(TransportError::PivDestinationOccupied(dest));
         }
         let (_, sw) = self.transmit_full(&piv::move_key(src, dest))?;
-        ok_or_write("piv move key", sw)
+        ok_or_write("piv move key", sw)?;
+        // The key itself relocated, not just its reference — carry a cached
+        // entry along with it rather than dropping it, so a subsequent
+        // CSR/self-sign at `dest` still works on metadata-less firmware.
+        if let Some(cached) = self.pubkey_cache.remove(&src.key_ref()) {
+            self.pubkey_cache.insert(dest.key_ref(), cached);
+        }
+        Ok(())
     }
 
     /// Whether `slot` holds a private key, via GET METADATA. Works for retired
@@ -641,7 +774,11 @@ impl PivSession {
         if sw == piv::SW_AUTH_BLOCKED {
             return Err(TransportError::PivResetNotAllowed);
         }
-        ok_or_write("piv reset", sw)
+        ok_or_write("piv reset", sw)?;
+        // Wipes every slot; nothing cached survives it. `force_reset` reaches
+        // this same reset() at the end of its own path, so it's covered too.
+        self.pubkey_cache.clear();
+        Ok(())
     }
 
     /// Factory-reset the PIV applet the manufacturer-intended way even when the

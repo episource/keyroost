@@ -23,7 +23,7 @@
 
 use std::fmt;
 
-use crate::KeyAlg;
+use crate::{KeyAlg, PublicKey};
 
 /// Errors from reading a Subject DN out of a DER certificate.
 #[derive(Debug, PartialEq, Eq)]
@@ -413,32 +413,35 @@ fn find_key_policy(mut input: &[u8]) -> Result<Option<(u8, u8)>, X509ParseError>
 }
 
 // ---------------------------------------------------------------------------
-// subjectPublicKeyInfo key algorithm
+// SubjectPublicKeyInfo -> KeyAlg
 // ---------------------------------------------------------------------------
 
-// Pre-encoded OBJECT IDENTIFIER *content* (tag/length stripped), matching the
-// OIDs [`crate::spki::subject_public_key_info`] writes — this is that
-// encoder's inverse, read back off a certificate rather than a card response.
-const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
-const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
-const OID_P256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
-const OID_P384: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
-const OID_ED25519: &[u8] = &[0x2B, 0x65, 0x70];
-const OID_X25519: &[u8] = &[0x2B, 0x65, 0x6E];
+// Dotted-decimal OIDs for the algorithms `KeyAlg` covers. Deliberately
+// separate from the pre-encoded `OID_*` DER byte constants in
+// [`crate::spki`] (that module *builds* an AlgorithmIdentifier; this one
+// *matches against* an already-decoded dotted string).
+const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+const OID_P256: &str = "1.2.840.10045.3.1.7";
+const OID_P384: &str = "1.3.132.0.34";
+const OID_ED25519: &str = "1.3.101.112";
+const OID_X25519: &str = "1.3.101.110";
 
-/// Read the key algorithm out of a certificate's `subjectPublicKeyInfo`, for
-/// PIV cards that don't answer GET METADATA (pre-5.3 firmware, or a
-/// non-Yubico card): the certificate stored in the slot was built (or
-/// imported) over the same key, so its own SPKI is a reliable fallback source
-/// for the algorithm shown in the slot state line.
+/// Parse the key algorithm out of a certificate's `SubjectPublicKeyInfo`.
 ///
-/// Navigates `Certificate -> tbsCertificate -> subjectPublicKeyInfo` per RFC
-/// 5280, continuing past where [`parse_subject_dn`] stops. Returns `Ok(None)`
-/// — not an error — for an SPKI algorithm this crate has no [`KeyAlg`]
-/// variant for (an unusual curve, an RSA modulus that isn't one of the four
-/// PIV sizes): this is a display-only fallback, so "can't tell" is a normal
-/// outcome, not a malformed certificate.
-pub fn parse_spki_key_alg(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
+/// This is independent of GET METADATA (the Yubico extension `PivSession`
+/// otherwise reads the algorithm from, available on firmware 5.3+ only): a
+/// certificate is a mandatory PIV data object on any PIV card, so a caller
+/// that already has the cert bytes (e.g. for its Subject DN) can recover the
+/// algorithm from them too, with no extra card round-trip and no firmware- or
+/// vendor-dependent extension involved.
+///
+/// Returns `Ok(None)` — not an error — for a key type this reader doesn't
+/// recognize (an OID/parameter combination outside PIV's `KeyAlg` set, or an
+/// RSA modulus whose bit length doesn't land on one of PIV's four sizes): an
+/// unusual certificate shouldn't stop the caller from displaying whatever
+/// else (e.g. the Subject DN) it already parsed.
+pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
     let (cert, _) = expect_tag(cert_der, 0x30)?;
     // tbsCertificate ::= SEQUENCE { ... }
@@ -461,16 +464,24 @@ pub fn parse_spki_key_alg(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseEr
     let (_, rest) = expect_tag(rest, 0x30)?;
     // subjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
     let (spki, _) = expect_tag(rest, 0x30)?;
-    // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }
-    let (alg_id, spk_rest) = expect_tag(spki.content, 0x30)?;
-    let (oid_tlv, params) = expect_tag(alg_id.content, 0x06)?;
+    let (alg_id, after_alg_id) = expect_tag(spki.content, 0x30)?;
+    let (spk, _) = expect_tag(after_alg_id, 0x03)?;
 
-    match oid_tlv.content {
-        OID_RSA_ENCRYPTION => rsa_key_size(spk_rest),
+    // AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }
+    let (oid_tlv, params) = expect_tag(alg_id.content, 0x06)?;
+    let oid = decode_oid(oid_tlv.content).ok_or(X509ParseError::Malformed)?;
+
+    // BIT STRING content is a 1-byte unused-bits count (always 0 for a public
+    // key) followed by the key material.
+    let key_bytes = spk.content.get(1..).ok_or(X509ParseError::Truncated)?;
+
+    match oid.as_str() {
+        OID_RSA_ENCRYPTION => rsa_key_alg(key_bytes),
         OID_EC_PUBLIC_KEY => {
             // parameters is the namedCurve OID for a NIST curve.
-            let (curve, _) = expect_tag(params, 0x06)?;
-            Ok(match curve.content {
+            let (curve_oid_tlv, _) = expect_tag(params, 0x06)?;
+            let curve_oid = decode_oid(curve_oid_tlv.content).ok_or(X509ParseError::Malformed)?;
+            Ok(match curve_oid.as_str() {
                 OID_P256 => Some(KeyAlg::EccP256),
                 OID_P384 => Some(KeyAlg::EccP384),
                 _ => None,
@@ -482,27 +493,114 @@ pub fn parse_spki_key_alg(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseEr
     }
 }
 
-/// Recover the PIV RSA [`KeyAlg`] (1024/2048/3072/4096) from the modulus size
-/// in an SPKI's `subjectPublicKey` BIT STRING, which wraps `RSAPublicKey ::=
-/// SEQUENCE { modulus INTEGER, publicExponent INTEGER }`. `None` for a
-/// modulus that isn't one of PIV's four sizes.
-fn rsa_key_size(bitstring_and_after: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
-    let (bitstr, _) = expect_tag(bitstring_and_after, 0x03)?;
-    // First content byte is the unused-bits count (0 for a byte-aligned DER
-    // encoding, which an RSAPublicKey SEQUENCE always is).
-    let inner = bitstr.content.get(1..).ok_or(X509ParseError::Truncated)?;
-    let (rsa_pub, _) = expect_tag(inner, 0x30)?;
+/// Map an RSA `subjectPublicKey` BIT STRING body — the DER `RSAPublicKey ::=
+/// SEQUENCE { modulus INTEGER, publicExponent INTEGER }` — to the `KeyAlg`
+/// matching its modulus bit length.
+fn rsa_key_alg(spk_bytes: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
+    let (rsa_pub, _) = expect_tag(spk_bytes, 0x30)?;
     let (modulus, _) = expect_tag(rsa_pub.content, 0x02)?;
-    // Strip the sign-guard `0x00` prefix (present whenever the modulus's top
-    // bit is set, i.e. almost always) before sizing.
-    let bytes = modulus.content.len() - modulus.content.iter().take_while(|&&b| b == 0).count();
-    Ok(match bytes {
-        128 => Some(KeyAlg::Rsa1024),
-        256 => Some(KeyAlg::Rsa2048),
-        384 => Some(KeyAlg::Rsa3072),
-        512 => Some(KeyAlg::Rsa4096),
+    // A DER INTEGER prepends a 0x00 sign-guard byte whenever the modulus's top
+    // bit is set — true for essentially every real RSA modulus — so strip it
+    // before counting bits, mirroring `spki::der_uint`'s encode side.
+    let m = match modulus.content {
+        [0x00, rest @ ..] if !rest.is_empty() => rest,
+        m => m,
+    };
+    Ok(match m.len() * 8 {
+        1024 => Some(KeyAlg::Rsa1024),
+        2048 => Some(KeyAlg::Rsa2048),
+        3072 => Some(KeyAlg::Rsa3072),
+        4096 => Some(KeyAlg::Rsa4096),
         _ => None,
     })
+}
+
+/// Strip a DER unsigned-INTEGER's leading sign-guard byte, the inverse half of
+/// [`crate::spki::der_uint`]: that encoder prepends a `0x00` whenever the raw
+/// value's top bit is set, so a value round-tripping through DER carries one
+/// extra leading zero byte the card never sent. Mirrors the identical inline
+/// match in [`rsa_key_alg`], which only needs it for a bit-length count and
+/// not the caller-visible bytes.
+fn strip_der_uint_sign_guard(content: &[u8]) -> &[u8] {
+    match content {
+        [0x00, rest @ ..] if !rest.is_empty() => rest,
+        m => m,
+    }
+}
+
+/// Parse a DER `SubjectPublicKeyInfo` — as built by
+/// [`crate::spki::subject_public_key_info`] — back into the algorithm and the
+/// exact key material GENERATE ASYMMETRIC KEY PAIR originally returned
+/// (modulus/exponent, or point, verbatim rather than just an RSA bit-length
+/// class).
+///
+/// This is the reverse of that builder, for callers that round-trip a key
+/// through DER to persist it — e.g. the `keyroost-transport` crate's
+/// cross-process fallback cache for cards that can't re-report a slot's key
+/// via GET METADATA (`PivSession::slot_key`'s doc comment covers why that's
+/// needed). [`parse_key_algorithm`] serves a different, narrower need — the
+/// algorithm only, out of a full `Certificate` — and is not reused here: this
+/// starts straight from an SPKI `SEQUENCE`, not a certificate, and needs the
+/// raw key bytes `parse_key_algorithm` deliberately never recovers.
+///
+/// Errors (rather than returning `Ok(None)`, unlike `parse_key_algorithm`) on
+/// any OID or structure this reader doesn't recognize: unlike a third-party
+/// certificate's key, every real input here started life as this same
+/// crate's own `subject_public_key_info` output, so an unrecognized shape
+/// signals corruption in whatever stored it, not a merely-unusual key.
+pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), X509ParseError> {
+    let (spki, _) = expect_tag(der, 0x30)?;
+    let (alg_id, after_alg_id) = expect_tag(spki.content, 0x30)?;
+    let (spk, _) = expect_tag(after_alg_id, 0x03)?;
+    let (oid_tlv, params) = expect_tag(alg_id.content, 0x06)?;
+    let oid = decode_oid(oid_tlv.content).ok_or(X509ParseError::Malformed)?;
+    // BIT STRING content is a 1-byte unused-bits count (always 0 here) then
+    // the key material.
+    let key_bytes = spk.content.get(1..).ok_or(X509ParseError::Truncated)?;
+
+    match oid.as_str() {
+        OID_RSA_ENCRYPTION => {
+            let alg = rsa_key_alg(key_bytes)?.ok_or(X509ParseError::Malformed)?;
+            let (rsa_pub, _) = expect_tag(key_bytes, 0x30)?;
+            let (modulus, after_modulus) = expect_tag(rsa_pub.content, 0x02)?;
+            let (exponent, _) = expect_tag(after_modulus, 0x02)?;
+            Ok((
+                alg,
+                PublicKey::Rsa {
+                    modulus: strip_der_uint_sign_guard(modulus.content).to_vec(),
+                    exponent: strip_der_uint_sign_guard(exponent.content).to_vec(),
+                },
+            ))
+        }
+        OID_EC_PUBLIC_KEY => {
+            let (curve_oid_tlv, _) = expect_tag(params, 0x06)?;
+            let curve_oid = decode_oid(curve_oid_tlv.content).ok_or(X509ParseError::Malformed)?;
+            let alg = match curve_oid.as_str() {
+                OID_P256 => KeyAlg::EccP256,
+                OID_P384 => KeyAlg::EccP384,
+                _ => return Err(X509ParseError::Malformed),
+            };
+            Ok((
+                alg,
+                PublicKey::Ecc {
+                    point: key_bytes.to_vec(),
+                },
+            ))
+        }
+        OID_ED25519 => Ok((
+            KeyAlg::Ed25519,
+            PublicKey::Ecc {
+                point: key_bytes.to_vec(),
+            },
+        )),
+        OID_X25519 => Ok((
+            KeyAlg::X25519,
+            PublicKey::Ecc {
+                point: key_bytes.to_vec(),
+            },
+        )),
+        _ => Err(X509ParseError::Malformed),
+    }
 }
 
 #[cfg(test)]
@@ -688,25 +786,6 @@ mod tests {
         cert
     }
 
-    /// Like [`build_cert`] but with a real `subjectPublicKeyInfo` in place of
-    /// the empty placeholder, for [`parse_spki_key_alg`] tests. Lengths can
-    /// exceed short form once a real SPKI is in play (an RSA-4096 SPKI is
-    /// well over 127 bytes), so this reuses [`crate::spki`]'s own DER
-    /// primitives rather than the single-byte lengths `build_cert` gets away
-    /// with.
-    fn build_cert_with_spki(spki: &[u8]) -> Vec<u8> {
-        use crate::spki::{der_seq, der_tlv};
-
-        let serial = der_tlv(0x02, &[0x01]); // INTEGER 1
-        let sig_alg = der_seq(&[]); // empty SEQUENCE
-        let issuer = der_seq(&[]); // empty Name SEQUENCE
-        let validity = der_seq(&[]); // empty SEQUENCE
-        let subject = der_seq(&[]); // empty Name SEQUENCE
-
-        let tbs = der_seq(&[&serial, &sig_alg, &issuer, &validity, &subject, spki]);
-        der_seq(&[&tbs])
-    }
-
     /// `Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }`
     /// (`critical` omitted — it's DEFAULT FALSE and optional).
     fn build_extension(oid_content: &[u8], value: &[u8]) -> Vec<u8> {
@@ -771,119 +850,214 @@ mod tests {
         );
     }
 
-    #[test]
-    fn spki_key_alg_round_trips_every_piv_algorithm() {
-        // Each `KeyAlg` fed through the real encoder (`subject_public_key_info`)
-        // must come back out of `parse_spki_key_alg` unchanged — the fallback
-        // path this exercises has to agree with what a card/cert actually
-        // carries, not just with a hand-built fixture.
-        let ecc_point = {
-            let mut p = vec![0x04];
-            p.extend(std::iter::repeat_n(0xAB, 64));
-            p
+    /// Like `build_cert`, but with a caller-supplied `subjectPublicKeyInfo`
+    /// (already-DER-encoded SEQUENCE) instead of the empty placeholder, and no
+    /// extensions field. Uses `crate::spki`'s length encoder throughout (not
+    /// the single-byte short form `build_cert` gets away with), since a real
+    /// SPKI — an RSA-4096 modulus especially — routinely needs long-form DER
+    /// lengths.
+    fn build_cert_with_spki(spki: &[u8]) -> Vec<u8> {
+        let serial = crate::spki::der_tlv(0x02, &[0x01]); // INTEGER 1
+        let sig_alg = crate::spki::der_seq(&[]);
+        let issuer = crate::spki::der_seq(&[]);
+        let validity = crate::spki::der_seq(&[]);
+        let subject = crate::spki::der_seq(&[]);
+
+        let tbs = crate::spki::der_seq(&[&serial, &sig_alg, &issuer, &validity, &subject, spki]);
+        crate::spki::der_seq(&[&tbs])
+    }
+
+    /// One (algorithm, key) pair per `KeyAlg` variant, shared by every
+    /// SPKI round-trip test below. RSA moduli deliberately set the top bit
+    /// (`0xC0..`) so a round-trip through `parse_subject_public_key_info`
+    /// exercises `strip_der_uint_sign_guard` undoing `der_uint`'s sign-guard
+    /// `0x00`, not just the no-guard-needed case.
+    fn round_trip_cases() -> Vec<(crate::KeyAlg, crate::PublicKey)> {
+        use crate::PublicKey;
+
+        let rsa_modulus = |bytes: usize| -> Vec<u8> {
+            let mut m = vec![0xFFu8; bytes]; // top bit set on purpose
+            m[0] = 0xC0;
+            m
         };
-        let eddsa_point = vec![0x11u8; 32];
-        let cases = [
+        let ec_point = |bytes: usize| vec![0x04u8; bytes]; // shape only, not a real point
+        let ed_point = vec![0x11u8; 32];
+
+        vec![
             (
-                KeyAlg::Rsa1024,
-                crate::PublicKey::Rsa {
-                    modulus: vec![0xFFu8; 128],
+                crate::KeyAlg::Rsa1024,
+                PublicKey::Rsa {
+                    modulus: rsa_modulus(128),
                     exponent: vec![0x01, 0x00, 0x01],
                 },
             ),
             (
-                KeyAlg::Rsa2048,
-                crate::PublicKey::Rsa {
-                    modulus: vec![0xFFu8; 256],
+                crate::KeyAlg::Rsa2048,
+                PublicKey::Rsa {
+                    modulus: rsa_modulus(256),
                     exponent: vec![0x01, 0x00, 0x01],
                 },
             ),
             (
-                KeyAlg::Rsa3072,
-                crate::PublicKey::Rsa {
-                    modulus: vec![0xFFu8; 384],
+                crate::KeyAlg::Rsa3072,
+                PublicKey::Rsa {
+                    modulus: rsa_modulus(384),
                     exponent: vec![0x01, 0x00, 0x01],
                 },
             ),
             (
-                KeyAlg::Rsa4096,
-                crate::PublicKey::Rsa {
-                    modulus: vec![0xFFu8; 512],
+                crate::KeyAlg::Rsa4096,
+                PublicKey::Rsa {
+                    modulus: rsa_modulus(512),
                     exponent: vec![0x01, 0x00, 0x01],
                 },
             ),
             (
-                KeyAlg::EccP256,
-                crate::PublicKey::Ecc {
-                    point: ecc_point.clone(),
+                crate::KeyAlg::EccP256,
+                PublicKey::Ecc {
+                    point: ec_point(65),
                 },
             ),
             (
-                KeyAlg::EccP384,
-                crate::PublicKey::Ecc {
-                    point: ecc_point.clone(),
+                crate::KeyAlg::EccP384,
+                PublicKey::Ecc {
+                    point: ec_point(97),
                 },
             ),
             (
-                KeyAlg::Ed25519,
-                crate::PublicKey::Ecc {
-                    point: eddsa_point.clone(),
+                crate::KeyAlg::Ed25519,
+                PublicKey::Ecc {
+                    point: ed_point.clone(),
                 },
             ),
-            (KeyAlg::X25519, crate::PublicKey::Ecc { point: eddsa_point }),
-        ];
-        for (alg, key) in cases {
-            let spki = crate::spki::subject_public_key_info(&key, alg).unwrap();
+            (crate::KeyAlg::X25519, PublicKey::Ecc { point: ed_point }),
+        ]
+    }
+
+    /// Round-trip every `KeyAlg` through [`crate::spki::subject_public_key_info`]
+    /// (the encoder) and [`parse_key_algorithm`] (this module's decoder) — the
+    /// two halves of the same ASN.1 shape, built independently, must agree.
+    #[test]
+    fn key_algorithm_round_trips_every_alg() {
+        for (alg, key) in &round_trip_cases() {
+            let spki = crate::spki::subject_public_key_info(key, *alg).unwrap();
             let cert = build_cert_with_spki(&spki);
             assert_eq!(
-                parse_spki_key_alg(&cert),
-                Ok(Some(alg)),
-                "algorithm {alg:?} did not round-trip"
+                parse_key_algorithm(&cert),
+                Ok(Some(*alg)),
+                "round-trip mismatch for {:?}",
+                alg
+            );
+        }
+    }
+
+    /// Round-trip every `KeyAlg` through [`crate::spki::subject_public_key_info`]
+    /// and [`parse_subject_public_key_info`] — the persistence path
+    /// `keyroost-transport`'s PIV key cache relies on to recover the *exact*
+    /// key bytes (not just the algorithm) it stored. Unlike
+    /// `key_algorithm_round_trips_every_alg`, this checks the full
+    /// `(KeyAlg, PublicKey)` comes back byte-identical to what went in.
+    #[test]
+    fn subject_public_key_info_round_trips_every_alg() {
+        for (alg, key) in &round_trip_cases() {
+            let der = crate::spki::subject_public_key_info(key, *alg).unwrap();
+            assert_eq!(
+                parse_subject_public_key_info(&der),
+                Ok((*alg, key.clone())),
+                "round-trip mismatch for {:?}",
+                alg
             );
         }
     }
 
     #[test]
-    fn spki_key_alg_rsa_modulus_with_high_bit_set_still_sizes_correctly() {
-        // A modulus whose top bit is set gets a DER sign-guard `0x00` prefix,
-        // one byte longer than the "raw" key size — the size calc must strip
-        // that prefix, not count it.
-        let key = crate::PublicKey::Rsa {
-            modulus: {
-                let mut m = vec![0xFFu8; 256]; // top bit set -> DER prefixes 0x00
-                m[0] = 0xFF;
-                m
-            },
-            exponent: vec![0x01, 0x00, 0x01],
-        };
-        let spki = crate::spki::subject_public_key_info(&key, KeyAlg::Rsa2048).unwrap();
-        let cert = build_cert_with_spki(&spki);
-        assert_eq!(parse_spki_key_alg(&cert), Ok(Some(KeyAlg::Rsa2048)));
+    fn subject_public_key_info_unknown_oid_is_an_error() {
+        // Unlike `parse_key_algorithm` (which degrades an unrecognized OID to
+        // `Ok(None)` because arbitrary third-party certificates are normal
+        // input), every real input to `parse_subject_public_key_info` is this
+        // crate's own `subject_public_key_info` output — an unrecognized OID
+        // here means the cache that stored it is corrupt, so it's an error.
+        let oid = [0x06, 0x03, 0x2A, 0x03, 0x04]; // 1.2.3.4
+        let null = [0x05, 0x00];
+        let mut alg_id_content = Vec::new();
+        alg_id_content.extend_from_slice(&oid);
+        alg_id_content.extend_from_slice(&null);
+        let mut alg_id = vec![0x30, alg_id_content.len() as u8];
+        alg_id.extend_from_slice(&alg_id_content);
+        let bit_string = [0x03, 0x02, 0x00, 0xAB];
+        let mut spki_content = alg_id;
+        spki_content.extend_from_slice(&bit_string);
+        let mut spki = vec![0x30, spki_content.len() as u8];
+        spki.extend_from_slice(&spki_content);
+
+        assert_eq!(
+            parse_subject_public_key_info(&spki),
+            Err(X509ParseError::Malformed)
+        );
     }
 
     #[test]
-    fn spki_key_alg_unrecognized_oid_is_none_not_an_error() {
-        use crate::spki::{der_seq, der_tlv};
-        // e.g. DSA (1.2.840.10040.4.1) — not a PIV algorithm, so this must
-        // degrade to "can't tell", not fail the whole read.
-        let dsa_oid = der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x01]);
-        let alg_id = der_seq(&[&dsa_oid]);
-        let spk = der_seq(&[&alg_id, &[0x03, 0x01, 0x00]]); // dummy empty BIT STRING
-        let cert = build_cert_with_spki(&spk);
-        assert_eq!(parse_spki_key_alg(&cert), Ok(None));
+    fn subject_public_key_info_truncated_input_errors_not_panics() {
+        // A cache file corrupted mid-write (a crash between the temp-file
+        // write and the rename would still leave a complete old-or-new file,
+        // but a hand-edited or bit-flipped one wouldn't) must be reported,
+        // never panic the caller.
+        let der = crate::spki::subject_public_key_info(
+            &crate::PublicKey::Ecc {
+                point: vec![0x11u8; 32],
+            },
+            crate::KeyAlg::Ed25519,
+        )
+        .unwrap();
+        for cut in 0..der.len() {
+            assert!(parse_subject_public_key_info(&der[..cut]).is_err());
+        }
+    }
+
+    #[test]
+    fn key_algorithm_unrecognized_rsa_modulus_size_is_none_not_error() {
+        // 2049 bytes (16392 bits) doesn't match any PIV RSA size — the reader
+        // must degrade to "unknown", not error out an otherwise-valid cert.
+        use crate::PublicKey;
+        let key = PublicKey::Rsa {
+            modulus: vec![0xC1; 2049],
+            exponent: vec![0x01, 0x00, 0x01],
+        };
+        let spki = crate::spki::subject_public_key_info(&key, crate::KeyAlg::Rsa2048).unwrap();
+        let cert = build_cert_with_spki(&spki);
+        assert_eq!(parse_key_algorithm(&cert), Ok(None));
+    }
+
+    #[test]
+    fn key_algorithm_unknown_oid_is_none_not_error() {
+        // AlgorithmIdentifier { OID 1.2.3.4, NULL }, BIT STRING over junk bytes
+        // — a key type this reader has no `KeyAlg` for.
+        let oid = [0x06, 0x03, 0x2A, 0x03, 0x04]; // 1.2.3.4
+        let null = [0x05, 0x00];
+        let mut alg_id_content = Vec::new();
+        alg_id_content.extend_from_slice(&oid);
+        alg_id_content.extend_from_slice(&null);
+        let mut alg_id = vec![0x30, alg_id_content.len() as u8];
+        alg_id.extend_from_slice(&alg_id_content);
+        let bit_string = [0x03, 0x02, 0x00, 0xAB];
+        let mut spki_content = alg_id;
+        spki_content.extend_from_slice(&bit_string);
+        let mut spki = vec![0x30, spki_content.len() as u8];
+        spki.extend_from_slice(&spki_content);
+
+        assert_eq!(parse_key_algorithm(&build_cert_with_spki(&spki)), Ok(None));
     }
 
     #[test]
     fn spki_key_alg_ec_unrecognized_curve_is_none() {
         use crate::spki::{der_seq, der_tlv};
+        // id-ecPublicKey (1.2.840.10045.2.1), raw DER OID content.
+        let ec_public_key = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
         // secp256k1 (1.3.132.0.10) — a real EC curve, but not one PIV supports.
         let secp256k1 = [0x2B, 0x81, 0x04, 0x00, 0x0A];
-        let alg_id = der_seq(&[
-            &der_tlv(0x06, OID_EC_PUBLIC_KEY),
-            &der_tlv(0x06, &secp256k1),
-        ]);
+        let alg_id = der_seq(&[&der_tlv(0x06, &ec_public_key), &der_tlv(0x06, &secp256k1)]);
         let spk = der_seq(&[&alg_id, &[0x03, 0x02, 0x00, 0x04]]);
         let cert = build_cert_with_spki(&spk);
-        assert_eq!(parse_spki_key_alg(&cert), Ok(None));
+        assert_eq!(parse_key_algorithm(&cert), Ok(None));
     }
 }
