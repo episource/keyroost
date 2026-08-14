@@ -66,12 +66,6 @@ Being worked on right now — check with whoever holds it before starting.
   card; the house pattern fuzzes every parser of untrusted input (15 targets
   today). One target feeding arbitrary bytes to all three entry points.
 
-- **Migration note at the next release:** `keyroost-piv::generate_key` and
-  `PivSession::generate_key` grew `pin_policy`/`touch_policy` parameters in
-  #97 — a breaking signature change for library consumers. One line in
-  `docs/migration.html`'s library-API table when the next version's section
-  is written (house precedent: the v0.7.5 API table).
-
 - **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
   capability is either present or absent and there is nowhere to record "we
   could not check". On a USB-HID-only enumeration nothing has been sent to the
