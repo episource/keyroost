@@ -32,12 +32,12 @@ Being worked on right now — check with whoever holds it before starting.
   `CARGO_PKG_VERSION` in the GUI (About/settings footer), and export
   `VERSION` in the AppImage build.
 
-- **Fix the GUI's Supported Devices link ([#99](https://github.com/framefilter/keyroost/issues/99)).**
-  The empty state links to `framefilter.github.io/keyroost/devices`, which
-  does not exist. Point it at a real page (or add a devices page/redirect).
-  Playbook follow-through: the release documentation audit checks pages
-  against code but not **links inside the app pointing at pages** — add that
-  direction to the audit step in `packaging/RELEASING.md`.
+- **Documentation audit: also walk links FROM the app TO the site.** #99's
+  broken Supported Devices link survived the full v0.7.8 audit because the
+  audit checks pages against code, never the app's outbound links against
+  the pages (`ui/help.rs` `learn_url` callers are the inventory). Add that
+  direction to the audit step in `packaging/RELEASING.md`. (The link itself
+  is fixed: `docs/devices.html` now exists.)
 
 - **Contribution model rework — DECIDED 2026-08-14, target: next release.**
   The model: squash-only button merges, required PR + required status checks,
