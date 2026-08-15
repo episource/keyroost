@@ -6221,8 +6221,14 @@ fn load_pubkey_material(
 ) -> Result<(keyroost_piv::KeyAlg, keyroost_piv::PublicKey), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let der = spki_to_der(&bytes)?;
-    let (alg, key) = keyroost_piv::x509_parse::parse_subject_public_key_info(&der)
-        .map_err(|e| format!("{}: not a valid SubjectPublicKeyInfo: {}", path.display(), e))?;
+    let (alg, key) =
+        keyroost_piv::x509_parse::parse_subject_public_key_info(&der).map_err(|e| {
+            format!(
+                "{}: not a valid SubjectPublicKeyInfo: {}",
+                path.display(),
+                e
+            )
+        })?;
     Ok((alg, key))
 }
 
