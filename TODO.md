@@ -24,20 +24,43 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Ready to pick up
 
-- **Rework the contribution model: PRs should land without manual rebases.**
-  Decision made 2026-08-14, after the second external PR in a week; the
-  maintainer wants a contributor-friendly flow and more efficient CI/CD, with
-  the security thinking done properly rather than dropped.
-  *Why the current model exists:* the `main` ruleset requires a verified
-  signature on every commit and forbids merge commits, and the maintainer
-  signs with a touch-required hardware key. So external PRs cannot use the
-  merge button at all — each one is fetched, rebased and re-signed locally
-  (one hardware touch per commit), pushed to main, and the PR closes as
-  "closed", not "merged". Both #96 and #97 hit mid-rebase signing failures
-  that needed manual unsticking; contributors lose the merged badge; nothing
-  about it scales.
-  *What to work through, not assume:*
-  - **What per-commit signatures actually protect here, and what could
+- **Show the app version ([#98](https://github.com/framefilter/keyroost/issues/98)).**
+  The GUI displays its version nowhere, and the AppImage carries no embedded
+  version metadata — AppImage managers read `X-AppImage-Version` from the
+  bundled desktop file, which linuxdeploy injects from a `VERSION` env var
+  `packaging/appimage/build-appimage.sh` never sets. Fix both: surface
+  `CARGO_PKG_VERSION` in the GUI (About/settings footer), and export
+  `VERSION` in the AppImage build.
+
+- **Fix the GUI's Supported Devices link ([#99](https://github.com/framefilter/keyroost/issues/99)).**
+  The empty state links to `framefilter.github.io/keyroost/devices`, which
+  does not exist. Point it at a real page (or add a devices page/redirect).
+  Playbook follow-through: the release documentation audit checks pages
+  against code but not **links inside the app pointing at pages** — add that
+  direction to the audit step in `packaging/RELEASING.md`.
+
+- **Contribution model rework — DECIDED 2026-08-14, target: next release.**
+  The model: squash-only button merges, required PR + required status checks,
+  strict fork-CI approval, per-commit signature rule dropped; the hardware key
+  moves to per-release attestation (before tagging, review the full
+  `git diff <last-tag>..HEAD`, then the signed tag covers the whole delta);
+  SECURITY.md gains an explicit trust-anchor statement (signed tags,
+  provenance attestations, SHA256SUMS, Trusted Publishing; main signatures
+  best-effort). Grounding: a survey of 11 comparable projects found none
+  requiring signed commits, and GitHub's rules make button-merges of others'
+  PRs structurally impossible under the current ruleset; the xz postmortem
+  shows release provenance, not commit signing, is what catches the real
+  attack.
+  **Still to design before flipping anything: the review model for other
+  people's commits.** Hard requirement from the maintainer: first-time
+  contributors must not get anywhere without manual intervention. Partly
+  satisfied structurally (only the maintainer can merge, and fork-CI approval
+  set to "require for all outside collaborators" gates CI runs too); what
+  needs designing is the review discipline itself — what a security review of
+  a contributor commit checks, and whether it is written down as a checklist
+  the way the release playbook is. No ruleset changes until that is settled.
+
+- **What per-commit signatures actually protect here, and what could
     replace them.** Release integrity already has independent guarantees:
     signed `v*` tags (admin-only by ruleset), build-provenance attestation on
     release assets, SHA256SUMS, and Trusted Publishing to crates.io. If those
