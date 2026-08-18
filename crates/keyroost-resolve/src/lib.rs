@@ -17,8 +17,8 @@ use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
 pub use device::{
-    correlate, enumerate, factory_reset_plan, Caps, Device, DeviceId, DeviceKind, ResetStep,
-    StepOutcome, StepReport,
+    correlate, enumerate, factory_reset_plan, CapState, Caps, Device, DeviceId, DeviceKind,
+    ResetStep, StepOutcome, StepReport,
 };
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.

@@ -4,7 +4,7 @@
 //! stdout wrappers.
 
 use crate::sanitize_terminal;
-use keyroost_resolve::{Device, DeviceKind};
+use keyroost_resolve::{CapState, Device, DeviceKind};
 
 /// The display label: the friendly name when set, else the model. Sanitized —
 /// the model comes from the device's USB descriptor and the name from
@@ -14,8 +14,18 @@ fn label(dev: &Device) -> String {
 }
 
 /// Capability badges joined for display, e.g. "FIDO2 · OATH · PGP · PIV".
+/// A capability keyroost could not check against the device renders with a
+/// trailing "?" (e.g. "OTP?"): offered as always, but never claimed as
+/// verified present.
 fn badge_line(dev: &Device) -> String {
-    dev.cap_badges().join(" · ")
+    dev.cap_badge_states()
+        .into_iter()
+        .map(|(label, state)| match state {
+            CapState::Unverified => format!("{label}?"),
+            _ => label.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Short serial for the at-a-glance overview: first 8 chars, "…" if longer.
@@ -163,6 +173,7 @@ mod tests {
             transport: transport.into(),
             firmware: String::new(),
             caps,
+            unverified: Caps::default(),
             kind,
             hid_path: None,
             reader: None,
@@ -256,6 +267,33 @@ mod tests {
                 "correlated line leaked a control char: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn unverified_badges_carry_a_question_mark() {
+        // A Token2 key seen only over USB-HID: OTP is offered on the vendor
+        // hint but was never checked against the device — the badge must say
+        // so ("OTP?"), in both the overview and the correlated summary.
+        let mut d = dev(
+            "Token2",
+            "PIN+",
+            None,
+            "S1",
+            "USB · FIDO HID",
+            caps_of(&[Caps::FIDO2, Caps::OTP]),
+            DeviceKind::Key,
+        );
+        d.unverified.insert(Caps::OTP);
+        let lines = overview_lines(std::slice::from_ref(&d));
+        assert!(lines[0].contains("FIDO2 · OTP?"), "got: {}", lines[0]);
+        let lines = correlated_lines(std::slice::from_ref(&d));
+        assert!(lines[0].contains("FIDO2 · OTP?"), "got: {}", lines[0]);
+
+        // Verified capabilities keep the bare label.
+        d.unverified = Caps::default();
+        let lines = overview_lines(std::slice::from_ref(&d));
+        assert!(lines[0].contains("FIDO2 · OTP"));
+        assert!(!lines[0].contains("OTP?"));
     }
 
     #[test]

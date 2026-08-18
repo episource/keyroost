@@ -33,6 +33,34 @@ impl Caps {
     }
 }
 
+/// How well a capability on a [`Device`] is known. `Caps` alone is a bitset —
+/// present or absent, with nowhere to record "we could not check" — so on a
+/// USB-HID-only enumeration absence of evidence used to be written down as
+/// absence of the feature (the whole of the v0.7.7 OTP argument, #82 → #95).
+/// This is the third state.
+///
+/// The behaviour rule: **`Unverified` always behaves as "offer the surface"**
+/// (the capability bit is set in [`Device::caps`], exactly the pre-existing
+/// fail-open behaviour). The tri-state changes what is *said*, not what is
+/// offered — an attempt against an unverified surface produces the real
+/// answer, which is a decent message rather than a silent guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapState {
+    /// The device itself answered: the applet responded to a real `SELECT`
+    /// over PC/SC, or (for FIDO2) the FIDO-HID node is the evidence.
+    Present,
+    /// Not offered. Either the card channel declined the applet's `SELECT`
+    /// (probed absence), or keyroost had no channel to ask over and no
+    /// label-grade reason to offer the surface. Never derived from a
+    /// product-id table (standing decision: no device→capability matrix).
+    Absent,
+    /// Nothing was asked of the device, but the surface is offered anyway on
+    /// a label-grade hint (today: the Token2 vendor id offering OTP, exactly
+    /// as `has_otp = is_token2` always did). Rendered distinctly so an offer
+    /// is never mistaken for verified presence.
+    Unverified,
+}
+
 /// What kind of physical device this is. `Token` is the Molto2 family;
 /// `ProgToken` is the single-profile programmable token; everything else is a
 /// `Key`.
@@ -58,18 +86,47 @@ pub struct Device {
     pub transport: String,
     pub firmware: String,
     pub caps: Caps,
+    /// The subset of `caps` that keyroost could not verify against the device
+    /// (no card channel answered a `SELECT` for it) — offered on a label-grade
+    /// hint only. Invariant: `unverified` ⊆ `caps`, so every `caps.has(..)`
+    /// caller keeps today's fail-open behaviour untouched; consult
+    /// [`Device::cap_state`] for the honest per-capability answer.
+    pub unverified: Caps,
     pub kind: DeviceKind,
     pub hid_path: Option<PathBuf>,
     pub reader: Option<String>,
 }
 
 impl Device {
+    /// The tri-state answer for one capability: [`CapState::Present`] when the
+    /// device answered for it, [`CapState::Unverified`] when it is offered
+    /// without device evidence, [`CapState::Absent`] otherwise.
+    pub fn cap_state(&self, c: Caps) -> CapState {
+        if !self.caps.has(c) {
+            CapState::Absent
+        } else if self.unverified.has(c) {
+            CapState::Unverified
+        } else {
+            CapState::Present
+        }
+    }
+
     /// Ordered capability badge labels — the shared vocabulary used by the CLI
     /// overview/list and the GUI pills, so they cannot drift. A Token shows a
     /// single "TOTP token" badge; a Key shows one per applet it answers.
     pub fn cap_badges(&self) -> Vec<&'static str> {
+        self.cap_badge_states()
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect()
+    }
+
+    /// [`Device::cap_badges`] with each badge's [`CapState`] attached, for
+    /// surfaces that render unverified capabilities distinctly. Only offered
+    /// capabilities appear, so every state here is `Present` or `Unverified`.
+    pub fn cap_badge_states(&self) -> Vec<(&'static str, CapState)> {
         if self.kind == DeviceKind::Token {
-            return vec!["TOTP token"];
+            return vec![("TOTP token", CapState::Present)];
         }
         let mut v = Vec::new();
         for (c, label) in [
@@ -80,7 +137,7 @@ impl Device {
             (Caps::OTP, "OTP"),
         ] {
             if self.caps.has(c) {
-                v.push(label);
+                v.push((label, self.cap_state(c)));
             }
         }
         v
@@ -375,6 +432,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
             transport: "USB · PC/SC".into(),
             firmware: String::new(),
             caps,
+            unverified: Caps::default(),
             kind: DeviceKind::Token,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
@@ -399,6 +457,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
             transport: "NFC · PC/SC".into(),
             firmware: String::new(),
             caps,
+            unverified: Caps::default(),
             kind: DeviceKind::ProgToken,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
@@ -450,7 +509,10 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
             serial,
             transport: "USB · PC/SC".into(),
             firmware: String::new(),
+            // Every capability on this row came from a real SELECT over the
+            // reader — ground truth, nothing unverified.
             caps,
+            unverified: Caps::default(),
             kind: DeviceKind::Key,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
@@ -494,9 +556,18 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
                     || (!serial.is_empty() && !dup_serials.contains(&serial) && d.serial == serial))
         });
         if let Some(dev) = existing {
+            // The HID node itself is the evidence for FIDO2 — verified.
             dev.caps.insert(Caps::FIDO2);
-            if has_otp {
+            // OTP: if the reader already answered the applet's SELECT it is
+            // verified present and stays so. If the probe did NOT answer for
+            // it, the vendor hint still offers the surface (insert-only, a
+            // real probe always wins) — but honestly, as unverified: per #95
+            // the applet may live on a channel the probe cannot see, so a
+            // declined SELECT is not proof of absence, and nothing was proven
+            // present either.
+            if has_otp && !dev.caps.has(Caps::OTP) {
                 dev.caps.insert(Caps::OTP);
+                dev.unverified.insert(Caps::OTP);
             }
             dev.hid_path = Some(hid.path.clone());
             dev.transport = "USB · PC/SC + FIDO HID".into();
@@ -513,9 +584,15 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
                 format!("hid:{}", hid.path.display())
             };
             let mut caps = Caps::default();
+            let mut unverified = Caps::default();
             caps.insert(Caps::FIDO2);
             if has_otp {
+                // No reader bound: nothing has been asked of this key over a
+                // card channel. The vendor id is a label-grade hint that the
+                // surface should be offered (exactly the has_otp rule above),
+                // not evidence — record it as unverified, never as presence.
                 caps.insert(Caps::OTP);
+                unverified.insert(Caps::OTP);
             }
             let vendor = vendor_name(hid.vendor_id).to_string();
             let model = if is_token2 {
@@ -534,6 +611,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
                 transport: "USB · FIDO HID".into(),
                 firmware: String::new(),
                 caps,
+                unverified,
                 kind: DeviceKind::Key,
                 hid_path: Some(hid.path.clone()),
                 reader: reader_name,
@@ -606,6 +684,11 @@ impl ResetStep {
 /// touch ceremony, so it ends the flow). Only applets the key advertises
 /// appear. Pure — the single source of truth both the CLI and GUI consume,
 /// so they can never disagree about what "everything" means.
+///
+/// Callers pass [`Device::caps`], the *offered* set, so an unverified
+/// capability (see [`CapState::Unverified`]) gets its reset step too:
+/// unverified always behaves as "offer it", and the attempt itself reports
+/// whether the applet is really there.
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     let mut steps = Vec::new();
     if caps.has(Caps::OATH) {
@@ -993,6 +1076,224 @@ mod tests {
                 devs[0].caps.has(Caps::OTP),
                 "unknown PID {pid:#06x} must keep OTP"
             );
+        }
+    }
+
+    #[test]
+    fn probed_applets_are_present_not_unverified() {
+        // Every capability on a probe-backed row came from a real SELECT over
+        // the reader — ground truth, so the tri-state reads Present.
+        let probes = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            true,
+            true,
+            Some("37806840"),
+            Some(9),
+            Some(16),
+        )];
+        let hids = [hid(
+            0x1050,
+            0x0407,
+            "/dev/hidraw17",
+            None,
+            Some(9),
+            Some(16),
+        )];
+        let d = &correlate(&hids, &probes, &Keyring::default())[0];
+        for c in [Caps::FIDO2, Caps::OATH, Caps::PGP, Caps::PIV] {
+            assert_eq!(d.cap_state(c), CapState::Present);
+        }
+        assert!(d.unverified.is_empty());
+    }
+
+    #[test]
+    fn probed_absent_stays_absent() {
+        // A SELECT the card declined is recorded absence, not an offer: the
+        // surface is neither offered nor rendered. (OATH answered; PGP/PIV
+        // declined.)
+        let probes = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            false,
+            false,
+            Some("37806840"),
+            Some(9),
+            Some(16),
+        )];
+        let d = &correlate(&[], &probes, &Keyring::default())[0];
+        assert_eq!(d.cap_state(Caps::OATH), CapState::Present);
+        assert_eq!(d.cap_state(Caps::PGP), CapState::Absent);
+        assert_eq!(d.cap_state(Caps::PIV), CapState::Absent);
+        assert!(!d.caps.has(Caps::PGP) && !d.caps.has(Caps::PIV));
+    }
+
+    #[test]
+    fn hid_only_token2_otp_is_unverified_and_still_offered() {
+        // A USB-HID-only enumeration has asked the device nothing over a card
+        // channel. FIDO2 is Present (the HID node is the evidence); OTP is
+        // offered on the vendor hint — and now honestly recorded as
+        // Unverified rather than silently written down as present.
+        let hids = [hid(
+            keyroost_proto::USB_VID,
+            0x0013,
+            "/dev/hidraw9",
+            Some("S1"),
+            Some(9),
+            Some(4),
+        )];
+        let d = &correlate(&hids, &[], &Keyring::default())[0];
+        assert_eq!(d.cap_state(Caps::FIDO2), CapState::Present);
+        assert_eq!(d.cap_state(Caps::OTP), CapState::Unverified);
+        // Unverified ALWAYS behaves as "offer it": the caps bit is set, so
+        // every existing caller (targeting, tabs, reset planning) sees it.
+        assert!(d.caps.has(Caps::OTP));
+        assert_eq!(
+            factory_reset_plan(d.caps),
+            vec![ResetStep::Token2Otp, ResetStep::Fido],
+            "an unverified OTP capability must still get its reset step"
+        );
+        assert_eq!(
+            d.cap_badge_states(),
+            vec![("FIDO2", CapState::Present), ("OTP", CapState::Unverified)]
+        );
+    }
+
+    #[test]
+    fn probe_answer_beats_the_vendor_hint_on_merge() {
+        // When the reader DID answer the OTP applet's SELECT, the merge keeps
+        // it verified — the hint never downgrades ground truth.
+        let mut p = probe(
+            "Token2 PIN+ 00 00",
+            false,
+            false,
+            false,
+            false,
+            None,
+            Some(1),
+            Some(2),
+        );
+        p.has_otp = true;
+        let hids = [hid(
+            keyroost_proto::USB_VID,
+            0x0025,
+            "/dev/hidraw1",
+            Some("S2"),
+            Some(1),
+            Some(2),
+        )];
+        let devs = correlate(&hids, std::slice::from_ref(&p), &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].cap_state(Caps::OTP), CapState::Present);
+        assert!(!devs[0].unverified.has(Caps::OTP));
+    }
+
+    #[test]
+    fn merged_card_row_offers_otp_as_unverified_when_the_probe_declined() {
+        // The probe SELECTed the OTP applet and got a decline, but the vendor
+        // hint still offers the surface (#95: the applet may live on a channel
+        // the probe cannot see). Offered — and labelled unverified, because
+        // neither answer was proven.
+        let probes = [probe(
+            "Token2 PIN+ 00 00",
+            false,
+            false,
+            true,
+            false,
+            None,
+            Some(1),
+            Some(2),
+        )];
+        let hids = [hid(
+            keyroost_proto::USB_VID,
+            0x0025,
+            "/dev/hidraw1",
+            Some("S2"),
+            Some(1),
+            Some(2),
+        )];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].cap_state(Caps::PGP), CapState::Present);
+        assert_eq!(devs[0].cap_state(Caps::OTP), CapState::Unverified);
+        assert!(devs[0].caps.has(Caps::OTP), "still offered");
+        assert_eq!(devs[0].cap_state(Caps::FIDO2), CapState::Present);
+    }
+
+    #[test]
+    fn unverified_never_comes_from_the_pid_table() {
+        // Standing decision: no device→capability matrix. The tri-state must
+        // be identical across product ids — one whose vendor function set
+        // lists OTP, one whose set omits it (Bio3, the #95 case), and ids the
+        // table has never heard of. Only the vendor id (a label-grade hint)
+        // and real probes may feed the state.
+        let mut states = std::collections::HashSet::new();
+        for pid in [0x0013u16, 0x0204, 0x0099, 0x0500] {
+            let hids = [hid(
+                keyroost_proto::USB_VID,
+                pid,
+                "/dev/hidraw9",
+                Some("S1"),
+                Some(9),
+                Some(4),
+            )];
+            let d = &correlate(&hids, &[], &Keyring::default())[0];
+            states.insert(format!("{:?}", d.cap_state(Caps::OTP)));
+        }
+        assert_eq!(
+            states.into_iter().collect::<Vec<_>>(),
+            vec!["Unverified".to_string()],
+            "every Token2 product id must get the same OTP state"
+        );
+        // Another vendor's key is untouched by the hint: Absent, not offered.
+        let other = [hid(0x1209, 0x0013, "/dev/hidraw3", Some("SK"), None, None)];
+        let d = &correlate(&other, &[], &Keyring::default())[0];
+        assert_eq!(d.cap_state(Caps::OTP), CapState::Absent);
+    }
+
+    #[test]
+    fn unverified_is_always_a_subset_of_caps() {
+        // The structural guarantee behind "unverified still behaves as offer
+        // it": an unverified bit outside `caps` would be a capability that is
+        // rendered but not offered, which no surface handles.
+        let probes = [probe(
+            "Token2 PIN+ 00 00",
+            false,
+            true,
+            false,
+            false,
+            None,
+            Some(1),
+            Some(2),
+        )];
+        let hids = [
+            hid(
+                keyroost_proto::USB_VID,
+                0x0025,
+                "/dev/hidraw1",
+                Some("S2"),
+                Some(1),
+                Some(2),
+            ),
+            hid(0x1050, 0x0407, "/dev/hidraw2", Some("YK"), Some(1), Some(3)),
+        ];
+        for d in correlate(&hids, &probes, &Keyring::default()) {
+            for c in [
+                Caps::FIDO2,
+                Caps::OATH,
+                Caps::PGP,
+                Caps::PIV,
+                Caps::TOTP,
+                Caps::OTP,
+                Caps::PROG,
+            ] {
+                assert!(
+                    !d.unverified.has(c) || d.caps.has(c),
+                    "unverified must be a subset of caps"
+                );
+            }
         }
     }
 

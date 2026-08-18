@@ -16,7 +16,7 @@ mod settings;
 mod ui;
 use otp_pane::OtpState;
 use settings::Settings;
-use ui::device::{self, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
+use ui::device::{self, CapState, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
 use ui::theme::{self, BtnKind, Mode, Palette};
 
 use eframe::egui;
@@ -5999,6 +5999,7 @@ impl App {
                                         transport: "USB · FIDO HID (admin required)".into(),
                                         firmware: String::new(),
                                         caps,
+                                        unverified: Caps::default(),
                                         kind: DeviceKind::Key,
                                         hid_path: None,
                                         reader: None,
@@ -8032,8 +8033,16 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
         (p.txt2, p.raised2)
     };
     let mut px = tx;
-    for label in dev.cap_badges() {
-        px += paint_pill(ui, egui::pos2(px, py), label, fg, bg) + 5.0;
+    for (label, state) in dev.cap_badge_states() {
+        // An unverified capability (offered on a hint, never checked against
+        // the device) renders as a dimmer "OTP?" pill — same vocabulary as the
+        // CLI's badge line, so the two never disagree about what was proven.
+        if state == CapState::Unverified {
+            let text = format!("{label}?");
+            px += paint_pill(ui, egui::pos2(px, py), &text, p.txt3, bg) + 5.0;
+        } else {
+            px += paint_pill(ui, egui::pos2(px, py), label, fg, bg) + 5.0;
+        }
     }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -9033,16 +9042,33 @@ impl App {
             for t in dev.tabs() {
                 let active = self.cap_tab == t;
                 let color = if active { p.txt } else { p.txt3 };
-                let resp = ui
+                // A capability keyroost could not check against the device
+                // gets a quiet "?" — the tab works exactly the same, the
+                // marker only keeps an offer from reading as verified fact.
+                let unverified = dev.tab_unverified(t);
+                let label = if unverified {
+                    format!("{} ?", cap_tab_label(t))
+                } else {
+                    cap_tab_label(t).to_string()
+                };
+                let mut resp = ui
                     .add(
                         egui::Label::new(
-                            egui::RichText::new(cap_tab_label(t))
+                            egui::RichText::new(label)
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
                         .sense(egui::Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if unverified {
+                    resp = resp.on_hover_text(
+                        "Not verified: no smart-card reader was available to \
+                         confirm this feature on the key (reader missing or the \
+                         smart-card service is not running). It is offered \
+                         anyway — using it gives a definite answer.",
+                    );
+                }
                 if active {
                     let y = resp.rect.bottom() + 6.0;
                     ui.painter().line_segment(
@@ -16717,6 +16743,7 @@ mod tests {
             transport: "USB".into(),
             firmware: String::new(),
             caps: Caps::default(),
+            unverified: Caps::default(),
             kind: DeviceKind::Key,
             hid_path: None,
             reader: None,

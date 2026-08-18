@@ -19,6 +19,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and cross-checked against Nitrokey's published firmware source. ([#102])
 
 ### Changed
+- **keyroost now says when it couldn't check a capability instead of guessing
+  silently.** A capability can be verified present (the device answered for
+  it), absent, or *unverified* — offered without device evidence, which
+  happens when a key is seen only over USB-HID and no smart-card reader was
+  available to ask. Unverified capabilities behave exactly as before (the
+  surface is offered and trying it gives the definite answer), but they are
+  now rendered honestly: the GUI tab and capability pill gain a quiet "?"
+  with an explanation, the CLI overview and `list` show e.g. `OTP?`, and the
+  `--json` device output carries the state in a new `caps_unverified` field.
+  This closes the gap behind the #82 → #95 OTP back-and-forth: the old
+  present/absent-only model had to write "could not check" down as one or the
+  other, giving a guess an authority it should never have had. ([#95])
+
 - **`piv generate-key --pin-policy` / `--touch-policy` now explain
   themselves.** The flags have chosen the key-generation PIN/touch policy
   since PIV management landed, but `--help` never said what the values mean.

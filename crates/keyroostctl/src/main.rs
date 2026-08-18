@@ -59,6 +59,12 @@ mod json_out {
         /// "key" or "token".
         pub kind: &'static str,
         pub caps: Vec<&'static str>,
+        /// The subset of `caps` keyroost could not verify against the device
+        /// (no card channel was available to ask): still offered, but not
+        /// proven present. Tri-state per capability: in `caps` only =
+        /// verified present; in both lists = offered but unverified; in
+        /// neither = absent.
+        pub caps_unverified: Vec<&'static str>,
     }
 
     /// `keyroostctl molto --json info`.
@@ -2476,6 +2482,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         DeviceKind::ProgToken => "prog-token",
                     },
                     caps: d.cap_badges(),
+                    caps_unverified: d
+                        .cap_badge_states()
+                        .into_iter()
+                        .filter(|(_, s)| *s == keyroost_resolve::CapState::Unverified)
+                        .map(|(l, _)| l)
+                        .collect(),
                 })
                 .collect();
             emit_json(&out)?;
@@ -9168,6 +9180,7 @@ mod cli_tests {
                 transport: "USB".into(),
                 firmware: String::new(),
                 caps,
+                unverified: Caps::default(),
                 kind: DeviceKind::Key,
                 hid_path: hid.map(std::path::PathBuf::from),
                 reader: reader.map(str::to_owned),
@@ -9240,6 +9253,7 @@ mod cli_tests {
                 transport: "USB · PC/SC".into(),
                 firmware: String::new(),
                 caps,
+                unverified: Caps::default(),
                 kind: DeviceKind::Token,
                 hid_path: None,
                 reader: Some(reader.to_string()),
@@ -9271,6 +9285,7 @@ mod cli_tests {
                 transport: String::new(),
                 firmware: String::new(),
                 caps: Caps::default(),
+                unverified: Caps::default(),
                 kind: DeviceKind::Key,
                 hid_path: None,
                 reader: Some(reader.to_string()),
@@ -9540,10 +9555,19 @@ mod cli_tests {
             transport: "USB · PC/SC + FIDO HID".into(),
             kind: "key",
             caps: vec!["FIDO2", "OATH", "PIV"],
+            caps_unverified: vec![],
         };
         assert_json_has_keys(
             &d,
-            &["vendor", "model", "serial", "transport", "kind", "caps"],
+            &[
+                "vendor",
+                "model",
+                "serial",
+                "transport",
+                "kind",
+                "caps",
+                "caps_unverified",
+            ],
         );
         // The whole overview is a JSON array of these.
         let arr = serde_json::to_string(&vec![d]).unwrap();
@@ -10026,6 +10050,7 @@ mod prop_tests {
             transport: String::new(),
             firmware: String::new(),
             caps,
+            unverified: keyroost_resolve::Caps::default(),
             kind: keyroost_resolve::DeviceKind::Key,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(String::from),
