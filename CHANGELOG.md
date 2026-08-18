@@ -15,6 +15,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (firmware-dependent). Settles the CLI half of the [#97] review follow-ups —
   the GUI/CLI parity itself turned out to already exist. ([#97])
 
+### Fixed
+- **The app now says which version it is.** The GUI shows a small version
+  next to the wordmark in the top bar, and the AppImage embeds its version in
+  the bundle metadata (`X-AppImage-Version`) so AppImage managers such as
+  Gear Lever can display it. Previously the version was visible nowhere —
+  not in the app, not in the AppImage. Reported by @alphazo. ([#98])
+
 ## [0.7.8] - 2026-08-13
 
 ### Fixed
@@ -853,6 +860,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#95]: https://github.com/framefilter/keyroost/issues/95
 [#96]: https://github.com/framefilter/keyroost/pull/96
 [#97]: https://github.com/framefilter/keyroost/pull/97
+[#98]: https://github.com/framefilter/keyroost/issues/98
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.8...HEAD
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7

@@ -32,6 +32,11 @@ use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
 use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 
+/// The version chip next to the wordmark in the top bar — the one place the
+/// running app shows which version it is (#98). Compile-time, straight from
+/// the workspace version, so it can never drift from the release.
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 /// How the selected FIDO key is reached: over USB-HID (a `hidraw` path) or over
 /// a PC/SC reader (NFC or contact, by reader name).
 #[derive(Debug, Clone)]
@@ -8194,6 +8199,14 @@ impl App {
                             .font(theme::f_bold(14.0))
                             .color(p.txt),
                     );
+                    ui.add_space(6.0);
+                    // Quiet version chip: the only place the app says which
+                    // version it is (#98), so keep it visible but muted.
+                    ui.label(
+                        egui::RichText::new(VERSION_LABEL)
+                            .font(theme::f_reg(11.0))
+                            .color(p.txt3),
+                    );
                     ui.add_space(12.0);
                     theme::status_dot(ui, p.ok, 7.0);
                     ui.add_space(5.0);
@@ -14828,6 +14841,24 @@ fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #98: the top bar's version chip is the only place the running app
+    /// states its version — keep it a well-formed "vX.Y.Z" so it never
+    /// regresses to an empty or unprefixed string.
+    #[test]
+    fn version_label_is_v_prefixed_semver() {
+        let rest = VERSION_LABEL
+            .strip_prefix('v')
+            .expect("version label must start with 'v'");
+        assert_eq!(rest, env!("CARGO_PKG_VERSION"));
+        assert!(
+            rest.split('.').count() >= 3
+                && rest.split('.').take(3).all(|part| {
+                    !part.is_empty() && part.chars().all(|c| c.is_ascii_digit() || c == '-')
+                }),
+            "version label {VERSION_LABEL:?} is not vMAJOR.MINOR.PATCH"
+        );
+    }
 
     #[test]
     fn factory_reset_summary_lists_applets_and_flags_piv_and_fido() {
