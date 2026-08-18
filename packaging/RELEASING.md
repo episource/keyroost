@@ -103,6 +103,15 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 
 ## 3. Tag and watch the build
 
+- [ ] **Pre-tag delta review.** Review the full release delta before
+      tagging: `git log --oneline <previous-tag>..HEAD` to walk it, then
+      `git diff <previous-tag>..HEAD` for anything unfamiliar. Commits on
+      main are not individually signed; the tag signature is the only
+      cryptographic statement covering the release, and SECURITY.md
+      documents that it is made after this review. Each contribution was
+      reviewed at merge (`packaging/REVIEWING.md`); this pass reviews the
+      aggregate.
+
 - [ ] `git tag -s vX.Y.Z -m "keyroost vX.Y.Z" && git push origin vX.Y.Z`
       (`v*` tags are admin-only by ruleset.)
 - [ ] Two workflows start on the tag: `release.yml` (platform archives +

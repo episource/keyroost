@@ -5,12 +5,12 @@ issue reports alike. This file collects the practical details in one place.
 
 ## How a PR lands
 
-`main` requires signed commits and a linear history, so PRs are not merged
-through the GitHub button. Instead the maintainer rebases your commit onto
-`main` and signs it — **your authorship is preserved** (`git log` shows you as
-the author), but GitHub will show the PR as *closed*, not *merged*, with a
-comment naming the landed commit. Contributions are credited in the README's
-Contributors section and the changelog.
+PRs are reviewed against `packaging/REVIEWING.md`, then squash-merged. The
+squash commit carries your authorship. CI for outside contributors runs
+after maintainer approval of the workflow run, so there can be a delay
+between opening a PR and checks starting. Contributions are credited in the
+changelog and, for a first contribution, in the README's Contributors
+section.
 
 ## Before you open a PR
 

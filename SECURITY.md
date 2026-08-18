@@ -133,6 +133,33 @@ What keyroost does **not** defend against:
   crates.io fanout authenticates through Trusted Publishing (OIDC), so no
   long-lived registry token exists to be stolen.
 
+## Release integrity
+
+Four mechanisms:
+
+- **Signed tags.** Release tags are signed by the maintainer with a hardware
+  key; tag creation is restricted to the repository admin by ruleset. The
+  maintainer reviews the complete diff since the previous release before
+  signing, so the tag signature covers every change in the release,
+  including merged contributions.
+- **Build provenance.** Release assets carry GitHub build-provenance
+  attestations identifying the workflow run and commit that produced them.
+  Verification command below.
+- **Checksums.** `SHA256SUMS` covers the platform archives. The AppImage and
+  flatpak publish separate `.sha256` files.
+- **crates.io Trusted Publishing.** Crates are published by the release
+  workflow over OIDC. No long-lived publishing token exists.
+
+Commits on `main` are not required to be signed. Changes land through
+reviewed pull requests (`packaging/REVIEWING.md` is the review checklist);
+only the maintainer can merge, and workflow runs for outside contributors
+start only after maintainer approval. Per-commit signature enforcement was
+removed because it prevented merging external pull requests, and it does
+not address the relevant attack class: a compromised or malicious committer
+produces validly signed commits, as in the xz-utils backdoor. The
+mechanisms above verify that a release matches the public source, which is
+the property that attack violates.
+
 ## Verifying a download
 
 ```sh
