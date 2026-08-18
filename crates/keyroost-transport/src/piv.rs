@@ -165,7 +165,62 @@ pub struct PivSession {
     /// that) and any operation that changes what's in a slot (`delete_key`,
     /// `move_key`, `reset`) invalidates the corresponding entries — see
     /// [`PivSession::slot_key`].
-    pubkey_cache: HashMap<u8, (KeyAlg, PublicKey)>,
+    pubkey_cache: PubkeyCache,
+}
+
+/// The in-session public-key cache behind `PivSession`, keyed by PIV key
+/// reference. Exactly five transitions exist, each mirroring the card
+/// operation that makes it true; the session methods are one-line callers so
+/// the unit tests below can pin the semantics without a live card:
+///
+/// * a fresh session starts empty (`new` — deliberately no persistence),
+/// * `generate_key` / `remember_pubkey` make the slot's entry exactly the new
+///   key (`remember`),
+/// * `delete_key` leaves nothing to fall back to (`evict`),
+/// * `move_key` relocates the key material, so its entry follows (`migrate`),
+/// * `reset` wipes every slot (`clear`).
+struct PubkeyCache(HashMap<u8, (KeyAlg, PublicKey)>);
+
+impl PubkeyCache {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// The slot now holds exactly this key — `generate_key` minted it there,
+    /// or the caller vouched for it via `remember_pubkey`. Replaces any
+    /// previous entry: after a regenerate, the old pubkey must not survive to
+    /// describe the new private key.
+    fn remember(&mut self, key_ref: u8, alg: KeyAlg, key: PublicKey) {
+        self.0.insert(key_ref, (alg, key));
+    }
+
+    /// The slot's key material is gone (`delete_key` succeeded): a stale
+    /// entry here would produce a CSR/self-signed cert for a key that no
+    /// longer exists. Evicting an uncached slot is a no-op.
+    fn evict(&mut self, key_ref: u8) {
+        self.0.remove(&key_ref);
+    }
+
+    /// The key itself relocated (`move_key` succeeded), not just its
+    /// reference — carry a cached entry along with it rather than dropping
+    /// it, so a subsequent CSR/self-sign at `dest` still works on
+    /// metadata-less firmware, and leave nothing behind at `src`. An uncached
+    /// `src` carries nothing and, crucially, invents nothing at `dest`.
+    fn migrate(&mut self, src: u8, dest: u8) {
+        if let Some(cached) = self.0.remove(&src) {
+            self.0.insert(dest, cached);
+        }
+    }
+
+    /// The applet was factory-reset (`reset`, which `force_reset` also
+    /// funnels into): every slot is empty, nothing cached survives.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn get(&self, key_ref: u8) -> Option<&(KeyAlg, PublicKey)> {
+        self.0.get(&key_ref)
+    }
 }
 
 /// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
@@ -189,7 +244,7 @@ impl PivSession {
         let mut session = Self {
             card,
             debug: false,
-            pubkey_cache: HashMap::new(),
+            pubkey_cache: PubkeyCache::new(),
         };
         session.select()?;
         Ok(session)
@@ -215,7 +270,7 @@ impl PivSession {
                 let mut session = PivSession {
                     card,
                     debug: false,
-                    pubkey_cache: HashMap::new(),
+                    pubkey_cache: PubkeyCache::new(),
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -446,7 +501,7 @@ impl PivSession {
             self.transmit_full(&piv::generate_key(slot, alg, pin_policy, touch_policy))?;
         ok_or_write("piv generate key", sw)?;
         let key = piv::parse_public_key(&data).map_err(TransportError::PivParse)?;
-        self.pubkey_cache.insert(slot.key_ref(), (alg, key.clone()));
+        self.pubkey_cache.remember(slot.key_ref(), alg, key.clone());
         Ok(key)
     }
 
@@ -472,7 +527,7 @@ impl PivSession {
     /// certificate whose SPKI doesn't match the private key that actually
     /// signed it.
     pub fn remember_pubkey(&mut self, slot: Slot, alg: KeyAlg, key: PublicKey) {
-        self.pubkey_cache.insert(slot.key_ref(), (alg, key));
+        self.pubkey_cache.remember(slot.key_ref(), alg, key);
     }
 
     /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
@@ -510,7 +565,7 @@ impl PivSession {
         }
         let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
         ok_or_write("piv delete key", sw)?;
-        self.pubkey_cache.remove(&slot.key_ref());
+        self.pubkey_cache.evict(slot.key_ref());
         Ok(())
     }
 
@@ -599,7 +654,7 @@ impl PivSession {
         if alg_from_metadata.is_some() {
             return alg_from_metadata;
         }
-        if let Some((alg, _)) = self.pubkey_cache.get(&slot.key_ref()) {
+        if let Some((alg, _)) = self.pubkey_cache.get(slot.key_ref()) {
             return Some(*alg);
         }
         self.read_certificate(slot)
@@ -661,7 +716,7 @@ impl PivSession {
             let key = public_key_from_metadata(&raw).map_err(TransportError::PivParse)?;
             return Ok((alg, key));
         }
-        if let Some(cached) = self.pubkey_cache.get(&key_ref).cloned() {
+        if let Some(cached) = self.pubkey_cache.get(key_ref).cloned() {
             return Ok(cached);
         }
         Err(TransportError::MalformedResponse(
@@ -744,9 +799,7 @@ impl PivSession {
         // The key itself relocated, not just its reference — carry a cached
         // entry along with it rather than dropping it, so a subsequent
         // CSR/self-sign at `dest` still works on metadata-less firmware.
-        if let Some(cached) = self.pubkey_cache.remove(&src.key_ref()) {
-            self.pubkey_cache.insert(dest.key_ref(), cached);
-        }
+        self.pubkey_cache.migrate(src.key_ref(), dest.key_ref());
         Ok(())
     }
 
@@ -1107,6 +1160,122 @@ mod tests {
         assert!(move_key_supported(Some((6, 0, 0))));
         // Unknown version -> allow the attempt (card will reject if unsupported).
         assert!(move_key_supported(None));
+    }
+
+    // --- pubkey-cache invalidation semantics ---------------------------------
+    //
+    // The session methods that drive these transitions need a live card, so
+    // what gets pinned here is the PubkeyCache transition each of them is a
+    // one-line caller of. What these defend: on metadata-less firmware the
+    // cache is the ONLY source for CSR/self-sign key material, so a stale
+    // entry silently produces a certificate whose SPKI doesn't match the
+    // private key on the card.
+
+    fn ecc(byte: u8) -> PublicKey {
+        PublicKey::Ecc {
+            point: vec![0x04, byte],
+        }
+    }
+
+    fn rsa(byte: u8) -> PublicKey {
+        PublicKey::Rsa {
+            modulus: vec![byte],
+            exponent: vec![0x01, 0x00, 0x01],
+        }
+    }
+
+    #[test]
+    fn pubkey_cache_starts_empty_and_remember_seeds_exactly_one_slot() {
+        // A fresh open() has nothing to fall back to — there is deliberately
+        // no on-disk or cross-process persistence.
+        let mut cache = PubkeyCache::new();
+        assert!(cache.0.is_empty());
+        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
+        assert_eq!(cache.0.len(), 1);
+        assert_eq!(cache.get(0x9A), Some(&(KeyAlg::EccP256, ecc(1))));
+        // Seeding 9A says nothing about any other slot.
+        assert_eq!(cache.get(0x9C), None);
+    }
+
+    #[test]
+    fn remember_replaces_the_slots_previous_entry() {
+        // generate_key over an occupied slot mints a new keypair: the old
+        // cached pubkey must not survive to describe the new private key.
+        let mut cache = PubkeyCache::new();
+        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
+        cache.remember(0x9A, KeyAlg::Rsa2048, rsa(2));
+        assert_eq!(cache.0.len(), 1);
+        assert_eq!(cache.get(0x9A), Some(&(KeyAlg::Rsa2048, rsa(2))));
+    }
+
+    #[test]
+    fn evict_forgets_only_the_deleted_slot() {
+        let mut cache = PubkeyCache::new();
+        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
+        cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
+        cache.evict(0x9A);
+        // The deleted slot's key material is gone from the card; a bystander
+        // slot's entry is still good.
+        assert_eq!(cache.get(0x9A), None);
+        assert_eq!(cache.get(0x9C), Some(&(KeyAlg::EccP384, ecc(2))));
+        // Deleting a slot this session never cached is a quiet no-op.
+        cache.evict(0x82);
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn migrate_carries_the_entry_and_leaves_nothing_at_src() {
+        let mut cache = PubkeyCache::new();
+        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
+        cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
+        cache.migrate(0x9A, 0x82);
+        // The key relocated: its entry follows it to dest — that's what keeps
+        // CSR/self-sign working at dest on metadata-less firmware — and src
+        // no longer holds anything to describe.
+        assert_eq!(cache.get(0x9A), None);
+        assert_eq!(cache.get(0x82), Some(&(KeyAlg::EccP256, ecc(1))));
+        // A bystander slot is untouched.
+        assert_eq!(cache.get(0x9C), Some(&(KeyAlg::EccP384, ecc(2))));
+    }
+
+    #[test]
+    fn migrate_of_an_uncached_src_changes_nothing() {
+        // Moving a key this session never generated: there is nothing to
+        // carry, and crucially nothing gets invented at dest.
+        let mut cache = PubkeyCache::new();
+        cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
+        cache.migrate(0x9A, 0x82);
+        assert_eq!(cache.get(0x82), None);
+        assert_eq!(cache.get(0x9C), Some(&(KeyAlg::EccP384, ecc(2))));
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn migrate_replaces_a_stale_dest_entry() {
+        // The card refuses MOVE KEY into an occupied slot, so any dest entry
+        // present here is stale by definition (e.g. remember_pubkey of a slot
+        // that was later emptied out-of-session) — the key that actually
+        // arrived must win.
+        let mut cache = PubkeyCache::new();
+        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
+        cache.remember(0x82, KeyAlg::EccP384, ecc(9));
+        cache.migrate(0x9A, 0x82);
+        assert_eq!(cache.get(0x82), Some(&(KeyAlg::EccP256, ecc(1))));
+        assert_eq!(cache.get(0x9A), None);
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn clear_wipes_every_slot() {
+        // reset() factory-wipes the applet, and force_reset funnels into the
+        // same reset() at the end of its path — both end here, with no
+        // survivors for any slot.
+        let mut cache = PubkeyCache::new();
+        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
+        cache.remember(0x9C, KeyAlg::Rsa2048, rsa(2));
+        cache.remember(0x82, KeyAlg::Ed25519, ecc(3));
+        cache.clear();
+        assert!(cache.0.is_empty());
     }
 
     #[test]
