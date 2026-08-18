@@ -32,13 +32,6 @@ Being worked on right now — check with whoever holds it before starting.
   `CARGO_PKG_VERSION` in the GUI (About/settings footer), and export
   `VERSION` in the AppImage build.
 
-- **Documentation audit: also walk links FROM the app TO the site.** #99's
-  broken Supported Devices link survived the full v0.7.8 audit because the
-  audit checks pages against code, never the app's outbound links against
-  the pages (`ui/help.rs` `learn_url` callers are the inventory). Add that
-  direction to the audit step in `packaging/RELEASING.md`. (The link itself
-  is fixed: `docs/devices.html` now exists.)
-
 - **Contribution model rework — DECIDED 2026-08-14, target: next release.**
   The model: squash-only button merges, required PR + required status checks,
   strict fork-CI approval, per-commit signature rule dropped; the hardware key
@@ -83,12 +76,6 @@ Being worked on right now — check with whoever holds it before starting.
     protection deferred until stable") need to say afterwards — this work IS
     that deferred protection, arriving from the friendlier direction.
 
-- **Fuzz target for the new certificate parser (#97 follow-up).**
-  `keyroost-piv::x509_parse` (`parse_key_policy_extension`,
-  `parse_spki_key_alg`, `parse_subject_dn`) parses DER handed to us by the
-  card; the house pattern fuzzes every parser of untrusted input (15 targets
-  today). One target feeding arbitrary bytes to all three entry points.
-
 - **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
   capability is either present or absent and there is nowhere to record "we
   could not check". On a USB-HID-only enumeration nothing has been sent to the
@@ -123,25 +110,6 @@ Being worked on right now — check with whoever holds it before starting.
   tag. Packaging pulls from upstreams that drift independently (the v0.7.3
   flatpak broke at release time because a source was pruned). Full sequence:
   `packaging/RELEASING.md`, which is the playbook for the whole release.
-
-- **PC/SC: `dlopen` libpcsclite at runtime instead of hard-linking it** — the
-  real fix for [#47](https://github.com/framefilter/keyroost/issues/47).
-  Two payoffs: the *host's* libpcsclite is always used (the only client
-  guaranteed to match the host's `pcscd`, for every distribution channel, not
-  just the AppImage), and when it is absent keyroost still launches with
-  FIDO/USB-HID working and the PC/SC panes showing "PC/SC unavailable".
-  Removes the known limitation documented in
-  `packaging/appimage/build-appimage.sh`. The `pcsc` crate links at build time —
-  check whether it exposes a dynamic-load path or whether we wrap libpcsclite in
-  a thin FFI loader ourselves. Design first; verify on a host with and without
-  the library.
-
-- **README + Learn site: point the Windows download at the signed asset.**
-  Signed zips now exist (Token2 signs out-of-band on a hardware token), but
-  `README.md`'s Windows direct-download section still names only the CI zip.
-  Add the pointer plus a short note that the signed build may trail the release
-  by a few days. winget availability is unaffected — it holds for the signed zip
-  by policy.
 
 - **Responsive layout at high zoom / narrow window.** At ~200% zoom in a
   partial-screen window, horizontal rows overflow and overlap (top-bar Reset vs
@@ -256,6 +224,24 @@ plan's two-key manual steps were never executed):
 ---
 
 ## Deferred to a later release
+
+- **PC/SC: `dlopen` libpcsclite at runtime instead of hard-linking it** — the
+  real fix for [#47](https://github.com/framefilter/keyroost/issues/47).
+  Two payoffs: the *host's* libpcsclite is always used (the only client
+  guaranteed to match the host's `pcscd`, for every distribution channel, not
+  just the AppImage), and when it is absent keyroost still launches with
+  FIDO/USB-HID working and the PC/SC panes showing "PC/SC unavailable".
+  Removes the known limitation documented in
+  `packaging/appimage/build-appimage.sh`. The `pcsc` crate links at build time —
+  check whether it exposes a dynamic-load path or whether we wrap libpcsclite in
+  a thin FFI loader ourselves. Design first; verify on a host with and without
+  the library.
+  **Backburnered by the maintainer (2026-08-15): the last attempt required
+  `unsafe` on more surface than they were comfortable with.** Do not pick this
+  up without a design that keeps the unsafe footprint to a thin, isolated
+  loader crate — and maintainer sign-off on that design first. Also gates the
+  AppImageHub submission (#53): the catalog CI runs on a bare VM without
+  libpcsclite, where the hard link fails before main().
 
 - **musl static Linux build** — under consideration, notes-only, not wired into
   any workflow. The draft design and runbook are in `packaging/musl/README.md`;

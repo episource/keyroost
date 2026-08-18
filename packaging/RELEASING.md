@@ -89,7 +89,12 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       the release binary's real `--help` tree (not the source); check
       contributor credit against `git log --format='%an' | sort -u` and the
       PRs since the last release; confirm every claim a page makes about GUI
-      gating/behavior against the code. Parallel audit agents (Learn pages /
+      gating/behavior against the code; and walk every link FROM the app TO
+      the site — the `learn_url(...)` callers in `crates/keyroost/src/ui/`
+      are the inventory, and each slug must resolve against `docs/`. That
+      direction is the one the audit never used to check, which is how the
+      GUI shipped three releases linking a /devices page that did not exist
+      (#99). Parallel audit agents (Learn pages /
       README / meta-docs) cover this in one pass; findings are fixed on the
       prep branch so the release ships accurate docs.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
