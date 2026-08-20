@@ -697,9 +697,9 @@ impl PivSession {
     }
 
     /// The algorithm and public key of the key stored in `slot`: from GET
-    /// METADATA (firmware 5.3+) when the card answers it, else from this
-    /// session's in-memory key cache. That cache is populated only by a prior
-    /// [`Self::generate_key`] on `slot` in *this* session, or by a caller
+    /// METADATA (firmware 5.3+) when the card actually names both, else from
+    /// this session's in-memory key cache. That cache is populated only by a
+    /// prior [`Self::generate_key`] on `slot` in *this* session, or by a caller
     /// explicitly carrying the key material forward via [`Self::remember_pubkey`]
     /// — that's what lets CSR/self-sign work right after generation on cards
     /// that don't support GET METADATA (older YubiKeys, non-Yubico PIV
@@ -708,31 +708,43 @@ impl PivSession {
     /// told us what it made, and this crate keeps no on-disk or
     /// cross-process copy of that on its own (see [`Self::remember_pubkey`]).
     ///
-    /// Errors when the slot is empty, the firmware predates GET METADATA
-    /// *and* nothing was generated into `slot` in this session (nor handed to
-    /// it via `remember_pubkey`), or a cached entry was invalidated by a later
-    /// delete/move/reset.
+    /// GET METADATA answering `SW_OK` is not by itself treated as authoritative
+    /// — some implementations (Nitrokey's `piv-authenticator`) accept the
+    /// instruction but reply with an empty body for slots they haven't wired
+    /// reporting up for yet, rather than failing it outright. That's
+    /// functionally identical to "no GET METADATA support" for our purposes,
+    /// so [`metadata_key_material`] is the single gate for "does this reply
+    /// actually name the key", and only a `Some` from it short-circuits the
+    /// cache fallback below.
+    ///
+    /// Called by [`Self::generate_csr`]/[`Self::self_signed_certificate`]
+    /// *before* they verify the PIN — GET METADATA is an unauthenticated
+    /// read (confirmed against real hardware: it succeeds before any PIN
+    /// VERIFY in the same session), so resolving the key first and verifying
+    /// right before the signing GENERAL AUTHENTICATE keeps that VERIFY the
+    /// last command before the signature on every card, rather than risking
+    /// a metadata probe sitting in between — some cards (Nitrokey's
+    /// `piv-authenticator` observed so far) don't tolerate any intervening
+    /// APDU between a PIN verify and the signing operation it authorizes.
+    ///
+    /// Errors when the slot is empty, GET METADATA doesn't name this slot's
+    /// key *and* nothing was generated into `slot` in this session (nor
+    /// handed to it via `remember_pubkey`), or a cached entry was invalidated
+    /// by a later delete/move/reset.
     pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
         let key_ref = slot.key_ref();
         if let Some(md) = self.metadata(key_ref) {
-            let alg =
-                md.algorithm
-                    .and_then(KeyAlg::from_id)
-                    .ok_or(TransportError::MalformedResponse(
-                        "slot metadata carries no key algorithm",
-                    ))?;
-            let raw = md.public_key.ok_or(TransportError::MalformedResponse(
-                "slot metadata carries no public key",
-            ))?;
-            let key = public_key_from_metadata(&raw).map_err(TransportError::PivParse)?;
-            return Ok((alg, key));
+            if let Some((alg, raw)) = metadata_key_material(&md) {
+                let key = public_key_from_metadata(raw).map_err(TransportError::PivParse)?;
+                return Ok((alg, key));
+            }
         }
         if let Some(cached) = self.pubkey_cache.get(key_ref).cloned() {
             return Ok(cached);
         }
         Err(TransportError::MalformedResponse(
-            "slot has no key, or the firmware lacks GET METADATA and the key \
-             material wasn't handed to this session — run `piv generate-key` \
+            "slot has no key, or GET METADATA doesn't name this slot's key and \
+             the key material wasn't handed to this session — run `piv generate-key` \
              on this slot in this same session, or pass its previously saved \
              key material to this command, so it can be cached for \
              CSR/self-sign",
@@ -741,14 +753,23 @@ impl PivSession {
 
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
     /// signed on the card, returned as PEM. The slot must hold a key
-    /// (generated or imported) and the PIN must already be verified.
-    pub fn generate_csr(&mut self, slot: Slot, subject: &str) -> Result<String, TransportError> {
+    /// (generated or imported). Verifies `pin` itself, deliberately placed
+    /// *after* resolving the slot's key material ([`Self::slot_key`]) and
+    /// *immediately* before the signing [`Self::sign`] call — see
+    /// `slot_key`'s doc comment for why that ordering matters.
+    pub fn generate_csr(
+        &mut self,
+        slot: Slot,
+        subject: &str,
+        pin: &[u8],
+    ) -> Result<String, TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
         let spki = piv::spki::subject_public_key_info(&key, alg)
             .map_err(|_| TransportError::MalformedResponse("slot key/algorithm mismatch"))?;
         let cri = piv::x509::csr_info(&subject, &spki);
         let prepared = prepared_block(alg, &cri)?;
+        self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;
         let der = piv::x509::assemble(&cri, alg, &sig).map_err(TransportError::X509)?;
         Ok(piv::x509::pem_csr(&der))
@@ -756,14 +777,18 @@ impl PivSession {
 
     /// Create a self-signed certificate for the key in `slot` (validity in
     /// unix seconds), sign it on the card, **import it into the slot**, and
-    /// return the DER. Requires a verified PIN (for the signature) and prior
-    /// management-key auth (for the import).
+    /// return the DER. Requires prior management-key auth (for the import).
+    /// Verifies `pin` itself, deliberately placed *after* resolving the
+    /// slot's key material ([`Self::slot_key`]) and *immediately* before the
+    /// signing [`Self::sign`] call — see `slot_key`'s doc comment for why
+    /// that ordering matters.
     pub fn self_signed_certificate(
         &mut self,
         slot: Slot,
         subject: &str,
         not_before: i64,
         not_after: i64,
+        pin: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
@@ -776,6 +801,7 @@ impl PivSession {
         let tbs = piv::x509::tbs_certificate(&serial, alg, &subject, not_before, not_after, &spki)
             .map_err(TransportError::X509)?;
         let prepared = prepared_block(alg, &tbs)?;
+        self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;
         let der = piv::x509::assemble(&tbs, alg, &sig).map_err(TransportError::X509)?;
         self.import_certificate(slot, &der)?;
@@ -1024,6 +1050,23 @@ fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
         SigHash::Sha384 => Ok(keyroost_proto::sha512::sha384(tbs).to_vec()),
         SigHash::None => Ok(tbs.to_vec()),
     }
+}
+
+/// `(algorithm, raw public key)` from a GET METADATA response, only when it
+/// actually carries both — the single gate [`PivSession::slot_key`] uses to
+/// decide whether a metadata reply is usable or whether to fall back to the
+/// session's pubkey cache. Split out as a pure, card-free function (same seam
+/// style as [`PubkeyCache`]) so the "is this metadata usable" rule is
+/// unit-testable without a card: some PIV implementations answer GET METADATA
+/// with `SW_OK` but an empty or partial body for slots they haven't wired
+/// reporting up for yet (observed on Nitrokey's `piv-authenticator`, whose
+/// `GetMetadata` handler is a stub for every slot but card-authentication) —
+/// functionally the same as "no GET METADATA support" for our purposes, not a
+/// malformed response worth erroring the caller over.
+fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
+    let alg = md.algorithm.and_then(KeyAlg::from_id)?;
+    let raw = md.public_key.as_deref()?;
+    Some((alg, raw))
 }
 
 /// Decode the public key carried in GET METADATA tag `0x04`. Yubico encodes it
@@ -1287,6 +1330,63 @@ mod tests {
         cache.remember(0x82, KeyAlg::Ed25519, ecc(3));
         cache.clear();
         assert!(cache.0.is_empty());
+    }
+
+    // --- metadata-vs-cache fallback gate ---------------------------------
+    //
+    // `slot_key` treats GET METADATA as usable only when it actually names
+    // both the algorithm and the public key; anything short of that (empty,
+    // algorithm-only, pubkey-only — e.g. Nitrokey's piv-authenticator, whose
+    // GetMetadata handler is a stub for every slot but card-authentication
+    // and answers SW_OK with nothing) must fall through to the pubkey cache
+    // instead of erroring the caller.
+
+    #[test]
+    fn metadata_with_neither_field_is_not_usable() {
+        // The stub-firmware case: SW_OK, empty body.
+        assert_eq!(metadata_key_material(&Metadata::default()), None);
+    }
+
+    #[test]
+    fn metadata_with_only_algorithm_is_not_usable() {
+        let md = Metadata {
+            algorithm: Some(KeyAlg::EccP256.id()),
+            ..Metadata::default()
+        };
+        assert_eq!(metadata_key_material(&md), None);
+    }
+
+    #[test]
+    fn metadata_with_only_public_key_is_not_usable() {
+        let md = Metadata {
+            public_key: Some(vec![0x86, 0x01, 0x04]),
+            ..Metadata::default()
+        };
+        assert_eq!(metadata_key_material(&md), None);
+    }
+
+    #[test]
+    fn metadata_with_an_unrecognized_algorithm_id_is_not_usable() {
+        // A byte GET METADATA reported that this crate's KeyAlg doesn't cover.
+        let md = Metadata {
+            algorithm: Some(0xFF),
+            public_key: Some(vec![0x86, 0x01, 0x04]),
+            ..Metadata::default()
+        };
+        assert_eq!(metadata_key_material(&md), None);
+    }
+
+    #[test]
+    fn metadata_with_both_fields_is_usable() {
+        let md = Metadata {
+            algorithm: Some(KeyAlg::EccP256.id()),
+            public_key: Some(vec![0x86, 0x01, 0x04]),
+            ..Metadata::default()
+        };
+        assert_eq!(
+            metadata_key_material(&md),
+            Some((KeyAlg::EccP256, &[0x86, 0x01, 0x04][..]))
+        );
     }
 
     #[test]

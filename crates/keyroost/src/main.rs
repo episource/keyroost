@@ -6833,12 +6833,17 @@ impl App {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
                     let mgmt_alg = s.management_key_algorithm();
                     s.authenticate_management(mgmt_alg, &mgmt)?;
-                    s.verify_pin(pin.as_bytes())?;
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
                     }
                     let now = i64::from(unix_now());
-                    s.self_signed_certificate(slot, &subject, now, now + days * 86_400)?;
+                    s.self_signed_certificate(
+                        slot,
+                        &subject,
+                        now,
+                        now + days * 86_400,
+                        pin.as_bytes(),
+                    )?;
                     s.status()
                 })();
                 Box::new(move |app: &mut App| {
@@ -6886,11 +6891,10 @@ impl App {
             move || {
                 let result = (|| -> Result<(), TransportError> {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
-                    s.verify_pin(pin.as_bytes())?;
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
                     }
-                    let pem = s.generate_csr(slot, &subject)?;
+                    let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
                     std::fs::write(&path, pem.as_bytes()).map_err(|_| {
                         TransportError::MalformedResponse("cannot write destination file")
                     })?;

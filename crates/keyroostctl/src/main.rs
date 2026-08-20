@@ -5851,13 +5851,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let mut s = open_piv(reader.as_deref(), debug)?;
-            s.verify_pin(pin.as_bytes())?;
             if let Some(path) = load_pubkey {
                 let (alg, key) = load_pubkey_material(path)?;
                 s.remember_pubkey(slot.to_slot(), alg, key);
             }
             eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
-            let pem = s.generate_csr(slot.to_slot(), subject)?;
+            let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes())?;
             match file {
                 Some(path) => {
                     std::fs::write(path, pem.as_bytes())
@@ -5892,7 +5891,6 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // Management-key auth covers the certificate import; the PIN
             // covers the signature itself.
             let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.verify_pin(pin.as_bytes())?;
             if let Some(path) = load_pubkey {
                 let (alg, key) = load_pubkey_material(path)?;
                 s.remember_pubkey(slot.to_slot(), alg, key);
@@ -5904,6 +5902,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 subject,
                 now,
                 now + i64::from(*days) * 86_400,
+                pin.as_bytes(),
             )?;
             println!(
                 "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
