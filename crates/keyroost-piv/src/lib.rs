@@ -27,9 +27,24 @@ pub mod spki;
 pub mod x509;
 pub mod x509_parse;
 
-/// PIV card-application AID (the 5-byte RID/PIX prefix; the card matches on it).
-/// Full PIV AID is `A0 00 00 03 08 00 00 10 00 01 00`; selecting by the prefix
-/// is what `yubikey-piv-tool` / `ykman` do and the card resolves it.
+/// The NIST SP 800-73-4 / FIPS 201 standardized PIV Card Application AID —
+/// RID `A0 00 00 03 08` + PIX `00 00 10 00 01 00`. Every spec-compliant PIV
+/// card (YubiKey included) registers under exactly this AID; it's what
+/// [`select_full`] sends first.
+pub const AID_FULL: [u8; 11] = [
+    0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,
+];
+
+/// PIV card-application AID, truncated to the 5-byte RID/PIX prefix. This is
+/// what `yubikey-piv-tool` / `ykman` send, relying on YubiKey's open-ended
+/// AID-prefix matching — not something the spec requires. [`select`] builds
+/// this short form; it exists only as [`select_full`]'s fallback, for cards
+/// that (hypothetically) reject the full AID. Nitrokey's `piv-authenticator`
+/// firmware needs the opposite treatment: it registers its AID as
+/// `Aid::new_truncatable(<full 11 bytes>, 9)`, which matches only an *exact*
+/// 9- or 11-byte SELECT, not this arbitrary 5-byte prefix — a bare `select()`
+/// against it comes back `SW_NOT_FOUND` even though the applet is present,
+/// which is why [`select_full`] is tried first.
 pub const AID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x08];
 
 /// Status word: success.
@@ -495,8 +510,28 @@ impl std::error::Error for PinLengthError {}
 // APDU builders
 // ---------------------------------------------------------------------------
 
-/// SELECT the PIV application by AID (case 4: a trailing `Le` requests the
-/// application property template the card returns on success).
+/// SELECT the PIV application by its full, spec-mandated AID ([`AID_FULL`]).
+/// Case 4 — a trailing `Le` requests the application property template the
+/// card returns on success. Try this before [`select`]: it's what every
+/// spec-compliant PIV card recognizes, including cards (like Nitrokey's)
+/// that don't answer the short RID-only prefix.
+#[must_use]
+pub fn select_full() -> Vec<u8> {
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::Select.code(),
+        INS_SELECT_P1_BY_AID,
+        0x00,
+        &AID_FULL,
+    );
+    apdu.push(0x00); // case-4 Le
+    apdu
+}
+
+/// SELECT the PIV application by its short RID/PIX-prefix AID ([`AID`]).
+/// Case 4 — a trailing `Le` requests the application property template the
+/// card returns on success. Fallback for [`select_full`]; see [`AID`]'s doc
+/// comment for why both exist.
 #[must_use]
 pub fn select() -> Vec<u8> {
     let mut apdu = build_apdu(
@@ -1043,6 +1078,18 @@ mod tests {
         assert_eq!(
             select(),
             vec![0x00, 0xA4, 0x04, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08, 0x00]
+        );
+    }
+
+    #[test]
+    fn select_full_bytes() {
+        // 00 A4 04 00 0B A0 00 00 03 08 00 00 10 00 01 00 00
+        assert_eq!(
+            select_full(),
+            vec![
+                0x00, 0xA4, 0x04, 0x00, 0x0B, 0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00,
+                0x01, 0x00, 0x00
+            ]
         );
     }
 

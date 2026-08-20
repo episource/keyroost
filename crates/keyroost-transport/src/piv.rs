@@ -285,9 +285,20 @@ impl PivSession {
     }
 
     fn select(&mut self) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&piv::select())?;
+        // Try the full, spec-mandated AID first — some PIV implementations
+        // (Nitrokey's `piv-authenticator`) only answer an exact-length AID
+        // match and reject the short RID-only prefix `select()` sends. Fall
+        // back to the short prefix only on a specific "not found", so a real
+        // fault on the full-AID attempt still surfaces immediately rather
+        // than being masked by a second, unrelated SELECT. See `piv::AID`'s
+        // doc comment for the full story.
+        let (_, sw) = self.transmit_full(&piv::select_full())?;
         if sw == piv::SW_NOT_FOUND {
-            return Err(TransportError::NoPivApplet);
+            let (_, sw) = self.transmit_full(&piv::select())?;
+            if sw == piv::SW_NOT_FOUND {
+                return Err(TransportError::NoPivApplet);
+            }
+            return ok_or_apdu("select piv applet (short aid)", sw);
         }
         ok_or_apdu("select piv applet", sw)
     }
