@@ -980,14 +980,8 @@ impl PivSession {
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
     fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
         let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
-        let (cert_present, cert_len) = if sw == piv::SW_OK {
-            // The object is a 0x53 template; report the inner value length.
-            let len = piv::unwrap_data_object(&data).map(<[u8]>::len).unwrap_or(0);
-            (true, len)
-        } else {
-            // 6A82 (not found) and friends just mean the slot is empty.
-            (false, 0)
-        };
+        let raw = (sw == piv::SW_OK).then_some(data.as_slice());
+        let (cert_present, cert_len) = cert_status_from_reply(raw);
         Ok(PivSlotStatus {
             slot,
             cert_present,
@@ -1067,6 +1061,29 @@ fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
     let alg = md.algorithm.and_then(KeyAlg::from_id)?;
     let raw = md.public_key.as_deref()?;
     Some((alg, raw))
+}
+
+/// `(cert_present, cert_len)` from a certificate-slot GET DATA reply: `raw` is
+/// the response body when the card answered `SW_OK`, `None` when it didn't
+/// (`6A82` and friends, which just mean the slot is empty).
+///
+/// `SW_OK` alone doesn't mean a certificate is there: some cards (Nitrokey's
+/// `piv-authenticator`, observed after `delete-cert`) answer a deleted slot
+/// with `53 00` — the `0x53` data-object template present, but with a
+/// zero-length value — rather than `6A82`. An empty value is exactly as
+/// absent as no object at all, so this gates on the unwrapped length, not
+/// just the status word; [`PivSession::read_certificate`] already reaches the
+/// same conclusion in its own way (an empty inner buffer has no `0x70` TLV to
+/// find). A body that fails to unwrap as a `0x53` template at all — not
+/// expected from a real card, but not a caller-visible error either — reports
+/// the same as empty rather than panicking or bubbling a parse error up
+/// through a read-only status call.
+fn cert_status_from_reply(raw: Option<&[u8]>) -> (bool, usize) {
+    let len = raw
+        .and_then(|d| piv::unwrap_data_object(d).ok())
+        .map(<[u8]>::len)
+        .unwrap_or(0);
+    (len > 0, len)
 }
 
 /// Decode the public key carried in GET METADATA tag `0x04`. Yubico encodes it
@@ -1387,6 +1404,40 @@ mod tests {
             metadata_key_material(&md),
             Some((KeyAlg::EccP256, &[0x86, 0x01, 0x04][..]))
         );
+    }
+
+    // --- certificate-slot occupancy from a GET DATA reply -----------------
+    //
+    // `cert_status_from_reply` is what `slot_status` uses to decide whether a
+    // slot reports as holding a certificate. The regression this guards: a
+    // deleted slot answering SW_OK with an empty `53 00` template (Nitrokey's
+    // piv-authenticator, observed with `piv status` after `piv delete-cert`)
+    // must report as empty, not "cert present (0 bytes)".
+
+    #[test]
+    fn cert_status_not_found_is_absent() {
+        // 6A82 and friends: `slot_status` passes `None` for anything but SW_OK.
+        assert_eq!(cert_status_from_reply(None), (false, 0));
+    }
+
+    #[test]
+    fn cert_status_empty_template_is_absent() {
+        // `53 00`: object present, zero-length value — the Nitrokey case.
+        assert_eq!(cert_status_from_reply(Some(&[0x53, 0x00])), (false, 0));
+    }
+
+    #[test]
+    fn cert_status_populated_template_is_present() {
+        // `53 03 70 01 AB`: a (fake, minimal) 3-byte value wrapping a `70` TLV.
+        let data = [0x53, 0x03, 0x70, 0x01, 0xAB];
+        assert_eq!(cert_status_from_reply(Some(&data)), (true, 3));
+    }
+
+    #[test]
+    fn cert_status_unparseable_body_is_absent_not_a_panic() {
+        // Not a `0x53` template at all — shouldn't happen on a real card, but
+        // a read-only status call must degrade gracefully, not panic or error.
+        assert_eq!(cert_status_from_reply(Some(&[0xFF, 0x00])), (false, 0));
     }
 
     #[test]
