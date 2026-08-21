@@ -136,6 +136,10 @@ pub struct PivStatus {
     pub pin_retries: Option<u8>,
     /// Per-slot certificate presence, in canonical slot order.
     pub slots: Vec<PivSlotStatus>,
+    /// The card's CHUID (FASC-N, GUID, expiration), when it has one. A
+    /// read-only, best-effort read: a transport failure degrades to `None`
+    /// rather than failing the whole status snapshot (see [`PivSession::status`]).
+    pub chuid: Option<keyroost_piv::Chuid>,
 }
 
 /// Whether a given PIV key slot holds a certificate (and its size).
@@ -233,6 +237,16 @@ fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
     }
 }
 
+/// A fresh, random 16-byte CHUID GUID — host-side only, no card I/O. For
+/// pre-filling (and, via a "refresh" action, regenerating) a "New CHUID"
+/// GUID input before [`PivSession::new_chuid`] writes whatever the user
+/// settled on — their own manual value included — to the card.
+pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
+    let mut guid = [0u8; 16];
+    getrandom::getrandom(&mut guid).map_err(|_| TransportError::HostRngFailed)?;
+    Ok(guid)
+}
+
 impl PivSession {
     /// Connect to `reader_name` and SELECT the PIV application. Returns
     /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
@@ -303,12 +317,16 @@ impl PivSession {
         ok_or_apdu("select piv applet", sw)
     }
 
-    /// Read a read-only status snapshot: version, serial, PIN retries, and which
-    /// slots hold a certificate. No PIN, no touch.
+    /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
+    /// and which slots hold a certificate. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
         let version = self.version();
         let serial = self.serial();
         let pin_retries = self.pin_retries();
+        // Best-effort: a transport hiccup reading the CHUID shouldn't fail
+        // the whole status snapshot, any more than an unsupported GET
+        // VERSION/SERIAL does above.
+        let chuid = self.read_chuid().unwrap_or_default();
         let mut slots = Vec::with_capacity(4);
         for slot in piv::Slot::all() {
             slots.push(self.slot_status(slot)?);
@@ -318,6 +336,7 @@ impl PivSession {
             serial,
             pin_retries,
             slots,
+            chuid,
         })
     }
 
@@ -547,6 +566,45 @@ impl PivSession {
         let value = piv::encode_certificate(der);
         let (_, sw) = self.transmit_full(&piv::put_data(&slot.cert_object_tag(), &value))?;
         ok_or_write("piv import certificate", sw)
+    }
+
+    /// Write a CHUID (Card Holder Unique Identifier) to the card: `guid` is
+    /// the 16-byte GUID (tag `0x34`) — see [`random_chuid_guid`] for a
+    /// host-side-only, no-card-I/O way to generate one a caller can pre-fill
+    /// an input with and let the user overwrite — and `expiration` is the
+    /// `YYYYMMDD` expiration date (tag `0x35`; see
+    /// [`keyroost_piv::chuid_expiration_in_days`]). Requires prior
+    /// management-key auth ([`authenticate_management`]).
+    ///
+    /// Mirrors `yubico-piv-tool`'s `set-chuid` (see [`keyroost_piv::encode_chuid`]
+    /// for the byte-for-byte template match): Windows' PIV minidriver caches
+    /// a card's contents by its CHUID, so after writing a new certificate or
+    /// key it may keep showing stale data until the CHUID changes — this is
+    /// the standard fix, not a workaround specific to any one vendor's card.
+    ///
+    /// [`authenticate_management`]: PivSession::authenticate_management
+    pub fn new_chuid(
+        &mut self,
+        guid: &[u8; 16],
+        expiration: &[u8; 8],
+    ) -> Result<(), TransportError> {
+        let value = piv::encode_chuid(guid, expiration);
+        let (_, sw) = self.transmit_full(&piv::put_data(&piv::OBJECT_CHUID, &value))?;
+        ok_or_write("piv new chuid", sw)
+    }
+
+    /// Read the card's CHUID: FASC-N, GUID, and expiration date (the
+    /// signature and LRC fields are parsed away — see
+    /// [`keyroost_piv::parse_chuid`]). `None` when the object is empty/absent
+    /// or doesn't parse as a CHUID. No PIN required — CHUID is a public data
+    /// object, like a certificate.
+    pub fn read_chuid(&mut self) -> Result<Option<keyroost_piv::Chuid>, TransportError> {
+        let (data, sw) = self.transmit_full(&piv::get_data(&piv::OBJECT_CHUID))?;
+        if sw != piv::SW_OK {
+            return Ok(None);
+        }
+        let inner = piv::unwrap_data_object(&data).map_err(TransportError::PivParse)?;
+        Ok(piv::parse_chuid(inner))
     }
 
     /// Clear `slot`'s certificate object (standard PIV; universal across

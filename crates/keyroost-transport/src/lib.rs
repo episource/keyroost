@@ -40,7 +40,7 @@ mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
 mod piv;
-pub use piv::{PivSession, PivSlotStatus, PivStatus};
+pub use piv::{random_chuid_guid, PivSession, PivSlotStatus, PivStatus};
 
 mod token2otp;
 pub use token2otp::{
