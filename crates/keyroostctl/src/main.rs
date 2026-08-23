@@ -6337,7 +6337,11 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             println!("Slots:");
             for s in &status.slots {
                 if s.cert_present {
-                    println!("  {:<16} cert present ({} bytes)", s.slot.label(), s.cert_len);
+                    println!(
+                        "  {:<16} cert present ({} bytes)",
+                        s.slot.label(),
+                        s.cert_len
+                    );
                 } else {
                     println!("  {:<16} empty", s.slot.label());
                 }
@@ -6447,8 +6451,7 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 slot.to_slot().label()
             );
             let pubkey = s.generate_key(slot.to_slot(), alg)?;
-            let der = match keyroost_piv::spki::subject_public_key_info(&pubkey, alg.to_piv_alg())
-            {
+            let der = match keyroost_piv::spki::subject_public_key_info(&pubkey, alg.to_piv_alg()) {
                 Ok(der) => der,
                 Err(e) => {
                     return Err(
@@ -6493,7 +6496,12 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             );
         }
 
-        IasCmd::ExportCert { reader, aid, slot, file } => {
+        IasCmd::ExportCert {
+            reader,
+            aid,
+            slot,
+            file,
+        } => {
             let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
             match s.read_certificate(slot.to_slot())? {
                 None => {
@@ -6921,12 +6929,8 @@ fn load_pubkey_material_ias(
     path: &std::path::Path,
 ) -> Result<(keyroost_ias::KeyAlg, keyroost_ias::PublicKey), Box<dyn std::error::Error>> {
     let (piv_alg, key) = load_pubkey_material(path)?;
-    let alg = keyroost_ias::KeyAlg::from_piv_alg(piv_alg).ok_or_else(|| {
-        format!(
-            "{}: key algorithm has no IAS analog",
-            path.display()
-        )
-    })?;
+    let alg = keyroost_ias::KeyAlg::from_piv_alg(piv_alg)
+        .ok_or_else(|| format!("{}: key algorithm has no IAS analog", path.display()))?;
     Ok((alg, key))
 }
 

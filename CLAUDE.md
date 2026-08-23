@@ -103,54 +103,71 @@ workflow during bring-up is:
   will exercise `0xD8` (it is listed in `DESTRUCTIVE_INS` and skipped by
   default). Probe before writing a builder.
 
-### IAS Classic/ECC — built without a reference spec, none of this is confirmed
+### IAS Classic/ECC — built without a reference spec for the eToken 5300 itself
 
 `keyroost-ias` / `IasSession` / `keyroostctl ias` / the GUI's "IAS" tab were
-built entirely from general ISO 7816-4/-8 knowledge — no ANSSI IAS-ECC
-referential, no Thales/IDPrime command reference, and no eToken 5300 (or any
-IAS card) to trace against. Every byte value below is a documented guess, not
-a confirmed one; expect the first real bring-up to land on one or more of
-these, fixed the same way the PIV soft spots above were: an isolated
-point-edit, not a rewrite.
+built from general ISO 7816-4/-8 knowledge with no eToken 5300 (or any IAS
+card) to trace against. Two secondary sources have since corrected/confirmed
+parts of it — neither is authoritative *for the eToken 5300 specifically*
+(different issuer, no wire-level manual for that exact product is public),
+but both are real:
 
-- **AID.** `keyroost_ias::CANDIDATE_AIDS` is a best-effort guess list — IAS
-  Classic/ECC has no single spec-mandated AID the way PIV/OpenPGP do; each
-  card issuer registers its own. `--aid <hex>` (CLI) / the GUI's "AID
-  override" field (in the IAS tab's status card) exist so a real AID can
-  be tried immediately, without a code change. Trace SELECT first, before
-  anything else.
-- **PIN/PUK/admin-key reference bytes** (`PIN_REF_USER`, `ADMIN_KEY_REF` in
-  `crates/keyroost-ias/src/lib.rs`) are placeholders. `SW 6A88` (reference
-  data not found) on VERIFY/CHANGE REFERENCE DATA is the first suspect.
-- **GENERATE ASYMMETRIC KEY PAIR's INS byte and CRT tag layout.** `0x46`
-  (ISO 7816-8's own table) vs `0x47` (what this workspace's own PIV/OpenPGP
-  layers use for the identical concept) are both real conventions; `SW 6D00`
-  means try the other INS before assuming the CRT shape (tag `0xB8` wrapping
-  `0x80`/`0x84`) is wrong.
+- **OpenSC's `card-cedulauy.c`** — a real, deployed open-source driver for
+  Uruguay's national eID, an IAS-Classic-family card. Confirmed several
+  bytes below; where it did, this crate now cites it directly in the
+  builder's own doc comment rather than marking the byte `[GUESS]`.
+- **Thales's public Common Criteria Security Target** for "IAS Classic v5.2
+  with MOC Server v3.1 on MultiApp V5.0" (D1506187_LITE rev 1.5) — a CC
+  assurance document, not a command reference, so it gives no
+  AID/INS/P1/P2/tag detail at all, but it does describe the admin-key
+  crypto's real *shape*. The actual byte-level manual for that card family
+  is Thales's restricted "IAS Classic v5.2, Reference Manual, D1542053B" —
+  not publicly available.
+
+Confirmed (adopted, no longer `[GUESS]`):
+- **SELECT's P2 is `0x00`** ("return FCI"), not PIV/Yubico's `0x0C`.
+- **A real, working AID** (Uruguay's, `A0 00 00 00 18 40 00 00 01 63 42 00`)
+  is `CANDIDATE_AIDS`' first entry — still not proven to match the eToken
+  5300 (each issuer registers its own AID for this card family), but a real
+  evidenced one is a better first guess than an invented one. `--aid <hex>`
+  (CLI) / the GUI's "AID override" field remain the fast path once a trace
+  names the real one.
+- **Signing is a three-step sequence**, not the single-step PSO:CDS this
+  crate originally shipped: MSE:SET DST (`00 22 41 B6`, CRT tag `0xB6`
+  wrapping key-ref `0x84` then algorithm-ref `0x80`, in that order) → PSO:LOAD
+  HASH (`00 2A 90 A0`, tag `0x90` wrapping the same DigestInfo/hash this crate
+  already computed for the old single-step form) → **empty-body**
+  PSO:COMPUTE DIGITAL SIGNATURE. `IasSession::sign` now takes `slot` and
+  drives all three; MSE's status word is intentionally not checked (a card
+  that doesn't need it shouldn't abort signing — a card that does need it
+  fails at the PSO steps instead, with a traceable status word).
+
+Still open (unconfirmed, isolated so a fix is a point-edit):
+- **PIN/PUK/admin-key reference bytes** (`PIN_REF_USER`, `ADMIN_KEY_REF`) are
+  still placeholders. `SW 6A88` (reference data not found) on VERIFY/CHANGE
+  REFERENCE DATA is the first suspect.
+- **GENERATE ASYMMETRIC KEY PAIR's own INS byte and CRT layout** — `0x46`
+  vs `0x47`, and CRT tag `0xB8` (algo-then-keyref) — are still guesses.
+  The cedulauy evidence above covers MSE:SET ahead of *signing* only; that
+  card has no user-triggered key generation to observe (keys are
+  provisioned at issuance), so none of it transfers to GENERATE. `SW 6D00`
+  means try the other INS.
 - **The admin-key crypto** (`admin_crypt` in
-  `crates/keyroost-transport/src/ias.rs`) is the single highest-uncertainty
-  piece of the whole feature, and is now known to likely be the wrong
-  *shape*, not just the wrong bytes. Thales's public Common Criteria
-  Security Target for this exact applet ("IAS Classic v5.2 with MOC Server
-  v3.1 on MultiApp V5.0", D1506187_LITE rev 1.5 — a CC assurance document,
-  not the byte-level command reference) confirms TDES/AES as the
-  administrator-authentication ciphers (matching `IasAdminAlg`) but shows
-  the real scheme is Diffie-Hellman/ECDH ephemeral session-key
-  establishment feeding actual secure messaging (separate encrypt + MAC per
-  command), not a static-key GET CHALLENGE/EXTERNAL AUTHENTICATE
-  challenge-response. The real byte-level reference is Thales's restricted
-  "IAS Classic v5.2, Reference Manual, D1542053B" — not publicly available.
+  `crates/keyroost-transport/src/ias.rs`) is still the single
+  highest-uncertainty piece of the whole feature, and is known to likely be
+  the wrong *shape*, not just the wrong bytes: the Security Target above
+  confirms TDES/AES as the ciphers (matching `IasAdminAlg`) but shows the
+  real scheme is Diffie-Hellman/ECDH ephemeral session-key establishment
+  feeding actual secure messaging (separate encrypt + MAC per command), not
+  a static-key GET CHALLENGE/EXTERNAL AUTHENTICATE challenge-response.
   Kept isolated in one function specifically so replacing it with the real
   key-exchange + secure-messaging scheme doesn't ripple into the CLI/GUI.
 - **The per-slot certificate FID table** (`Slot::default_cert_fid`,
-  `FidTable`) is a 3-entry guess. `--fid <slot>=<hex>`-style overrides (via
-  `FidTable`, threaded through `IasSession::open`) exist so correcting a
-  real card's layout is a config change, not a rewrite.
+  `FidTable`) is a 3-entry guess. `--fid <slot>=<hex>`-style overrides exist
+  so correcting a real card's layout is a config change, not a rewrite.
 - **`set_pin_retries` always returns `IasNotSupported`, on purpose.** No
   ISO 7816-4/-8 instruction covers it and no defensible placeholder byte
-  sequence exists (unlike the other guesses above, which at least follow a
-  reasoned convention) — see the doc comment on
-  `IasSession::set_pin_retries`.
+  sequence exists — see the doc comment on `IasSession::set_pin_retries`.
 - **No applet reset exists in this feature at all**, not even as a guess —
   there's no basis to assume IAS-ECC profiles expose a full-applet factory
   reset the way PIV/OpenPGP do. This is a deliberate gap, not an oversight.

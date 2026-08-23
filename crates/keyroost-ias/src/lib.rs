@@ -58,6 +58,16 @@ pub use keyroost_piv::PublicKey;
 /// use it the moment a real trace shows the actual AID, rather than editing
 /// this list.
 pub const CANDIDATE_AIDS: &[&[u8]] = &[
+    // Uruguay's national eID ("Cédula de Identidad") AID, byte-for-byte from
+    // OpenSC's card-cedulauy.c driver — a real, deployed IAS-Classic-family
+    // card. [HIGH confidence this exact AID is real and works on *that*
+    // card] but [GUESS that it also matches the eToken 5300] — different
+    // issuers of the same card family register their own AIDs (see this
+    // constant's own doc comment). Kept first since a real, evidenced AID is
+    // a better first guess than an invented one.
+    &[
+        0xA0, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x01, 0x63, 0x42, 0x00,
+    ],
     // A commonly-cited ANSSI IAS-ECC-profile applet AID. GUESS.
     &[
         0xA0, 0x00, 0x00, 0x00, 0x77, 0x01, 0x08, 0x00, 0x07, 0x00, 0x00, 0xFE, 0x00, 0x00, 0x01,
@@ -122,22 +132,24 @@ pub enum Instruction {
     /// `[HIGH]`
     ExternalAuthenticate = 0x82,
     /// MANAGE SECURITY ENVIRONMENT — select the key/algorithm reference
-    /// ahead of GENERATE KEY PAIR / PSO on profiles that need it. ISO
-    /// 7816-4 base instruction. `[HIGH]` (whether IAS needs it at all, and
-    /// its exact CRT layout, is `[GUESS]` — see [`manage_security_environment`]).
+    /// ahead of PSO signing. ISO 7816-4 base instruction. `[HIGH]` — the
+    /// instruction byte, its use ahead of signing, and the Digital Signature
+    /// Template CRT layout are now evidence-based, not a blind guess; see
+    /// [`manage_security_environment`].
     ManageSecurityEnvironment = 0x22,
     /// GENERATE ASYMMETRIC KEY PAIR. `[GUESS: 0x46 per ISO 7816-8's own
     /// table]` — note both PIV and OpenPGP in this workspace use `0x47` for
     /// the identical concept on their own cards, so `0x47` is a live
     /// alternative if `0x46` comes back `6D00`.
     GenerateAsymmetricKeyPair = 0x46,
-    /// PERFORM SECURITY OPERATION — used here for COMPUTE DIGITAL SIGNATURE
-    /// (`P1=0x9E P2=0x9A`). ISO 7816-8 base instruction, and byte-identical
-    /// to this workspace's own `keyroost-openpgp::Instruction::
-    /// PerformSecurityOperation` (`0x2A`), which is tested against real
-    /// OpenPGP-card hardware — the highest-confidence non-ISO-7816-4-base
-    /// choice in this enum precisely because it's independently confirmed
-    /// in-repo. `[HIGH]`
+    /// PERFORM SECURITY OPERATION — used here for both LOAD HASH
+    /// (`P1=0x90 P2=0xA0`, see [`pso_load_hash`]) and COMPUTE DIGITAL
+    /// SIGNATURE (`P1=0x9E P2=0x9A`, see [`pso_compute_signature`]). ISO
+    /// 7816-8 base instruction; byte-identical to this workspace's own
+    /// `keyroost-openpgp::Instruction::PerformSecurityOperation` (`0x2A`),
+    /// which is tested against real OpenPGP-card hardware, *and* to the
+    /// exact sequence OpenSC's `card-cedulauy.c` driver issues against a
+    /// real, deployed IAS-Classic-family card. `[HIGH]`
     PerformSecurityOperation = 0x2A,
     /// READ BINARY — read an EF (certificate file), either after a SELECT
     /// FILE or via a short-EF-id in P1. ISO 7816-4 base instruction. `[HIGH]`
@@ -403,7 +415,9 @@ impl core::fmt::Display for ParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ParseError::Truncated => write!(f, "IAS response truncated"),
-            ParseError::NotPublicKeyTemplate => write!(f, "IAS response is not a 7F49 public-key template"),
+            ParseError::NotPublicKeyTemplate => {
+                write!(f, "IAS response is not a 7F49 public-key template")
+            }
             ParseError::BadLength => write!(f, "IAS response used an unsupported BER length form"),
         }
     }
@@ -428,10 +442,14 @@ fn pad_pin(pin: &[u8]) -> Result<Zeroizing<Vec<u8>>, PinLengthError> {
 // ---------------------------------------------------------------------------
 
 /// SELECT the IAS applet by `aid` (case 4: a trailing `Le` requests whatever
-/// property template the card returns on success).
+/// property template the card returns on success). `P2=0x00` ("return FCI,
+/// first/only occurrence") rather than PIV/Yubico's `0x0C` ("no response
+/// data") — `[HIGH]`, confirmed by OpenSC's `card-cedulauy.c` driver for a
+/// real, deployed IAS-Classic-family card (Uruguay's national eID), which
+/// builds this exact `00 A4 04 00 <Lc> <aid>` SELECT and reads an FCI back.
 #[must_use]
 pub fn select(aid: &[u8]) -> Vec<u8> {
-    let mut apdu = build_apdu(0x00, Instruction::Select.code(), 0x04, 0x0C, aid);
+    let mut apdu = build_apdu(0x00, Instruction::Select.code(), 0x04, 0x00, aid);
     apdu.push(0x00);
     apdu
 }
@@ -525,29 +543,42 @@ pub fn external_authenticate(admin_key_ref: u8, response: &[u8]) -> Vec<u8> {
     )
 }
 
-/// MANAGE SECURITY ENVIRONMENT: SET the key/algorithm reference for a
-/// subsequent GENERATE KEY PAIR or PSO operation, on cards that need an
-/// explicit pre-step. **Not called by default anywhere in this workspace's
-/// transport layer** — a no-op unless a trace shows GENERATE/PSO failing
-/// without it. `[GUESS]` — P1=`0x41` ("SET, compute/decipher"), P2=`0xB8`
-/// (confidentiality-template tag, repurposed here by ISO 7816-8 convention),
-/// data = the same CRT [`generate_key_pair`] builds.
+/// MANAGE SECURITY ENVIRONMENT — SET the Digital Signature Template (DST)
+/// ahead of PSO:COMPUTE DIGITAL SIGNATURE, selecting which key/algorithm the
+/// next signature operation uses. `[HIGH]` — confirmed by OpenSC's
+/// `card-cedulauy.c` driver, which issues exactly this APDU
+/// (`00 22 41 B6 <Lc> 84 01 <keyref> 80 01 <algo>`) before every signature.
+/// Tag `0xB6` (DST) is also the ISO 7816-8-correct choice for a *signature*
+/// key selection specifically (as opposed to `0xB8`, Confidentiality
+/// Template, used for decipher/confidentiality operations) — unlike the
+/// [`generate_key_pair`] CRT below, this one is evidence-based, not a blind
+/// guess, and is called unconditionally by
+/// [`keyroost_transport`](../../keyroost_transport/index.html)'s
+/// `IasSession::sign` ahead of every signature.
 #[must_use]
 pub fn manage_security_environment(slot: Slot, alg: KeyAlg) -> Vec<u8> {
-    let crt = generate_key_pair_crt(slot, alg);
+    let mut inner = Vec::with_capacity(6);
+    push_tlv(&mut inner, &[0x84], &[slot.key_ref()]);
+    push_tlv(&mut inner, &[0x80], &[alg.id()]);
+    let mut crt = Vec::with_capacity(inner.len() + 2);
+    push_tlv(&mut crt, &[0xB6], &inner);
     build_apdu(
         0x00,
         Instruction::ManageSecurityEnvironment.code(),
         0x41,
-        0xB8,
+        0xB6,
         &crt,
     )
 }
 
-/// The CRT (control reference template) shared by [`generate_key_pair`] and
-/// [`manage_security_environment`]: tag `0xB8` wrapping algorithm-reference
-/// (tag `0x80`) + key-reference (tag `0x84`). `[GUESS]` tag choice — a real
-/// card may instead expect `0xA6`, or no outer wrapper at all.
+/// The CRT (control reference template) [`generate_key_pair`] wraps its
+/// algorithm/key-reference in. **Not the same tag/field-order the now-
+/// confirmed [`manage_security_environment`] uses** — that evidence covers
+/// MSE:SET DST ahead of signing, not GENERATE ASYMMETRIC KEY PAIR itself (the
+/// real card this crate's other evidence comes from, Uruguay's eID, has no
+/// user-triggered key generation to observe at all — keys are provisioned
+/// at issuance). `[GUESS]` tag choice — a real card may instead expect
+/// `0xA6`, `0xB6` matching MSE:SET's own tag, or no outer wrapper at all.
 fn generate_key_pair_crt(slot: Slot, alg: KeyAlg) -> Vec<u8> {
     let mut inner = Vec::with_capacity(6);
     push_tlv(&mut inner, &[0x80], &[alg.id()]);
@@ -575,10 +606,56 @@ pub fn generate_key_pair(slot: Slot, alg: KeyAlg) -> Vec<u8> {
     apdu
 }
 
+/// PSO:LOAD HASH (a.k.a. PSO:HASH): push the to-be-signed digest — a full
+/// PKCS#1 v1.5 DigestInfo for RSA, or the raw hash for ECDSA; this layer
+/// never hashes — to the card ahead of an empty-body
+/// [`pso_compute_signature`]. `[HIGH]` — confirmed by OpenSC's
+/// `card-cedulauy.c` driver: `00 2A 90 A0 <Lc> 90 <len> <data>` (tag `0x90`
+/// wraps the digest), no response expected. On the real card this evidence
+/// comes from, the two-step MSE:SET DST → PSO:HASH → empty PSO:CDS sequence
+/// *replaces* sending the digest directly in PSO:CDS's own body — see
+/// `IasSession::sign`, which now does exactly that sequence unconditionally
+/// rather than the single-step form this crate originally shipped with.
+#[must_use]
+pub fn pso_load_hash(data: &[u8]) -> Vec<u8> {
+    let mut tlv = Vec::with_capacity(data.len() + 2);
+    push_tlv(&mut tlv, &[0x90], data);
+    build_apdu_ext(
+        0x00,
+        Instruction::PerformSecurityOperation.code(),
+        0x90,
+        0xA0,
+        &tlv,
+        None,
+    )
+}
+
+/// Command-chaining form of [`pso_load_hash`], for cards/readers that reject
+/// a single extended-length PSO:HASH — an RSA-3072/4096 DigestInfo can
+/// exceed the 255-byte short-form ceiling.
+#[must_use]
+pub fn pso_load_hash_chained(data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
+    let mut tlv = Vec::with_capacity(data.len() + 2);
+    push_tlv(&mut tlv, &[0x90], data);
+    chain_apdu(
+        0x00,
+        Instruction::PerformSecurityOperation.code(),
+        0x90,
+        0xA0,
+        &tlv,
+        max_chunk,
+        None,
+    )
+}
+
 /// PSO:COMPUTE DIGITAL SIGNATURE, single short/extended-length APDU:
 /// `00 2A 9E 9A <Lc> <data> <Le>` — byte-identical framing to this
-/// workspace's own `keyroost_openpgp` PSO:CDS. `data` is the caller-prepared
-/// DigestInfo (RSA) or raw hash (ECDSA); this layer never hashes. `[HIGH]`
+/// workspace's own `keyroost_openpgp` PSO:CDS. `[HIGH]` framing. Two calling
+/// conventions are both live in this workspace: pass the caller-prepared
+/// DigestInfo/hash directly as `data` (this crate's original, unconfirmed
+/// single-step guess), or pass `&[]` after a prior [`pso_load_hash`] — the
+/// now-evidence-based two-step form `IasSession::sign` actually uses (see
+/// that function's doc comment).
 #[must_use]
 pub fn pso_compute_signature(data: &[u8]) -> Vec<u8> {
     build_apdu_ext(
@@ -770,8 +847,18 @@ mod tests {
         let aid = [0xA0, 0x00, 0x00, 0x01];
         assert_eq!(
             select(&aid),
-            vec![0x00, 0xA4, 0x04, 0x0C, 0x04, 0xA0, 0x00, 0x00, 0x01, 0x00]
+            vec![0x00, 0xA4, 0x04, 0x00, 0x04, 0xA0, 0x00, 0x00, 0x01, 0x00]
         );
+    }
+
+    #[test]
+    fn candidate_aids_include_the_confirmed_cedulauy_aid() {
+        // Real, evidenced AID (OpenSC card-cedulauy.c) — must stay in the
+        // list, and the select() APDU built from it must round-trip.
+        let real_aid = [
+            0xA0, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x01, 0x63, 0x42, 0x00,
+        ];
+        assert!(CANDIDATE_AIDS.contains(&&real_aid[..]));
     }
 
     #[test]
@@ -780,7 +867,18 @@ mod tests {
         assert_eq!(
             apdu,
             vec![
-                0x00, 0x20, 0x00, PIN_REF_USER, 0x08, 0x31, 0x32, 0x33, 0x34, 0xFF, 0xFF, 0xFF,
+                0x00,
+                0x20,
+                0x00,
+                PIN_REF_USER,
+                0x08,
+                0x31,
+                0x32,
+                0x33,
+                0x34,
+                0xFF,
+                0xFF,
+                0xFF,
                 0xFF
             ]
         );
@@ -805,8 +903,14 @@ mod tests {
         let apdu = change_reference_data(b"1234", b"5678").unwrap();
         assert_eq!(apdu[..4], [0x00, 0x24, 0x00, PIN_REF_USER]);
         assert_eq!(apdu[4], 0x10); // Lc: two padded 8-byte fields
-        assert_eq!(&apdu[5..13], &[0x31, 0x32, 0x33, 0x34, 0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(&apdu[13..21], &[0x35, 0x36, 0x37, 0x38, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            &apdu[5..13],
+            &[0x31, 0x32, 0x33, 0x34, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            &apdu[13..21],
+            &[0x35, 0x36, 0x37, 0x38, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -835,7 +939,18 @@ mod tests {
         assert_eq!(
             external_authenticate(ADMIN_KEY_REF, &[0xAA; 8]),
             vec![
-                0x00, 0x82, 0x00, ADMIN_KEY_REF, 0x08, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+                0x00,
+                0x82,
+                0x00,
+                ADMIN_KEY_REF,
+                0x08,
+                0xAA,
+                0xAA,
+                0xAA,
+                0xAA,
+                0xAA,
+                0xAA,
+                0xAA,
                 0xAA
             ]
         );
@@ -848,21 +963,68 @@ mod tests {
         assert_eq!(
             apdu,
             vec![
-                0x00, 0x46, 0x00, 0x00, 0x08, 0xB8, 0x06, 0x80, 0x01, 0x0C, 0x84, 0x01, 0x81,
-                0x00
+                0x00, 0x46, 0x00, 0x00, 0x08, 0xB8, 0x06, 0x80, 0x01, 0x0C, 0x84, 0x01, 0x81, 0x00
             ]
         );
     }
 
     #[test]
     fn manage_security_environment_bytes() {
+        // Confirmed shape (OpenSC card-cedulauy.c): 00 22 41 B6 <Lc>
+        // B6 <len> { 84 01 <keyref>  80 01 <algo> }
         let apdu = manage_security_environment(Slot::Signature, KeyAlg::Rsa2048);
-        assert_eq!(apdu[..4], [0x00, 0x22, 0x41, 0xB8]);
+        assert_eq!(apdu[..4], [0x00, 0x22, 0x41, 0xB6]);
         assert_eq!(apdu[4], 0x08); // Lc: CRT length
         assert_eq!(
             &apdu[5..],
-            &[0xB8, 0x06, 0x80, 0x01, 0x02, 0x84, 0x01, 0x82]
+            &[0xB6, 0x06, 0x84, 0x01, 0x82, 0x80, 0x01, 0x02]
         );
+    }
+
+    #[test]
+    fn pso_load_hash_bytes() {
+        // Confirmed shape (OpenSC card-cedulauy.c): 00 2A 90 A0 <Lc> 90 <len> <data>
+        let apdu = pso_load_hash(&[0xAA, 0xBB]);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0x2A, 0x90, 0xA0, 0x04, 0x90, 0x02, 0xAA, 0xBB]
+        );
+    }
+
+    #[test]
+    fn pso_load_hash_extended_form_over_255() {
+        // An RSA-3072 DigestInfo is well over the 255-byte short-form
+        // ceiling; must not panic (build_apdu would).
+        let data = vec![0x11u8; 384];
+        let apdu = pso_load_hash(&data);
+        assert_eq!(&apdu[..5], &[0x00, 0x2A, 0x90, 0xA0, 0x00]);
+        let lc = ((apdu[5] as usize) << 8) | apdu[6] as usize;
+        // Inner TLV: 1 tag byte + 3-byte long-form BER length (0x82 hi lo) + data.
+        assert_eq!(lc, 1 + 3 + 384);
+        assert_eq!(&apdu[7..11], &[0x90, 0x82, 0x01, 0x80]); // tag 0x90, 2-byte BER length form (384 = 0x0180)
+        assert_eq!(&apdu[11..11 + 384], data.as_slice());
+    }
+
+    #[test]
+    fn pso_load_hash_chained_reassembles_to_extended_body() {
+        let data = vec![0x22u8; 384];
+        let extended = pso_load_hash(&data);
+        let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
+        let ext_body = &extended[7..7 + ext_lc];
+
+        let chunks = pso_load_hash_chained(&data, 254);
+        assert!(chunks.len() > 1);
+        let last = chunks.len() - 1;
+        let mut reassembled = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected_cla = if i < last { 0x10 } else { 0x00 };
+            assert_eq!(chunk[0], expected_cla);
+            assert_eq!(&chunk[1..4], &[0x2A, 0x90, 0xA0]);
+            let lc = chunk[4] as usize;
+            reassembled.extend_from_slice(&chunk[5..5 + lc]);
+            assert_eq!(chunk.len(), 5 + lc); // PSO:HASH requests no Le, on any link
+        }
+        assert_eq!(reassembled, ext_body);
     }
 
     #[test]
@@ -918,10 +1080,7 @@ mod tests {
 
     #[test]
     fn read_binary_bytes() {
-        assert_eq!(
-            read_binary(0x0010, 256),
-            vec![0x00, 0xB0, 0x00, 0x10, 0x00]
-        );
+        assert_eq!(read_binary(0x0010, 256), vec![0x00, 0xB0, 0x00, 0x10, 0x00]);
     }
 
     #[test]
@@ -964,9 +1123,15 @@ mod tests {
     #[test]
     fn slot_key_ref_and_fid_are_distinct_per_slot() {
         let refs: Vec<u8> = Slot::all().iter().map(|s| s.key_ref()).collect();
-        assert_eq!(refs.len(), refs.iter().collect::<std::collections::HashSet<_>>().len());
+        assert_eq!(
+            refs.len(),
+            refs.iter().collect::<std::collections::HashSet<_>>().len()
+        );
         let fids: Vec<u16> = Slot::all().iter().map(|s| s.default_cert_fid()).collect();
-        assert_eq!(fids.len(), fids.iter().collect::<std::collections::HashSet<_>>().len());
+        assert_eq!(
+            fids.len(),
+            fids.iter().collect::<std::collections::HashSet<_>>().len()
+        );
     }
 
     #[test]
@@ -982,12 +1147,20 @@ mod tests {
         let mut t = FidTable::default();
         t.signature = 0xABCD;
         assert_eq!(t.fid_for(Slot::Signature), 0xABCD);
-        assert_eq!(t.fid_for(Slot::Authentication), Slot::Authentication.default_cert_fid());
+        assert_eq!(
+            t.fid_for(Slot::Authentication),
+            Slot::Authentication.default_cert_fid()
+        );
     }
 
     #[test]
     fn key_alg_round_trips() {
-        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::EccP256, KeyAlg::EccP384] {
+        for alg in [
+            KeyAlg::Rsa2048,
+            KeyAlg::Rsa3072,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+        ] {
             assert_eq!(KeyAlg::from_id(alg.id()), Some(alg));
         }
         assert_eq!(KeyAlg::from_id(0xFF), None);
@@ -1001,7 +1174,12 @@ mod tests {
 
     #[test]
     fn key_alg_from_piv_alg_round_trips() {
-        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::EccP256, KeyAlg::EccP384] {
+        for alg in [
+            KeyAlg::Rsa2048,
+            KeyAlg::Rsa3072,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+        ] {
             assert_eq!(KeyAlg::from_piv_alg(alg.to_piv_alg()), Some(alg));
         }
         assert_eq!(KeyAlg::from_piv_alg(keyroost_piv::KeyAlg::Ed25519), None);
@@ -1067,6 +1245,9 @@ mod tests {
             parse_generated_public_key(&[0x7F, 0x48, 0x00]),
             Err(ParseError::NotPublicKeyTemplate)
         );
-        assert_eq!(parse_generated_public_key(&[]), Err(ParseError::NotPublicKeyTemplate));
+        assert_eq!(
+            parse_generated_public_key(&[]),
+            Err(ParseError::NotPublicKeyTemplate)
+        );
     }
 }

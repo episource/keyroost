@@ -14181,7 +14181,9 @@ impl App {
                             s.read_certificate(slot)
                                 .ok()
                                 .flatten()
-                                .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
+                                .and_then(|der| {
+                                    keyroost_piv::x509_parse::parse_subject_dn(&der).ok()
+                                })
                                 .map(|dn| dn.to_string()),
                         ),
                         Err(_) => (None, None),
@@ -15262,132 +15264,129 @@ impl App {
         let mut want_close = false;
         let mismatch = ias_cred_mismatch(&self.ias, kind);
 
-        let closed = Self::modal_window(ctx, p, "ias_cred", kind.title(), |ui| {
-            match &result {
-                Some(Ok(())) => {
-                    ui.label(
-                        egui::RichText::new(format!("\u{2713} {}", ias_cred_success(kind)))
-                            .font(theme::f_sb(13.0))
-                            .color(p.ok),
-                    );
-                    ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
-                        want_close = true;
-                    }
+        let closed = Self::modal_window(ctx, p, "ias_cred", kind.title(), |ui| match &result {
+            Some(Ok(())) => {
+                ui.label(
+                    egui::RichText::new(format!("\u{2713} {}", ias_cred_success(kind)))
+                        .font(theme::f_sb(13.0))
+                        .color(p.ok),
+                );
+                ui.add_space(16.0);
+                if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                    want_close = true;
                 }
-                _ => {
-                    match kind {
-                        IasCredKind::ChangePin => {
-                            pin_field(ui, p, "Current PIN", &mut self.ias.pin_old);
-                            pin_field(ui, p, "New PIN", &mut self.ias.pin_new);
-                            pin_field(ui, p, "Confirm new PIN", &mut self.ias.pin_confirm);
-                            card_note(ui, p, "4\u{2013}8 characters.");
-                        }
-                        IasCredKind::ChangePuk => {
-                            pin_field(ui, p, "Current PUK", &mut self.ias.puk_old);
-                            pin_field(ui, p, "New PUK", &mut self.ias.puk_new);
-                            pin_field(ui, p, "Confirm new PUK", &mut self.ias.puk_confirm);
-                            card_note(ui, p, "4\u{2013}8 characters.");
-                        }
-                        IasCredKind::UnblockPin => {
-                            pin_field(ui, p, "PUK", &mut self.ias.unblock_puk);
-                            pin_field(ui, p, "New PIN", &mut self.ias.unblock_new_pin);
-                            card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
-                        }
-                        IasCredKind::GenerateKey => {
-                            self.ias_modal_admin_field(ui, p, kind);
-                            card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
-                        }
-                        IasCredKind::ImportCert => {
-                            self.ias_modal_admin_field(ui, p, kind);
-                            card_note(ui, p, "Authorizes writing the certificate to the slot.");
-                        }
-                        IasCredKind::SelfSign => {
-                            self.ias_modal_admin_field(ui, p, kind);
-                            pin_field(ui, p, "PIN", &mut self.ias.sign_pin);
-                            card_note(
-                                ui,
-                                p,
-                                "Admin key authorizes the import; the PIN authorizes the \
+            }
+            _ => {
+                match kind {
+                    IasCredKind::ChangePin => {
+                        pin_field(ui, p, "Current PIN", &mut self.ias.pin_old);
+                        pin_field(ui, p, "New PIN", &mut self.ias.pin_new);
+                        pin_field(ui, p, "Confirm new PIN", &mut self.ias.pin_confirm);
+                        card_note(ui, p, "4\u{2013}8 characters.");
+                    }
+                    IasCredKind::ChangePuk => {
+                        pin_field(ui, p, "Current PUK", &mut self.ias.puk_old);
+                        pin_field(ui, p, "New PUK", &mut self.ias.puk_new);
+                        pin_field(ui, p, "Confirm new PUK", &mut self.ias.puk_confirm);
+                        card_note(ui, p, "4\u{2013}8 characters.");
+                    }
+                    IasCredKind::UnblockPin => {
+                        pin_field(ui, p, "PUK", &mut self.ias.unblock_puk);
+                        pin_field(ui, p, "New PIN", &mut self.ias.unblock_new_pin);
+                        card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
+                    }
+                    IasCredKind::GenerateKey => {
+                        self.ias_modal_admin_field(ui, p, kind);
+                        card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
+                    }
+                    IasCredKind::ImportCert => {
+                        self.ias_modal_admin_field(ui, p, kind);
+                        card_note(ui, p, "Authorizes writing the certificate to the slot.");
+                    }
+                    IasCredKind::SelfSign => {
+                        self.ias_modal_admin_field(ui, p, kind);
+                        pin_field(ui, p, "PIN", &mut self.ias.sign_pin);
+                        card_note(
+                            ui,
+                            p,
+                            "Admin key authorizes the import; the PIN authorizes the \
                                  on-card signature.",
-                            );
-                        }
-                        IasCredKind::RequestCsr => {
-                            pin_field(ui, p, "PIN", &mut self.ias.sign_pin);
-                            card_note(ui, p, "The PIN authorizes the on-card signature.");
-                        }
-                        IasCredKind::ChangeAdminKey => {
-                            self.ias_modal_admin_field(ui, p, kind);
-                            secret_field(
-                                ui,
-                                p,
-                                "New key",
-                                &mut self.ias.new_admin_key_input,
-                                "hex (48/32 chars)",
-                                300.0,
-                            );
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("New algorithm")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt2),
-                                );
-                                ui.add_space(8.0);
-                                ias_adminalg_combo(
-                                    ui,
-                                    "ias-change-new-admin-alg",
-                                    &mut self.ias.new_admin_alg,
-                                );
-                            });
-                            card_note(ui, p, "Enter the current key, then the new key.");
-                        }
-                        IasCredKind::DeleteCert => {
-                            let slot = self.ias.selected_slot.label();
-                            ui.colored_label(
-                                p.err,
-                                egui::RichText::new(format!(
-                                    "Removes the certificate in {slot}. The private key in \
-                                     the slot remains. This cannot be undone."
-                                ))
-                                .font(theme::f_sb(12.5)),
-                            );
-                            ui.add_space(6.0);
-                            self.ias_modal_admin_field(ui, p, kind);
-                            card_note(ui, p, "The admin key authorizes the deletion.");
-                        }
+                        );
                     }
-
-                    if let Some(msg) = mismatch {
-                        ui.add_space(6.0);
-                        ui.colored_label(p.err, msg);
-                    } else if let Some(Err(e)) = &result {
-                        ui.add_space(6.0);
-                        ui.colored_label(p.err, e);
+                    IasCredKind::RequestCsr => {
+                        pin_field(ui, p, "PIN", &mut self.ias.sign_pin);
+                        card_note(ui, p, "The PIN authorizes the on-card signature.");
                     }
-
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        if busy {
-                            ui.add(egui::Spinner::new());
+                    IasCredKind::ChangeAdminKey => {
+                        self.ias_modal_admin_field(ui, p, kind);
+                        secret_field(
+                            ui,
+                            p,
+                            "New key",
+                            &mut self.ias.new_admin_key_input,
+                            "hex (48/32 chars)",
+                            300.0,
+                        );
+                        ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(kind.busy_label())
-                                    .font(theme::f_reg(12.5))
+                                egui::RichText::new("New algorithm")
+                                    .font(theme::f_reg(13.0))
                                     .color(p.txt2),
                             );
-                        } else {
-                            if theme::button(ui, p, BtnKind::Primary, kind.submit_label())
-                                .clicked()
-                                && mismatch.is_none()
-                            {
-                                want_submit = true;
-                            }
                             ui.add_space(8.0);
-                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
-                                want_close = true;
-                            }
-                        }
-                    });
+                            ias_adminalg_combo(
+                                ui,
+                                "ias-change-new-admin-alg",
+                                &mut self.ias.new_admin_alg,
+                            );
+                        });
+                        card_note(ui, p, "Enter the current key, then the new key.");
+                    }
+                    IasCredKind::DeleteCert => {
+                        let slot = self.ias.selected_slot.label();
+                        ui.colored_label(
+                            p.err,
+                            egui::RichText::new(format!(
+                                "Removes the certificate in {slot}. The private key in \
+                                     the slot remains. This cannot be undone."
+                            ))
+                            .font(theme::f_sb(12.5)),
+                        );
+                        ui.add_space(6.0);
+                        self.ias_modal_admin_field(ui, p, kind);
+                        card_note(ui, p, "The admin key authorizes the deletion.");
+                    }
                 }
+
+                if let Some(msg) = mismatch {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.err, msg);
+                } else if let Some(Err(e)) = &result {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.err, e);
+                }
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.add(egui::Spinner::new());
+                        ui.label(
+                            egui::RichText::new(kind.busy_label())
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
+                        );
+                    } else {
+                        if theme::button(ui, p, BtnKind::Primary, kind.submit_label()).clicked()
+                            && mismatch.is_none()
+                        {
+                            want_submit = true;
+                        }
+                        ui.add_space(8.0);
+                        if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                            want_close = true;
+                        }
+                    }
+                });
             }
         });
 

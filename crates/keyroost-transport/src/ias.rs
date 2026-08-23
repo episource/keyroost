@@ -270,8 +270,7 @@ impl IasSession {
         let (data, sw) = self.transmit_full(&ias::generate_key_pair(slot, alg))?;
         ok_or_write("ias generate key", sw)?;
         let key = ias::parse_generated_public_key(&data).map_err(TransportError::IasParse)?;
-        self.pubkey_cache
-            .insert(slot.key_ref(), (alg, key.clone()));
+        self.pubkey_cache.insert(slot.key_ref(), (alg, key.clone()));
         Ok(key)
     }
 
@@ -361,14 +360,14 @@ impl IasSession {
         if let Some(cached) = self.pubkey_cache.get(&slot.key_ref()).cloned() {
             return Ok(cached);
         }
-        let der = self.read_certificate(slot)?.ok_or(
-            TransportError::MalformedResponse(
+        let der = self
+            .read_certificate(slot)?
+            .ok_or(TransportError::MalformedResponse(
                 "slot has no key: no certificate to read one from, and nothing was \
                  generated into this slot in this session — run `ias generate-key` \
                  on this slot in this same session, or pass its previously saved \
                  key material to this command",
-            ),
-        )?;
+            ))?;
         let (piv_alg, key) = keyroost_piv::x509_parse::parse_subject_public_key_info(&der)
             .map_err(|_| {
                 TransportError::MalformedResponse("slot certificate's public key is unparseable")
@@ -379,37 +378,56 @@ impl IasSession {
         Ok((alg, key))
     }
 
-    /// Ask `slot`'s private key to sign a *prepared* block via PSO:COMPUTE
-    /// DIGITAL SIGNATURE: a full PKCS#1 v1.5 padded block for RSA, the raw
-    /// hash for ECDSA. Requires a verified PIN. Tries a single
-    /// extended-length APDU first, falling back to command chaining when
-    /// that gets rejected after actually using extended-length encoding —
-    /// same fallback shape as [`Self::import_certificate`].
+    /// Ask `slot`'s private key to sign a *prepared* block: a full
+    /// PKCS#1 v1.5 DigestInfo for RSA, the raw hash for ECDSA. Requires a
+    /// verified PIN.
     ///
-    /// `alg` isn't needed by [`ias::pso_compute_signature`]'s framing itself
-    /// (PSO:CDS carries no algorithm/key-reference bytes — it signs whatever
-    /// the currently-selected security environment points at); it's taken
-    /// here only so a future MSE:SET pre-step (see
-    /// [`ias::manage_security_environment`]) has it to hand if a trace shows
-    /// one is needed, without changing this method's signature.
-    pub fn sign(&mut self, _alg: KeyAlg, prepared: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let apdu = ias::pso_compute_signature(prepared);
-        let (data, sw) = if force_chaining() {
+    /// Three-step sequence, confirmed against OpenSC's `card-cedulauy.c`
+    /// driver for a real, deployed IAS-Classic-family card (Uruguay's
+    /// national eID) — see the doc comments on [`ias::manage_security_environment`]
+    /// and [`ias::pso_load_hash`]:
+    /// 1. MSE:SET DST, selecting `slot`'s key and `alg` for the signature
+    ///    that follows. Best-effort: its status word is intentionally not
+    ///    checked, since a card that doesn't need this step (or uses a
+    ///    different key-reference convention) shouldn't abort signing here
+    ///    — step 2/3 fail on their own, with their own status word, if this
+    ///    step really was required and silently didn't take effect.
+    /// 2. PSO:LOAD HASH with `prepared`, extended-length then chained
+    ///    fallback (an RSA-3072/4096 DigestInfo exceeds the 255-byte
+    ///    short-form ceiling) — same fallback shape as
+    ///    [`Self::import_certificate`].
+    /// 3. PSO:COMPUTE DIGITAL SIGNATURE with an empty body, returning the
+    ///    signature over the hash loaded in step 2.
+    pub fn sign(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        prepared: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        let _ = self.transmit_full(&ias::manage_security_environment(slot, alg));
+
+        let hash_apdu = ias::pso_load_hash(prepared);
+        let hash_sw = if force_chaining() {
             self.transmit_chain(
-                "ias sign",
-                &ias::pso_compute_signature_chained(prepared, CHAIN_CHUNK),
+                "ias sign (load hash)",
+                &ias::pso_load_hash_chained(prepared, CHAIN_CHUNK),
             )?
+            .1
         } else {
-            let (data, sw) = self.transmit_full(&apdu)?;
-            if sw == ias::SW_OK || !uses_extended_length(&apdu) {
-                (data, sw)
+            let (_, sw) = self.transmit_full(&hash_apdu)?;
+            if sw == ias::SW_OK || !uses_extended_length(&hash_apdu) {
+                sw
             } else {
                 self.transmit_chain(
-                    "ias sign",
-                    &ias::pso_compute_signature_chained(prepared, CHAIN_CHUNK),
+                    "ias sign (load hash)",
+                    &ias::pso_load_hash_chained(prepared, CHAIN_CHUNK),
                 )?
+                .1
             }
         };
+        ok_or_write("ias sign (load hash)", hash_sw)?;
+
+        let (data, sw) = self.transmit_full(&ias::pso_compute_signature(&[]))?;
         ok_or_write("ias sign", sw)?;
         Ok(data)
     }
@@ -428,8 +446,9 @@ impl IasSession {
             .map_err(|_| TransportError::MalformedResponse("slot key/algorithm mismatch"))?;
         let cri = keyroost_piv::x509::csr_info(&subject, &spki);
         let prepared = prepared_block(piv_alg, &cri)?;
-        let sig = self.sign(alg, &prepared)?;
-        let der = keyroost_piv::x509::assemble(&cri, piv_alg, &sig).map_err(TransportError::X509)?;
+        let sig = self.sign(slot, alg, &prepared)?;
+        let der =
+            keyroost_piv::x509::assemble(&cri, piv_alg, &sig).map_err(TransportError::X509)?;
         Ok(keyroost_piv::x509::pem_csr(&der))
     }
 
@@ -457,8 +476,9 @@ impl IasSession {
         )
         .map_err(TransportError::X509)?;
         let prepared = prepared_block(piv_alg, &tbs)?;
-        let sig = self.sign(alg, &prepared)?;
-        let der = keyroost_piv::x509::assemble(&tbs, piv_alg, &sig).map_err(TransportError::X509)?;
+        let sig = self.sign(slot, alg, &prepared)?;
+        let der =
+            keyroost_piv::x509::assemble(&tbs, piv_alg, &sig).map_err(TransportError::X509)?;
         self.import_certificate(slot, &der)?;
         Ok(der)
     }
@@ -469,8 +489,9 @@ impl IasSession {
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
         // Redact bodies that carry secret material: VERIFY (20), CHANGE
         // REFERENCE DATA (24), RESET RETRY COUNTER (2C), EXTERNAL
-        // AUTHENTICATE (82), PERFORM SECURITY OPERATION (2A, the signing
-        // payload).
+        // AUTHENTICATE (82), PERFORM SECURITY OPERATION (2A — covers both
+        // PSO:LOAD HASH, whose body is the DigestInfo/hash of whatever the
+        // caller is signing, and PSO:COMPUTE DIGITAL SIGNATURE itself).
         let cmd_sensitive = matches!(
             apdu.get(1),
             Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x82) | Some(0x2A)
