@@ -1776,6 +1776,12 @@ struct IasState {
     /// change / delete-cert, and its algorithm. Cleared after use.
     admin_key_input: String,
     admin_alg: IasAdminAlgSel,
+    /// AID override (hex), tried before `keyroost_ias::CANDIDATE_AIDS` on
+    /// every `IasSession::open` this pane makes — the GUI's equivalent of
+    /// the CLI's `--aid`. Empty means "use the built-in guesses". Not a
+    /// secret; persists across modal opens/closes (only wiped on device
+    /// switch, with the rest of `IasState`).
+    aid_override: String,
     pin_old: String,
     pin_new: String,
     pin_confirm: String,
@@ -1833,6 +1839,7 @@ impl Default for IasState {
             loaded: false,
             admin_key_input: String::new(),
             admin_alg: IasAdminAlgSel::default(),
+            aid_override: String::new(),
             pin_old: String::new(),
             pin_new: String::new(),
             pin_confirm: String::new(),
@@ -14146,12 +14153,19 @@ impl App {
         let Some(reader) = self.selected_oath_reader() else {
             return;
         };
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         let pubkey_cache = self.ias.pubkey_cache.clone();
         self.spawn_job("Reading IAS status\u{2026}", move || {
             let result = keyroost_transport::IasSession::open(
                 &reader,
-                None,
+                aid.as_deref(),
                 keyroost_ias::FidTable::default(),
             )
             .map(|mut s| {
@@ -14225,6 +14239,18 @@ impl App {
         piv_mgmt_key_bytes(&self.ias.admin_key_input)
     }
 
+    /// Decode the AID-override field (if any) — the GUI's equivalent of the
+    /// CLI's `--aid`, tried before the built-in candidate-AID guesses.
+    fn ias_aid_override(&self) -> Result<Option<Vec<u8>>, String> {
+        let s = self.ias.aid_override.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        keyroost_proto::codec::hex_decode(s)
+            .map(Some)
+            .map_err(|e| format!("AID must be hex: {e}"))
+    }
+
     fn ias_change_pin(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
@@ -14234,13 +14260,20 @@ impl App {
             self.ias.error = Some("the two new PINs don't match".into());
             return;
         }
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         let (old, new) = (self.ias.pin_old.clone(), self.ias.pin_new.clone());
         self.ias.notice = None;
         self.spawn_job("Changing IAS PIN\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.change_pin(old.as_bytes(), new.as_bytes())?;
@@ -14265,13 +14298,20 @@ impl App {
             self.ias.error = Some("the two new PUKs don't match".into());
             return;
         }
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         let (old, new) = (self.ias.puk_old.clone(), self.ias.puk_new.clone());
         self.ias.notice = None;
         self.spawn_job("Changing PUK\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.change_puk(old.as_bytes(), new.as_bytes())?;
@@ -14291,6 +14331,13 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         let (puk, new) = (
             self.ias.unblock_puk.clone(),
             self.ias.unblock_new_pin.clone(),
@@ -14300,7 +14347,7 @@ impl App {
             let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
@@ -14343,12 +14390,19 @@ impl App {
             ));
             return;
         }
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.spawn_job("Changing admin key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.authenticate_admin(old_alg, &old)?;
@@ -14378,6 +14432,13 @@ impl App {
         let admin_alg = self.ias.admin_alg.to_alg();
         let slot = self.ias.selected_slot.to_slot();
         let alg = self.ias.gen_alg.to_alg();
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.ias.gen_pubkey_pem = None;
         self.spawn_job("Generating key\u{2026} (touch if it blinks)", move || {
@@ -14387,7 +14448,7 @@ impl App {
             > {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.authenticate_admin(admin_alg, &admin)?;
@@ -14443,6 +14504,13 @@ impl App {
         let admin_alg = self.ias.admin_alg.to_alg();
         let slot = self.ias.selected_slot.to_slot();
         let path = self.ias.cert_path.trim().to_owned();
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.spawn_job("Importing certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
@@ -14453,7 +14521,7 @@ impl App {
                     .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.authenticate_admin(admin_alg, &admin)?;
@@ -14484,12 +14552,19 @@ impl App {
             ));
             return;
         }
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.spawn_job("Exporting certificate\u{2026}", move || {
             let result = (|| -> Result<usize, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 let der = s
@@ -14528,12 +14603,19 @@ impl App {
         };
         let admin_alg = self.ias.admin_alg.to_alg();
         let slot = self.ias.selected_slot.to_slot();
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.spawn_job("Deleting certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.authenticate_admin(admin_alg, &admin)?;
@@ -14584,6 +14666,13 @@ impl App {
         let slot = self.ias.selected_slot.to_slot();
         let days = i64::from(self.ias.cert_days.max(1));
         let known_key = self.ias.pubkey_cache.get(&slot.key_ref()).cloned();
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.spawn_job(
             "Creating self-signed certificate\u{2026} (touch if it blinks)",
@@ -14591,7 +14680,7 @@ impl App {
                 let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
                     let mut s = keyroost_transport::IasSession::open(
                         &name,
-                        None,
+                        aid.as_deref(),
                         keyroost_ias::FidTable::default(),
                     )?;
                     s.authenticate_admin(admin_alg, &admin)?;
@@ -14633,12 +14722,19 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.ias.sign_pin.clone());
         let slot = self.ias.selected_slot.to_slot();
         let known_key = self.ias.pubkey_cache.get(&slot.key_ref()).cloned();
+        let aid = match self.ias_aid_override() {
+            Ok(a) => a,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
         self.ias.notice = None;
         self.spawn_job("Signing request\u{2026} (touch if it blinks)", move || {
             let result = (|| -> Result<String, TransportError> {
                 let mut s = keyroost_transport::IasSession::open(
                     &name,
-                    None,
+                    aid.as_deref(),
                     keyroost_ias::FidTable::default(),
                 )?;
                 s.verify_pin(pin.as_bytes())?;
@@ -14798,10 +14894,20 @@ impl App {
                     ias_adminalg_combo(ui, "ias-new-admin-alg", &mut self.ias.new_admin_alg);
                 });
             });
+            ui.add_space(10.0);
+            text_field(
+                ui,
+                p,
+                "AID override",
+                &mut self.ias.aid_override,
+                "hex \u{2014} leave empty to try the built-in guesses",
+                240.0,
+            );
             note(
                 ui,
                 "AID, PIN reference, and admin-key crypto are best-effort guesses on this \
-                 card family \u{2014} see CLAUDE.md's \u{201C}Known soft spots\u{201D}.",
+                 card family \u{2014} see CLAUDE.md's \u{201C}Known soft spots\u{201D}. Set the \
+                 AID above once you know the card's real one.",
             );
         });
 
