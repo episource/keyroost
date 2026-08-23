@@ -230,23 +230,54 @@ Still open (unconfirmed, isolated so a fix is a point-edit):
   requirement could still need different timing, or could apply only to
   key-generation/signing rather than VERIFY, which is a real, common split
   on combo authenticators).
-  **New leading hypothesis, from public evidence, not yet tested**: this
-  token may not be *personalized/initialized* for PIN-based use at all yet.
-  Thales's own SafeNet Authentication Client (SAC) documentation states a
-  SafeNet eToken must be initialized through SAC — which sets the working
-  PIN and PUK — before PIN operations are meaningful; a related open OpenSC
-  issue (#3486, "Safenet 5300") independently reports this exact model
-  refusing to cooperate with OpenSC at all without SAC installed first. If
-  the token has never been through that flow, there may be no active PIN
-  security context for *any* VERIFY to satisfy — explaining why even the
-  empty-body retry-counter query (which needs no correct PIN, just an
-  existing PIN object to report on) also gets `6982`, not the `63 Cx` a
-  live-but-wrong-answer PIN would give. This is a lifecycle/personalization
-  question this crate has no way to answer or fix in code — SAC's
-  initialization protocol is proprietary and untraced here — so the
-  actionable next step is checking with SAC itself (or Thales support)
-  whether this specific token shows as initialized, not a further code
-  change.
+  **"Uninitialized token" hypothesis: ruled out.** The user confirmed this
+  exact token is initialized and personalized — it works correctly under
+  Windows with SafeNet Authentication Client (SAC), with two certificates
+  already loaded. So the token is not blank; SAC is doing something on the
+  wire that a plain VERIFY doesn't.
+  **New leading hypothesis: this token's PIN VERIFY requires secure
+  messaging that plain-text VERIFY can never satisfy — not a byte-layer bug
+  at all, but a missing protocol layer.** Several independent pieces of
+  evidence now converge on this: (1) OpenSC's own ATR-table label for this
+  exact card is `"eToken 5110+ FIPS"`, and a FIPS 140-2 validated module
+  ("IDPrime 930/3930 FIPS 140-2 Cryptographic Module") is publicly
+  documented for this family — FIPS validation commonly *mandates* that a
+  PIN never cross the contact interface in the clear. (2) `card-idprime.c`
+  treats `SC_CARD_TYPE_IDPRIME_930_PLUS` differently from plain `_930` in
+  at least one other place already found in this file (a different private-key
+  reference formula, `0x10 + cert_id * 2`, used only for `_930_PLUS`) — i.e.
+  the FIPS variant is independently known to need special-cased handling
+  beyond just PIN padding. (3) Thales's public CC Security Target for this
+  card family (cited above, for the admin key) already told us the *general
+  shape* is DH/ECDH ephemeral session-key establishment feeding real secure
+  messaging (separate encrypt + MAC per command) — this crate assumed that
+  applied only to admin-key auth, but it may equally gate PIN VERIFY on the
+  FIPS variant. (4) `card-idprime.c` has no `pin_cmd()` override and no
+  secure-messaging code anywhere in the file — OpenSC's own IDPrime driver
+  does not implement whatever SAC does differently, which is consistent
+  with (and may be the root cause of) OpenSC issue #3486 ("Safenet 5300")
+  reporting this exact model simply refusing to cooperate with OpenSC at
+  all without SAC installed.
+  **Why this isn't implemented here yet: there is no wire-level evidence to
+  implement against, anywhere.** The CC Security Target confirms the
+  *cipher primitives* (TDES/AES) and the *general scheme* (DH/ECDH + SM),
+  not usable protocol bytes — no key-agreement command, no curve/group, no
+  KDF, no SM data-object tag layout. No open-source driver (OpenSC's own
+  IDPrime driver included) implements this for the FIPS variant to copy
+  from. Guessing a DH/ECDH secure-messaging protocol from a document that
+  explicitly doesn't give byte-level detail would be worse than any guess
+  already flagged in this file — building and shipping cryptographic
+  protocol code with zero ability to verify it against the one thing that's
+  known to work (SAC) is exactly the failure mode this project's evidence
+  discipline exists to prevent.
+  **The concrete next step, if it's ever going to happen, is a real APDU
+  capture of SAC talking to this exact token** — a USB capture (e.g.
+  Wireshark + USBPcap on Windows) of the token's CCID traffic while SAC
+  performs a PIN verify would show the actual command structure SAC sends
+  (INS/P1/P2/Lc, even if the payload itself is SM-encrypted ciphertext),
+  which is the only way to derive a correct implementation rather than a
+  guess. Without that trace, this stays an open, documented gap rather than
+  a fabricated implementation.
   `--pin-env`/`--pin-stdin` on `keyroostctl ias status`/`export-cert`
   (`IasSession::status_with_pin`, `IasSlotStatus::pin_required`) are what
   surfaced this finding and remain the right tool for the next experiment;
