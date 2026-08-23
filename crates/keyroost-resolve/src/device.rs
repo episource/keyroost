@@ -21,6 +21,7 @@ impl Caps {
     pub const TOTP: Caps = Caps(1 << 4); // Molto2 programmable token
     pub const OTP: Caps = Caps(1 << 5); // Token2 FIDO key on-device OTP applet
     pub const PROG: Caps = Caps(1 << 6); // Token2 single-profile programmable token
+    pub const IAS: Caps = Caps(1 << 7); // IAS Classic/ECC smart card (e.g. Thales eToken 5300)
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -78,6 +79,7 @@ impl Device {
             (Caps::PGP, "PGP"),
             (Caps::PIV, "PIV"),
             (Caps::OTP, "OTP"),
+            (Caps::IAS, "IAS"),
         ] {
             if self.caps.has(c) {
                 v.push(label);
@@ -423,6 +425,9 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         if p.has_otp {
             caps.insert(Caps::OTP);
         }
+        if p.has_ias {
+            caps.insert(Caps::IAS);
+        }
         if caps.is_empty() {
             continue;
         }
@@ -692,6 +697,7 @@ mod tests {
             has_oath: oath,
             has_openpgp: pgp,
             has_piv: piv,
+            has_ias: false,
             has_fido: false,
             has_otp: false,
             is_prog: false,

@@ -42,6 +42,9 @@ pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 mod piv;
 pub use piv::{PivSession, PivSlotStatus, PivStatus};
 
+mod ias;
+pub use ias::{IasSession, IasSlotStatus, IasStatus};
+
 mod token2otp;
 pub use token2otp::{
     otp_type_str, ButtonPrompt, HidOtpTransport, OtpTransportError, PcScOtpTransport,
@@ -151,6 +154,33 @@ pub enum TransportError {
     /// builder would otherwise panic); guards against a malformed card
     /// attribute as well as a genuine key/card mismatch.
     OpenPgpExponentTooWide,
+    /// An IAS applet response could not be parsed.
+    IasParse(keyroost_ias::ParseError),
+    /// No IAS Classic/ECC applet answered any candidate AID (`SW 6A82`, or
+    /// nothing in [`keyroost_ias::CANDIDATE_AIDS`] plus any `--aid` override
+    /// matched).
+    NoIasApplet,
+    /// IAS admin/SO-key authentication failed (the card rejected the
+    /// EXTERNAL AUTHENTICATE response — wrong key, or the crypto this build
+    /// guesses at is wrong for this card; see `CLAUDE.md`'s "Known soft spots").
+    IasAdminAuthFailed,
+    /// An IAS PIN/PUK verification failed; `tries_remaining` is the count the
+    /// card reported (`63 Cx`), or `None` when blocked/unknown.
+    IasPinRejected { tries_remaining: Option<u8> },
+    /// A supplied IAS PIN/PUK was outside the length range the byte layer
+    /// accepts. Caught before transmit — the card would silently truncate or
+    /// pad.
+    IasBadPinLength,
+    /// An IAS write needed an authorization (admin-key auth or PIN) that
+    /// hadn't been satisfied (`SW 6982`).
+    IasSecurityNotSatisfied,
+    /// A supplied IAS admin key was the wrong length for its algorithm.
+    IasBadKeyLength,
+    /// The card answered an IAS operation with `6D00`/`6A81` ("instruction
+    /// not supported") — genuinely unconfirmed whether this card's profile
+    /// implements it at all (e.g. SET PIN RETRIES). Carries the
+    /// human-readable operation name.
+    IasNotSupported(&'static str),
 }
 
 impl fmt::Display for TransportError {
@@ -294,6 +324,38 @@ impl fmt::Display for TransportError {
                 "the key's RSA public exponent is wider than this OpenPGP card's \
                  declared exponent field"
             ),
+            TransportError::IasParse(e) => write!(f, "IAS response parse error: {}", e),
+            TransportError::NoIasApplet => write!(
+                f,
+                "no IAS Classic/ECC applet answered on this card (tried the built-in \
+                 candidate AIDs and any --aid override); pass the card's real AID \
+                 with --aid once you know it"
+            ),
+            TransportError::IasAdminAuthFailed => {
+                write!(f, "IAS admin-key authentication failed (wrong key)")
+            }
+            TransportError::IasPinRejected {
+                tries_remaining: Some(n),
+            } => write!(f, "IAS PIN/PUK rejected ({} tries remaining)", n),
+            TransportError::IasPinRejected {
+                tries_remaining: None,
+            } => write!(f, "IAS PIN/PUK rejected (may be blocked)"),
+            TransportError::IasBadPinLength => {
+                write!(f, "IAS PIN/PUK must be 4-8 characters")
+            }
+            TransportError::IasSecurityNotSatisfied => write!(
+                f,
+                "IAS operation needs an admin-key auth or PIN that wasn't satisfied"
+            ),
+            TransportError::IasBadKeyLength => {
+                write!(f, "IAS admin key has the wrong length for its algorithm")
+            }
+            TransportError::IasNotSupported(op) => write!(
+                f,
+                "this card did not answer the {} instruction (unsupported on this \
+                 IAS profile, or its INS byte is wrong for this card)",
+                op
+            ),
         }
     }
 }
@@ -307,6 +369,7 @@ impl std::error::Error for TransportError {
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
             TransportError::X509(e) => Some(e),
+            TransportError::IasParse(e) => Some(e),
             _ => None,
         }
     }
@@ -689,6 +752,13 @@ pub struct ReaderProbe {
     pub has_oath: bool,
     pub has_openpgp: bool,
     pub has_piv: bool,
+    /// True when the card answers a SELECT of any of
+    /// [`keyroost_ias::CANDIDATE_AIDS`] — a low-confidence, best-effort AID
+    /// list (IAS Classic/ECC has no single spec-mandated AID; see that
+    /// constant's doc comment). A card whose real AID isn't in the list
+    /// simply won't be detected here until a `--aid` override is used
+    /// directly against `IasSession::open`.
+    pub has_ias: bool,
     /// True when the card answers a SELECT of the FIDO applet
     /// (`A0000006472F0001`) — i.e. a FIDO2/U2F security key reached over this
     /// reader (NFC or contact). Lets the GUI offer the FIDO2 tab for reader-
@@ -761,6 +831,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 has_oath: false,
                 has_openpgp: false,
                 has_piv: false,
+                has_ias: false,
                 has_fido: false,
                 has_otp: false,
                 is_prog: false,
@@ -780,6 +851,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             has_oath: false,
             has_openpgp: false,
             has_piv: false,
+            has_ias: false,
             has_fido: false,
             has_otp: false,
             is_prog: false,
@@ -815,6 +887,12 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             probe.has_oath = answers("oath", keyroost_oath::select());
             probe.has_openpgp = answers("openpgp", keyroost_openpgp::select());
             probe.has_piv = answers("piv", keyroost_piv::select());
+            // IAS Classic/ECC: try every candidate AID in turn (see
+            // ReaderProbe::has_ias's doc comment for why there's more than
+            // one) — first match wins.
+            probe.has_ias = keyroost_ias::CANDIDATE_AIDS
+                .iter()
+                .any(|aid| answers("ias", keyroost_ias::select(aid)));
             // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
             // a security key is reachable over this reader (NFC or contact), to
             // be driven by CtapPcscDevice.
@@ -835,7 +913,12 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // — a generic NFC card that happens to answer won't be mislabelled.
             // Skip if an applet already matched (a FIDO/OATH key isn't a prog
             // token), keeping the get_info off cards that clearly aren't one.
-            if !probe.has_fido && !probe.has_oath && !probe.has_piv && !probe.has_openpgp {
+            if !probe.has_fido
+                && !probe.has_oath
+                && !probe.has_piv
+                && !probe.has_openpgp
+                && !probe.has_ias
+            {
                 let info = keyroost_token2prog::get_info();
                 if let Ok((data, s1, s2)) = transmit_apdu(&card, &info.apdu) {
                     let body = if s1 == 0x61 {
