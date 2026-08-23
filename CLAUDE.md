@@ -35,6 +35,7 @@ tool. Workspace contains:
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | `zeroize` |
+| `keyroost-ias` | Pure-Rust IAS Classic/ECC (ISO 7816-4/-8) byte layer for cards like the Thales eToken 5300; built without a reference spec or hardware to trace against — see "Known soft spots" below | `zeroize`; `keyroost-piv` (its `x509`/`x509_parse`/`spki` DER modules only — never PIV protocol bytes) |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`), `rand_core`, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
@@ -102,6 +103,48 @@ workflow during bring-up is:
   will exercise `0xD8` (it is listed in `DESTRUCTIVE_INS` and skipped by
   default). Probe before writing a builder.
 
+### IAS Classic/ECC — built without a reference spec, none of this is confirmed
+
+`keyroost-ias` / `IasSession` / `keyroostctl ias` / the GUI's "IAS" tab were
+built entirely from general ISO 7816-4/-8 knowledge — no ANSSI IAS-ECC
+referential, no Thales/IDPrime command reference, and no eToken 5300 (or any
+IAS card) to trace against. Every byte value below is a documented guess, not
+a confirmed one; expect the first real bring-up to land on one or more of
+these, fixed the same way the PIV soft spots above were: an isolated
+point-edit, not a rewrite.
+
+- **AID.** `keyroost_ias::CANDIDATE_AIDS` is a best-effort guess list — IAS
+  Classic/ECC has no single spec-mandated AID the way PIV/OpenPGP do; each
+  card issuer registers its own. `--aid <hex>` (CLI) / the GUI's "AID
+  override" field (in the IAS tab's status card) exist so a real AID can
+  be tried immediately, without a code change. Trace SELECT first, before
+  anything else.
+- **PIN/PUK/admin-key reference bytes** (`PIN_REF_USER`, `ADMIN_KEY_REF` in
+  `crates/keyroost-ias/src/lib.rs`) are placeholders. `SW 6A88` (reference
+  data not found) on VERIFY/CHANGE REFERENCE DATA is the first suspect.
+- **GENERATE ASYMMETRIC KEY PAIR's INS byte and CRT tag layout.** `0x46`
+  (ISO 7816-8's own table) vs `0x47` (what this workspace's own PIV/OpenPGP
+  layers use for the identical concept) are both real conventions; `SW 6D00`
+  means try the other INS before assuming the CRT shape (tag `0xB8` wrapping
+  `0x80`/`0x84`) is wrong.
+- **The admin-key crypto** (`admin_crypt` in
+  `crates/keyroost-transport/src/ias.rs`) is the single highest-uncertainty
+  piece of the whole feature: cipher (3DES/AES), mode, and whether a MAC is
+  required are all unconfirmed guesses. Kept isolated in one function
+  specifically so a full rewrite here doesn't ripple into the CLI/GUI.
+- **The per-slot certificate FID table** (`Slot::default_cert_fid`,
+  `FidTable`) is a 3-entry guess. `--fid <slot>=<hex>`-style overrides (via
+  `FidTable`, threaded through `IasSession::open`) exist so correcting a
+  real card's layout is a config change, not a rewrite.
+- **`set_pin_retries` always returns `IasNotSupported`, on purpose.** No
+  ISO 7816-4/-8 instruction covers it and no defensible placeholder byte
+  sequence exists (unlike the other guesses above, which at least follow a
+  reasoned convention) — see the doc comment on
+  `IasSession::set_pin_retries`.
+- **No applet reset exists in this feature at all**, not even as a guess —
+  there's no basis to assume IAS-ECC profiles expose a full-applet factory
+  reset the way PIV/OpenPGP do. This is a deliberate gap, not an oversight.
+
 ## Conventions
 
 - **Don't push to remote without explicit user permission.** Local commits are
@@ -113,7 +156,13 @@ workflow during bring-up is:
   (`hidapi` off-Linux, `windows-sys` on Windows), and vetted RustCrypto/`rsa`/
   `scrypt`/`aes-gcm`/`zeroize`/`getrandom` where hand-rolling the primitive
   would be irresponsible (see the per-crate deps in the table above). No new
-  deps without a discussion first.
+  deps without a discussion first. One narrow in-tree exception:
+  `keyroost-ias` takes a path dependency on `keyroost-piv` for its
+  `x509`/`x509_parse`/`spki` DER modules only (CSR/self-signed-cert
+  building, SPKI encode/decode) — that code is algorithm-shape-driven, not
+  PIV-protocol-driven, and forking it a second time was the wrong call when
+  the existing implementation is already tested. Never treat this as
+  precedent for byte-layer crates depending on each other generally.
 - **No documentation files unless explicitly asked.** `docs/` holds the protocol
   references, the bring-up runbook, the device-research record, and the
   published Learn site (`docs/*.html`, deployed by `pages.yml`); don't add more
