@@ -313,6 +313,22 @@ impl KeyAlg {
             KeyAlg::EccP384 => keyroost_piv::KeyAlg::EccP384,
         }
     }
+
+    /// The inverse of [`KeyAlg::to_piv_alg`], for the direction that reads an
+    /// algorithm back out of `keyroost_piv`'s DER parsers (a slot's
+    /// certificate, or a `--load-pubkey` file). `None` for a `keyroost_piv`
+    /// algorithm with no IAS-side equivalent in this crate's narrower set
+    /// (e.g. RSA-1024/4096, Ed25519, X25519).
+    #[must_use]
+    pub const fn from_piv_alg(alg: keyroost_piv::KeyAlg) -> Option<Self> {
+        match alg {
+            keyroost_piv::KeyAlg::Rsa2048 => Some(KeyAlg::Rsa2048),
+            keyroost_piv::KeyAlg::Rsa3072 => Some(KeyAlg::Rsa3072),
+            keyroost_piv::KeyAlg::EccP256 => Some(KeyAlg::EccP256),
+            keyroost_piv::KeyAlg::EccP384 => Some(KeyAlg::EccP384),
+            _ => None,
+        }
+    }
 }
 
 /// Cipher for the GET CHALLENGE / EXTERNAL AUTHENTICATE admin-key round.
@@ -449,6 +465,27 @@ pub fn change_reference_data(old: &[u8], new: &[u8]) -> Result<Vec<u8>, PinLengt
         PIN_REF_USER,
         &body,
     ))
+}
+
+/// CHANGE REFERENCE DATA against the admin/SO key reference, rather than
+/// the PIN: raw `old`/`new` key bytes, unpadded (unlike the PIN's fixed
+/// 8-byte field — a symmetric key is already a fixed algorithm-defined
+/// length, so there's nothing to pad). `[HIGH]` for reusing CHANGE
+/// REFERENCE DATA's own instruction byte for a non-PIN reference (that's
+/// exactly what ISO 7816-4 defines the "reference data" concept to cover);
+/// `[GUESS]` for [`ADMIN_KEY_REF`] itself.
+#[must_use]
+pub fn change_admin_key(old: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(old.len() + new.len());
+    body.extend_from_slice(old);
+    body.extend_from_slice(new);
+    build_apdu(
+        0x00,
+        Instruction::ChangeReferenceData.code(),
+        0x00,
+        ADMIN_KEY_REF,
+        &body,
+    )
 }
 
 /// RESET RETRY COUNTER: unblock the PIN with an unblock code (PUK), setting
@@ -773,6 +810,15 @@ mod tests {
     }
 
     #[test]
+    fn change_admin_key_bytes() {
+        let apdu = change_admin_key(&[0x11; 24], &[0x22; 24]);
+        assert_eq!(apdu[..4], [0x00, 0x24, 0x00, ADMIN_KEY_REF]);
+        assert_eq!(apdu[4], 48); // Lc: unpadded old+new, no fixed 8-byte field
+        assert_eq!(&apdu[5..29], &[0x11u8; 24][..]);
+        assert_eq!(&apdu[29..53], &[0x22u8; 24][..]);
+    }
+
+    #[test]
     fn reset_retry_counter_bytes() {
         let apdu = reset_retry_counter(b"00000000", b"1234").unwrap();
         assert_eq!(apdu[..4], [0x00, 0x2C, 0x00, PIN_REF_USER]);
@@ -951,6 +997,14 @@ mod tests {
     fn key_alg_to_piv_alg_preserves_shape() {
         assert_eq!(KeyAlg::EccP256.to_piv_alg(), keyroost_piv::KeyAlg::EccP256);
         assert_eq!(KeyAlg::Rsa2048.to_piv_alg(), keyroost_piv::KeyAlg::Rsa2048);
+    }
+
+    #[test]
+    fn key_alg_from_piv_alg_round_trips() {
+        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::EccP256, KeyAlg::EccP384] {
+            assert_eq!(KeyAlg::from_piv_alg(alg.to_piv_alg()), Some(alg));
+        }
+        assert_eq!(KeyAlg::from_piv_alg(keyroost_piv::KeyAlg::Ed25519), None);
     }
 
     #[test]

@@ -225,6 +225,14 @@ impl IasSession {
         map_pin_sw(sw)
     }
 
+    /// Replace the admin/SO key. Requires prior admin-key auth under the
+    /// *old* key.
+    pub fn change_admin_key(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
+        let apdu = Zeroizing::new(ias::change_admin_key(old, new));
+        let (_, sw) = self.transmit_full(&apdu)?;
+        ok_or_write("ias change admin key", sw)
+    }
+
     /// "Change the PUK" — reuses [`Self::change_pin`]'s reference (there is
     /// no separate PUK-change instruction in this byte layer; RESET RETRY
     /// COUNTER already *is* the PUK-consuming operation). Kept as its own
@@ -365,7 +373,7 @@ impl IasSession {
             .map_err(|_| {
                 TransportError::MalformedResponse("slot certificate's public key is unparseable")
             })?;
-        let alg = ias_alg_from_piv(piv_alg).ok_or(TransportError::MalformedResponse(
+        let alg = KeyAlg::from_piv_alg(piv_alg).ok_or(TransportError::MalformedResponse(
             "slot certificate's key algorithm has no IAS analog",
         ))?;
         Ok((alg, key))
@@ -553,19 +561,6 @@ fn prepared_block(alg: keyroost_piv::KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, Tran
     }
 }
 
-/// Inverse of [`KeyAlg::to_piv_alg`](keyroost_ias::KeyAlg::to_piv_alg), for
-/// the one place (`slot_key`, reading an algorithm back out of a parsed
-/// certificate) that needs to go the other direction.
-fn ias_alg_from_piv(alg: keyroost_piv::KeyAlg) -> Option<KeyAlg> {
-    match alg {
-        keyroost_piv::KeyAlg::Rsa2048 => Some(KeyAlg::Rsa2048),
-        keyroost_piv::KeyAlg::Rsa3072 => Some(KeyAlg::Rsa3072),
-        keyroost_piv::KeyAlg::EccP256 => Some(KeyAlg::EccP256),
-        keyroost_piv::KeyAlg::EccP384 => Some(KeyAlg::EccP384),
-        _ => None,
-    }
-}
-
 /// Map an IAS status word to success or a labelled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == ias::SW_OK {
@@ -678,13 +673,6 @@ mod tests {
     fn admin_crypt_aes128_produces_one_block() {
         let out = admin_crypt(IasAdminAlg::Aes128, &[0x11u8; 16], &[0x22u8; 16]).unwrap();
         assert_eq!(out.len(), 16);
-    }
-
-    #[test]
-    fn ias_alg_from_piv_round_trips_supported_algs() {
-        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::EccP256, KeyAlg::EccP384] {
-            assert_eq!(ias_alg_from_piv(alg.to_piv_alg()), Some(alg));
-        }
     }
 
     #[test]

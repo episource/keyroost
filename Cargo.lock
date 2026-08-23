@@ -2108,6 +2108,7 @@ dependencies = [
  "clap_mangen",
  "keyroost-ctap",
  "keyroost-hid",
+ "keyroost-ias",
  "keyroost-import",
  "keyroost-keyring",
  "keyroost-oath",

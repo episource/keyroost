@@ -156,6 +156,22 @@ mod json_out {
         pub cert_len: usize,
     }
 
+    /// `keyroostctl ias --json status`.
+    #[derive(Serialize)]
+    pub struct IasStatusJson {
+        pub aid: String,
+        pub pin_retries: Option<u8>,
+        pub slots: Vec<IasSlotJson>,
+    }
+
+    /// One IAS key slot in the status output.
+    #[derive(Serialize)]
+    pub struct IasSlotJson {
+        pub slot: String,
+        pub cert_present: bool,
+        pub cert_len: usize,
+    }
+
     /// `keyroostctl openpgp --json status`.
     #[derive(Serialize)]
     pub struct OpenpgpStatusJson {
@@ -440,6 +456,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PivCmd,
     },
+    /// Manage an IAS Classic/ECC smart card (e.g. Thales eToken 5300) over
+    /// PC/SC: status, PIN/PUK, admin key, key generation, and certificate
+    /// import/export. Built without a reference specification or hardware to
+    /// trace against — every AID/PIN-reference/tag value this talks to is a
+    /// documented guess; see `CLAUDE.md`'s "Known soft spots" before
+    /// reporting a status word as a bug.
+    Ias {
+        #[command(subcommand)]
+        cmd: IasCmd,
+    },
     /// Manage on-device OTP entries on a Token2 T2F2 / PIN+ FIDO key over USB-HID
     /// or CCID/NFC: list, get a code, add/delete entries, the button-press HOTP
     /// keystroke slot, and the serial number. This is the Token2 OTP applet,
@@ -668,6 +694,273 @@ impl CliTouchPolicy {
             CliTouchPolicy::Cached => Cached,
         }
     }
+}
+
+/// An IAS key/certificate container, selected on the CLI by name.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliIasSlot {
+    /// Authentication container.
+    Auth,
+    /// Digital-signature (non-repudiation) container.
+    Sign,
+    /// Key-management (confidentiality/decryption) container.
+    #[value(name = "key-mgmt")]
+    KeyMgmt,
+}
+
+impl CliIasSlot {
+    fn to_slot(self) -> keyroost_ias::Slot {
+        match self {
+            CliIasSlot::Auth => keyroost_ias::Slot::Authentication,
+            CliIasSlot::Sign => keyroost_ias::Slot::Signature,
+            CliIasSlot::KeyMgmt => keyroost_ias::Slot::KeyManagement,
+        }
+    }
+}
+
+/// Asymmetric key algorithm for `ias generate-key`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliIasKeyAlg {
+    Rsa2048,
+    Rsa3072,
+    #[value(name = "eccp256")]
+    EccP256,
+    #[value(name = "eccp384")]
+    EccP384,
+}
+
+impl CliIasKeyAlg {
+    fn to_alg(self) -> keyroost_ias::KeyAlg {
+        match self {
+            CliIasKeyAlg::Rsa2048 => keyroost_ias::KeyAlg::Rsa2048,
+            CliIasKeyAlg::Rsa3072 => keyroost_ias::KeyAlg::Rsa3072,
+            CliIasKeyAlg::EccP256 => keyroost_ias::KeyAlg::EccP256,
+            CliIasKeyAlg::EccP384 => keyroost_ias::KeyAlg::EccP384,
+        }
+    }
+}
+
+/// Admin/SO-key cipher algorithm.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliIasAdminAlg {
+    #[value(name = "3des")]
+    TripleDes,
+    Aes128,
+}
+
+impl CliIasAdminAlg {
+    fn to_alg(self) -> keyroost_ias::IasAdminAlg {
+        match self {
+            CliIasAdminAlg::TripleDes => keyroost_ias::IasAdminAlg::TripleDes,
+            CliIasAdminAlg::Aes128 => keyroost_ias::IasAdminAlg::Aes128,
+        }
+    }
+}
+
+/// Subcommands for an IAS Classic/ECC smart card. Secret material (PINs,
+/// PUK, admin key) is read from env/stdin, never argv. The admin key is a
+/// hex string (48 hex chars for 3DES, 32 for AES-128). Every subcommand
+/// accepts `--aid <HEX>` to override the built-in candidate-AID guesses the
+/// moment a real device trace shows the card's actual AID.
+#[derive(Subcommand)]
+enum IasCmd {
+    /// Show IAS status: which AID answered, PIN retries, and which key slots
+    /// hold a certificate. No PIN or admin-key auth required.
+    Status {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+    },
+    /// Change the PIN. PINs are sourced from env vars or stdin (stdin reads
+    /// two consecutive lines: old then new).
+    ChangePin {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
+        old_pin_env: Option<String>,
+        #[arg(long)]
+        old_pin_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        #[arg(long)]
+        new_pin_stdin: bool,
+    },
+    /// Change the PUK. `[GUESS]` — may turn out to be identical to the admin
+    /// key on the real card; see `CLAUDE.md`'s "Known soft spots".
+    ChangePuk {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "old_puk_stdin")]
+        old_puk_env: Option<String>,
+        #[arg(long)]
+        old_puk_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_puk_stdin")]
+        new_puk_env: Option<String>,
+        #[arg(long)]
+        new_puk_stdin: bool,
+    },
+    /// Unblock a blocked PIN using the PUK (unblock code), setting a new PIN.
+    UnblockPin {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "puk_stdin")]
+        puk_env: Option<String>,
+        #[arg(long)]
+        puk_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        #[arg(long)]
+        new_pin_stdin: bool,
+    },
+    /// Change the admin/SO key.
+    ChangeAdminKey {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "old_admin_key_stdin")]
+        old_admin_key_env: Option<String>,
+        #[arg(long)]
+        old_admin_key_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_admin_key_stdin")]
+        new_admin_key_env: Option<String>,
+        #[arg(long)]
+        new_admin_key_stdin: bool,
+        /// Algorithm of the NEW admin key.
+        #[arg(long, value_enum, default_value = "3des")]
+        new_algorithm: CliIasAdminAlg,
+    },
+    /// Generate a new key pair in a slot and print its public key (PEM).
+    /// Needs the admin key. Overwrites any existing key in the slot.
+    GenerateKey {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliIasSlot,
+        #[arg(long, value_enum, default_value = "eccp256")]
+        algorithm: CliIasKeyAlg,
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_key_stdin")]
+        admin_key_env: Option<String>,
+        #[arg(long)]
+        admin_key_stdin: bool,
+        /// Also write the generated public key (PEM) to this path. Needed to
+        /// `request-cert`/`self-sign` this same key from a *later*, separate
+        /// `keyroostctl` invocation — IAS has no metadata query to name a
+        /// key this fresh on its own, so nothing here is cached
+        /// automatically; pass the same path to that later command's
+        /// `--load-pubkey`.
+        #[arg(long, value_name = "PATH")]
+        save_pubkey: Option<std::path::PathBuf>,
+    },
+    /// Import a DER or PEM X.509 certificate into a slot. Needs the admin key.
+    ImportCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliIasSlot,
+        /// Path to a `.der` or `.pem` certificate file.
+        #[arg(long, value_name = "PATH")]
+        file: std::path::PathBuf,
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_key_stdin")]
+        admin_key_env: Option<String>,
+        #[arg(long)]
+        admin_key_stdin: bool,
+    },
+    /// Export a slot's certificate (DER) to a file or stdout. No PIN required.
+    ExportCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliIasSlot,
+        /// Output path; omit to write DER to stdout.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Create a PKCS#10 certificate signing request for the key in a slot,
+    /// signed on the card (PEM to stdout or --file). Hand the result to a CA;
+    /// import the certificate it issues with `import-cert`.
+    RequestCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliIasSlot,
+        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
+        /// (supported attributes: CN, O, OU, C, L, ST).
+        #[arg(long, value_name = "DN")]
+        subject: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        /// Output path; omit to print the PEM to stdout.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+        /// Path from a prior `generate-key --save-pubkey`.
+        #[arg(long, value_name = "PATH")]
+        load_pubkey: Option<std::path::PathBuf>,
+    },
+    /// Create a self-signed certificate for the key in a slot, signed on the
+    /// card, and store it in that slot.
+    SelfSign {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliIasSlot,
+        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
+        /// (supported attributes: CN, O, OU, C, L, ST).
+        #[arg(long, value_name = "DN")]
+        subject: String,
+        /// Validity period in days, starting now.
+        #[arg(long, value_name = "N", default_value_t = 365)]
+        days: u32,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_key_stdin")]
+        admin_key_env: Option<String>,
+        #[arg(long)]
+        admin_key_stdin: bool,
+        /// Also write the certificate as PEM to this path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+        /// Path from a prior `generate-key --save-pubkey`.
+        #[arg(long, value_name = "PATH")]
+        load_pubkey: Option<std::path::PathBuf>,
+    },
+    /// Clear a slot's certificate file (best-effort; the private key is left
+    /// in place). Needs the admin key. DESTRUCTIVE: requires `--yes`.
+    DeleteCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "HEX")]
+        aid: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliIasSlot,
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_key_stdin")]
+        admin_key_env: Option<String>,
+        #[arg(long)]
+        admin_key_stdin: bool,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Subcommands for the PIV smart-card applet. Secret material (PINs, PUK,
@@ -2493,6 +2786,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // PIV is another CCID applet reached over PC/SC.
     if let Cmd::Piv { cmd } = cmd {
         run_piv(cmd, cli.debug)?;
+        return Ok(());
+    }
+
+    // IAS Classic/ECC is another CCID applet reached over PC/SC.
+    if let Cmd::Ias { cmd } = cmd {
+        run_ias(cmd, cli.debug)?;
         return Ok(());
     }
 
@@ -6006,6 +6305,335 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        IasCmd::Status { reader, aid } => {
+            let mut session = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            let status = session.status()?;
+
+            if json_output() {
+                emit_json(&json_out::IasStatusJson {
+                    aid: hex_encode(&status.aid),
+                    pin_retries: status.pin_retries,
+                    slots: status
+                        .slots
+                        .iter()
+                        .map(|s| json_out::IasSlotJson {
+                            slot: s.slot.label().to_string(),
+                            cert_present: s.cert_present,
+                            cert_len: s.cert_len,
+                        })
+                        .collect(),
+                })?;
+                return Ok(());
+            }
+
+            println!("AID:         {}", hex_encode(&status.aid));
+            match status.pin_retries {
+                Some(0) => println!("PIN retries: 0 (blocked)"),
+                Some(n) => println!("PIN retries: {}", n),
+                None => println!("PIN retries: (unavailable)"),
+            }
+            println!("Slots:");
+            for s in &status.slots {
+                if s.cert_present {
+                    println!("  {:<16} cert present ({} bytes)", s.slot.label(), s.cert_len);
+                } else {
+                    println!("  {:<16} empty", s.slot.label());
+                }
+            }
+        }
+
+        IasCmd::ChangePin {
+            reader,
+            aid,
+            old_pin_env,
+            old_pin_stdin,
+            new_pin_env,
+            new_pin_stdin,
+        } => {
+            let old = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
+            let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            s.change_pin(old.as_bytes(), new.as_bytes())?;
+            println!("PIN changed.");
+        }
+
+        IasCmd::ChangePuk {
+            reader,
+            aid,
+            old_puk_env,
+            old_puk_stdin,
+            new_puk_env,
+            new_puk_stdin,
+        } => {
+            let old = read_secret("old PUK", old_puk_env.as_deref(), *old_puk_stdin)?;
+            let new = read_secret("new PUK", new_puk_env.as_deref(), *new_puk_stdin)?;
+            let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            s.change_puk(old.as_bytes(), new.as_bytes())?;
+            println!("PUK changed.");
+        }
+
+        IasCmd::UnblockPin {
+            reader,
+            aid,
+            puk_env,
+            puk_stdin,
+            new_pin_env,
+            new_pin_stdin,
+        } => {
+            let puk = read_secret("PUK", puk_env.as_deref(), *puk_stdin)?;
+            let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+            println!("PIN unblocked and reset.");
+        }
+
+        IasCmd::ChangeAdminKey {
+            reader,
+            aid,
+            old_admin_key_env,
+            old_admin_key_stdin,
+            new_admin_key_env,
+            new_admin_key_stdin,
+            new_algorithm,
+        } => {
+            let old = read_admin_key(
+                "admin key",
+                old_admin_key_env.as_deref(),
+                *old_admin_key_stdin,
+            )?;
+            let new = read_admin_key(
+                "new admin key",
+                new_admin_key_env.as_deref(),
+                *new_admin_key_stdin,
+            )?;
+            let new_alg = new_algorithm.to_alg();
+            if new.len() != new_alg.key_len() {
+                return Err(format!(
+                    "new admin key is {} bytes; {} needs {}",
+                    new.len(),
+                    new_alg.label(),
+                    new_alg.key_len()
+                )
+                .into());
+            }
+            // The old key's algorithm is assumed to match the new one (both
+            // default to 3DES); pass --new-algorithm to match whatever this
+            // card's *current* key actually is if that assumption is wrong.
+            let old_alg = new_algorithm.to_alg();
+            let mut s = open_ias_authed(reader.as_deref(), aid.as_deref(), debug, old_alg, &old)?;
+            s.change_admin_key(&old, &new)?;
+            println!("Admin key changed to {}.", new_alg.label());
+        }
+
+        IasCmd::GenerateKey {
+            reader,
+            aid,
+            slot,
+            algorithm,
+            admin_key_env,
+            admin_key_stdin,
+            save_pubkey,
+        } => {
+            let admin_alg = keyroost_ias::IasAdminAlg::TripleDes;
+            let admin = read_admin_key("admin key", admin_key_env.as_deref(), *admin_key_stdin)?;
+            let alg = algorithm.to_alg();
+            let mut s =
+                open_ias_authed(reader.as_deref(), aid.as_deref(), debug, admin_alg, &admin)?;
+            eprintln!(
+                "Generating {} in {} (touch the key if it blinks)\u{2026}",
+                alg.label(),
+                slot.to_slot().label()
+            );
+            let pubkey = s.generate_key(slot.to_slot(), alg)?;
+            let der = match keyroost_piv::spki::subject_public_key_info(&pubkey, alg.to_piv_alg())
+            {
+                Ok(der) => der,
+                Err(e) => {
+                    return Err(
+                        format!("key generated, but encoding its public key failed: {}", e).into(),
+                    )
+                }
+            };
+            let pem = keyroost_piv::spki::to_pem(&der);
+            if let Some(path) = save_pubkey {
+                std::fs::write(path, pem.as_bytes())
+                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                eprintln!(
+                    "Wrote key material for {} to {} — pass it to request-cert/self-sign's \
+                     --load-pubkey if you sign this key from a separate command.",
+                    slot.to_slot().label(),
+                    path.display()
+                );
+            }
+            print!("{}", pem);
+        }
+
+        IasCmd::ImportCert {
+            reader,
+            aid,
+            slot,
+            file,
+            admin_key_env,
+            admin_key_stdin,
+        } => {
+            let admin_alg = keyroost_ias::IasAdminAlg::TripleDes;
+            let admin = read_admin_key("admin key", admin_key_env.as_deref(), *admin_key_stdin)?;
+            let bytes =
+                std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
+            let der = cert_to_der(&bytes)?;
+            let mut s =
+                open_ias_authed(reader.as_deref(), aid.as_deref(), debug, admin_alg, &admin)?;
+            s.import_certificate(slot.to_slot(), &der)?;
+            println!(
+                "Imported {}-byte certificate into {}.",
+                der.len(),
+                slot.to_slot().label()
+            );
+        }
+
+        IasCmd::ExportCert { reader, aid, slot, file } => {
+            let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            match s.read_certificate(slot.to_slot())? {
+                None => {
+                    return Err(format!("{} holds no certificate", slot.to_slot().label()).into())
+                }
+                Some(der) => match file {
+                    Some(path) => {
+                        std::fs::write(path, &der)
+                            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                        eprintln!(
+                            "Wrote {}-byte DER certificate to {}.",
+                            der.len(),
+                            path.display()
+                        );
+                    }
+                    None => {
+                        use std::io::{IsTerminal, Write};
+                        if std::io::stdout().is_terminal() {
+                            return Err("stdout is a terminal; pass --file PATH or pipe \
+                                        (e.g. | openssl x509 -inform der -text)"
+                                .into());
+                        }
+                        std::io::stdout().write_all(&der)?;
+                    }
+                },
+            }
+        }
+
+        IasCmd::RequestCert {
+            reader,
+            aid,
+            slot,
+            subject,
+            pin_env,
+            pin_stdin,
+            file,
+            load_pubkey,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            s.verify_pin(pin.as_bytes())?;
+            if let Some(path) = load_pubkey {
+                let (alg, key) = load_pubkey_material_ias(path)?;
+                s.remember_pubkey(slot.to_slot(), alg, key);
+            }
+            eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
+            let pem = s.generate_csr(slot.to_slot(), subject)?;
+            match file {
+                Some(path) => {
+                    std::fs::write(path, pem.as_bytes())
+                        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                    eprintln!(
+                        "Wrote certificate request for {} to {}.",
+                        slot.to_slot().label(),
+                        path.display()
+                    );
+                }
+                None => print!("{}", pem),
+            }
+        }
+
+        IasCmd::SelfSign {
+            reader,
+            aid,
+            slot,
+            subject,
+            days,
+            pin_env,
+            pin_stdin,
+            admin_key_env,
+            admin_key_stdin,
+            file,
+            load_pubkey,
+        } => {
+            if *days == 0 {
+                return Err("validity must be at least 1 day".into());
+            }
+            let admin_alg = keyroost_ias::IasAdminAlg::TripleDes;
+            let admin = read_admin_key("admin key", admin_key_env.as_deref(), *admin_key_stdin)?;
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            // Admin-key auth covers the certificate import; the PIN covers
+            // the signature itself.
+            let mut s =
+                open_ias_authed(reader.as_deref(), aid.as_deref(), debug, admin_alg, &admin)?;
+            s.verify_pin(pin.as_bytes())?;
+            if let Some(path) = load_pubkey {
+                let (alg, key) = load_pubkey_material_ias(path)?;
+                s.remember_pubkey(slot.to_slot(), alg, key);
+            }
+            eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
+            let now = unix_now() as i64;
+            let der = s.self_signed_certificate(
+                slot.to_slot(),
+                subject,
+                now,
+                now + i64::from(*days) * 86_400,
+            )?;
+            println!(
+                "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
+                der.len(),
+                days,
+                slot.to_slot().label()
+            );
+            if let Some(path) = file {
+                std::fs::write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
+                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                eprintln!("PEM copy written to {}.", path.display());
+            }
+        }
+
+        IasCmd::DeleteCert {
+            reader,
+            aid,
+            slot,
+            admin_key_env,
+            admin_key_stdin,
+            yes,
+        } => {
+            if !yes {
+                return Err(format!(
+                    "refusing to clear the certificate in {} without --yes \
+                     (the slot's private key is left in place)",
+                    slot.to_slot().label()
+                )
+                .into());
+            }
+            let admin_alg = keyroost_ias::IasAdminAlg::TripleDes;
+            let admin = read_admin_key("admin key", admin_key_env.as_deref(), *admin_key_stdin)?;
+            let mut s =
+                open_ias_authed(reader.as_deref(), aid.as_deref(), debug, admin_alg, &admin)?;
+            s.clear_certificate(slot.to_slot())?;
+            println!(
+                "Cleared the certificate in {} (the private key remains).",
+                slot.to_slot().label()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Open the OpenPGP session on the reader matching `reader` (or the sole
 /// OpenPGP reader), announcing the target on stderr.
 fn open_openpgp(
@@ -6060,6 +6688,61 @@ fn open_piv_authed(
 
 /// Read a management key (a hex string) from env/stdin and decode it to bytes.
 fn read_mgmt_key(
+    label: &str,
+    env: Option<&str>,
+    from_stdin: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let hex = read_secret(label, env, from_stdin)?;
+    Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
+}
+
+/// Open the IAS session on the reader matching `reader` (or the sole IAS
+/// reader). `aid` (hex), when given, is tried before the built-in candidate
+/// AIDs — pass it the moment a real device trace shows this card's actual
+/// AID.
+fn open_ias(
+    reader: Option<&str>,
+    aid: Option<&str>,
+    debug: bool,
+) -> Result<keyroost_transport::IasSession, Box<dyn std::error::Error>> {
+    let readers = keyroost_transport::IasSession::list_ias_readers()?;
+    let by_name = reader_from_name()?;
+    let name = resolve_reader(readers, reader.or(by_name.as_deref()), "IAS")?;
+    let aid_bytes = aid.map(|h| hex_decode(h.trim())).transpose()?;
+    eprintln!("\u{2192} IAS on {}", sanitize_terminal(&name));
+    let mut session = keyroost_transport::IasSession::open(
+        &name,
+        aid_bytes.as_deref(),
+        keyroost_ias::FidTable::default(),
+    )?;
+    session.set_debug(debug);
+    Ok(session)
+}
+
+/// [`open_ias`], then authenticate the admin key.
+fn open_ias_authed(
+    reader: Option<&str>,
+    aid: Option<&str>,
+    debug: bool,
+    alg: keyroost_ias::IasAdminAlg,
+    admin_key: &[u8],
+) -> Result<keyroost_transport::IasSession, Box<dyn std::error::Error>> {
+    if admin_key.len() != alg.key_len() {
+        return Err(format!(
+            "admin key is {} bytes; {} needs {}",
+            admin_key.len(),
+            alg.label(),
+            alg.key_len()
+        )
+        .into());
+    }
+    let mut session = open_ias(reader, aid, debug)?;
+    session.authenticate_admin(alg, admin_key)?;
+    Ok(session)
+}
+
+/// Read an admin key (a hex string) from env/stdin and decode it to bytes.
+fn read_admin_key(
     label: &str,
     env: Option<&str>,
     from_stdin: bool,
@@ -6229,6 +6912,21 @@ fn load_pubkey_material(
                 e
             )
         })?;
+    Ok((alg, key))
+}
+
+/// Like [`load_pubkey_material`], but for `keyroost-ias`'s `--load-pubkey`
+/// (as written by `ias generate-key --save-pubkey`).
+fn load_pubkey_material_ias(
+    path: &std::path::Path,
+) -> Result<(keyroost_ias::KeyAlg, keyroost_ias::PublicKey), Box<dyn std::error::Error>> {
+    let (piv_alg, key) = load_pubkey_material(path)?;
+    let alg = keyroost_ias::KeyAlg::from_piv_alg(piv_alg).ok_or_else(|| {
+        format!(
+            "{}: key algorithm has no IAS analog",
+            path.display()
+        )
+    })?;
     Ok((alg, key))
 }
 
