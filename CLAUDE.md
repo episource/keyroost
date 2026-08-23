@@ -194,27 +194,41 @@ Confirmed (adopted, no longer `[GUESS]`):
   fails at the PSO steps instead, with a traceable status word).
 
 Still open (unconfirmed, isolated so a fix is a point-edit):
-- **The eToken 5300 appears to gate certificate reads behind PIN
-  verification; the IDPrime 930 does not.** On the IDPrime 930, `ias status`
-  reads both populated cert files with no PIN at all (READ BINARY returns
-  `9000` + data straight after AID SELECT). On the eToken 5300, the same
-  SELECT FILE (`0001`/`0002`) succeeds (`9000`) but READ BINARY on both is
-  refused with `SW_SECURITY_NOT_SATISFIED` (`6982`) — and, unusually, so is
-  the very first command in the whole flow, the empty-body VERIFY that only
-  *queries* the retry counter (`00 20 00 11` → `6982`, not the `63 Cx` the
-  IDPrime 930 and ISO 7816-4 both give for that no-op query). That a
-  no-op status query is refused, not just the reads it gates, is itself
-  unexplained — plausible causes include a deactivated/not-yet-personalized
-  PIN object, or a security precondition this crate's flow doesn't perform
-  yet (an initial GET DATA / life-cycle check, a different PIN reference for
-  this specific product despite `card-idprime.c`'s evidence, or a
-  higher-level "activate" step). Added, not yet hardware-confirmed against
-  the 5300 unlocking anything: `IasSlotStatus::pin_required` (distinguishes
-  this from a genuinely empty/absent cert file), `IasSession::status_with_pin`,
-  and `--pin-env`/`--pin-stdin` on `keyroostctl ias status`/`export-cert` so
-  a real PIN can be tried directly. If VERIFYing a correct PIN *still*
-  doesn't unblock the reads, the precondition is something other than PIN
-  state and needs a fresh trace to identify.
+- **VERIFY's own byte layer is now fully hardware-confirmed correct — twice
+  over — but the eToken 5300 still refuses it for a reason that isn't PIN
+  correctness.** OpenSC's `pkcs15-idprime.c` independently confirms this
+  crate's PIN encoding exactly: `SC_PKCS15_PIN_TYPE_ASCII_NUMERIC`,
+  `stored_length = 16`, `pad_char = 0x00`, `min_length = 4`, `reference =
+  0x11` — byte-for-byte what `pad_pin()`/`PIN_REF_USER` already do. Real
+  hardware then confirmed it end to end: VERIFYing `"0000"` on the IDPrime
+  930 got a textbook `63 C4` (wrong PIN) with the retry counter genuinely
+  decrementing (`5` → `4` across two runs) — the card parsed and compared
+  the PIN correctly; `"0000"` is just not this particular token's real PIN,
+  which is a fact about the token, not a bug here.
+  On the **eToken 5300**, the identical well-formed VERIFY (real PIN data,
+  not just the empty-body retry-counter query from before) still comes back
+  `SW_SECURITY_NOT_SATISFIED` (`6982`), not `63 Cx` — ruling out both "wrong
+  PIN value" and "wrong encoding" as the explanation, since the same bytes
+  produce the expected response on a sibling card. **Leading hypothesis,
+  from the user's own hardware**: this specific eToken has a physical touch
+  sensor gating private-key/PIN operations (a real feature on several
+  SafeNet/Thales combo security keys), and VERIFY needs a touch either
+  immediately before or during the command — which this crate's transport
+  makes no attempt to prompt for or wait on (`transmit_full` is one
+  synchronous `card.transmit()`; if the reader/card don't transparently
+  stretch that call via T=1 WTX while waiting for a touch, a same-command
+  touch requirement would need this crate to detect "waiting" and retry,
+  which it doesn't do today). Unconfirmed and untested: whether touching
+  the sensor concurrently with the VERIFY command changes the result. Not
+  yet acted on in code — deliberately, since building retry/wait logic
+  around a guessed touch protocol without a trace showing what the "waiting"
+  state actually looks like on the wire (a `61xx`? a longer-than-usual
+  `transmit()`? nothing distinguishable at all?) would be exactly the kind
+  of unconfirmed guess this file's whole point is to avoid. `--pin-env`/
+  `--pin-stdin` on `keyroostctl ias status`/`export-cert`
+  (`IasSession::status_with_pin`, `IasSlotStatus::pin_required`) are what
+  surfaced this finding in the first place and remain the right tool for
+  the next experiment.
 - **`ADMIN_KEY_REF`** is still a placeholder. `SW 6A88` (reference data not
   found) on EXTERNAL AUTHENTICATE/CHANGE REFERENCE DATA is the first
   suspect.
