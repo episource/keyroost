@@ -1,0 +1,1018 @@
+//! IAS Classic/ECC smart-card byte layer (Thales eToken 5300 and similar).
+//!
+//! A pure, I/O-free APDU builder + parser layer for IAS Classic/ECC smart
+//! cards, the same shape as `keyroost-piv`/`keyroost-oath`/`keyroost-openpgp`:
+//! it turns intentions into APDU byte vectors and response bytes into typed
+//! values, and performs **no card I/O** (that lives in `keyroost-transport`'s
+//! `IasSession`).
+//!
+//! # This crate was built without a reference specification
+//!
+//! Unlike this workspace's PIV support (built directly from the public NIST
+//! SP 800-73-4 document), no ANSSI IAS-ECC referential or Thales/IDPrime
+//! command reference was available while writing this crate, and no IAS
+//! hardware was available to trace against. Every byte value below is one of:
+//!
+//! - **`[HIGH]`** — a genuinely standard ISO 7816-4 base instruction, or a
+//!   convention already confirmed working in this workspace against real
+//!   hardware (IAS's PERFORM SECURITY OPERATION framing is byte-identical to
+//!   `keyroost-openpgp`'s, which is tested against real OpenPGP cards).
+//! - **`[GUESS]`** — a specific, reasoned placeholder that is plausible but
+//!   unconfirmed, and likely wrong in some detail.
+//! - **`[UNKNOWN]`** — no defensible default exists (e.g. the admin-key
+//!   crypto); the code isolates these into single functions/tables so a
+//!   correction, once a real device is traced, is a point-edit, not a
+//!   rewrite. See `CLAUDE.md`'s "Known soft spots" for the running list.
+//!
+//! # Reuse of `keyroost-piv`
+//!
+//! This crate takes a path dependency on `keyroost-piv` for its `x509`,
+//! `x509_parse`, and `spki` modules only — pure DER CSR/certificate/SPKI
+//! code that is algorithm-shape-driven (RSA modulus/exponent sizes, EC
+//! curves), not PIV-protocol-driven. It is never used here for PIV protocol
+//! bytes, and [`KeyAlg`] is a deliberately separate type from
+//! `keyroost_piv::KeyAlg` (see its doc comment for why) — [`KeyAlg::to_piv_alg`]
+//! is the one narrow bridge between the two, used only at DER-construction
+//! call sites in `keyroost-transport`.
+
+#![forbid(unsafe_code)]
+
+use keyroost_proto::apdu::{build_apdu, build_apdu_ext, build_apdu_get, chain_apdu, push_tlv};
+use zeroize::Zeroizing;
+
+/// A DER-decoded public key: RSA modulus/exponent or an EC point. Identical
+/// in shape to `keyroost_piv::PublicKey` (this is just DER-relevant key
+/// material, not protocol-specific), so this crate reuses that type directly
+/// rather than defining a byte-identical duplicate.
+pub use keyroost_piv::PublicKey;
+
+// ---------------------------------------------------------------------------
+// AID, status words, reference bytes
+// ---------------------------------------------------------------------------
+
+/// Best-effort candidate AIDs for IAS-ECC/IAS-Classic applets, tried in order
+/// by the transport layer's `open()`. **`[UNKNOWN]`** — unlike PIV/OpenPGP,
+/// IAS-ECC has no single spec-mandated AID; each card issuer registers its
+/// own. Every entry here is a low-confidence guess, not a confirmed value.
+/// The transport layer also accepts a `--aid`/env override tried *first* —
+/// use it the moment a real trace shows the actual AID, rather than editing
+/// this list.
+pub const CANDIDATE_AIDS: &[&[u8]] = &[
+    // A commonly-cited ANSSI IAS-ECC-profile applet AID. GUESS.
+    &[
+        0xA0, 0x00, 0x00, 0x00, 0x77, 0x01, 0x08, 0x00, 0x07, 0x00, 0x00, 0xFE, 0x00, 0x00, 0x01,
+        0x00,
+    ],
+    // A generic "IAS" RID prefix some issuers register under. GUESS, likely wrong.
+    &[0xA0, 0x00, 0x00, 0x00, 0x77, 0x01, 0x08, 0x00],
+];
+
+/// Status word: success.
+pub const SW_OK: u16 = 0x9000;
+/// First byte of a `61xx` "more data available" status word.
+pub const SW_MORE_DATA: u8 = 0x61;
+/// File/application/object not found.
+pub const SW_NOT_FOUND: u16 = 0x6A82;
+/// Security status not satisfied (a write needed an auth/PIN that wasn't done).
+pub const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
+/// Authentication method blocked (PIN/PUK/admin key exhausted).
+pub const SW_AUTH_BLOCKED: u16 = 0x6983;
+/// Reference data (key/PIN reference) not found.
+pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
+/// Instruction code not supported by this card/applet.
+pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
+
+/// VERIFY/CHANGE REFERENCE DATA/RESET RETRY COUNTER reference (P2) for the
+/// user PIN. **`[GUESS]`** — IAS profiles vary; this does not reliably carry
+/// over from PIV's own fixed `0x80`. If VERIFY answers `6A88` (reference
+/// data not found), this is the first suspect.
+pub const PIN_REF_USER: u8 = 0x01;
+/// Key reference (P2 of EXTERNAL AUTHENTICATE / VERIFY, if the card treats
+/// the admin/SO secret as VERIFY-able) for the admin/SO key. **`[GUESS]`**.
+pub const ADMIN_KEY_REF: u8 = 0x02;
+
+// ---------------------------------------------------------------------------
+// Instructions
+// ---------------------------------------------------------------------------
+
+/// IAS Classic/ECC instruction bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Instruction {
+    /// SELECT — ISO 7816-4 base instruction. `[HIGH]`
+    Select = 0xA4,
+    /// VERIFY — present the PIN, or query its retry counter with an empty
+    /// body. ISO 7816-4 base instruction. `[HIGH]`
+    Verify = 0x20,
+    /// CHANGE REFERENCE DATA — change the PIN. ISO 7816-4 base instruction.
+    /// `[HIGH]`
+    ChangeReferenceData = 0x24,
+    /// RESET RETRY COUNTER — unblock the PIN via an unblock code. Ubiquitous
+    /// across PIV/OpenPGP/GlobalPlatform-style profiles at this byte value
+    /// (matches what this workspace's own PIV/OpenPGP layers use for the
+    /// same concept). `[HIGH-by-convention]`
+    ResetRetryCounter = 0x2C,
+    /// GET CHALLENGE — the card issues a nonce for EXTERNAL AUTHENTICATE.
+    /// ISO 7816-4 base instruction. `[HIGH]` (the *use* of it for admin-key
+    /// auth, and everything about the crypto underneath, is `[UNKNOWN]` —
+    /// see `keyroost-transport::ias::admin_crypt`).
+    GetChallenge = 0x84,
+    /// EXTERNAL AUTHENTICATE — host proves it holds the admin/SO key by
+    /// answering the GET CHALLENGE nonce. ISO 7816-4 base instruction.
+    /// `[HIGH]`
+    ExternalAuthenticate = 0x82,
+    /// MANAGE SECURITY ENVIRONMENT — select the key/algorithm reference
+    /// ahead of GENERATE KEY PAIR / PSO on profiles that need it. ISO
+    /// 7816-4 base instruction. `[HIGH]` (whether IAS needs it at all, and
+    /// its exact CRT layout, is `[GUESS]` — see [`manage_security_environment`]).
+    ManageSecurityEnvironment = 0x22,
+    /// GENERATE ASYMMETRIC KEY PAIR. `[GUESS: 0x46 per ISO 7816-8's own
+    /// table]` — note both PIV and OpenPGP in this workspace use `0x47` for
+    /// the identical concept on their own cards, so `0x47` is a live
+    /// alternative if `0x46` comes back `6D00`.
+    GenerateAsymmetricKeyPair = 0x46,
+    /// PERFORM SECURITY OPERATION — used here for COMPUTE DIGITAL SIGNATURE
+    /// (`P1=0x9E P2=0x9A`). ISO 7816-8 base instruction, and byte-identical
+    /// to this workspace's own `keyroost-openpgp::Instruction::
+    /// PerformSecurityOperation` (`0x2A`), which is tested against real
+    /// OpenPGP-card hardware — the highest-confidence non-ISO-7816-4-base
+    /// choice in this enum precisely because it's independently confirmed
+    /// in-repo. `[HIGH]`
+    PerformSecurityOperation = 0x2A,
+    /// READ BINARY — read an EF (certificate file), either after a SELECT
+    /// FILE or via a short-EF-id in P1. ISO 7816-4 base instruction. `[HIGH]`
+    ReadBinary = 0xB0,
+    /// UPDATE BINARY — write/replace an EF's contents. ISO 7816-4 base
+    /// instruction. `[HIGH]`
+    UpdateBinary = 0xD6,
+    /// GET RESPONSE — pull the next chunk of a `61xx`-chained reply. ISO
+    /// 7816-4 base instruction. `[HIGH]`
+    GetResponse = 0xC0,
+}
+
+impl Instruction {
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slots (key/certificate containers) and the FID table
+// ---------------------------------------------------------------------------
+
+/// One key/certificate container. IAS-ECC profiles commonly expose a small,
+/// fixed set of containers rather than PIV's tagged-object model. **The
+/// key-reference bytes and file IDs are `[GUESS]` placeholders** — a real
+/// card's layout is issuer/profile-specific and set at provisioning time.
+/// [`FidTable`] exists so correcting the FID half of this, once traced, is a
+/// config change (`--fid <slot>=<hex>`), not a rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    /// Authentication container.
+    Authentication,
+    /// Digital-signature (non-repudiation) container.
+    Signature,
+    /// Key-management (confidentiality/decryption) container.
+    KeyManagement,
+}
+
+impl Slot {
+    /// Private-key reference (used in MSE/GENERATE/PSO tags). `[GUESS]`
+    #[must_use]
+    pub const fn key_ref(self) -> u8 {
+        match self {
+            Slot::Authentication => 0x81,
+            Slot::Signature => 0x82,
+            Slot::KeyManagement => 0x83,
+        }
+    }
+
+    /// Default certificate file ID (2 bytes), before any `--fid` override.
+    /// `[GUESS]`
+    #[must_use]
+    pub const fn default_cert_fid(self) -> u16 {
+        match self {
+            Slot::Authentication => 0x0101,
+            Slot::Signature => 0x0102,
+            Slot::KeyManagement => 0x0103,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Slot::Authentication => "authentication",
+            Slot::Signature => "signature",
+            Slot::KeyManagement => "key management",
+        }
+    }
+
+    #[must_use]
+    pub const fn all() -> [Slot; 3] {
+        [Slot::Authentication, Slot::Signature, Slot::KeyManagement]
+    }
+}
+
+/// Runtime per-slot certificate FID table, defaulting to
+/// [`Slot::default_cert_fid`] but overridable per slot — the "cheap to fix
+/// once traced" mechanism the fixed/configurable-FID design calls for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FidTable {
+    pub authentication: u16,
+    pub signature: u16,
+    pub key_management: u16,
+}
+
+impl Default for FidTable {
+    fn default() -> Self {
+        Self {
+            authentication: Slot::Authentication.default_cert_fid(),
+            signature: Slot::Signature.default_cert_fid(),
+            key_management: Slot::KeyManagement.default_cert_fid(),
+        }
+    }
+}
+
+impl FidTable {
+    #[must_use]
+    pub const fn fid_for(&self, slot: Slot) -> u16 {
+        match slot {
+            Slot::Authentication => self.authentication,
+            Slot::Signature => self.signature,
+            Slot::KeyManagement => self.key_management,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key/admin algorithms
+// ---------------------------------------------------------------------------
+
+/// A key algorithm this crate can ask IAS to generate/use, identified by its
+/// ISO 7816-8 algorithm-reference byte. **Deliberately a separate type from
+/// `keyroost_piv::KeyAlg`**: PIV's algorithm-ID bytes (e.g. `EccP256 = 0x11`,
+/// SP 800-78's table) have no meaning in ISO 7816-8's generic
+/// algorithm-reference space, so reusing that type would silently send the
+/// wrong byte on the wire. [`KeyAlg::to_piv_alg`] bridges the two only where
+/// DER construction (which cares about key *shape*, not wire ID) needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAlg {
+    Rsa2048,
+    Rsa3072,
+    EccP256,
+    EccP384,
+}
+
+impl KeyAlg {
+    /// Algorithm-reference byte for the GENERATE KEY PAIR CRT's tag-`0x80`
+    /// subfield. `[GUESS]` — ISO 7816-8 leaves exact algorithm-reference
+    /// numbering to the card's own registered table; these are placeholders,
+    /// not derived from a spec this crate had access to.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            KeyAlg::Rsa2048 => 0x02,
+            KeyAlg::Rsa3072 => 0x04,
+            KeyAlg::EccP256 => 0x0C,
+            KeyAlg::EccP384 => 0x0D,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0x02 => Some(KeyAlg::Rsa2048),
+            0x04 => Some(KeyAlg::Rsa3072),
+            0x0C => Some(KeyAlg::EccP256),
+            0x0D => Some(KeyAlg::EccP384),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            KeyAlg::Rsa2048 => "RSA-2048",
+            KeyAlg::Rsa3072 => "RSA-3072",
+            KeyAlg::EccP256 => "ECC P-256",
+            KeyAlg::EccP384 => "ECC P-384",
+        }
+    }
+
+    /// Bridge to `keyroost_piv::KeyAlg`, used only where this crate hands key
+    /// material to `keyroost-piv`'s DER (CSR/self-sign/SPKI) builders — those
+    /// only care about key shape (RSA modulus size, EC curve), not the wire
+    /// algorithm-ID byte, so the conversion is exact and lossless.
+    #[must_use]
+    pub const fn to_piv_alg(self) -> keyroost_piv::KeyAlg {
+        match self {
+            KeyAlg::Rsa2048 => keyroost_piv::KeyAlg::Rsa2048,
+            KeyAlg::Rsa3072 => keyroost_piv::KeyAlg::Rsa3072,
+            KeyAlg::EccP256 => keyroost_piv::KeyAlg::EccP256,
+            KeyAlg::EccP384 => keyroost_piv::KeyAlg::EccP384,
+        }
+    }
+}
+
+/// Cipher for the GET CHALLENGE / EXTERNAL AUTHENTICATE admin-key round.
+/// `[UNKNOWN]` — see `keyroost-transport::ias::admin_crypt`'s doc comment;
+/// this enum exists so swapping the cipher, once traced, is a one-match-arm
+/// edit rather than a signature change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IasAdminAlg {
+    TripleDes,
+    Aes128,
+}
+
+impl IasAdminAlg {
+    #[must_use]
+    pub const fn block_size(self) -> usize {
+        match self {
+            IasAdminAlg::TripleDes => 8,
+            IasAdminAlg::Aes128 => 16,
+        }
+    }
+
+    #[must_use]
+    pub const fn key_len(self) -> usize {
+        match self {
+            IasAdminAlg::TripleDes => 24,
+            IasAdminAlg::Aes128 => 16,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            IasAdminAlg::TripleDes => "3DES",
+            IasAdminAlg::Aes128 => "AES-128",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// An out-of-range PIN/PUK/admin-secret length. Never pad/truncate a secret
+/// into a different valid-length one and burn a retry against the card —
+/// same discipline as `keyroost_piv::PinLengthError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinLengthError {
+    /// The rejected length, in bytes.
+    pub len: usize,
+}
+
+impl core::fmt::Display for PinLengthError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "IAS PIN/PUK must be 4-8 bytes (got {})", self.len)
+    }
+}
+
+impl std::error::Error for PinLengthError {}
+
+/// A malformed or unexpected card response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    /// Buffer ended before a length-prefixed value did.
+    Truncated,
+    /// Expected the `7F49` public-key template, found something else.
+    NotPublicKeyTemplate,
+    /// A BER length used an unsupported form (indefinite, or >2-byte long form).
+    BadLength,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ParseError::Truncated => write!(f, "IAS response truncated"),
+            ParseError::NotPublicKeyTemplate => write!(f, "IAS response is not a 7F49 public-key template"),
+            ParseError::BadLength => write!(f, "IAS response used an unsupported BER length form"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Pad a 4-8 byte PIN/PUK/admin-secret to a fixed 8-byte field with `0xFF`,
+/// same shape as `keyroost_piv`'s `pad_pin`. `[GUESS]` length bound — IAS
+/// PINs are commonly 4-8 digits, but this is not confirmed.
+fn pad_pin(pin: &[u8]) -> Result<Zeroizing<Vec<u8>>, PinLengthError> {
+    if !(4..=8).contains(&pin.len()) {
+        return Err(PinLengthError { len: pin.len() });
+    }
+    let mut out = Zeroizing::new(vec![0xFFu8; 8]);
+    out[..pin.len()].copy_from_slice(pin);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// APDU builders
+// ---------------------------------------------------------------------------
+
+/// SELECT the IAS applet by `aid` (case 4: a trailing `Le` requests whatever
+/// property template the card returns on success).
+#[must_use]
+pub fn select(aid: &[u8]) -> Vec<u8> {
+    let mut apdu = build_apdu(0x00, Instruction::Select.code(), 0x04, 0x0C, aid);
+    apdu.push(0x00);
+    apdu
+}
+
+/// VERIFY the PIN. `[GUESS]` P2 reference — see [`PIN_REF_USER`].
+pub fn verify_pin(pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    Ok(build_apdu(
+        0x00,
+        Instruction::Verify.code(),
+        0x00,
+        PIN_REF_USER,
+        &pad_pin(pin)?,
+    ))
+}
+
+/// VERIFY with an empty body — queries the PIN retry counter without
+/// consuming a try. Case 1 (no `Lc`, no `Le`).
+#[must_use]
+pub fn verify_pin_status() -> Vec<u8> {
+    vec![0x00, Instruction::Verify.code(), 0x00, PIN_REF_USER]
+}
+
+/// CHANGE REFERENCE DATA: change the PIN.
+pub fn change_reference_data(old: &[u8], new: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    let mut body = pad_pin(old)?.to_vec();
+    body.extend_from_slice(&pad_pin(new)?);
+    Ok(build_apdu(
+        0x00,
+        Instruction::ChangeReferenceData.code(),
+        0x00,
+        PIN_REF_USER,
+        &body,
+    ))
+}
+
+/// RESET RETRY COUNTER: unblock the PIN with an unblock code (PUK), setting
+/// a new PIN in the same command. `[GUESS]` body layout — modeled on PIV's
+/// own unblock (concatenated padded PUK + padded new PIN).
+pub fn reset_retry_counter(puk: &[u8], new_pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    let mut body = pad_pin(puk)?.to_vec();
+    body.extend_from_slice(&pad_pin(new_pin)?);
+    Ok(build_apdu(
+        0x00,
+        Instruction::ResetRetryCounter.code(),
+        0x00,
+        PIN_REF_USER,
+        &body,
+    ))
+}
+
+/// GET CHALLENGE: request an `le`-byte nonce from the card ahead of EXTERNAL
+/// AUTHENTICATE. `le` should match the admin algorithm's block size.
+#[must_use]
+pub fn get_challenge(le: u8) -> Vec<u8> {
+    build_apdu_get(0x00, Instruction::GetChallenge.code(), 0x00, 0x00, le)
+}
+
+/// EXTERNAL AUTHENTICATE: present the host's encrypted response to a prior
+/// GET CHALLENGE, under `admin_key_ref`. `[HIGH]` framing; `response`'s
+/// construction (cipher/mode/MAC) is entirely `[UNKNOWN]` — see
+/// `keyroost-transport::ias::admin_crypt`.
+#[must_use]
+pub fn external_authenticate(admin_key_ref: u8, response: &[u8]) -> Vec<u8> {
+    build_apdu(
+        0x00,
+        Instruction::ExternalAuthenticate.code(),
+        0x00,
+        admin_key_ref,
+        response,
+    )
+}
+
+/// MANAGE SECURITY ENVIRONMENT: SET the key/algorithm reference for a
+/// subsequent GENERATE KEY PAIR or PSO operation, on cards that need an
+/// explicit pre-step. **Not called by default anywhere in this workspace's
+/// transport layer** — a no-op unless a trace shows GENERATE/PSO failing
+/// without it. `[GUESS]` — P1=`0x41` ("SET, compute/decipher"), P2=`0xB8`
+/// (confidentiality-template tag, repurposed here by ISO 7816-8 convention),
+/// data = the same CRT [`generate_key_pair`] builds.
+#[must_use]
+pub fn manage_security_environment(slot: Slot, alg: KeyAlg) -> Vec<u8> {
+    let crt = generate_key_pair_crt(slot, alg);
+    build_apdu(
+        0x00,
+        Instruction::ManageSecurityEnvironment.code(),
+        0x41,
+        0xB8,
+        &crt,
+    )
+}
+
+/// The CRT (control reference template) shared by [`generate_key_pair`] and
+/// [`manage_security_environment`]: tag `0xB8` wrapping algorithm-reference
+/// (tag `0x80`) + key-reference (tag `0x84`). `[GUESS]` tag choice — a real
+/// card may instead expect `0xA6`, or no outer wrapper at all.
+fn generate_key_pair_crt(slot: Slot, alg: KeyAlg) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(6);
+    push_tlv(&mut inner, &[0x80], &[alg.id()]);
+    push_tlv(&mut inner, &[0x84], &[slot.key_ref()]);
+    let mut crt = Vec::with_capacity(inner.len() + 2);
+    push_tlv(&mut crt, &[0xB8], &inner);
+    crt
+}
+
+/// GENERATE ASYMMETRIC KEY PAIR: `00 46 00 00 Lc <CRT> 00`. The card creates
+/// a fresh private key in `slot` and returns its public key (`7F49`
+/// template, parsed by [`parse_generated_public_key`]). Requires prior
+/// admin-key authentication. `[GUESS]` INS/CRT — see [`Instruction::GenerateAsymmetricKeyPair`].
+#[must_use]
+pub fn generate_key_pair(slot: Slot, alg: KeyAlg) -> Vec<u8> {
+    let crt = generate_key_pair_crt(slot, alg);
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::GenerateAsymmetricKeyPair.code(),
+        0x00,
+        0x00,
+        &crt,
+    );
+    apdu.push(0x00);
+    apdu
+}
+
+/// PSO:COMPUTE DIGITAL SIGNATURE, single short/extended-length APDU:
+/// `00 2A 9E 9A <Lc> <data> <Le>` — byte-identical framing to this
+/// workspace's own `keyroost_openpgp` PSO:CDS. `data` is the caller-prepared
+/// DigestInfo (RSA) or raw hash (ECDSA); this layer never hashes. `[HIGH]`
+#[must_use]
+pub fn pso_compute_signature(data: &[u8]) -> Vec<u8> {
+    build_apdu_ext(
+        0x00,
+        Instruction::PerformSecurityOperation.code(),
+        0x9E,
+        0x9A,
+        data,
+        Some(0),
+    )
+}
+
+/// Command-chaining form of [`pso_compute_signature`], for cards/readers
+/// that reject a single extended-length PSO:CDS — the same fallback shape
+/// this workspace's PIV/OpenPGP layers use for their own large-payload
+/// commands.
+#[must_use]
+pub fn pso_compute_signature_chained(data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
+    chain_apdu(
+        0x00,
+        Instruction::PerformSecurityOperation.code(),
+        0x9E,
+        0x9A,
+        data,
+        max_chunk,
+        Some(0x00),
+    )
+}
+
+/// SELECT FILE (an EF under the current DF) by 2-byte FID:
+/// `00 A4 02 0C 02 <fid_hi> <fid_lo>`. `[HIGH]` ISO 7816-4 base SELECT
+/// semantics; whether the target card needs this before READ/UPDATE BINARY
+/// at all, vs. supporting short-EF-id addressing directly (see
+/// [`read_binary_short_ef`]), is `[GUESS]`.
+#[must_use]
+pub fn select_file_fid(fid: u16) -> Vec<u8> {
+    build_apdu(
+        0x00,
+        Instruction::Select.code(),
+        0x02,
+        0x0C,
+        &[(fid >> 8) as u8, fid as u8],
+    )
+}
+
+/// READ BINARY at `offset` after a prior [`select_file_fid`], requesting up
+/// to `le` bytes (`0` = "up to 65536" in extended form). `[HIGH]` framing.
+#[must_use]
+pub fn read_binary(offset: u16, le: u16) -> Vec<u8> {
+    build_apdu_ext(
+        0x00,
+        Instruction::ReadBinary.code(),
+        (offset >> 8) as u8,
+        offset as u8,
+        &[],
+        Some(le),
+    )
+}
+
+/// READ BINARY addressed directly by a short EF identifier in P1 (bit 0x80
+/// set, low 5 bits = `sfi`), without a prior SELECT FILE. `[GUESS]` whether
+/// the target card supports this addressing mode at all.
+#[must_use]
+pub fn read_binary_short_ef(sfi: u8, offset: u8, le: u8) -> Vec<u8> {
+    build_apdu_get(
+        0x00,
+        Instruction::ReadBinary.code(),
+        0x80 | (sfi & 0x1F),
+        offset,
+        le,
+    )
+}
+
+/// UPDATE BINARY at `offset` after a prior [`select_file_fid`], single
+/// short/extended-length APDU. `[HIGH]` framing.
+#[must_use]
+pub fn update_binary(offset: u16, data: &[u8]) -> Vec<u8> {
+    build_apdu_ext(
+        0x00,
+        Instruction::UpdateBinary.code(),
+        (offset >> 8) as u8,
+        offset as u8,
+        data,
+        None,
+    )
+}
+
+/// Command-chaining form of [`update_binary`], for cards/readers that reject
+/// a single extended-length UPDATE BINARY (certificate import routinely
+/// exceeds 255 bytes).
+#[must_use]
+pub fn update_binary_chained(offset: u16, data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
+    chain_apdu(
+        0x00,
+        Instruction::UpdateBinary.code(),
+        (offset >> 8) as u8,
+        offset as u8,
+        data,
+        max_chunk,
+        None,
+    )
+}
+
+/// GET RESPONSE: pull the next chunk of a `61xx`-chained reply.
+#[must_use]
+pub fn get_response() -> Vec<u8> {
+    vec![0x00, Instruction::GetResponse.code(), 0x00, 0x00, 0x00]
+}
+
+// ---------------------------------------------------------------------------
+// Response parsers
+// ---------------------------------------------------------------------------
+
+/// Find the first top-level TLV with a single-byte `tag` in `buf`, returning
+/// its value bytes. Bounds-checked; never panics on truncated/garbage input.
+#[must_use]
+pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < buf.len() {
+        let t = buf[i];
+        let (len, header) = read_ber_len(buf.get(i + 1..)?).ok()?;
+        let start = i + 1 + header;
+        let end = start.checked_add(len)?;
+        let value = buf.get(start..end)?;
+        if t == tag {
+            return Some(value);
+        }
+        i = end;
+    }
+    None
+}
+
+/// Read a BER-TLV definite length at the start of `buf`, returning
+/// `(length, header_byte_count)`. Short form and the 1-/2-byte long forms
+/// only; rejects indefinite (`0x80`) and >2-byte forms as [`ParseError::BadLength`].
+pub fn read_ber_len(buf: &[u8]) -> Result<(usize, usize), ParseError> {
+    match buf.first() {
+        None => Err(ParseError::Truncated),
+        Some(&b) if b < 0x80 => Ok((b as usize, 1)),
+        Some(&0x81) => {
+            let len = *buf.get(1).ok_or(ParseError::Truncated)?;
+            Ok((len as usize, 2))
+        }
+        Some(&0x82) => {
+            let hi = *buf.get(1).ok_or(ParseError::Truncated)? as usize;
+            let lo = *buf.get(2).ok_or(ParseError::Truncated)? as usize;
+            Ok(((hi << 8) | lo, 3))
+        }
+        Some(_) => Err(ParseError::BadLength),
+    }
+}
+
+/// Parse a `7F49` generated-public-key template into a [`PublicKey`]. Same
+/// tag and inner-TLV conventions PIV uses (`81`/`82` RSA modulus/exponent,
+/// `86` EC point) — ISO 7816-8's own SubjectPublicKeyInfo-in-TLV wrapper,
+/// `[HIGH]` for the tag itself, `[GUESS]` for whether IAS populates it
+/// identically.
+pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
+    if buf.get(..2) != Some(&[0x7F, 0x49][..]) {
+        return Err(ParseError::NotPublicKeyTemplate);
+    }
+    let (len, header) = read_ber_len(&buf[2..])?;
+    let start = 2 + header;
+    let end = start.checked_add(len).ok_or(ParseError::Truncated)?;
+    let inner = buf.get(start..end).ok_or(ParseError::Truncated)?;
+    if let Some(point) = find_tlv(inner, 0x86) {
+        return Ok(PublicKey::Ecc {
+            point: point.to_vec(),
+        });
+    }
+    let modulus = find_tlv(inner, 0x81).ok_or(ParseError::NotPublicKeyTemplate)?;
+    let exponent = find_tlv(inner, 0x82).ok_or(ParseError::NotPublicKeyTemplate)?;
+    Ok(PublicKey::Rsa {
+        modulus: modulus.to_vec(),
+        exponent: exponent.to_vec(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_bytes() {
+        let aid = [0xA0, 0x00, 0x00, 0x01];
+        assert_eq!(
+            select(&aid),
+            vec![0x00, 0xA4, 0x04, 0x0C, 0x04, 0xA0, 0x00, 0x00, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn verify_pin_pads_to_eight() {
+        let apdu = verify_pin(b"1234").unwrap();
+        assert_eq!(
+            apdu,
+            vec![
+                0x00, 0x20, 0x00, PIN_REF_USER, 0x08, 0x31, 0x32, 0x33, 0x34, 0xFF, 0xFF, 0xFF,
+                0xFF
+            ]
+        );
+    }
+
+    #[test]
+    fn verify_pin_rejects_out_of_range() {
+        assert_eq!(verify_pin(b"123").unwrap_err(), PinLengthError { len: 3 });
+        assert_eq!(
+            verify_pin(b"123456789").unwrap_err(),
+            PinLengthError { len: 9 }
+        );
+    }
+
+    #[test]
+    fn verify_pin_status_bytes() {
+        assert_eq!(verify_pin_status(), vec![0x00, 0x20, 0x00, PIN_REF_USER]);
+    }
+
+    #[test]
+    fn change_reference_data_bytes() {
+        let apdu = change_reference_data(b"1234", b"5678").unwrap();
+        assert_eq!(apdu[..4], [0x00, 0x24, 0x00, PIN_REF_USER]);
+        assert_eq!(apdu[4], 0x10); // Lc: two padded 8-byte fields
+        assert_eq!(&apdu[5..13], &[0x31, 0x32, 0x33, 0x34, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&apdu[13..21], &[0x35, 0x36, 0x37, 0x38, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn reset_retry_counter_bytes() {
+        let apdu = reset_retry_counter(b"00000000", b"1234").unwrap();
+        assert_eq!(apdu[..4], [0x00, 0x2C, 0x00, PIN_REF_USER]);
+        assert_eq!(apdu[4], 0x10);
+    }
+
+    #[test]
+    fn get_challenge_bytes() {
+        assert_eq!(get_challenge(8), vec![0x00, 0x84, 0x00, 0x00, 0x08]);
+    }
+
+    #[test]
+    fn external_authenticate_bytes() {
+        assert_eq!(
+            external_authenticate(ADMIN_KEY_REF, &[0xAA; 8]),
+            vec![
+                0x00, 0x82, 0x00, ADMIN_KEY_REF, 0x08, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+                0xAA
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_key_pair_bytes() {
+        // 00 46 00 00 08 B8 06 80 01 0C 84 01 81 00 (P-256 in Authentication slot)
+        let apdu = generate_key_pair(Slot::Authentication, KeyAlg::EccP256);
+        assert_eq!(
+            apdu,
+            vec![
+                0x00, 0x46, 0x00, 0x00, 0x08, 0xB8, 0x06, 0x80, 0x01, 0x0C, 0x84, 0x01, 0x81,
+                0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn manage_security_environment_bytes() {
+        let apdu = manage_security_environment(Slot::Signature, KeyAlg::Rsa2048);
+        assert_eq!(apdu[..4], [0x00, 0x22, 0x41, 0xB8]);
+        assert_eq!(apdu[4], 0x08); // Lc: CRT length
+        assert_eq!(
+            &apdu[5..],
+            &[0xB8, 0x06, 0x80, 0x01, 0x02, 0x84, 0x01, 0x82]
+        );
+    }
+
+    #[test]
+    fn pso_compute_signature_short_form() {
+        let apdu = pso_compute_signature(&[0x01, 0x02, 0x03]);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0x2A, 0x9E, 0x9A, 0x03, 0x01, 0x02, 0x03, 0x00]
+        );
+    }
+
+    #[test]
+    fn pso_compute_signature_extended_form_over_255() {
+        let data = vec![0x5Au8; 256];
+        let apdu = pso_compute_signature(&data);
+        assert_eq!(&apdu[..5], &[0x00, 0x2A, 0x9E, 0x9A, 0x00]);
+        assert_eq!(&apdu[5..7], &[0x01, 0x00]); // 256 = 0x0100
+    }
+
+    #[test]
+    fn pso_compute_signature_chained_reassembles_to_extended_body() {
+        let data = vec![0x5Au8; 256]; // RSA-2048 prepared block
+        let extended = pso_compute_signature(&data);
+        let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
+        let ext_body = &extended[7..7 + ext_lc];
+
+        let chunks = pso_compute_signature_chained(&data, 254);
+        assert!(chunks.len() > 1);
+        let last = chunks.len() - 1;
+        let mut reassembled = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected_cla = if i < last { 0x10 } else { 0x00 };
+            assert_eq!(chunk[0], expected_cla);
+            assert_eq!(&chunk[1..4], &[0x2A, 0x9E, 0x9A]);
+            let lc = chunk[4] as usize;
+            reassembled.extend_from_slice(&chunk[5..5 + lc]);
+            if i == last {
+                assert_eq!(&chunk[5 + lc..], &[0x00]);
+            } else {
+                assert_eq!(chunk.len(), 5 + lc);
+            }
+        }
+        assert_eq!(reassembled, ext_body);
+    }
+
+    #[test]
+    fn select_file_fid_bytes() {
+        assert_eq!(
+            select_file_fid(0x0101),
+            vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x01, 0x01]
+        );
+    }
+
+    #[test]
+    fn read_binary_bytes() {
+        assert_eq!(
+            read_binary(0x0010, 256),
+            vec![0x00, 0xB0, 0x00, 0x10, 0x00]
+        );
+    }
+
+    #[test]
+    fn read_binary_short_ef_bytes() {
+        assert_eq!(
+            read_binary_short_ef(0x01, 0x00, 0x00),
+            vec![0x00, 0xB0, 0x81, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn update_binary_chained_reassembles() {
+        let data = vec![0x11u8; 400];
+        let extended = update_binary(0, &data);
+        let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
+        let ext_body = &extended[7..7 + ext_lc];
+
+        let chunks = update_binary_chained(0, &data, 254);
+        assert!(chunks.len() > 1);
+        let mut reassembled = Vec::new();
+        for chunk in &chunks {
+            let lc = chunk[4] as usize;
+            reassembled.extend_from_slice(&chunk[5..5 + lc]);
+        }
+        assert_eq!(reassembled, ext_body);
+    }
+
+    #[test]
+    fn get_response_bytes() {
+        assert_eq!(get_response(), vec![0x00, 0xC0, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn instruction_codes() {
+        assert_eq!(Instruction::Select.code(), 0xA4);
+        assert_eq!(Instruction::PerformSecurityOperation.code(), 0x2A);
+        assert_eq!(Instruction::GenerateAsymmetricKeyPair.code(), 0x46);
+    }
+
+    #[test]
+    fn slot_key_ref_and_fid_are_distinct_per_slot() {
+        let refs: Vec<u8> = Slot::all().iter().map(|s| s.key_ref()).collect();
+        assert_eq!(refs.len(), refs.iter().collect::<std::collections::HashSet<_>>().len());
+        let fids: Vec<u16> = Slot::all().iter().map(|s| s.default_cert_fid()).collect();
+        assert_eq!(fids.len(), fids.iter().collect::<std::collections::HashSet<_>>().len());
+    }
+
+    #[test]
+    fn fid_table_default_matches_slot_defaults() {
+        let t = FidTable::default();
+        for slot in Slot::all() {
+            assert_eq!(t.fid_for(slot), slot.default_cert_fid());
+        }
+    }
+
+    #[test]
+    fn fid_table_override_is_per_slot() {
+        let mut t = FidTable::default();
+        t.signature = 0xABCD;
+        assert_eq!(t.fid_for(Slot::Signature), 0xABCD);
+        assert_eq!(t.fid_for(Slot::Authentication), Slot::Authentication.default_cert_fid());
+    }
+
+    #[test]
+    fn key_alg_round_trips() {
+        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::EccP256, KeyAlg::EccP384] {
+            assert_eq!(KeyAlg::from_id(alg.id()), Some(alg));
+        }
+        assert_eq!(KeyAlg::from_id(0xFF), None);
+    }
+
+    #[test]
+    fn key_alg_to_piv_alg_preserves_shape() {
+        assert_eq!(KeyAlg::EccP256.to_piv_alg(), keyroost_piv::KeyAlg::EccP256);
+        assert_eq!(KeyAlg::Rsa2048.to_piv_alg(), keyroost_piv::KeyAlg::Rsa2048);
+    }
+
+    #[test]
+    fn admin_alg_block_and_key_len() {
+        assert_eq!(IasAdminAlg::TripleDes.block_size(), 8);
+        assert_eq!(IasAdminAlg::TripleDes.key_len(), 24);
+        assert_eq!(IasAdminAlg::Aes128.block_size(), 16);
+        assert_eq!(IasAdminAlg::Aes128.key_len(), 16);
+    }
+
+    #[test]
+    fn read_ber_len_forms() {
+        assert_eq!(read_ber_len(&[0x05]), Ok((5, 1)));
+        assert_eq!(read_ber_len(&[0x81, 0x80]), Ok((0x80, 2)));
+        assert_eq!(read_ber_len(&[0x82, 0x01, 0x02]), Ok((0x0102, 3)));
+        assert_eq!(read_ber_len(&[0x80]), Err(ParseError::BadLength));
+        assert_eq!(read_ber_len(&[]), Err(ParseError::Truncated));
+    }
+
+    #[test]
+    fn find_tlv_locates_second_of_two() {
+        let buf = [0x80, 0x01, 0xAA, 0x84, 0x01, 0xBB];
+        assert_eq!(find_tlv(&buf, 0x84), Some(&[0xBB][..]));
+        assert_eq!(find_tlv(&buf, 0x99), None);
+    }
+
+    #[test]
+    fn find_tlv_never_panics_on_truncated_input() {
+        for buf in [&[0x80][..], &[0x80, 0x05][..], &[0x81][..], &[][..]] {
+            let _ = find_tlv(buf, 0x80);
+        }
+    }
+
+    #[test]
+    fn parse_generated_public_key_rsa() {
+        let buf = [
+            0x7F, 0x49, 0x08, 0x81, 0x02, 0xAA, 0xBB, 0x82, 0x02, 0x01, 0x00,
+        ];
+        match parse_generated_public_key(&buf).unwrap() {
+            PublicKey::Rsa { modulus, exponent } => {
+                assert_eq!(modulus, vec![0xAA, 0xBB]);
+                assert_eq!(exponent, vec![0x01, 0x00]);
+            }
+            PublicKey::Ecc { .. } => panic!("expected RSA"),
+        }
+    }
+
+    #[test]
+    fn parse_generated_public_key_ecc() {
+        let buf = [0x7F, 0x49, 0x06, 0x86, 0x04, 0x04, 0x11, 0x22, 0x33];
+        match parse_generated_public_key(&buf).unwrap() {
+            PublicKey::Ecc { point } => assert_eq!(point, vec![0x04, 0x11, 0x22, 0x33]),
+            PublicKey::Rsa { .. } => panic!("expected ECC"),
+        }
+    }
+
+    #[test]
+    fn parse_generated_public_key_rejects_wrong_tag() {
+        assert_eq!(
+            parse_generated_public_key(&[0x7F, 0x48, 0x00]),
+            Err(ParseError::NotPublicKeyTemplate)
+        );
+        assert_eq!(parse_generated_public_key(&[]), Err(ParseError::NotPublicKeyTemplate));
+    }
+}

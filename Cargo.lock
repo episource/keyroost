@@ -1953,6 +1953,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-ias"
+version = "0.7.8"
+dependencies = [
+ "keyroost-piv",
+ "keyroost-proto",
+ "zeroize",
+]
+
+[[package]]
 name = "keyroost-import"
 version = "0.7.8"
 dependencies = [

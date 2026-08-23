@@ -1,0 +1,20 @@
+[package]
+name = "keyroost-ias"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust IAS Classic/ECC (ISO 7816-4/-8) smartcard byte layer (APDU + BER-TLV)."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.8" }
+# Path dependency for keyroost-piv's x509/x509_parse/spki DER builders only
+# (CSR/self-signed-cert construction, SPKI encode/decode) — that code is
+# algorithm-shape-driven, not PIV-protocol-driven. See this crate's lib.rs
+# doc comment; never used here for PIV protocol bytes.
+keyroost-piv = { path = "../keyroost-piv", version = "0.7.8" }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
