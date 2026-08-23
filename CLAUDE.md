@@ -107,31 +107,60 @@ workflow during bring-up is:
 
 `keyroost-ias` / `IasSession` / `keyroostctl ias` / the GUI's "IAS" tab were
 built from general ISO 7816-4/-8 knowledge with no eToken 5300 (or any IAS
-card) to trace against. Two secondary sources have since corrected/confirmed
-parts of it — neither is authoritative *for the eToken 5300 specifically*
-(different issuer, no wire-level manual for that exact product is public),
-but both are real:
+card) to trace against. **The user's real eToken 5300 rejected every
+CANDIDATE_AIDS guess with `SW 6A82`** (PIV's standard AID failed the same
+way, confirming this device genuinely has no PIV applet — it's IAS-only).
+Reading the ATR the user captured
+(`3b ff 96 00 00 81 31 fe 43 80 31 80 65 b0 84 56 51 10 12 01 78 82 90 00 6a`)
+against OpenSC's own ATR table identified the real chip family precisely:
+this is a **Gemalto/Thales IDPrime** card (`SC_CARD_TYPE_IDPRIME_930_PLUS`/
+`_940`, ATR-table label "eToken 5110+ FIPS") — a specific, better-documented
+sibling of the generic "IAS Classic/ECC" applet family this feature was
+originally named after, with its own dedicated OpenSC driver
+(`card-idprime.c`/`pkcs15-idprime.c`). Three sources have now
+corrected/confirmed parts of the byte layer — none is authoritative *for the
+eToken 5300 specifically* (no wire-level manual for that exact product is
+public), but all are real:
 
 - **OpenSC's `card-cedulauy.c`** — a real, deployed open-source driver for
-  Uruguay's national eID, an IAS-Classic-family card. Confirmed several
-  bytes below; where it did, this crate now cites it directly in the
-  builder's own doc comment rather than marking the byte `[GUESS]`.
+  Uruguay's national eID, a related-but-distinct IAS-Classic-family card
+  (Gemalto RID, different PIX/issuer). Confirmed the signing sequence and
+  MSE:SET framing below.
+- **OpenSC's `card-idprime.c`**, plus GitHub issue #3488 and its fix PR
+  #3493 (a real bring-up report *for this exact chip family*, SafeNet
+  eToken 5100/5110 SC) — the strongest evidence source so far, since it's
+  an actual APDU trace against IDPrime silicon, not just driver source.
+  Confirmed the AID, PIN field shape, MSE algorithm-reference byte, and GET
+  CHALLENGE `P2` below.
 - **Thales's public Common Criteria Security Target** for "IAS Classic v5.2
   with MOC Server v3.1 on MultiApp V5.0" (D1506187_LITE rev 1.5) — a CC
   assurance document, not a command reference, so it gives no
-  AID/INS/P1/P2/tag detail at all, but it does describe the admin-key
-  crypto's real *shape*. The actual byte-level manual for that card family
-  is Thales's restricted "IAS Classic v5.2, Reference Manual, D1542053B" —
-  not publicly available.
+  AID/INS/P1/P2/tag detail, but it does describe the admin-key crypto's
+  real *shape*. The actual byte-level manual for that card family is
+  Thales's restricted "IAS Classic v5.2, Reference Manual, D1542053B" — not
+  publicly available.
 
 Confirmed (adopted, no longer `[GUESS]`):
 - **SELECT's P2 is `0x00`** ("return FCI"), not PIV/Yubico's `0x0C`.
-- **A real, working AID** (Uruguay's, `A0 00 00 00 18 40 00 00 01 63 42 00`)
-  is `CANDIDATE_AIDS`' first entry — still not proven to match the eToken
-  5300 (each issuer registers its own AID for this card family), but a real
-  evidenced one is a better first guess than an invented one. `--aid <hex>`
-  (CLI) / the GUI's "AID override" field remain the fast path once a trace
-  names the real one.
+- **`CANDIDATE_AIDS`' first entry is now the real IDPrime applet AID**
+  (`A0 00 00 00 18 80 00 00 00 06 62`, from `card-idprime.c`'s
+  `idprime_path`), ahead of Uruguay's cedulauy AID — not yet verified to
+  actually SELECT on the user's own eToken 5300 (that's the next real-world
+  test). `--aid <hex>` (CLI) / the GUI's "AID override" field remain the
+  fast path if it still doesn't match.
+- **`PIN_REF_USER` is `0x11`**, not `0x01` — confirmed by issue #3488's real
+  APDU trace (`00 20 00 11 06 31 32 33 34 35 36`).
+- **PIN/PUK fields are 16 bytes, `0x00`-padded**, not PIV's 8-byte
+  `0xFF`-padded field — confirmed by issue #3488 / PR #3493's exact APDU.
+  `pad_pin()` now accepts 4–16 byte secrets (was 4–8).
+- **MSE:SET DST's algorithm-reference byte is `0x42` (RSA) / `0x44` (EC)**
+  — confirmed by `card-idprime.c`, and deliberately kept on a separate
+  method (`KeyAlg::mse_sign_algo_id`) from the still-unconfirmed
+  `KeyAlg::id()` used only by GENERATE, so this evidence can't silently
+  leak onto a command it doesn't cover.
+- **GET CHALLENGE's `P2` selects the challenge length** (`0x01` for 8
+  bytes, `0x00` for 16) rather than being a fixed `0x00` — confirmed by
+  `card-idprime.c`.
 - **Signing is a three-step sequence**, not the single-step PSO:CDS this
   crate originally shipped: MSE:SET DST (`00 22 41 B6`, CRT tag `0xB6`
   wrapping key-ref `0x84` then algorithm-ref `0x80`, in that order) → PSO:LOAD
@@ -143,15 +172,13 @@ Confirmed (adopted, no longer `[GUESS]`):
   fails at the PSO steps instead, with a traceable status word).
 
 Still open (unconfirmed, isolated so a fix is a point-edit):
-- **PIN/PUK/admin-key reference bytes** (`PIN_REF_USER`, `ADMIN_KEY_REF`) are
-  still placeholders. `SW 6A88` (reference data not found) on VERIFY/CHANGE
-  REFERENCE DATA is the first suspect.
+- **`ADMIN_KEY_REF`** is still a placeholder. `SW 6A88` (reference data not
+  found) on EXTERNAL AUTHENTICATE/CHANGE REFERENCE DATA is the first
+  suspect.
 - **GENERATE ASYMMETRIC KEY PAIR's own INS byte and CRT layout** — `0x46`
   vs `0x47`, and CRT tag `0xB8` (algo-then-keyref) — are still guesses.
-  The cedulauy evidence above covers MSE:SET ahead of *signing* only; that
-  card has no user-triggered key generation to observe (keys are
-  provisioned at issuance), so none of it transfers to GENERATE. `SW 6D00`
-  means try the other INS.
+  Neither the cedulauy nor the IDPrime evidence above covers on-card key
+  generation; `SW 6D00` means try the other INS.
 - **The admin-key crypto** (`admin_crypt` in
   `crates/keyroost-transport/src/ias.rs`) is still the single
   highest-uncertainty piece of the whole feature, and is known to likely be

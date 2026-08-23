@@ -50,21 +50,37 @@ pub use keyroost_piv::PublicKey;
 // AID, status words, reference bytes
 // ---------------------------------------------------------------------------
 
-/// Best-effort candidate AIDs for IAS-ECC/IAS-Classic applets, tried in order
-/// by the transport layer's `open()`. **`[UNKNOWN]`** — unlike PIV/OpenPGP,
-/// IAS-ECC has no single spec-mandated AID; each card issuer registers its
-/// own. Every entry here is a low-confidence guess, not a confirmed value.
-/// The transport layer also accepts a `--aid`/env override tried *first* —
-/// use it the moment a real trace shows the actual AID, rather than editing
-/// this list.
+/// Best-effort candidate AIDs for IAS-ECC/IAS-Classic-family applets, tried
+/// in order by the transport layer's `open()`. The transport layer also
+/// accepts a `--aid`/env override tried *first* — use it the moment a trace
+/// shows an AID not already in this list, rather than editing it.
+///
+/// The first entry is no longer a guess: an ATR captured from a real SafeNet
+/// eToken 5300 (`3b ff 96 00 00 81 31 fe 43 80 31 80 65 b0 84 56 51 10 12 01
+/// 78 82 90 00 6a`) matches — modulo the historical-byte tail OpenSC's own
+/// ATR-matching masks already treat as don't-care — the ATR table entry
+/// OpenSC's `card-idprime.c` uses to identify a **Gemalto/Thales IDPrime**
+/// card (the `SC_CARD_TYPE_IDPRIME_930_PLUS`/`_940` family, "eToken 5110+
+/// FIPS" in that table's own label). That driver's own AID is what's listed
+/// first below. IDPrime is Thales's own applet on this exact chip family,
+/// not a separately-issued IAS-Classic/ECC deployment — but it shares
+/// enough of the same ISO 7816-8 command vocabulary (confirmed by a real
+/// PIN-VERIFY trace and PIN-padding fix for this exact chip family, see
+/// [`PIN_REF_USER`]) that this crate's IAS-Classic-shaped builders are still
+/// the closest starting point, not a wrong turn.
 pub const CANDIDATE_AIDS: &[&[u8]] = &[
+    // Gemalto/Thales IDPrime applet AID, byte-for-byte from OpenSC's
+    // card-idprime.c (`idprime_path`) — the exact driver for this chip
+    // family, per the ATR match this constant's own doc comment describes.
+    // [HIGH] confidence this is the real AID for the eToken 5300.
+    &[
+        0xA0, 0x00, 0x00, 0x00, 0x18, 0x80, 0x00, 0x00, 0x00, 0x06, 0x62,
+    ],
     // Uruguay's national eID ("Cédula de Identidad") AID, byte-for-byte from
-    // OpenSC's card-cedulauy.c driver — a real, deployed IAS-Classic-family
-    // card. [HIGH confidence this exact AID is real and works on *that*
-    // card] but [GUESS that it also matches the eToken 5300] — different
-    // issuers of the same card family register their own AIDs (see this
-    // constant's own doc comment). Kept first since a real, evidenced AID is
-    // a better first guess than an invented one.
+    // OpenSC's card-cedulauy.c driver — a different real, deployed
+    // IAS-Classic-family card (not IDPrime). Shares the same Gemalto RID
+    // (`A0 00 00 00 18`) as the IDPrime AID above, differing only in the
+    // PIX suffix — issuers of the same card family register their own AIDs.
     &[
         0xA0, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x01, 0x63, 0x42, 0x00,
     ],
@@ -93,10 +109,11 @@ pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
 pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 
 /// VERIFY/CHANGE REFERENCE DATA/RESET RETRY COUNTER reference (P2) for the
-/// user PIN. **`[GUESS]`** — IAS profiles vary; this does not reliably carry
-/// over from PIV's own fixed `0x80`. If VERIFY answers `6A88` (reference
-/// data not found), this is the first suspect.
-pub const PIN_REF_USER: u8 = 0x01;
+/// user PIN. `[HIGH]` — confirmed by a real APDU trace from a SafeNet eToken
+/// 5100/5110 SC (OpenSC issue #3488: `00 20 00 11 ...`), the same Gemalto
+/// IDPrime chip family as the eToken 5300 (confirmed by ATR match — see
+/// `CANDIDATE_AIDS`'s doc comment).
+pub const PIN_REF_USER: u8 = 0x11;
 /// Key reference (P2 of EXTERNAL AUTHENTICATE / VERIFY, if the card treats
 /// the admin/SO secret as VERIFY-able) for the admin/SO key. **`[GUESS]`**.
 pub const ADMIN_KEY_REF: u8 = 0x02;
@@ -341,6 +358,23 @@ impl KeyAlg {
             _ => None,
         }
     }
+
+    /// Algorithm-reference byte for [`manage_security_environment`]'s
+    /// Digital Signature Template — a *different* field from [`KeyAlg::id`]
+    /// above, confirmed by OpenSC's `card-idprime.c` (the driver for the
+    /// eToken 5300's actual chip family — see [`CANDIDATE_AIDS`]) to encode
+    /// the signing hash+padding scheme, not the key size/curve: `0x42` for
+    /// RSA-PKCS1-v1.5 with SHA-256 (what this crate's own `prepared_block`
+    /// always builds for RSA), `0x44` for generic EC signing. `[HIGH]` —
+    /// unlike [`KeyAlg::id`] (still `[GUESS]`, and used only by the
+    /// unconfirmed GENERATE ASYMMETRIC KEY PAIR CRT), this value is real.
+    #[must_use]
+    pub const fn mse_sign_algo_id(self) -> u8 {
+        match self {
+            KeyAlg::Rsa2048 | KeyAlg::Rsa3072 => 0x42,
+            KeyAlg::EccP256 | KeyAlg::EccP384 => 0x44,
+        }
+    }
 }
 
 /// Cipher for the GET CHALLENGE / EXTERNAL AUTHENTICATE admin-key round.
@@ -425,14 +459,19 @@ impl core::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Pad a 4-8 byte PIN/PUK/admin-secret to a fixed 8-byte field with `0xFF`,
-/// same shape as `keyroost_piv`'s `pad_pin`. `[GUESS]` length bound — IAS
-/// PINs are commonly 4-8 digits, but this is not confirmed.
+/// Pad a 4-16 byte PIN/PUK to a fixed 16-byte field with `0x00`. `[HIGH]` —
+/// confirmed by OpenSC issue #3488 and its fix, PR #3493: a real SafeNet
+/// eToken 5100/5110 SC (same Gemalto IDPrime chip family as the 5300 — see
+/// [`CANDIDATE_AIDS`]) rejected an unpadded/8-byte-padded VERIFY with
+/// `SW 6700` and required a 16-byte, `0x00`-padded field instead. Unlike
+/// PIV's fixed 8-byte `0xFF`-padded field, this is a different size *and* a
+/// different pad byte, not just a length bump — verified directly from that
+/// issue's APDU traces, not inferred.
 fn pad_pin(pin: &[u8]) -> Result<Zeroizing<Vec<u8>>, PinLengthError> {
-    if !(4..=8).contains(&pin.len()) {
+    if !(4..=16).contains(&pin.len()) {
         return Err(PinLengthError { len: pin.len() });
     }
-    let mut out = Zeroizing::new(vec![0xFFu8; 8]);
+    let mut out = Zeroizing::new(vec![0x00u8; 16]);
     out[..pin.len()].copy_from_slice(pin);
     Ok(out)
 }
@@ -522,10 +561,16 @@ pub fn reset_retry_counter(puk: &[u8], new_pin: &[u8]) -> Result<Vec<u8>, PinLen
 }
 
 /// GET CHALLENGE: request an `le`-byte nonce from the card ahead of EXTERNAL
-/// AUTHENTICATE. `le` should match the admin algorithm's block size.
+/// AUTHENTICATE. `le` should match the admin algorithm's block size (8 for
+/// 3DES, 16 for AES — see [`IasAdminAlg::block_size`]). `P2` selects the
+/// challenge length rather than being a fixed `0x00`: `[HIGH]`, confirmed by
+/// OpenSC's `card-idprime.c` for the eToken 5300's own chip family — `0x01`
+/// for an 8-byte challenge, `0x00` for 16 bytes, matching this crate's own
+/// `IasAdminAlg` block sizes exactly.
 #[must_use]
 pub fn get_challenge(le: u8) -> Vec<u8> {
-    build_apdu_get(0x00, Instruction::GetChallenge.code(), 0x00, 0x00, le)
+    let p2 = if le == 8 { 0x01 } else { 0x00 };
+    build_apdu_get(0x00, Instruction::GetChallenge.code(), 0x00, p2, le)
 }
 
 /// EXTERNAL AUTHENTICATE: present the host's encrypted response to a prior
@@ -559,7 +604,7 @@ pub fn external_authenticate(admin_key_ref: u8, response: &[u8]) -> Vec<u8> {
 pub fn manage_security_environment(slot: Slot, alg: KeyAlg) -> Vec<u8> {
     let mut inner = Vec::with_capacity(6);
     push_tlv(&mut inner, &[0x84], &[slot.key_ref()]);
-    push_tlv(&mut inner, &[0x80], &[alg.id()]);
+    push_tlv(&mut inner, &[0x80], &[alg.mse_sign_algo_id()]);
     let mut crt = Vec::with_capacity(inner.len() + 2);
     push_tlv(&mut crt, &[0xB6], &inner);
     build_apdu(
@@ -862,25 +907,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_pin_pads_to_eight() {
+    fn verify_pin_pads_to_sixteen() {
+        // Confirmed shape (OpenSC issue #3488 / PR #3493, real eToken 5300
+        // trace): 00 20 00 11 10 <pin digits> 00-padded to 16 bytes total.
         let apdu = verify_pin(b"1234").unwrap();
+        assert_eq!(apdu[..5], [0x00, 0x20, 0x00, PIN_REF_USER, 0x10]);
+        assert_eq!(apdu.len(), 5 + 16);
         assert_eq!(
-            apdu,
-            vec![
-                0x00,
-                0x20,
-                0x00,
-                PIN_REF_USER,
-                0x08,
-                0x31,
-                0x32,
-                0x33,
-                0x34,
-                0xFF,
-                0xFF,
-                0xFF,
-                0xFF
-            ]
+            &apdu[5..],
+            &[0x31, 0x32, 0x33, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 
@@ -888,8 +923,8 @@ mod tests {
     fn verify_pin_rejects_out_of_range() {
         assert_eq!(verify_pin(b"123").unwrap_err(), PinLengthError { len: 3 });
         assert_eq!(
-            verify_pin(b"123456789").unwrap_err(),
-            PinLengthError { len: 9 }
+            verify_pin(b"12345678901234567").unwrap_err(),
+            PinLengthError { len: 17 }
         );
     }
 
@@ -902,14 +937,14 @@ mod tests {
     fn change_reference_data_bytes() {
         let apdu = change_reference_data(b"1234", b"5678").unwrap();
         assert_eq!(apdu[..4], [0x00, 0x24, 0x00, PIN_REF_USER]);
-        assert_eq!(apdu[4], 0x10); // Lc: two padded 8-byte fields
+        assert_eq!(apdu[4], 0x20); // Lc: two padded 16-byte fields
         assert_eq!(
-            &apdu[5..13],
-            &[0x31, 0x32, 0x33, 0x34, 0xFF, 0xFF, 0xFF, 0xFF]
+            &apdu[5..21],
+            &[0x31, 0x32, 0x33, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
-            &apdu[13..21],
-            &[0x35, 0x36, 0x37, 0x38, 0xFF, 0xFF, 0xFF, 0xFF]
+            &apdu[21..37],
+            &[0x35, 0x36, 0x37, 0x38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 
@@ -926,12 +961,15 @@ mod tests {
     fn reset_retry_counter_bytes() {
         let apdu = reset_retry_counter(b"00000000", b"1234").unwrap();
         assert_eq!(apdu[..4], [0x00, 0x2C, 0x00, PIN_REF_USER]);
-        assert_eq!(apdu[4], 0x10);
+        assert_eq!(apdu[4], 0x20);
     }
 
     #[test]
     fn get_challenge_bytes() {
-        assert_eq!(get_challenge(8), vec![0x00, 0x84, 0x00, 0x00, 0x08]);
+        // Confirmed shape (card-idprime.c): P2=0x01 for an 8-byte challenge,
+        // P2=0x00 otherwise.
+        assert_eq!(get_challenge(8), vec![0x00, 0x84, 0x00, 0x01, 0x08]);
+        assert_eq!(get_challenge(16), vec![0x00, 0x84, 0x00, 0x00, 0x10]);
     }
 
     #[test]
@@ -972,12 +1010,16 @@ mod tests {
     fn manage_security_environment_bytes() {
         // Confirmed shape (OpenSC card-cedulauy.c): 00 22 41 B6 <Lc>
         // B6 <len> { 84 01 <keyref>  80 01 <algo> }
+        // Algorithm-reference byte itself is the card-idprime.c-confirmed
+        // value (0x42 RSA / 0x44 EC PKCS1-SHA digital-signature scheme), not
+        // KeyAlg::id() (which is a separate, still-unconfirmed byte space
+        // used only by GENERATE ASYMMETRIC KEY PAIR).
         let apdu = manage_security_environment(Slot::Signature, KeyAlg::Rsa2048);
         assert_eq!(apdu[..4], [0x00, 0x22, 0x41, 0xB6]);
         assert_eq!(apdu[4], 0x08); // Lc: CRT length
         assert_eq!(
             &apdu[5..],
-            &[0xB6, 0x06, 0x84, 0x01, 0x82, 0x80, 0x01, 0x02]
+            &[0xB6, 0x06, 0x84, 0x01, 0x82, 0x80, 0x01, 0x42]
         );
     }
 
