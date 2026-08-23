@@ -20,7 +20,7 @@
 
 #![forbid(unsafe_code)]
 
-use keyroost_proto::apdu::{build_apdu, build_apdu_get};
+use keyroost_proto::apdu::{build_apdu, build_apdu_ext, build_apdu_get, push_tlv};
 use zeroize::Zeroizing;
 
 pub mod spki;
@@ -574,70 +574,15 @@ pub fn get_response() -> Vec<u8> {
 // TLV + extended-APDU helpers (write path)
 // ---------------------------------------------------------------------------
 
-/// Encode a BER-TLV definite length: short form below 0x80, else `0x81`/`0x82`
-/// long form. PIV write objects (certs, RSA moduli) exceed 255 bytes, so the
-/// 2-byte form is required. Values are host-built and never legitimately exceed
-/// the 2-byte form, so anything larger is a caller bug — assert rather than
-/// silently truncate the length field.
-fn push_ber_len(out: &mut Vec<u8>, len: usize) {
-    assert!(len <= 0xFFFF, "BER-TLV value too large");
-    if len < 0x80 {
-        out.push(len as u8);
-    } else if len <= 0xFF {
-        out.push(0x81);
-        out.push(len as u8);
-    } else {
-        out.push(0x82);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    }
-}
-
-/// Append a TLV: `tag || ber_len(value) || value`.
-fn push_tlv(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
-    out.extend_from_slice(tag);
-    push_ber_len(out, value.len());
-    out.extend_from_slice(value);
-}
-
-/// Build a case-3/case-4 APDU, choosing short or extended-length encoding by
-/// body size. `le` requests a response (`Some(0)` = "up to 65536" in extended
-/// form, 256 in short form). YubiKey accepts extended-length APDUs over CCID;
-/// bodies over 255 bytes (cert import, RSA signing input) require them.
-fn build_apdu_ext(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8], le: Option<u16>) -> Vec<u8> {
-    assert!(data.len() <= 0xFFFF, "extended APDU body too large");
-    if data.len() <= 255 && le.is_none_or(|v| v <= 256) {
-        // Short form. Le==256 is encoded as the single byte 0x00.
-        let mut out = Vec::with_capacity(6 + data.len());
-        out.extend_from_slice(&[cla, ins, p1, p2]);
-        if !data.is_empty() {
-            out.push(data.len() as u8);
-            out.extend_from_slice(data);
-        }
-        if let Some(le) = le {
-            out.push(if le == 256 { 0x00 } else { le as u8 });
-        }
-        return out;
-    }
-    // Extended form: a leading 0x00 marker, then 2-byte Lc and/or 2-byte Le.
-    let mut out = Vec::with_capacity(9 + data.len());
-    out.extend_from_slice(&[cla, ins, p1, p2, 0x00]);
-    if !data.is_empty() {
-        out.push((data.len() >> 8) as u8);
-        out.push(data.len() as u8);
-        out.extend_from_slice(data);
-    }
-    if let Some(le) = le {
-        // 0 → 0x0000 meaning 65536.
-        out.push((le >> 8) as u8);
-        out.push(le as u8);
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Write / auth APDU builders
 // ---------------------------------------------------------------------------
+//
+// `push_ber_len`/`push_tlv`/`build_apdu_ext` are protocol-agnostic ISO 7816-4
+// mechanics (BER-TLV encoding, extended-length APDU framing) with nothing
+// PIV-specific in them, so they live in `keyroost-proto::apdu` and are
+// imported above rather than forked here — shared with every other TLV-based
+// card protocol in the workspace (e.g. IAS).
 
 /// GENERAL AUTHENTICATE step 1: request a witness from the management key. The
 /// card replies with `7C L 80 <bs> <ciphertext>` — the witness encrypted under
