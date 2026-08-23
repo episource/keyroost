@@ -6330,9 +6330,14 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let mut session = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
             let status = if pin_env.is_some() || *pin_stdin {
                 let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-                let status = session.status_with_pin(pin.as_bytes())?;
+                let (verify_result, status) = session.status_with_pin(pin.as_bytes())?;
                 if !json_output() {
-                    eprintln!("PIN verified.");
+                    match verify_result {
+                        Ok(()) => eprintln!("PIN verified."),
+                        Err(e) => {
+                            eprintln!("PIN verification failed: {e} (status below reflects this)")
+                        }
+                    }
                 }
                 status
             } else {

@@ -217,31 +217,47 @@ Confirmed (adopted, no longer `[GUESS]`):
   `"0000"` against the corrected encoding at time of writing).
 
 Still open (unconfirmed, isolated so a fix is a point-edit):
-- **Whether the corrected PIN encoding actually fixes the eToken 5300's
-  `SW_SECURITY_NOT_SATISFIED` (`6982`) on VERIFY is untested.** The old,
-  wrongly-always-padded encoding fully explains the IDPrime 930's `63 Cx`
-  (wrong-PIN-shaped) rejection, but the eToken 5300 gave a *different*
-  status word — `6982`, not `63 Cx` — for the same wrong bytes, which reads
-  as a security-precondition failure rather than "PIN didn't match", so the
-  encoding fix might not be sufficient there on its own. **The user's own
-  leading hypothesis, not yet tested**: this specific eToken has a physical
-  touch sensor gating private-key/PIN operations (a real feature on several
-  SafeNet/Thales combo security keys), and VERIFY needs a touch either
-  immediately before or during the command — which this crate's transport
-  makes no attempt to prompt for or wait on (`transmit_full` is one
-  synchronous `card.transmit()`; if the reader/card don't transparently
-  stretch that call via T=1 WTX while waiting for a touch, a same-command
-  touch requirement would need this crate to detect "waiting" and retry,
-  which it doesn't do today). Not yet acted on in code — deliberately,
-  since building retry/wait logic around a guessed touch protocol without a
-  trace showing what the "waiting" state actually looks like on the wire (a
-  `61xx`? a longer-than-usual `transmit()`? nothing distinguishable at all?)
-  would be exactly the kind of unconfirmed guess this file exists to flag.
+- **The eToken 5300's VERIFY still fails with `SW_SECURITY_NOT_SATISFIED`
+  (`6982`), confirmed to be unrelated to PIN padding.** The corrected,
+  card-type-conditional encoding directly above was validated against a
+  real IDPrime 930 (its genuine PIN now verifies correctly) but did *not*
+  change the eToken 5300's result: a correctly-encoded, unpadded, exact-4-byte
+  VERIFY of the real PIN still gets `6982`, identical to the old wrong
+  encoding — ruling padding out entirely as this device's problem.
+  **Touch-sensor hypothesis: tested once, no observed effect** — the user
+  touched the sensor during a `status --pin-env` run and got the same `6982`
+  — downgraded from leading theory, though not fully ruled out (a touch
+  requirement could still need different timing, or could apply only to
+  key-generation/signing rather than VERIFY, which is a real, common split
+  on combo authenticators).
+  **New leading hypothesis, from public evidence, not yet tested**: this
+  token may not be *personalized/initialized* for PIN-based use at all yet.
+  Thales's own SafeNet Authentication Client (SAC) documentation states a
+  SafeNet eToken must be initialized through SAC — which sets the working
+  PIN and PUK — before PIN operations are meaningful; a related open OpenSC
+  issue (#3486, "Safenet 5300") independently reports this exact model
+  refusing to cooperate with OpenSC at all without SAC installed first. If
+  the token has never been through that flow, there may be no active PIN
+  security context for *any* VERIFY to satisfy — explaining why even the
+  empty-body retry-counter query (which needs no correct PIN, just an
+  existing PIN object to report on) also gets `6982`, not the `63 Cx` a
+  live-but-wrong-answer PIN would give. This is a lifecycle/personalization
+  question this crate has no way to answer or fix in code — SAC's
+  initialization protocol is proprietary and untraced here — so the
+  actionable next step is checking with SAC itself (or Thales support)
+  whether this specific token shows as initialized, not a further code
+  change.
   `--pin-env`/`--pin-stdin` on `keyroostctl ias status`/`export-cert`
   (`IasSession::status_with_pin`, `IasSlotStatus::pin_required`) are what
-  surfaced this finding and remain the right tool for the next experiment,
-  now against the corrected encoding; `ias status`'s new `PIN encoding:`
-  line reports which one a session picked without needing `--debug`.
+  surfaced this finding and remain the right tool for the next experiment;
+  `status_with_pin` was itself corrected in this same round — an earlier
+  version aborted the whole status report on a rejected PIN via `?`, which
+  is exactly backwards for a diagnostic command (it hid the post-attempt
+  retry count on the IDPrime 930 while its PIN was still wrong). It now
+  always returns the resulting `IasStatus` and reports the VERIFY outcome
+  alongside it instead of folding one into the other. `ias status`'s new
+  `PIN encoding:` line reports which encoding a session picked without
+  needing `--debug`.
 - **`ADMIN_KEY_REF`** is still a placeholder. `SW 6A88` (reference data not
   found) on EXTERNAL AUTHENTICATE/CHANGE REFERENCE DATA is the first
   suspect.

@@ -191,14 +191,22 @@ impl IasSession {
         })
     }
 
-    /// [`Self::status`], but VERIFYing `pin` first. If the PIN is wrong or
-    /// the card rejects it, that error is returned as-is (same as
-    /// [`Self::verify_pin`]) rather than falling through to an unauthenticated
-    /// status — a caller that explicitly supplied a PIN wants to know it
-    /// didn't work, not a silently-incomplete report.
-    pub fn status_with_pin(&mut self, pin: &[u8]) -> Result<IasStatus, TransportError> {
-        self.verify_pin(pin)?;
-        self.status()
+    /// [`Self::status`], but VERIFYing `pin` first. Unlike an earlier version
+    /// of this method, a rejected PIN does *not* abort before reporting
+    /// status — real-hardware evidence this matters: on a card that needs
+    /// this, aborting on a wrong PIN hid the very thing a diagnostic command
+    /// exists to show (the post-attempt retry count, and whatever slot
+    /// access a failed VERIFY still leaves you with), which is backwards for
+    /// a bring-up tool. The VERIFY outcome is returned alongside the status
+    /// instead of being folded into the `Result`; only a transport-level
+    /// failure of [`Self::status`] itself (not of VERIFY) becomes `Err`.
+    pub fn status_with_pin(
+        &mut self,
+        pin: &[u8],
+    ) -> Result<(Result<(), TransportError>, IasStatus), TransportError> {
+        let verify_result = self.verify_pin(pin);
+        let status = self.status()?;
+        Ok((verify_result, status))
     }
 
     /// Like [`Self::read_certificate`], but for [`Self::status`]'s
