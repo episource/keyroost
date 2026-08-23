@@ -148,6 +148,19 @@ Confirmed (adopted, no longer `[GUESS]`):
   actually SELECT on the user's own eToken 5300 (that's the next real-world
   test). `--aid <hex>` (CLI) / the GUI's "AID override" field remain the
   fast path if it still doesn't match.
+- **A one-byte-truncated prefix of that AID** (`A0 00 00 00 18 80 00 00 00
+  06`) is the second `CANDIDATE_AIDS` entry, relying on ISO 7816-4's
+  partial-DF-name SELECT matching — the exact mechanism `keyroost-piv`
+  already uses for PIV's own AID (`keyroost_piv::AID` is PIV's 11-byte AID
+  truncated to its 5-byte RID/PIX prefix, hardware-verified earlier in this
+  project). This hedges against the real card's AID differing from
+  `card-idprime.c`'s only in a trailing version/variant byte. Deliberately
+  *not* truncated all the way to the bare 5-byte Gemalto RID
+  (`A0 00 00 00 18`) as a default try — that RID is shared across many
+  unrelated Gemalto/Thales applets (MD, PIV-compatible, OpenPGP-like), so
+  an automatic RID-only match risks ambiguity or the wrong applet on a
+  multi-applet card; `--aid a000000018` is there if a trace ever calls for
+  going that short deliberately.
 - **`PIN_REF_USER` is `0x11`**, not `0x01` — confirmed by issue #3488's real
   APDU trace (`00 20 00 11 06 31 32 33 34 35 36`).
 - **PIN/PUK fields are 16 bytes, `0x00`-padded**, not PIV's 8-byte

@@ -62,12 +62,36 @@ pub use keyroost_piv::PublicKey;
 /// OpenSC's `card-idprime.c` uses to identify a **Gemalto/Thales IDPrime**
 /// card (the `SC_CARD_TYPE_IDPRIME_930_PLUS`/`_940` family, "eToken 5110+
 /// FIPS" in that table's own label). That driver's own AID is what's listed
-/// first below. IDPrime is Thales's own applet on this exact chip family,
-/// not a separately-issued IAS-Classic/ECC deployment — but it shares
-/// enough of the same ISO 7816-8 command vocabulary (confirmed by a real
-/// PIN-VERIFY trace and PIN-padding fix for this exact chip family, see
-/// [`PIN_REF_USER`]) that this crate's IAS-Classic-shaped builders are still
-/// the closest starting point, not a wrong turn.
+/// first below (`select()`'s bytes are used exactly as given — SELECT by
+/// full DF name — since `card-idprime.c` never truncates it, using this
+/// single 11-byte value unmodified across all five ATR-distinguished chip
+/// variants it supports). IDPrime is Thales's own applet on this exact chip
+/// family — publicly branded "IAS Classic" in Gemalto/Thales's own FIPS
+/// documentation for the IDPrime MD/930/3930 line — not a separately-issued
+/// IAS-Classic/ECC deployment, but close enough in ISO 7816-8 command
+/// vocabulary (confirmed by a real PIN-VERIFY trace and PIN-padding fix for
+/// this exact chip family, see [`PIN_REF_USER`]) that this crate's
+/// IAS-Classic-shaped builders are still the closest starting point, not a
+/// wrong turn.
+///
+/// The second entry is a **partial-name fallback**, not a distinct guess:
+/// ISO 7816-4 SELECT (`P1=0x04`, "select by DF name") matches on a
+/// right-truncated name as long as it unambiguously identifies one
+/// application on the card — this is the exact mechanism
+/// [`keyroost_piv::AID`] already relies on for PIV in this workspace
+/// (PIV's 11-byte AID is truncated to its 5-byte RID/PIX prefix
+/// `A0 00 00 03 08`, and that's the one actually sent over the wire,
+/// hardware-verified earlier in this project). Applying the same idea here:
+/// if the real card's full AID differs from the IDPrime driver's in a
+/// trailing byte (a per-product/version suffix, a real pattern in other
+/// vendor AID schemes), a shorter prefix still selects it. Truncated by
+/// exactly one byte (dropping the trailing `0x62`) rather than all the way
+/// to the bare 5-byte Gemalto RID `A0 00 00 00 18` — that RID is shared
+/// across many unrelated Gemalto/Thales applets (MD, PIV-compatible,
+/// OpenPGP-like), so an automatic RID-only try risks selecting the wrong
+/// application on a multi-applet card, or failing ambiguity checks outright.
+/// `--aid a000000018` remains available as a manual, deliberate escape
+/// hatch if a trace ever calls for going that short.
 pub const CANDIDATE_AIDS: &[&[u8]] = &[
     // Gemalto/Thales IDPrime applet AID, byte-for-byte from OpenSC's
     // card-idprime.c (`idprime_path`) — the exact driver for this chip
@@ -76,6 +100,11 @@ pub const CANDIDATE_AIDS: &[&[u8]] = &[
     &[
         0xA0, 0x00, 0x00, 0x00, 0x18, 0x80, 0x00, 0x00, 0x00, 0x06, 0x62,
     ],
+    // One-byte-truncated prefix of the AID above, relying on ISO 7816-4
+    // partial-DF-name SELECT (the same mechanism keyroost-piv uses for PIV's
+    // own AID). [GUESS] that this specific truncation point is where a real
+    // per-product suffix would start; see this constant's own doc comment.
+    &[0xA0, 0x00, 0x00, 0x00, 0x18, 0x80, 0x00, 0x00, 0x00, 0x06],
     // Uruguay's national eID ("Cédula de Identidad") AID, byte-for-byte from
     // OpenSC's card-cedulauy.c driver — a different real, deployed
     // IAS-Classic-family card (not IDPrime). Shares the same Gemalto RID
@@ -904,6 +933,30 @@ mod tests {
             0xA0, 0x00, 0x00, 0x00, 0x18, 0x40, 0x00, 0x00, 0x01, 0x63, 0x42, 0x00,
         ];
         assert!(CANDIDATE_AIDS.contains(&&real_aid[..]));
+    }
+
+    #[test]
+    fn candidate_aids_include_a_truncated_idprime_prefix() {
+        // The IDPrime AID's own one-byte-truncated prefix must be present,
+        // immediately after the full AID, as an ISO 7816-4 partial-DF-name
+        // fallback (mirrors keyroost-piv's own AID truncation).
+        let full = [
+            0xA0, 0x00, 0x00, 0x00, 0x18, 0x80, 0x00, 0x00, 0x00, 0x06, 0x62,
+        ];
+        let prefix = [0xA0, 0x00, 0x00, 0x00, 0x18, 0x80, 0x00, 0x00, 0x00, 0x06];
+        let full_pos = CANDIDATE_AIDS
+            .iter()
+            .position(|a| *a == &full[..])
+            .expect("full IDPrime AID missing");
+        let prefix_pos = CANDIDATE_AIDS
+            .iter()
+            .position(|a| *a == &prefix[..])
+            .expect("truncated IDPrime prefix missing");
+        assert_eq!(prefix_pos, full_pos + 1);
+        // Every byte of the prefix must actually match the full AID's
+        // leading bytes -- a stale hand-edit here would silently produce an
+        // unrelated AID rather than a true prefix.
+        assert_eq!(&full[..prefix.len()], &prefix[..]);
     }
 
     #[test]
