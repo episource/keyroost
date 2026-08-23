@@ -607,15 +607,26 @@ fn map_pin_sw(sw: u16) -> Result<(), TransportError> {
 }
 
 /// Encrypt the GET CHALLENGE nonce under the admin key for EXTERNAL
-/// AUTHENTICATE. **`[UNKNOWN]`**: cipher choice (3DES/AES) is the one thing
-/// [`IasAdminAlg`] pins down; mode, IV, and whether a MAC is required are
-/// all unconfirmed. A single-block CBC-with-zero-IV encryption is
-/// mathematically identical to plain ECB for one block (the IV XORs into
-/// the first — and only — block before encryption), so this doubles as a
-/// defensible guess at either convention for a challenge that's always
-/// exactly one block long ([`IasAdminAlg::block_size`]). Kept as one
-/// isolated function precisely so a real card's actual requirement (a
-/// different mode, an appended MAC, …) is a rewrite here only.
+/// AUTHENTICATE. **`[GUESS], and now known to likely be the wrong shape —
+/// see below`**: cipher choice (3DES/AES) is confirmed correct (Thales's
+/// public "IAS Classic v5.2 with MOC Server v3.1" Common Criteria Security
+/// Target, D1506187_LITE rev 1.5, §2.1 and §7.1.1 confirm TDES/AES as the
+/// administrator authentication ciphers on this exact applet version), but
+/// that same document's FCS_CKM.1/Session and FCS_COP.1/Session tables show
+/// the real scheme is **Diffie-Hellman (PKCS#3) or ECDH (IEEE P1363)
+/// ephemeral session-key establishment**, not a static-key challenge
+/// response — the negotiated TDES/AES session key then drives real secure
+/// messaging (separate encrypt and MAC operations) on every subsequent
+/// command. This function's single-block-encrypt-a-static-key shape is a
+/// structurally different (and likely wrong) protocol, not just wrong
+/// bytes — a real fix here is a DH/ECDH key-exchange implementation plus a
+/// secure-messaging APDU wrapper, not a byte tweak. That Security Target
+/// gives no APDU/INS/P1/P2/tag detail at all (it's a CC assurance document,
+/// not the command reference — the actual byte-level manual is Thales's
+/// restricted "IAS Classic v5.2, Reference Manual, D1542053B"), so the rest
+/// of this crate's placeholders are unaffected. Kept as one isolated
+/// function precisely so replacing this with the real key-exchange scheme
+/// doesn't ripple into callers.
 fn admin_crypt(alg: IasAdminAlg, key: &[u8], challenge: &[u8]) -> Result<Vec<u8>, TransportError> {
     use cipher::generic_array::GenericArray;
     use cipher::{BlockEncrypt, KeyInit};

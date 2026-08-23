@@ -129,9 +129,19 @@ point-edit, not a rewrite.
   `0x80`/`0x84`) is wrong.
 - **The admin-key crypto** (`admin_crypt` in
   `crates/keyroost-transport/src/ias.rs`) is the single highest-uncertainty
-  piece of the whole feature: cipher (3DES/AES), mode, and whether a MAC is
-  required are all unconfirmed guesses. Kept isolated in one function
-  specifically so a full rewrite here doesn't ripple into the CLI/GUI.
+  piece of the whole feature, and is now known to likely be the wrong
+  *shape*, not just the wrong bytes. Thales's public Common Criteria
+  Security Target for this exact applet ("IAS Classic v5.2 with MOC Server
+  v3.1 on MultiApp V5.0", D1506187_LITE rev 1.5 — a CC assurance document,
+  not the byte-level command reference) confirms TDES/AES as the
+  administrator-authentication ciphers (matching `IasAdminAlg`) but shows
+  the real scheme is Diffie-Hellman/ECDH ephemeral session-key
+  establishment feeding actual secure messaging (separate encrypt + MAC per
+  command), not a static-key GET CHALLENGE/EXTERNAL AUTHENTICATE
+  challenge-response. The real byte-level reference is Thales's restricted
+  "IAS Classic v5.2, Reference Manual, D1542053B" — not publicly available.
+  Kept isolated in one function specifically so replacing it with the real
+  key-exchange + secure-messaging scheme doesn't ripple into the CLI/GUI.
 - **The per-slot certificate FID table** (`Slot::default_cert_fid`,
   `FidTable`) is a 3-entry guess. `--fid <slot>=<hex>`-style overrides (via
   `FidTable`, threaded through `IasSession::open`) exist so correcting a
