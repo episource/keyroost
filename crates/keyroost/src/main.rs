@@ -9684,7 +9684,13 @@ impl App {
                                 let lab = format!(
                                     "{} \u{00B7} {}",
                                     slot.slot.label(),
-                                    if slot.cert_present { "cert" } else { "empty" }
+                                    if slot.cert_present {
+                                        "cert"
+                                    } else if slot.pin_required {
+                                        "needs PIN"
+                                    } else {
+                                        "empty"
+                                    }
                                 );
                                 theme::pill(ui, &lab, p.txt2, p.raised2);
                             }

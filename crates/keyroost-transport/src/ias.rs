@@ -41,6 +41,16 @@ pub struct IasSlotStatus {
     pub slot: Slot,
     pub cert_present: bool,
     pub cert_len: usize,
+    /// The slot's certificate file SELECTed successfully but READ BINARY was
+    /// refused with `SW_SECURITY_NOT_SATISFIED` (`6982`), rather than the
+    /// file simply not existing/being empty. Real-hardware evidence this
+    /// distinction matters: a user's SafeNet eToken 5300 SELECTs both cert
+    /// files fine but refuses to read either without PIN verification first
+    /// — unlike a second real card (an IDPrime 930) that reads the same file
+    /// IDs unauthenticated. `status()` doesn't verify a PIN on its own (see
+    /// its own doc comment); this flag is the signal to retry with one (see
+    /// `IasSession::status_with_pin`).
+    pub pin_required: bool,
 }
 
 /// An open IAS applet session on one PC/SC reader.
@@ -136,16 +146,19 @@ impl IasSession {
     }
 
     /// Read a read-only status snapshot: PIN retries and which slots hold a
-    /// certificate. No PIN, no admin-key auth.
+    /// certificate. No PIN, no admin-key auth — some cards (see
+    /// [`IasSlotStatus::pin_required`]) refuse the certificate reads this
+    /// performs without one; use [`Self::status_with_pin`] on those.
     pub fn status(&mut self) -> Result<IasStatus, TransportError> {
         let pin_retries = self.pin_retries();
         let mut slots = Vec::with_capacity(3);
         for slot in Slot::all() {
-            let cert = self.read_certificate(slot)?;
+            let (cert, pin_required) = self.read_certificate_diag(slot)?;
             slots.push(IasSlotStatus {
                 slot,
                 cert_present: cert.is_some(),
                 cert_len: cert.map(|d| d.len()).unwrap_or(0),
+                pin_required,
             });
         }
         Ok(IasStatus {
@@ -153,6 +166,40 @@ impl IasSession {
             pin_retries,
             slots,
         })
+    }
+
+    /// [`Self::status`], but VERIFYing `pin` first. If the PIN is wrong or
+    /// the card rejects it, that error is returned as-is (same as
+    /// [`Self::verify_pin`]) rather than falling through to an unauthenticated
+    /// status — a caller that explicitly supplied a PIN wants to know it
+    /// didn't work, not a silently-incomplete report.
+    pub fn status_with_pin(&mut self, pin: &[u8]) -> Result<IasStatus, TransportError> {
+        self.verify_pin(pin)?;
+        self.status()
+    }
+
+    /// Like [`Self::read_certificate`], but for [`Self::status`]'s
+    /// diagnostic report: distinguishes "nothing here" from "SELECT
+    /// succeeded but READ BINARY was refused for a security reason" rather
+    /// than collapsing both to `None`. See [`IasSlotStatus::pin_required`]
+    /// for why this distinction earns its own method.
+    fn read_certificate_diag(
+        &mut self,
+        slot: Slot,
+    ) -> Result<(Option<Vec<u8>>, bool), TransportError> {
+        let fid = self.fids.fid_for(slot);
+        let (_, sw) = self.transmit_full(&ias::select_file_fid(fid))?;
+        if sw != ias::SW_OK {
+            return Ok((None, false));
+        }
+        let (data, sw) = self.transmit_full(&ias::read_binary(0, 0))?;
+        if sw == ias::SW_SECURITY_NOT_SATISFIED {
+            return Ok((None, true));
+        }
+        if sw != ias::SW_OK || data.is_empty() {
+            return Ok((None, false));
+        }
+        Ok((Some(data), false))
     }
 
     /// Remaining PIN tries via a no-op VERIFY. `63 Cx` -> `Some(x)`, `6983`

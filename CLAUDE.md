@@ -142,12 +142,21 @@ public), but all are real:
 
 Confirmed (adopted, no longer `[GUESS]`):
 - **SELECT's P2 is `0x00`** ("return FCI"), not PIV/Yubico's `0x0C`.
-- **`CANDIDATE_AIDS`' first entry is now the real IDPrime applet AID**
+- **`CANDIDATE_AIDS`' first entry is the real IDPrime applet AID**
   (`A0 00 00 00 18 80 00 00 00 06 62`, from `card-idprime.c`'s
-  `idprime_path`), ahead of Uruguay's cedulauy AID — not yet verified to
-  actually SELECT on the user's own eToken 5300 (that's the next real-world
-  test). `--aid <hex>` (CLI) / the GUI's "AID override" field remain the
-  fast path if it still doesn't match.
+  `idprime_path`), ahead of Uruguay's cedulauy AID — **now confirmed
+  working against two real devices**: the user's SafeNet eToken 5300 and a
+  second card, a genuine IDPrime 930. `keyroostctl ias status` succeeds
+  end-to-end on both (`AID: a000000018800000000662` in the printed status),
+  and both expose the *same* three cert-file IDs this crate already
+  guessed (`Slot::default_cert_fid`) — `SELECT FILE` by FID `0001`/`0002`
+  succeeds on both, `0003` correctly comes back `6A82` (empty key-management
+  slot) on both. One caveat: `open_ias`'s `set_debug` is applied *after*
+  `IasSession::open()` returns (a pre-existing pattern shared with every
+  other applet session in this CLI, not IAS-specific), so the SELECT
+  exchange itself never appears in a `--debug` trace — we know it succeeded
+  only because `open_ias` didn't return `NoIasApplet`, not from which exact
+  candidate (full AID vs. its truncated-prefix fallback) actually matched.
 - **A one-byte-truncated prefix of that AID** (`A0 00 00 00 18 80 00 00 00
   06`) is the second `CANDIDATE_AIDS` entry, relying on ISO 7816-4's
   partial-DF-name SELECT matching — the exact mechanism `keyroost-piv`
@@ -185,6 +194,27 @@ Confirmed (adopted, no longer `[GUESS]`):
   fails at the PSO steps instead, with a traceable status word).
 
 Still open (unconfirmed, isolated so a fix is a point-edit):
+- **The eToken 5300 appears to gate certificate reads behind PIN
+  verification; the IDPrime 930 does not.** On the IDPrime 930, `ias status`
+  reads both populated cert files with no PIN at all (READ BINARY returns
+  `9000` + data straight after AID SELECT). On the eToken 5300, the same
+  SELECT FILE (`0001`/`0002`) succeeds (`9000`) but READ BINARY on both is
+  refused with `SW_SECURITY_NOT_SATISFIED` (`6982`) — and, unusually, so is
+  the very first command in the whole flow, the empty-body VERIFY that only
+  *queries* the retry counter (`00 20 00 11` → `6982`, not the `63 Cx` the
+  IDPrime 930 and ISO 7816-4 both give for that no-op query). That a
+  no-op status query is refused, not just the reads it gates, is itself
+  unexplained — plausible causes include a deactivated/not-yet-personalized
+  PIN object, or a security precondition this crate's flow doesn't perform
+  yet (an initial GET DATA / life-cycle check, a different PIN reference for
+  this specific product despite `card-idprime.c`'s evidence, or a
+  higher-level "activate" step). Added, not yet hardware-confirmed against
+  the 5300 unlocking anything: `IasSlotStatus::pin_required` (distinguishes
+  this from a genuinely empty/absent cert file), `IasSession::status_with_pin`,
+  and `--pin-env`/`--pin-stdin` on `keyroostctl ias status`/`export-cert` so
+  a real PIN can be tried directly. If VERIFYing a correct PIN *still*
+  doesn't unblock the reads, the precondition is something other than PIN
+  state and needs a fresh trace to identify.
 - **`ADMIN_KEY_REF`** is still a placeholder. `SW 6A88` (reference data not
   found) on EXTERNAL AUTHENTICATE/CHANGE REFERENCE DATA is the first
   suspect.

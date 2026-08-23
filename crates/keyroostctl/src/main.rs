@@ -170,6 +170,7 @@ mod json_out {
         pub slot: String,
         pub cert_present: bool,
         pub cert_len: usize,
+        pub pin_required: bool,
     }
 
     /// `keyroostctl openpgp --json status`.
@@ -765,12 +766,18 @@ impl CliIasAdminAlg {
 #[derive(Subcommand)]
 enum IasCmd {
     /// Show IAS status: which AID answered, PIN retries, and which key slots
-    /// hold a certificate. No PIN or admin-key auth required.
+    /// hold a certificate. No PIN or admin-key auth required by default —
+    /// pass a PIN if a slot reports "needs PIN" (some cards refuse
+    /// certificate reads without one; see `CLAUDE.md`'s "Known soft spots").
     Status {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
         #[arg(long, value_name = "HEX")]
         aid: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
     },
     /// Change the PIN. PINs are sourced from env vars or stdin (stdin reads
     /// two consecutive lines: old then new).
@@ -888,6 +895,12 @@ enum IasCmd {
         /// Output path; omit to write DER to stdout.
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
+        /// Some cards refuse this read without a verified PIN first (see
+        /// `ias status`'s "needs PIN" report); pass one if so.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
     },
     /// Create a PKCS#10 certificate signing request for the key in a slot,
     /// signed on the card (PEM to stdout or --file). Hand the result to a CA;
@@ -6307,9 +6320,23 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
 fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        IasCmd::Status { reader, aid } => {
+        IasCmd::Status {
+            reader,
+            aid,
+            pin_env,
+            pin_stdin,
+        } => {
             let mut session = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
-            let status = session.status()?;
+            let status = if pin_env.is_some() || *pin_stdin {
+                let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+                let status = session.status_with_pin(pin.as_bytes())?;
+                if !json_output() {
+                    eprintln!("PIN verified.");
+                }
+                status
+            } else {
+                session.status()?
+            };
 
             if json_output() {
                 emit_json(&json_out::IasStatusJson {
@@ -6322,6 +6349,7 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             slot: s.slot.label().to_string(),
                             cert_present: s.cert_present,
                             cert_len: s.cert_len,
+                            pin_required: s.pin_required,
                         })
                         .collect(),
                 })?;
@@ -6341,6 +6369,11 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         "  {:<16} cert present ({} bytes)",
                         s.slot.label(),
                         s.cert_len
+                    );
+                } else if s.pin_required {
+                    println!(
+                        "  {:<16} needs PIN (file present, read refused without one; retry with --pin-env/--pin-stdin)",
+                        s.slot.label()
                     );
                 } else {
                     println!("  {:<16} empty", s.slot.label());
@@ -6501,8 +6534,15 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             aid,
             slot,
             file,
+            pin_env,
+            pin_stdin,
         } => {
             let mut s = open_ias(reader.as_deref(), aid.as_deref(), debug)?;
+            if pin_env.is_some() || *pin_stdin {
+                let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+                s.verify_pin(pin.as_bytes())?;
+                eprintln!("PIN verified.");
+            }
             match s.read_certificate(slot.to_slot())? {
                 None => {
                     return Err(format!("{} holds no certificate", slot.to_slot().label()).into())
