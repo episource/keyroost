@@ -23,6 +23,7 @@ keyroost-transport = { path = "../keyroost-transport", version = "0.7.8" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.8" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.8" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.7.8" }
+keyroost-ias = { path = "../keyroost-ias", version = "0.7.8" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.7.8" }
 keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.8" }
 keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.8" }

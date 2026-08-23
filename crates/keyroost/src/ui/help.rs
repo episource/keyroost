@@ -24,7 +24,8 @@ pub struct Help {
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
 ///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate, piv-import,
-///   piv-export, piv-delete, piv-admin
+///   piv-export, piv-delete, piv-admin, ias, ias-generate, ias-certificate,
+///   ias-import, ias-export, ias-delete, ias-admin
 pub fn help(topic: &str) -> Option<&'static Help> {
     Some(match topic {
         "device" => &Help {
@@ -136,6 +137,41 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Card administration",
             body: "These settings — the PIN and PUK, how many tries they allow, the management key, and a full reset — apply to the whole PIV applet, not to a single slot.",
             slug: "/piv#admin",
+        },
+        "ias" => &Help {
+            title: "IAS Classic/ECC smart card",
+            body: "An ISO 7816-4/-8 smart-card family used by some enterprise cards (e.g. Thales eToken 5300). Manage it here: generate keys, create self-signed certificates or CA requests (signed on the card), import certificates, and change the PIN/PUK and admin key. Built without a reference specification or real hardware to test against \u{2014} every AID, PIN reference, and the admin-key crypto are documented best-effort guesses, most likely to need correcting once tried against a real card.",
+            slug: "/ias",
+        },
+        "ias-generate" => &Help {
+            title: "Generate a key",
+            body: "Creates a brand-new private key inside this slot and shows you its public key. If the slot already held a key, this overwrites it for good. You'll need the admin key.",
+            slug: "/ias#generate",
+        },
+        "ias-certificate" => &Help {
+            title: "Create a certificate",
+            body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN.",
+            slug: "/ias#certificate",
+        },
+        "ias-import" => &Help {
+            title: "Import a certificate",
+            body: "Loads a certificate file you already have (PEM or DER) into this slot. You'll need the admin key.",
+            slug: "/ias#import",
+        },
+        "ias-export" => &Help {
+            title: "Export the certificate",
+            body: "Saves this slot's certificate to a file on your computer. It's public information, so no PIN is needed.",
+            slug: "/ias#export",
+        },
+        "ias-delete" => &Help {
+            title: "Delete from the slot",
+            body: "Clears the certificate file; the private key is left in place (IAS has no confirmed way to erase a key from this app). This is best-effort and permanent.",
+            slug: "/ias#delete",
+        },
+        "ias-admin" => &Help {
+            title: "Card administration",
+            body: "The PIN and PUK and the admin key apply to the whole card, not to a single slot. Unlike PIV there is no well-known factory-default admin key to offer as a shortcut here.",
+            slug: "/ias#admin",
         },
         "molto" => &Help {
             title: "Programmable TOTP token",

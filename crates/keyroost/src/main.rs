@@ -1667,6 +1667,270 @@ impl PivMgmtAlgSel {
     ];
 }
 
+/// Credential-entry flow for the IAS pane's modal. Mirrors [`PivCredKind`] —
+/// same single-modal-driven-by-enum pattern — minus every flow with no IAS
+/// analog (no CHUID, no PIN/touch policy, no move/delete-key, no reset).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IasCredKind {
+    ChangePin,
+    ChangePuk,
+    UnblockPin,
+    GenerateKey,
+    ImportCert,
+    SelfSign,
+    RequestCsr,
+    ChangeAdminKey,
+    DeleteCert,
+}
+
+impl IasCredKind {
+    fn title(self) -> &'static str {
+        match self {
+            IasCredKind::ChangePin => "Change PIN",
+            IasCredKind::ChangePuk => "Change PUK",
+            IasCredKind::UnblockPin => "Unblock PIN",
+            IasCredKind::GenerateKey => "Generate key",
+            IasCredKind::ImportCert => "Import certificate",
+            IasCredKind::SelfSign => "Self-signed certificate",
+            IasCredKind::RequestCsr => "Sign certificate request",
+            IasCredKind::ChangeAdminKey => "Change admin key",
+            IasCredKind::DeleteCert => "Delete certificate",
+        }
+    }
+    fn submit_label(self) -> &'static str {
+        match self {
+            IasCredKind::GenerateKey => "Generate",
+            IasCredKind::ImportCert => "Import",
+            IasCredKind::SelfSign => "Create",
+            IasCredKind::RequestCsr => "Sign & save",
+            IasCredKind::ChangeAdminKey => "Change key",
+            IasCredKind::DeleteCert => "Delete",
+            _ => self.title(),
+        }
+    }
+    fn busy_label(self) -> &'static str {
+        match self {
+            IasCredKind::ChangePin => "Changing PIN\u{2026}",
+            IasCredKind::ChangePuk => "Changing PUK\u{2026}",
+            IasCredKind::UnblockPin => "Unblocking PIN\u{2026}",
+            IasCredKind::GenerateKey => "Generating key\u{2026}",
+            IasCredKind::ImportCert => "Importing certificate\u{2026}",
+            IasCredKind::SelfSign => "Creating certificate\u{2026}",
+            IasCredKind::RequestCsr => "Signing request\u{2026}",
+            IasCredKind::ChangeAdminKey => "Changing admin key\u{2026}",
+            IasCredKind::DeleteCert => "Deleting certificate\u{2026}",
+        }
+    }
+    /// True when this flow collects the *current* admin key. Unlike PIV,
+    /// there's no well-known factory default to offer a "use default"
+    /// shortcut for, so this always renders a required secret field rather
+    /// than a checkbox + optional field.
+    fn needs_admin_key(self) -> bool {
+        matches!(
+            self,
+            IasCredKind::GenerateKey
+                | IasCredKind::ImportCert
+                | IasCredKind::SelfSign
+                | IasCredKind::ChangeAdminKey
+                | IasCredKind::DeleteCert
+        )
+    }
+}
+
+/// Live state of the IAS credential-entry modal. Mirrors [`PivCredModal`].
+struct IasCredModal {
+    kind: IasCredKind,
+    busy: bool,
+    result: Option<Result<(), String>>,
+}
+
+impl IasCredModal {
+    fn new(kind: IasCredKind) -> Self {
+        IasCredModal {
+            kind,
+            busy: false,
+            result: None,
+        }
+    }
+}
+
+/// State for the IAS pane. Mirrors [`PivState`] minus every field with no
+/// IAS analog (CHUID, PIN/touch policy, retired slots, move-key). Built
+/// without a reference specification or hardware to trace against — see
+/// `keyroost-ias`'s crate doc comment and `CLAUDE.md`'s "Known soft spots".
+struct IasState {
+    /// Last status read from the selected card.
+    status: Option<keyroost_transport::IasStatus>,
+    /// Per-slot detail, in canonical slot order: key algorithm (from this
+    /// session's pubkey cache, else the slot certificate's
+    /// SubjectPublicKeyInfo) and the certificate's Subject DN.
+    slot_keys: Vec<(
+        keyroost_ias::Slot,
+        Option<keyroost_ias::KeyAlg>,
+        Option<String>,
+    )>,
+    error: Option<String>,
+    notice: Option<String>,
+    loaded: bool,
+    /// Admin key (hex) entered to authorize key-gen / cert-import / admin-key
+    /// change / delete-cert, and its algorithm. Cleared after use.
+    admin_key_input: String,
+    admin_alg: IasAdminAlgSel,
+    pin_old: String,
+    pin_new: String,
+    pin_confirm: String,
+    puk_old: String,
+    puk_new: String,
+    puk_confirm: String,
+    unblock_puk: String,
+    unblock_new_pin: String,
+    /// The slot every key/certificate action targets, chosen by clicking a
+    /// tab (same pattern as PIV's `selected_slot`).
+    selected_slot: IasSlotSel,
+    gen_alg: IasKeyAlgSel,
+    /// PEM of the most recently generated public key, shown for copying.
+    gen_pubkey_pem: Option<String>,
+    cert_path: String,
+    export_path: String,
+    new_admin_key_input: String,
+    new_admin_alg: IasAdminAlgSel,
+    cert_subject: String,
+    cert_days: u32,
+    sign_pin: String,
+    csr_path: String,
+    cred_modal: Option<IasCredModal>,
+    /// Algorithm + public key of any slot generated on the selected device
+    /// during this app run, keyed by IAS key reference. Same role as
+    /// `PivState::pubkey_cache` — IAS has no metadata query to re-report a
+    /// freshly generated key, so this in-memory-only map is what lets
+    /// generate -> self-sign/CSR work within one running app.
+    pubkey_cache: std::collections::HashMap<u8, (keyroost_ias::KeyAlg, keyroost_ias::PublicKey)>,
+}
+
+impl Drop for IasState {
+    fn drop(&mut self) {
+        wipe(&mut self.admin_key_input);
+        wipe(&mut self.pin_old);
+        wipe(&mut self.pin_new);
+        wipe(&mut self.pin_confirm);
+        wipe(&mut self.puk_old);
+        wipe(&mut self.puk_new);
+        wipe(&mut self.puk_confirm);
+        wipe(&mut self.unblock_puk);
+        wipe(&mut self.unblock_new_pin);
+        wipe(&mut self.new_admin_key_input);
+        wipe(&mut self.sign_pin);
+    }
+}
+
+impl Default for IasState {
+    fn default() -> Self {
+        IasState {
+            status: None,
+            slot_keys: Vec::new(),
+            error: None,
+            notice: None,
+            loaded: false,
+            admin_key_input: String::new(),
+            admin_alg: IasAdminAlgSel::default(),
+            pin_old: String::new(),
+            pin_new: String::new(),
+            pin_confirm: String::new(),
+            puk_old: String::new(),
+            puk_new: String::new(),
+            puk_confirm: String::new(),
+            unblock_puk: String::new(),
+            unblock_new_pin: String::new(),
+            selected_slot: IasSlotSel::default(),
+            gen_alg: IasKeyAlgSel::default(),
+            gen_pubkey_pem: None,
+            cert_path: String::new(),
+            export_path: String::new(),
+            new_admin_key_input: String::new(),
+            new_admin_alg: IasAdminAlgSel::default(),
+            cert_subject: String::new(),
+            cert_days: 365,
+            sign_pin: String::new(),
+            csr_path: String::new(),
+            cred_modal: None,
+            pubkey_cache: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// IAS key-slot selector for the GUI controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum IasSlotSel {
+    #[default]
+    Auth,
+    Sign,
+    KeyMgmt,
+}
+
+impl IasSlotSel {
+    fn to_slot(self) -> keyroost_ias::Slot {
+        match self {
+            IasSlotSel::Auth => keyroost_ias::Slot::Authentication,
+            IasSlotSel::Sign => keyroost_ias::Slot::Signature,
+            IasSlotSel::KeyMgmt => keyroost_ias::Slot::KeyManagement,
+        }
+    }
+    fn label(self) -> String {
+        self.to_slot().label().to_string()
+    }
+}
+
+/// IAS key-generation algorithm selector.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum IasKeyAlgSel {
+    #[default]
+    EccP256,
+    EccP384,
+    Rsa2048,
+    Rsa3072,
+}
+
+impl IasKeyAlgSel {
+    fn to_alg(self) -> keyroost_ias::KeyAlg {
+        match self {
+            IasKeyAlgSel::EccP256 => keyroost_ias::KeyAlg::EccP256,
+            IasKeyAlgSel::EccP384 => keyroost_ias::KeyAlg::EccP384,
+            IasKeyAlgSel::Rsa2048 => keyroost_ias::KeyAlg::Rsa2048,
+            IasKeyAlgSel::Rsa3072 => keyroost_ias::KeyAlg::Rsa3072,
+        }
+    }
+    fn label(self) -> &'static str {
+        self.to_alg().label()
+    }
+    const ALL: [IasKeyAlgSel; 4] = [
+        IasKeyAlgSel::EccP256,
+        IasKeyAlgSel::EccP384,
+        IasKeyAlgSel::Rsa2048,
+        IasKeyAlgSel::Rsa3072,
+    ];
+}
+
+/// IAS admin-key cipher algorithm selector.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum IasAdminAlgSel {
+    #[default]
+    TripleDes,
+    Aes128,
+}
+
+impl IasAdminAlgSel {
+    fn to_alg(self) -> keyroost_ias::IasAdminAlg {
+        match self {
+            IasAdminAlgSel::TripleDes => keyroost_ias::IasAdminAlg::TripleDes,
+            IasAdminAlgSel::Aes128 => keyroost_ias::IasAdminAlg::Aes128,
+        }
+    }
+    fn label(self) -> &'static str {
+        self.to_alg().label()
+    }
+    const ALL: [IasAdminAlgSel; 2] = [IasAdminAlgSel::TripleDes, IasAdminAlgSel::Aes128];
+}
+
 /// A unit of work applied back to the [`App`] on the UI thread once a background
 /// job finishes. Returned by the job closure and run inside `update()`.
 type ApplyFn = Box<dyn FnOnce(&mut App) + Send>;
@@ -1886,6 +2150,8 @@ struct App {
     openpgp: OpenPgpState,
     /// PIV read-only status view state.
     piv: PivState,
+    /// IAS Classic/ECC view state.
+    ias: IasState,
     /// Token2 on-device OTP (TOTP/HOTP) view state.
     otp: OtpState,
     /// Dark / light theme (persisted via eframe storage).
@@ -1907,6 +2173,8 @@ struct App {
     oath_tried: bool,
     /// Same guard for the PIV pane's auto-read.
     piv_tried: bool,
+    /// Same guard for the IAS pane's auto-read.
+    ias_tried: bool,
     /// Same guard for the OTP pane's auto-read.
     otp_tried: bool,
     /// True while the Molto2 factory-reset confirmation is showing.
@@ -2021,6 +2289,12 @@ enum FileTarget {
     PivCert,
     /// PIV "Export certificate" destination (`piv.export_path`).
     PivExport,
+    /// IAS "Sign & save CSR" destination (`ias.csr_path`).
+    IasCsr,
+    /// IAS "Import certificate" source file (`ias.cert_path`).
+    IasCert,
+    /// IAS "Export certificate" destination (`ias.export_path`).
+    IasExport,
     /// Storage tab "Export…" destination for a large-blob entry. Carries the
     /// entry index so a second Export click (or a cancelled dialog) can never
     /// mismatch which entry a resolving dialog belongs to.
@@ -2125,6 +2399,9 @@ impl App {
                             FileTarget::PivCsr => self.piv.csr_path = text,
                             FileTarget::PivCert => self.piv.cert_path = text,
                             FileTarget::PivExport => self.piv.export_path = text,
+                            FileTarget::IasCsr => self.ias.csr_path = text,
+                            FileTarget::IasCert => self.ias.cert_path = text,
+                            FileTarget::IasExport => self.ias.export_path = text,
                             FileTarget::LbExport(idx) => {
                                 use keyroost_ctap::large_blobs::EntryKind;
                                 // The array may have been reloaded, cleared, or
@@ -6100,6 +6377,7 @@ impl App {
         self.openpgp.name_input.clear();
         self.openpgp.url_input.clear();
         self.piv = PivState::default();
+        self.ias = IasState::default();
         // Typed secrets must never survive a selection change — a PIN entered
         // for one key would otherwise be sent to another (the OATH pane even
         // auto-submits its password on tab open), silently burning retry
@@ -6137,6 +6415,7 @@ impl App {
         self.factory_reset_report.clear();
         self.oath_tried = false;
         self.piv_tried = false;
+        self.ias_tried = false;
         self.otp_tried = false;
         self.otp = OtpState::default();
         self.molto_reset_confirm = false;
@@ -7240,6 +7519,7 @@ fn cap_tab_label(t: CapTab) -> &'static str {
         CapTab::Pgp => "OpenPGP",
         CapTab::Piv => "PIV",
         CapTab::Otp => "On-device OTP",
+        CapTab::Ias => "IAS",
     }
 }
 
@@ -7539,6 +7819,73 @@ fn piv_mgmtalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivMgmtAlgSel) {
                 ui.selectable_value(sel, opt, opt.label());
             }
         });
+}
+
+/// IAS key-generation algorithm picker combo.
+fn ias_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut IasKeyAlgSel) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for opt in IasKeyAlgSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
+/// IAS admin-key-algorithm picker combo.
+fn ias_adminalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut IasAdminAlgSel) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for opt in IasAdminAlgSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
+/// New==confirm guard for the IAS credential modal. Mirrors
+/// [`piv_cred_mismatch`].
+fn ias_cred_mismatch(ias: &IasState, kind: IasCredKind) -> Option<&'static str> {
+    let (new, confirm, msg) = match kind {
+        IasCredKind::ChangePin => (
+            &ias.pin_new,
+            &ias.pin_confirm,
+            "the two new PINs don't match",
+        ),
+        IasCredKind::ChangePuk => (
+            &ias.puk_new,
+            &ias.puk_confirm,
+            "the two new PUKs don't match",
+        ),
+        IasCredKind::UnblockPin
+        | IasCredKind::GenerateKey
+        | IasCredKind::ImportCert
+        | IasCredKind::SelfSign
+        | IasCredKind::RequestCsr
+        | IasCredKind::ChangeAdminKey
+        | IasCredKind::DeleteCert => return None,
+    };
+    if confirm.is_empty() || new == confirm {
+        None
+    } else {
+        Some(msg)
+    }
+}
+
+/// In-modal success confirmation text for each IAS credential flow. Mirrors
+/// [`piv_cred_success`].
+fn ias_cred_success(kind: IasCredKind) -> &'static str {
+    match kind {
+        IasCredKind::ChangePin => "PIN changed",
+        IasCredKind::ChangePuk => "PUK changed",
+        IasCredKind::UnblockPin => "PIN unblocked and reset",
+        IasCredKind::GenerateKey => "Key generated",
+        IasCredKind::ImportCert => "Certificate imported",
+        IasCredKind::SelfSign => "Certificate created",
+        IasCredKind::RequestCsr => "Request signed and saved",
+        IasCredKind::ChangeAdminKey => "Admin key changed",
+        IasCredKind::DeleteCert => "Certificate deleted",
+    }
 }
 
 /// Accept a certificate file's bytes as PEM or DER, returning DER. `None` when
@@ -8096,6 +8443,7 @@ impl eframe::App for App {
         self.render_openpgp_cred_modal(ctx, &p);
         self.render_piv_confirms(ctx);
         self.render_piv_cred_modal(ctx, &p);
+        self.render_ias_cred_modal(ctx, &p);
         self.molto_dialogs(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
@@ -8711,6 +9059,7 @@ impl App {
                                             CapTab::Pgp => self.cap_pgp(ui, p),
                                             CapTab::Piv => self.cap_piv(ui, p),
                                             CapTab::Otp => self.cap_otp(ui, p),
+                                            CapTab::Ias => self.cap_ias(ui, p),
                                         }
                                         // Breathing room below the last card.
                                         ui.add_space(18.0);
@@ -9308,6 +9657,34 @@ impl App {
                     } else {
                         ui.label(
                             egui::RichText::new("Open PIV to read certificate slots.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
+                });
+            }
+            if dev.caps.has(Caps::IAS) {
+                ui.add_space(14.0);
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "IAS Classic/ECC", "ias") {
+                        self.cap_tab = CapTab::Ias;
+                    }
+                    ui.add_space(8.0);
+                    if let Some(st) = &self.ias.status {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            for slot in &st.slots {
+                                let lab = format!(
+                                    "{} \u{00B7} {}",
+                                    slot.slot.label(),
+                                    if slot.cert_present { "cert" } else { "empty" }
+                                );
+                                theme::pill(ui, &lab, p.txt2, p.raised2);
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Open IAS to read certificate slots.")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -13755,6 +14132,1189 @@ impl App {
         if let Some(pem) = copy_pem {
             ui.ctx().copy_text(pem);
             self.clipboard_clear_at = None; // public key, not a secret to auto-clear
+        }
+    }
+
+    // --- IAS Classic/ECC pane -----------------------------------------------
+    // Mirrors the PIV pane's structure (load/apply/op methods, then cap_ias,
+    // then render_ias_cred_modal) with every PIV-only concept dropped. Built
+    // without a reference specification or hardware to trace against — see
+    // `keyroost-ias`'s crate doc comment and `CLAUDE.md`'s "Known soft spots".
+
+    fn load_ias_status(&mut self) {
+        self.ias.error = None;
+        let Some(reader) = self.selected_oath_reader() else {
+            return;
+        };
+        let for_device = self.selected_device.clone();
+        let pubkey_cache = self.ias.pubkey_cache.clone();
+        self.spawn_job("Reading IAS status\u{2026}", move || {
+            let result = keyroost_transport::IasSession::open(
+                &reader,
+                None,
+                keyroost_ias::FidTable::default(),
+            )
+            .map(|mut s| {
+                let status = s.status();
+                let mut slot_keys = Vec::with_capacity(3);
+                for slot in keyroost_ias::Slot::all() {
+                    if let Some((alg, key)) = pubkey_cache.get(&slot.key_ref()) {
+                        s.remember_pubkey(slot, *alg, key.clone());
+                    }
+                    let (alg, subject) = match s.slot_key(slot) {
+                        Ok((alg, _)) => (
+                            Some(alg),
+                            s.read_certificate(slot)
+                                .ok()
+                                .flatten()
+                                .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
+                                .map(|dn| dn.to_string()),
+                        ),
+                        Err(_) => (None, None),
+                    };
+                    slot_keys.push((slot, alg, subject));
+                }
+                (status, slot_keys)
+            });
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok((Ok(status), slot_keys)) => {
+                        app.ias.status = Some(status);
+                        app.ias.slot_keys = slot_keys;
+                        app.ias.loaded = true;
+                    }
+                    Ok((Err(e), _)) | Err(e) => app.ias.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
+    fn apply_ias_write(
+        app: &mut App,
+        result: Result<keyroost_transport::IasStatus, TransportError>,
+        notice: String,
+    ) {
+        match result {
+            Ok(status) => {
+                app.ias.status = Some(status);
+                app.ias.error = None;
+                app.ias.notice = Some(notice);
+                app.load_ias_status();
+            }
+            Err(e) => {
+                app.ias.notice = None;
+                app.ias.error = Some(e.to_string());
+            }
+        }
+    }
+
+    fn apply_ias_cred_result(app: &mut App) {
+        if let Some(m) = app.ias.cred_modal.as_mut() {
+            m.busy = false;
+            m.result = match &app.ias.error {
+                Some(e) => Some(Err(e.clone())),
+                None => Some(Ok(())),
+            };
+        }
+    }
+
+    fn ias_current_admin_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        piv_mgmt_key_bytes(&self.ias.admin_key_input)
+    }
+
+    fn ias_change_pin(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        if self.ias.pin_new != self.ias.pin_confirm {
+            self.ias.notice = None;
+            self.ias.error = Some("the two new PINs don't match".into());
+            return;
+        }
+        let (old, new) = (self.ias.pin_old.clone(), self.ias.pin_new.clone());
+        self.ias.notice = None;
+        self.spawn_job("Changing IAS PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.change_pin(old.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.pin_old);
+                wipe(&mut app.ias.pin_new);
+                wipe(&mut app.ias.pin_confirm);
+                Self::apply_ias_write(app, result, "PIN changed.".into());
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_change_puk(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        if self.ias.puk_new != self.ias.puk_confirm {
+            self.ias.notice = None;
+            self.ias.error = Some("the two new PUKs don't match".into());
+            return;
+        }
+        let (old, new) = (self.ias.puk_old.clone(), self.ias.puk_new.clone());
+        self.ias.notice = None;
+        self.spawn_job("Changing PUK\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.change_puk(old.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.puk_old);
+                wipe(&mut app.ias.puk_new);
+                wipe(&mut app.ias.puk_confirm);
+                Self::apply_ias_write(app, result, "PUK changed.".into());
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_unblock_pin(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let (puk, new) = (
+            self.ias.unblock_puk.clone(),
+            self.ias.unblock_new_pin.clone(),
+        );
+        self.ias.notice = None;
+        self.spawn_job("Unblocking PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.unblock_puk);
+                wipe(&mut app.ias.unblock_new_pin);
+                Self::apply_ias_write(app, result, "PIN unblocked and reset.".into());
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_change_admin_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let old = match self.ias_current_admin_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
+        let new = match piv_mgmt_key_bytes(&self.ias.new_admin_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
+        let (old_alg, new_alg) = (self.ias.admin_alg.to_alg(), self.ias.new_admin_alg.to_alg());
+        if new.len() != new_alg.key_len() {
+            self.ias.error = Some(format!(
+                "new admin key is {} bytes; {} needs {}",
+                new.len(),
+                new_alg.label(),
+                new_alg.key_len()
+            ));
+            return;
+        }
+        self.ias.notice = None;
+        self.spawn_job("Changing admin key\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.authenticate_admin(old_alg, &old)?;
+                s.change_admin_key(&old, &new)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.admin_key_input);
+                wipe(&mut app.ias.new_admin_key_input);
+                Self::apply_ias_write(app, result, "Admin key changed.".into());
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_generate_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let admin = match self.ias_current_admin_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
+        let admin_alg = self.ias.admin_alg.to_alg();
+        let slot = self.ias.selected_slot.to_slot();
+        let alg = self.ias.gen_alg.to_alg();
+        self.ias.notice = None;
+        self.ias.gen_pubkey_pem = None;
+        self.spawn_job("Generating key\u{2026} (touch if it blinks)", move || {
+            let result = (|| -> Result<
+                (keyroost_ias::PublicKey, keyroost_transport::IasStatus),
+                TransportError,
+            > {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.authenticate_admin(admin_alg, &admin)?;
+                let pubkey = s.generate_key(slot, alg)?;
+                Ok((pubkey, s.status()?))
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.admin_key_input);
+                match result {
+                    Ok((pubkey, status)) => {
+                        app.ias.status = Some(status);
+                        app.ias.error = None;
+                        app.ias
+                            .pubkey_cache
+                            .insert(slot.key_ref(), (alg, pubkey.clone()));
+                        match keyroost_piv::spki::subject_public_key_info(&pubkey, alg.to_piv_alg())
+                        {
+                            Ok(der) => {
+                                app.ias.gen_pubkey_pem = Some(keyroost_piv::spki::to_pem(&der));
+                                app.ias.notice = Some(format!("Generated {} key.", alg.label()));
+                            }
+                            Err(e) => {
+                                app.ias.notice = Some(format!(
+                                    "Generated {} key (public-key encoding failed: {})",
+                                    alg.label(),
+                                    e
+                                ));
+                            }
+                        }
+                        app.load_ias_status();
+                    }
+                    Err(e) => {
+                        app.ias.notice = None;
+                        app.ias.error = Some(e.to_string());
+                    }
+                }
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_import_cert(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let admin = match self.ias_current_admin_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
+        let admin_alg = self.ias.admin_alg.to_alg();
+        let slot = self.ias.selected_slot.to_slot();
+        let path = self.ias.cert_path.trim().to_owned();
+        self.ias.notice = None;
+        self.spawn_job("Importing certificate\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    TransportError::MalformedResponse("cannot read certificate file")
+                })?;
+                let der = cert_bytes_to_der(&bytes)
+                    .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.authenticate_admin(admin_alg, &admin)?;
+                s.import_certificate(slot, &der)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.admin_key_input);
+                Self::apply_ias_write(app, result, "Certificate imported.".into());
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_export_cert(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let slot = self.ias.selected_slot.to_slot();
+        let path = self.ias.export_path.trim().to_owned();
+        if path.is_empty() {
+            self.ias.error = Some("enter a destination path for the certificate".into());
+            return;
+        }
+        if std::path::Path::new(&path).exists() {
+            self.ias.error = Some(format!(
+                "{path} already exists — delete it first or choose another name"
+            ));
+            return;
+        }
+        self.ias.notice = None;
+        self.spawn_job("Exporting certificate\u{2026}", move || {
+            let result = (|| -> Result<usize, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                let der = s
+                    .read_certificate(slot)?
+                    .ok_or(TransportError::MalformedResponse(
+                        "slot holds no certificate",
+                    ))?;
+                std::fs::write(&path, &der).map_err(|_| {
+                    TransportError::MalformedResponse("cannot write destination file")
+                })?;
+                Ok(der.len())
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok(n) => {
+                    app.ias.error = None;
+                    app.ias.notice = Some(format!("Exported {}-byte DER certificate.", n));
+                }
+                Err(e) => {
+                    app.ias.notice = None;
+                    app.ias.error = Some(e.to_string());
+                }
+            })
+        });
+    }
+
+    fn ias_delete_cert(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let admin = match self.ias_current_admin_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
+        let admin_alg = self.ias.admin_alg.to_alg();
+        let slot = self.ias.selected_slot.to_slot();
+        self.ias.notice = None;
+        self.spawn_job("Deleting certificate\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.authenticate_admin(admin_alg, &admin)?;
+                s.clear_certificate(slot)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.admin_key_input);
+                Self::apply_ias_write(
+                    app,
+                    result,
+                    format!("Certificate removed from {}.", slot.label()),
+                );
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_subject(&self) -> Option<String> {
+        let s = self.ias.cert_subject.trim();
+        if s.is_empty() {
+            return None;
+        }
+        Some(if s.contains('=') {
+            s.to_owned()
+        } else {
+            format!("CN={s}")
+        })
+    }
+
+    fn ias_self_sign(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let admin = match self.ias_current_admin_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.ias.error = Some(e);
+                return;
+            }
+        };
+        let admin_alg = self.ias.admin_alg.to_alg();
+        let Some(subject) = self.ias_subject() else {
+            self.ias.error = Some("enter a name for the certificate".into());
+            return;
+        };
+        let pin = zeroize::Zeroizing::new(self.ias.sign_pin.clone());
+        let slot = self.ias.selected_slot.to_slot();
+        let days = i64::from(self.ias.cert_days.max(1));
+        let known_key = self.ias.pubkey_cache.get(&slot.key_ref()).cloned();
+        self.ias.notice = None;
+        self.spawn_job(
+            "Creating self-signed certificate\u{2026} (touch if it blinks)",
+            move || {
+                let result = (|| -> Result<keyroost_transport::IasStatus, TransportError> {
+                    let mut s = keyroost_transport::IasSession::open(
+                        &name,
+                        None,
+                        keyroost_ias::FidTable::default(),
+                    )?;
+                    s.authenticate_admin(admin_alg, &admin)?;
+                    s.verify_pin(pin.as_bytes())?;
+                    if let Some((alg, key)) = known_key {
+                        s.remember_pubkey(slot, alg, key);
+                    }
+                    let now = i64::from(unix_now());
+                    s.self_signed_certificate(slot, &subject, now, now + days * 86_400)?;
+                    s.status()
+                })();
+                Box::new(move |app: &mut App| {
+                    wipe(&mut app.ias.sign_pin);
+                    wipe(&mut app.ias.admin_key_input);
+                    Self::apply_ias_write(
+                        app,
+                        result,
+                        format!("Self-signed certificate stored in {}.", slot.label()),
+                    );
+                    Self::apply_ias_cred_result(app);
+                })
+            },
+        );
+    }
+
+    fn ias_request_csr(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(subject) = self.ias_subject() else {
+            self.ias.error = Some("enter a name for the certificate request".into());
+            return;
+        };
+        let path = self.ias.csr_path.trim().to_owned();
+        if path.is_empty() {
+            self.ias.error = Some("enter a destination path for the request".into());
+            return;
+        }
+        let pin = zeroize::Zeroizing::new(self.ias.sign_pin.clone());
+        let slot = self.ias.selected_slot.to_slot();
+        let known_key = self.ias.pubkey_cache.get(&slot.key_ref()).cloned();
+        self.ias.notice = None;
+        self.spawn_job("Signing request\u{2026} (touch if it blinks)", move || {
+            let result = (|| -> Result<String, TransportError> {
+                let mut s = keyroost_transport::IasSession::open(
+                    &name,
+                    None,
+                    keyroost_ias::FidTable::default(),
+                )?;
+                s.verify_pin(pin.as_bytes())?;
+                if let Some((alg, key)) = known_key {
+                    s.remember_pubkey(slot, alg, key);
+                }
+                let pem = s.generate_csr(slot, &subject)?;
+                std::fs::write(&path, pem.as_bytes())
+                    .map_err(|_| TransportError::MalformedResponse("cannot write CSR file"))?;
+                Ok(pem)
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.ias.sign_pin);
+                match result {
+                    Ok(_) => {
+                        app.ias.error = None;
+                        app.ias.notice = Some(format!("Wrote certificate request to {path}."));
+                    }
+                    Err(e) => {
+                        app.ias.notice = None;
+                        app.ias.error = Some(e.to_string());
+                    }
+                }
+                Self::apply_ias_cred_result(app);
+            })
+        });
+    }
+
+    fn ias_modal_admin_field(&mut self, ui: &mut egui::Ui, p: &Palette, kind: IasCredKind) {
+        if !kind.needs_admin_key() {
+            return;
+        }
+        secret_field(
+            ui,
+            p,
+            "Admin key",
+            &mut self.ias.admin_key_input,
+            "hex (48 chars 3DES, 32 AES-128)",
+            300.0,
+        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Algorithm")
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            );
+            ui.add_space(8.0);
+            ias_adminalg_combo(ui, "ias-admin-alg", &mut self.ias.admin_alg);
+        });
+        ui.add_space(4.0);
+    }
+
+    fn cap_ias(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if !self.ias_tried && !self.busy() {
+            self.ias_tried = true;
+            self.load_ias_status();
+        }
+        let mut do_refresh = false;
+        let mut open_change_pin = false;
+        let mut open_change_puk = false;
+        let mut open_unblock = false;
+        let mut open_change_admin = false;
+        let mut open_generate = false;
+        let mut open_import = false;
+        let mut go_export = false;
+        let mut open_self_sign = false;
+        let mut open_csr = false;
+        let mut open_delete_cert = false;
+        let mut clicked_slot: Option<IasSlotSel> = None;
+        let selected = self.ias.selected_slot;
+        let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
+
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("IAS Classic/ECC")
+                        .font(theme::f_sb(14.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                        do_refresh = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            if let Some(err) = &self.ias.error {
+                ui.colored_label(p.err, err);
+                ui.add_space(6.0);
+            }
+            if let Some(n) = &self.ias.notice {
+                ui.colored_label(p.ok, n);
+                ui.add_space(6.0);
+            }
+            if let Some(st) = &self.ias.status {
+                let retries = st
+                    .pin_retries
+                    .map_or("\u{2014}".to_string(), |n| n.to_string());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "AID {} \u{00B7} PIN retries {retries}",
+                        keyroost_proto::codec::hex_encode(&st.aid)
+                    ))
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+                );
+            } else if self.ias.error.is_none() {
+                ui.label(
+                    egui::RichText::new("Reading IAS status\u{2026}")
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt3),
+                );
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("PIN & PUK")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-admin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                        open_unblock = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                        open_change_puk = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                        open_change_pin = true;
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Admin key")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-admin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Change admin key\u{2026}").clicked()
+                    {
+                        open_change_admin = true;
+                    }
+                    ui.add_space(8.0);
+                    ias_adminalg_combo(ui, "ias-new-admin-alg", &mut self.ias.new_admin_alg);
+                });
+            });
+            note(
+                ui,
+                "AID, PIN reference, and admin-key crypto are best-effort guesses on this \
+                 card family \u{2014} see CLAUDE.md's \u{201C}Known soft spots\u{201D}.",
+            );
+        });
+
+        let sel_slot = selected.to_slot();
+        let cert_present = self
+            .ias
+            .status
+            .as_ref()
+            .and_then(|s| s.slots.iter().find(|sl| sl.slot == sel_slot))
+            .map(|sl| sl.cert_present)
+            .unwrap_or(false);
+        let entry = self.ias.slot_keys.iter().find(|(s, _, _)| *s == sel_slot);
+        let alg = entry.and_then(|(_, a, _)| *a);
+        let dn = entry.and_then(|(_, _, d)| d.as_deref());
+        let mut sel_state = match (cert_present, alg) {
+            (true, Some(a)) => format!("certificate present ({})", a.label()),
+            (true, None) => "certificate present".to_string(),
+            (false, Some(a)) => format!("key present ({}), no certificate", a.label()),
+            (false, None) => "empty".to_string(),
+        };
+        if let Some(dn) = dn {
+            sel_state.push_str(" \u{00B7} ");
+            if dn.chars().count() > 64 {
+                sel_state.extend(dn.chars().take(63));
+                sel_state.push('\u{2026}');
+            } else {
+                sel_state.push_str(dn);
+            }
+        }
+
+        ui.add_space(14.0);
+        {
+            let top = ui.cursor().top();
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), top - 4.0),
+                egui::pos2(ui.max_rect().right(), top + 30.0),
+            );
+            ui.painter().rect_filled(strip, 0.0, p.surface);
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 20.0;
+            let tab = |ui: &mut egui::Ui, label: String, active: bool| -> bool {
+                let color = if active { p.txt } else { p.txt3 };
+                let resp = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .font(theme::f_sb(13.5))
+                                .color(color),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if active {
+                    let y = resp.rect.bottom() + 6.0;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(resp.rect.left(), y),
+                            egui::pos2(resp.rect.right(), y),
+                        ],
+                        egui::Stroke::new(2.0, p.accent),
+                    );
+                }
+                resp.clicked()
+            };
+            for slot in [IasSlotSel::Auth, IasSlotSel::Sign, IasSlotSel::KeyMgmt] {
+                if tab(ui, slot.label(), selected == slot) {
+                    clicked_slot = Some(slot);
+                }
+            }
+        });
+
+        ui.add_space(14.0);
+        ui.label(
+            egui::RichText::new(format!("State: {sel_state}"))
+                .font(theme::f_reg(12.5))
+                .color(p.txt2),
+        );
+        ui.add_space(10.0);
+        theme::card_frame(p).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Generate key")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-generate");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                        open_generate = true;
+                    }
+                    ui.add_space(8.0);
+                    ias_keyalg_combo(ui, "ias-gen-alg", &mut self.ias.gen_alg);
+                });
+            });
+            if let Some(pem) = &self.ias.gen_pubkey_pem {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut pem.as_str())
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Certificate")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-certificate");
+            });
+            ui.add_space(6.0);
+            text_field(
+                ui,
+                p,
+                "Name",
+                &mut self.ias.cert_subject,
+                "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                300.0,
+            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Valid for")
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.ias.cert_days)
+                        .range(1..=3650u32)
+                        .suffix(" days"),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
+                    {
+                        open_self_sign = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            let mut save_csr = false;
+            ui.horizontal(|ui| {
+                text_field(
+                    ui,
+                    p,
+                    "CSR file",
+                    &mut self.ias.csr_path,
+                    "/path/to/request.csr",
+                    240.0,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
+                        open_csr = true;
+                    }
+                    ui.add_space(8.0);
+                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                });
+            });
+            if save_csr {
+                self.spawn_file_dialog(
+                    FileTarget::IasCsr,
+                    true,
+                    &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
+                    Some("request.csr"),
+                );
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Import cert")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-import");
+            });
+            ui.add_space(6.0);
+            let mut browse_cert = false;
+            ui.horizontal(|ui| {
+                text_field(
+                    ui,
+                    p,
+                    "File",
+                    &mut self.ias.cert_path,
+                    "/path/to/cert.pem",
+                    240.0,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
+                        open_import = true;
+                    }
+                    ui.add_space(8.0);
+                    browse_cert =
+                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                });
+            });
+            if browse_cert {
+                self.spawn_file_dialog(
+                    FileTarget::IasCert,
+                    false,
+                    &[
+                        ("Certificates", &["pem", "der", "crt", "cer"]),
+                        ("All files", &["*"]),
+                    ],
+                    None,
+                );
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Export cert")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-export");
+            });
+            ui.add_space(6.0);
+            let mut save_export = false;
+            ui.horizontal(|ui| {
+                text_field(
+                    ui,
+                    p,
+                    "Destination",
+                    &mut self.ias.export_path,
+                    "/path/to/out.der",
+                    240.0,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
+                        go_export = true;
+                    }
+                    ui.add_space(8.0);
+                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                });
+            });
+            if save_export {
+                self.spawn_file_dialog(
+                    FileTarget::IasExport,
+                    true,
+                    &[
+                        ("Certificate (DER)", &["der", "cer"]),
+                        ("Certificate (PEM)", &["pem", "crt"]),
+                        ("All files", &["*"]),
+                    ],
+                    Some("cert.der"),
+                );
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Delete")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "ias-delete");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                        .clicked()
+                    {
+                        open_delete_cert = true;
+                    }
+                });
+            });
+            note(
+                ui,
+                "Best-effort: clears the certificate file. The private key is left in place.",
+            );
+        });
+
+        // Apply collected intents now that the card borrows have ended.
+        if let Some(slot) = clicked_slot {
+            self.ias.selected_slot = slot;
+        }
+        if do_refresh {
+            self.load_ias_status();
+        }
+        if open_change_pin {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::ChangePin));
+        }
+        if open_change_puk {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::ChangePuk));
+        }
+        if open_unblock {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::UnblockPin));
+        }
+        if open_change_admin {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::ChangeAdminKey));
+        }
+        if open_generate {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::GenerateKey));
+        }
+        if open_import {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::ImportCert));
+        }
+        if go_export {
+            self.ias_export_cert();
+        }
+        if open_self_sign {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::SelfSign));
+        }
+        if open_csr {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::RequestCsr));
+        }
+        if open_delete_cert {
+            self.ias_cred_modal_close();
+            self.ias.cred_modal = Some(IasCredModal::new(IasCredKind::DeleteCert));
+        }
+    }
+
+    fn ias_cred_modal_close(&mut self) {
+        wipe(&mut self.ias.pin_old);
+        wipe(&mut self.ias.pin_new);
+        wipe(&mut self.ias.pin_confirm);
+        wipe(&mut self.ias.puk_old);
+        wipe(&mut self.ias.puk_new);
+        wipe(&mut self.ias.puk_confirm);
+        wipe(&mut self.ias.unblock_puk);
+        wipe(&mut self.ias.unblock_new_pin);
+        wipe(&mut self.ias.admin_key_input);
+        wipe(&mut self.ias.new_admin_key_input);
+        wipe(&mut self.ias.sign_pin);
+        self.ias.cred_modal = None;
+    }
+
+    /// IAS credential-entry modal — mirrors [`App::render_piv_cred_modal`].
+    fn render_ias_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(kind) = self.ias.cred_modal.as_ref().map(|m| m.kind) else {
+            return;
+        };
+        let busy = self.ias.cred_modal.as_ref().is_some_and(|m| m.busy);
+        let result = self.ias.cred_modal.as_ref().and_then(|m| m.result.clone());
+        let mut want_submit = false;
+        let mut want_close = false;
+        let mismatch = ias_cred_mismatch(&self.ias, kind);
+
+        let closed = Self::modal_window(ctx, p, "ias_cred", kind.title(), |ui| {
+            match &result {
+                Some(Ok(())) => {
+                    ui.label(
+                        egui::RichText::new(format!("\u{2713} {}", ias_cred_success(kind)))
+                            .font(theme::f_sb(13.0))
+                            .color(p.ok),
+                    );
+                    ui.add_space(16.0);
+                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                        want_close = true;
+                    }
+                }
+                _ => {
+                    match kind {
+                        IasCredKind::ChangePin => {
+                            pin_field(ui, p, "Current PIN", &mut self.ias.pin_old);
+                            pin_field(ui, p, "New PIN", &mut self.ias.pin_new);
+                            pin_field(ui, p, "Confirm new PIN", &mut self.ias.pin_confirm);
+                            card_note(ui, p, "4\u{2013}8 characters.");
+                        }
+                        IasCredKind::ChangePuk => {
+                            pin_field(ui, p, "Current PUK", &mut self.ias.puk_old);
+                            pin_field(ui, p, "New PUK", &mut self.ias.puk_new);
+                            pin_field(ui, p, "Confirm new PUK", &mut self.ias.puk_confirm);
+                            card_note(ui, p, "4\u{2013}8 characters.");
+                        }
+                        IasCredKind::UnblockPin => {
+                            pin_field(ui, p, "PUK", &mut self.ias.unblock_puk);
+                            pin_field(ui, p, "New PIN", &mut self.ias.unblock_new_pin);
+                            card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
+                        }
+                        IasCredKind::GenerateKey => {
+                            self.ias_modal_admin_field(ui, p, kind);
+                            card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
+                        }
+                        IasCredKind::ImportCert => {
+                            self.ias_modal_admin_field(ui, p, kind);
+                            card_note(ui, p, "Authorizes writing the certificate to the slot.");
+                        }
+                        IasCredKind::SelfSign => {
+                            self.ias_modal_admin_field(ui, p, kind);
+                            pin_field(ui, p, "PIN", &mut self.ias.sign_pin);
+                            card_note(
+                                ui,
+                                p,
+                                "Admin key authorizes the import; the PIN authorizes the \
+                                 on-card signature.",
+                            );
+                        }
+                        IasCredKind::RequestCsr => {
+                            pin_field(ui, p, "PIN", &mut self.ias.sign_pin);
+                            card_note(ui, p, "The PIN authorizes the on-card signature.");
+                        }
+                        IasCredKind::ChangeAdminKey => {
+                            self.ias_modal_admin_field(ui, p, kind);
+                            secret_field(
+                                ui,
+                                p,
+                                "New key",
+                                &mut self.ias.new_admin_key_input,
+                                "hex (48/32 chars)",
+                                300.0,
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("New algorithm")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                                ui.add_space(8.0);
+                                ias_adminalg_combo(
+                                    ui,
+                                    "ias-change-new-admin-alg",
+                                    &mut self.ias.new_admin_alg,
+                                );
+                            });
+                            card_note(ui, p, "Enter the current key, then the new key.");
+                        }
+                        IasCredKind::DeleteCert => {
+                            let slot = self.ias.selected_slot.label();
+                            ui.colored_label(
+                                p.err,
+                                egui::RichText::new(format!(
+                                    "Removes the certificate in {slot}. The private key in \
+                                     the slot remains. This cannot be undone."
+                                ))
+                                .font(theme::f_sb(12.5)),
+                            );
+                            ui.add_space(6.0);
+                            self.ias_modal_admin_field(ui, p, kind);
+                            card_note(ui, p, "The admin key authorizes the deletion.");
+                        }
+                    }
+
+                    if let Some(msg) = mismatch {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.err, msg);
+                    } else if let Some(Err(e)) = &result {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.err, e);
+                    }
+
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new());
+                            ui.label(
+                                egui::RichText::new(kind.busy_label())
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt2),
+                            );
+                        } else {
+                            if theme::button(ui, p, BtnKind::Primary, kind.submit_label())
+                                .clicked()
+                                && mismatch.is_none()
+                            {
+                                want_submit = true;
+                            }
+                            ui.add_space(8.0);
+                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                                want_close = true;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        if (closed || want_close) && !busy {
+            self.ias_cred_modal_close();
+            return;
+        }
+        if want_submit && !busy {
+            if let Some(m) = self.ias.cred_modal.as_mut() {
+                m.busy = true;
+                m.result = None;
+            }
+            self.ias.error = None;
+            match kind {
+                IasCredKind::ChangePin => self.ias_change_pin(),
+                IasCredKind::ChangePuk => self.ias_change_puk(),
+                IasCredKind::UnblockPin => self.ias_unblock_pin(),
+                IasCredKind::GenerateKey => self.ias_generate_key(),
+                IasCredKind::ImportCert => self.ias_import_cert(),
+                IasCredKind::SelfSign => self.ias_self_sign(),
+                IasCredKind::RequestCsr => self.ias_request_csr(),
+                IasCredKind::ChangeAdminKey => self.ias_change_admin_key(),
+                IasCredKind::DeleteCert => self.ias_delete_cert(),
+            }
+            if !self.busy() {
+                let guard_err = self.ias.error.clone();
+                if let Some(m) = self.ias.cred_modal.as_mut() {
+                    m.busy = false;
+                    if let Some(e) = guard_err {
+                        m.result = Some(Err(e));
+                    }
+                }
+            }
         }
     }
 

@@ -16,6 +16,7 @@ pub enum CapTab {
     Pgp,
     Piv,
     Otp,
+    Ias,
 }
 
 /// GUI view helpers on the shared [`Device`]. An extension trait because `Device`
@@ -49,6 +50,9 @@ impl DeviceView for Device {
         }
         if self.caps.has(Caps::OTP) {
             v.push(CapTab::Otp);
+        }
+        if self.caps.has(Caps::IAS) {
+            v.push(CapTab::Ias);
         }
         v
     }
