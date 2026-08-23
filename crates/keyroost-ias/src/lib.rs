@@ -122,6 +122,183 @@ pub const CANDIDATE_AIDS: &[&[u8]] = &[
     &[0xA0, 0x00, 0x00, 0x00, 0x77, 0x01, 0x08, 0x00],
 ];
 
+/// One row of OpenSC's `card-idprime.c` `idprime_atrs` ATR-matching table,
+/// reduced to the fields [`needs_padded_pin`] needs: the ATR, its match
+/// mask (same length as the ATR; a `0x00` mask byte is "don't care"), and
+/// whether `pkcs15-idprime.c` pads the primary user PIN (ref `0x11`) to a
+/// fixed 16-byte `0x00`-padded field for this card type, or leaves it
+/// unpadded (`stored_length = 0`, i.e. sent as its own exact length).
+struct IdprimeAtrMatch {
+    atr: &'static [u8],
+    mask: &'static [u8],
+    padded_pin: bool,
+}
+
+/// `[HIGH]` — ported directly from OpenSC's own source, not a guess:
+/// `card-idprime.c`'s `idprime_atrs` table (which ATR maps to which
+/// `SC_CARD_TYPE_IDPRIME_*`) cross-referenced with `pkcs15-idprime.c`'s PIN
+/// setup, which pads the primary user PIN to 16 bytes with `0x00` *only*
+/// for `SC_CARD_TYPE_IDPRIME_840`/`_940`/`_GENERIC` — every other type
+/// (`_830`, `_3810`, `_930`, `_930_PLUS`) is left at `stored_length = 0`,
+/// i.e. sent unpadded, at its own exact length. Both real devices traced in
+/// this project (a genuine IDPrime 930, and the user's SafeNet eToken 5300,
+/// which matches the `_930_PLUS`/"eToken 5110+ FIPS" row) fall in the
+/// *unpadded* bucket — confirmed live: a real IDPrime 930 VERIFY of a known
+/// correct PIN was rejected with `63 Cx` (and its retry counter genuinely
+/// decremented) using the old always-padded encoding, i.e. the padded
+/// encoding itself was the bug, not the PIN value.
+const IDPRIME_ATR_TABLE: &[IdprimeAtrMatch] = &[
+    // "Gemalto IDPrime 3810" -> SC_CARD_TYPE_IDPRIME_3810 (unpadded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x84, 0x41, 0x3d, 0xf6,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: false,
+    },
+    // "Gemalto IDPrime 830" -> SC_CARD_TYPE_IDPRIME_830 (unpadded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x84, 0x56, 0x51, 0x10,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: false,
+    },
+    // "Gemalto IDPrime 930/3930" -> SC_CARD_TYPE_IDPRIME_930 (unpadded) --
+    // matches the user's own second device (a genuine IDPrime 930) modulo
+    // the mask's don't-care bytes.
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x84, 0x61, 0x60, 0xfb,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: false,
+    },
+    // "based Gemalto IDPrime 930 (eToken 5110+ FIPS)" -> SC_CARD_TYPE_IDPRIME_930_PLUS
+    // (unpadded) -- matches the user's SafeNet eToken 5300 exactly, modulo
+    // the mask's don't-care bytes (verified byte-for-byte against the ATR
+    // the user captured).
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0xff, 0x96, 0x00, 0x00, 0x81, 0x31, 0xfe, 0x43, 0x80, 0x31, 0x80, 0x65, 0xb0,
+            0x84, 0x65, 0x66, 0xfb, 0x12, 0x01, 0x78, 0x82, 0x90, 0x00, 0x85,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+        ],
+        padded_pin: false,
+    },
+    // "Gemalto IDPrime 840" -> SC_CARD_TYPE_IDPRIME_840 (padded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x85, 0x03, 0x00, 0xef,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: true,
+    },
+    // "Gemalto IDPrime 940" -> SC_CARD_TYPE_IDPRIME_940 (padded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x85, 0x59, 0x56, 0xfb,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: true,
+    },
+    // "Gemalto IDPrime 940C" -> SC_CARD_TYPE_IDPRIME_940 (padded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x85, 0x05, 0x00, 0x39,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: true,
+    },
+    // "Gemalto IDPrime MD 940 (eToken 5110)" -> SC_CARD_TYPE_IDPRIME_940 (padded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0xff, 0x96, 0x00, 0x00, 0x81, 0x31, 0xfe, 0x43, 0x80, 0x31, 0x80, 0x65, 0xb0,
+            0x85, 0x59, 0x56, 0xfb, 0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x00, 0x00, 0xff, 0xf0, 0x00, 0xff, 0xff, 0xff, 0x00,
+        ],
+        padded_pin: true,
+    },
+    // "Gemalto IDPrime MD 8840, 3840, 3810, 840, 830 and MD 940 Cards" ->
+    // SC_CARD_TYPE_IDPRIME_GENERIC (padded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x84, 0x41, 0x3d, 0xf6,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+        ],
+        padded_pin: true,
+    },
+    // "Gemalto IDPrime MD 8840, 3840, 3810, 840 and 830 Cards (eToken)" ->
+    // SC_CARD_TYPE_IDPRIME_GENERIC (padded)
+    IdprimeAtrMatch {
+        atr: &[
+            0x3b, 0xff, 0x96, 0x00, 0x00, 0x81, 0x31, 0x80, 0x43, 0x80, 0x31, 0x80, 0x65, 0xb0,
+            0x85, 0x03, 0x00, 0xef, 0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00, 0x66,
+        ],
+        mask: &[
+            0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+        ],
+        padded_pin: true,
+    },
+];
+
+/// Whether the primary user PIN needs 16-byte `0x00` padding for a card
+/// with this `atr`, per [`IDPRIME_ATR_TABLE`]. `None` when the ATR doesn't
+/// match any known row — [`keyroost_transport::ias::IasSession`] treats
+/// that the same as `Some(false)` (unpadded), since that's both the safer
+/// default from real-hardware evidence (every device seen so far in this
+/// project needs unpadded) and OpenSC's own fallback when a card doesn't
+/// match any type-specific branch (`stored_length` stays `0`).
+#[must_use]
+pub fn needs_padded_pin(atr: &[u8]) -> Option<bool> {
+    IDPRIME_ATR_TABLE.iter().find_map(|row| {
+        (row.atr.len() == atr.len()
+            && row.mask.len() == atr.len()
+            && row
+                .atr
+                .iter()
+                .zip(atr)
+                .zip(row.mask)
+                .all(|((a, b), m)| (a & m) == (b & m)))
+        .then_some(row.padded_pin)
+    })
+}
+
 /// Status word: success.
 pub const SW_OK: u16 = 0x9000;
 /// First byte of a `61xx` "more data available" status word.
@@ -488,17 +665,20 @@ impl core::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Pad a 4-16 byte PIN/PUK to a fixed 16-byte field with `0x00`. `[HIGH]` —
-/// confirmed by OpenSC issue #3488 and its fix, PR #3493: a real SafeNet
-/// eToken 5100/5110 SC (same Gemalto IDPrime chip family as the 5300 — see
-/// [`CANDIDATE_AIDS`]) rejected an unpadded/8-byte-padded VERIFY with
-/// `SW 6700` and required a 16-byte, `0x00`-padded field instead. Unlike
-/// PIV's fixed 8-byte `0xFF`-padded field, this is a different size *and* a
-/// different pad byte, not just a length bump — verified directly from that
-/// issue's APDU traces, not inferred.
-fn pad_pin(pin: &[u8]) -> Result<Zeroizing<Vec<u8>>, PinLengthError> {
+/// Encode a 4-16 byte PIN/PUK for VERIFY/CHANGE REFERENCE DATA/RESET RETRY
+/// COUNTER: either padded to a fixed 16-byte field with `0x00`, or sent
+/// as-is at its own exact length. `[HIGH]` which of the two a given card
+/// wants (see [`needs_padded_pin`]'s doc comment for the full evidence
+/// chain) — but the *caller* must supply the right one; this function no
+/// longer guesses a single global default the way it originally did. Unlike
+/// PIV's fixed 8-byte `0xFF`-padded field, the padded form here is a
+/// different size *and* a different pad byte, not just a length bump.
+fn pad_pin(pin: &[u8], padded: bool) -> Result<Zeroizing<Vec<u8>>, PinLengthError> {
     if !(4..=16).contains(&pin.len()) {
         return Err(PinLengthError { len: pin.len() });
+    }
+    if !padded {
+        return Ok(Zeroizing::new(pin.to_vec()));
     }
     let mut out = Zeroizing::new(vec![0x00u8; 16]);
     out[..pin.len()].copy_from_slice(pin);
@@ -522,14 +702,14 @@ pub fn select(aid: &[u8]) -> Vec<u8> {
     apdu
 }
 
-/// VERIFY the PIN. `[GUESS]` P2 reference — see [`PIN_REF_USER`].
-pub fn verify_pin(pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+/// VERIFY the PIN. `padded` selects the encoding — see [`needs_padded_pin`].
+pub fn verify_pin(pin: &[u8], padded: bool) -> Result<Vec<u8>, PinLengthError> {
     Ok(build_apdu(
         0x00,
         Instruction::Verify.code(),
         0x00,
         PIN_REF_USER,
-        &pad_pin(pin)?,
+        &pad_pin(pin, padded)?,
     ))
 }
 
@@ -540,10 +720,15 @@ pub fn verify_pin_status() -> Vec<u8> {
     vec![0x00, Instruction::Verify.code(), 0x00, PIN_REF_USER]
 }
 
-/// CHANGE REFERENCE DATA: change the PIN.
-pub fn change_reference_data(old: &[u8], new: &[u8]) -> Result<Vec<u8>, PinLengthError> {
-    let mut body = pad_pin(old)?.to_vec();
-    body.extend_from_slice(&pad_pin(new)?);
+/// CHANGE REFERENCE DATA: change the PIN. `padded` selects the encoding —
+/// see [`needs_padded_pin`].
+pub fn change_reference_data(
+    old: &[u8],
+    new: &[u8],
+    padded: bool,
+) -> Result<Vec<u8>, PinLengthError> {
+    let mut body = pad_pin(old, padded)?.to_vec();
+    body.extend_from_slice(&pad_pin(new, padded)?);
     Ok(build_apdu(
         0x00,
         Instruction::ChangeReferenceData.code(),
@@ -576,10 +761,15 @@ pub fn change_admin_key(old: &[u8], new: &[u8]) -> Vec<u8> {
 
 /// RESET RETRY COUNTER: unblock the PIN with an unblock code (PUK), setting
 /// a new PIN in the same command. `[GUESS]` body layout — modeled on PIV's
-/// own unblock (concatenated padded PUK + padded new PIN).
-pub fn reset_retry_counter(puk: &[u8], new_pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
-    let mut body = pad_pin(puk)?.to_vec();
-    body.extend_from_slice(&pad_pin(new_pin)?);
+/// own unblock (concatenated padded PUK + padded new PIN). `padded` selects
+/// the encoding — see [`needs_padded_pin`].
+pub fn reset_retry_counter(
+    puk: &[u8],
+    new_pin: &[u8],
+    padded: bool,
+) -> Result<Vec<u8>, PinLengthError> {
+    let mut body = pad_pin(puk, padded)?.to_vec();
+    body.extend_from_slice(&pad_pin(new_pin, padded)?);
     Ok(build_apdu(
         0x00,
         Instruction::ResetRetryCounter.code(),
@@ -960,10 +1150,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_pin_pads_to_sixteen() {
-        // Confirmed shape (OpenSC issue #3488 / PR #3493, real eToken 5300
-        // trace): 00 20 00 11 10 <pin digits> 00-padded to 16 bytes total.
-        let apdu = verify_pin(b"1234").unwrap();
+    fn verify_pin_pads_to_sixteen_when_padded() {
+        // Confirmed shape for card->type in {840, 940, GENERIC} only (see
+        // needs_padded_pin's doc comment): 00 20 00 11 10 <pin digits>
+        // 00-padded to 16 bytes total.
+        let apdu = verify_pin(b"1234", true).unwrap();
         assert_eq!(apdu[..5], [0x00, 0x20, 0x00, PIN_REF_USER, 0x10]);
         assert_eq!(apdu.len(), 5 + 16);
         assert_eq!(
@@ -973,10 +1164,26 @@ mod tests {
     }
 
     #[test]
-    fn verify_pin_rejects_out_of_range() {
-        assert_eq!(verify_pin(b"123").unwrap_err(), PinLengthError { len: 3 });
+    fn verify_pin_sends_exact_length_when_unpadded() {
+        // Confirmed shape for every other IDPrime type -- including both
+        // real devices traced in this project (a genuine IDPrime 930, and
+        // the user's SafeNet eToken 5300): 00 20 00 11 <len> <pin digits>,
+        // no padding at all.
+        let apdu = verify_pin(b"0000", false).unwrap();
         assert_eq!(
-            verify_pin(b"12345678901234567").unwrap_err(),
+            apdu,
+            vec![0x00, 0x20, 0x00, PIN_REF_USER, 0x04, 0x30, 0x30, 0x30, 0x30]
+        );
+    }
+
+    #[test]
+    fn verify_pin_rejects_out_of_range() {
+        assert_eq!(
+            verify_pin(b"123", false).unwrap_err(),
+            PinLengthError { len: 3 }
+        );
+        assert_eq!(
+            verify_pin(b"12345678901234567", false).unwrap_err(),
             PinLengthError { len: 17 }
         );
     }
@@ -987,8 +1194,8 @@ mod tests {
     }
 
     #[test]
-    fn change_reference_data_bytes() {
-        let apdu = change_reference_data(b"1234", b"5678").unwrap();
+    fn change_reference_data_bytes_padded() {
+        let apdu = change_reference_data(b"1234", b"5678", true).unwrap();
         assert_eq!(apdu[..4], [0x00, 0x24, 0x00, PIN_REF_USER]);
         assert_eq!(apdu[4], 0x20); // Lc: two padded 16-byte fields
         assert_eq!(
@@ -1002,6 +1209,15 @@ mod tests {
     }
 
     #[test]
+    fn change_reference_data_bytes_unpadded() {
+        let apdu = change_reference_data(b"1234", b"5678", false).unwrap();
+        assert_eq!(apdu[..4], [0x00, 0x24, 0x00, PIN_REF_USER]);
+        assert_eq!(apdu[4], 0x08); // Lc: two unpadded 4-byte fields
+        assert_eq!(&apdu[5..9], &[0x31, 0x32, 0x33, 0x34]);
+        assert_eq!(&apdu[9..13], &[0x35, 0x36, 0x37, 0x38]);
+    }
+
+    #[test]
     fn change_admin_key_bytes() {
         let apdu = change_admin_key(&[0x11; 24], &[0x22; 24]);
         assert_eq!(apdu[..4], [0x00, 0x24, 0x00, ADMIN_KEY_REF]);
@@ -1012,9 +1228,40 @@ mod tests {
 
     #[test]
     fn reset_retry_counter_bytes() {
-        let apdu = reset_retry_counter(b"00000000", b"1234").unwrap();
+        let apdu = reset_retry_counter(b"00000000", b"1234", true).unwrap();
         assert_eq!(apdu[..4], [0x00, 0x2C, 0x00, PIN_REF_USER]);
         assert_eq!(apdu[4], 0x20);
+    }
+
+    #[test]
+    fn needs_padded_pin_matches_both_real_devices_as_unpadded() {
+        // The user's SafeNet eToken 5300 (SC_CARD_TYPE_IDPRIME_930_PLUS).
+        let etoken_5300 = [
+            0x3b, 0xff, 0x96, 0x00, 0x00, 0x81, 0x31, 0xfe, 0x43, 0x80, 0x31, 0x80, 0x65, 0xb0,
+            0x84, 0x56, 0x51, 0x10, 0x12, 0x01, 0x78, 0x82, 0x90, 0x00, 0x6a,
+        ];
+        assert_eq!(needs_padded_pin(&etoken_5300), Some(false));
+
+        // A genuine second IDPrime 930 (SC_CARD_TYPE_IDPRIME_930).
+        let idprime_930 = [
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x84, 0x61, 0x60, 0xfb,
+            0x12, 0x0f, 0xfd, 0x82, 0x90, 0x00,
+        ];
+        assert_eq!(needs_padded_pin(&idprime_930), Some(false));
+    }
+
+    #[test]
+    fn needs_padded_pin_matches_940_as_padded() {
+        let idprime_940 = [
+            0x3b, 0x7f, 0x96, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xb0, 0x85, 0x59, 0x56, 0xfb,
+            0x12, 0x0f, 0xfe, 0x82, 0x90, 0x00,
+        ];
+        assert_eq!(needs_padded_pin(&idprime_940), Some(true));
+    }
+
+    #[test]
+    fn needs_padded_pin_unrecognized_atr_is_none() {
+        assert_eq!(needs_padded_pin(&[0xAA; 20]), None);
     }
 
     #[test]

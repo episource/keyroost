@@ -192,43 +192,56 @@ Confirmed (adopted, no longer `[GUESS]`):
   drives all three; MSE's status word is intentionally not checked (a card
   that doesn't need it shouldn't abort signing — a card that does need it
   fails at the PSO steps instead, with a traceable status word).
+- **PIN padding is card-type-*conditional*, not a single global rule — the
+  earlier "PIN/PUK fields are 16 bytes, `0x00`-padded" entry above was
+  itself wrong, caught by real hardware.** The 16-byte-padded encoding is
+  real, but OpenSC's `pkcs15-idprime.c` only applies it for
+  `SC_CARD_TYPE_IDPRIME_840`/`_940`/`_GENERIC`; every other IDPrime type —
+  `_830`, `_3810`, `_930`, `_930_PLUS` — is left at `stored_length = 0`,
+  i.e. **unpadded**, sent at its own exact length (still `[HIGH]`: this is
+  quoted directly from that driver's source, not inferred). Proven live:
+  the user VERIFYing their IDPrime 930's genuine factory PIN (`"0000"`) got
+  a false wrong-PIN rejection (`63 Cx`, with the retry counter for real
+  decrementing) under the old always-padded encoding — the padding itself
+  was the bug, not the PIN value. `needs_padded_pin()` now ports OpenSC's
+  own ATR+mask table (`IDPRIME_ATR_TABLE`) so `IasSession::open` decides
+  per-session from the card's real ATR, defaulting to unpadded for any ATR
+  that matches nothing (both OpenSC's own fallback and every real device
+  traced in this project so far). `pad_pin()`/`verify_pin()`/
+  `change_reference_data()`/`reset_retry_counter()` all take this as an
+  explicit `padded: bool` rather than assuming one encoding. Confirmed by
+  unit test against both real devices' exact ATRs (the user's eToken 5300 →
+  `930_PLUS` → unpadded; their separate IDPrime 930 → `930` → unpadded) —
+  matching `needs_padded_pin`'s output to what the table itself says both
+  should be, not yet to a live VERIFY succeeding (the user hasn't reverified
+  `"0000"` against the corrected encoding at time of writing).
 
 Still open (unconfirmed, isolated so a fix is a point-edit):
-- **VERIFY's own byte layer is now fully hardware-confirmed correct — twice
-  over — but the eToken 5300 still refuses it for a reason that isn't PIN
-  correctness.** OpenSC's `pkcs15-idprime.c` independently confirms this
-  crate's PIN encoding exactly: `SC_PKCS15_PIN_TYPE_ASCII_NUMERIC`,
-  `stored_length = 16`, `pad_char = 0x00`, `min_length = 4`, `reference =
-  0x11` — byte-for-byte what `pad_pin()`/`PIN_REF_USER` already do. Real
-  hardware then confirmed it end to end: VERIFYing `"0000"` on the IDPrime
-  930 got a textbook `63 C4` (wrong PIN) with the retry counter genuinely
-  decrementing (`5` → `4` across two runs) — the card parsed and compared
-  the PIN correctly; `"0000"` is just not this particular token's real PIN,
-  which is a fact about the token, not a bug here.
-  On the **eToken 5300**, the identical well-formed VERIFY (real PIN data,
-  not just the empty-body retry-counter query from before) still comes back
-  `SW_SECURITY_NOT_SATISFIED` (`6982`), not `63 Cx` — ruling out both "wrong
-  PIN value" and "wrong encoding" as the explanation, since the same bytes
-  produce the expected response on a sibling card. **Leading hypothesis,
-  from the user's own hardware**: this specific eToken has a physical touch
-  sensor gating private-key/PIN operations (a real feature on several
+- **Whether the corrected PIN encoding actually fixes the eToken 5300's
+  `SW_SECURITY_NOT_SATISFIED` (`6982`) on VERIFY is untested.** The old,
+  wrongly-always-padded encoding fully explains the IDPrime 930's `63 Cx`
+  (wrong-PIN-shaped) rejection, but the eToken 5300 gave a *different*
+  status word — `6982`, not `63 Cx` — for the same wrong bytes, which reads
+  as a security-precondition failure rather than "PIN didn't match", so the
+  encoding fix might not be sufficient there on its own. **The user's own
+  leading hypothesis, not yet tested**: this specific eToken has a physical
+  touch sensor gating private-key/PIN operations (a real feature on several
   SafeNet/Thales combo security keys), and VERIFY needs a touch either
   immediately before or during the command — which this crate's transport
   makes no attempt to prompt for or wait on (`transmit_full` is one
   synchronous `card.transmit()`; if the reader/card don't transparently
   stretch that call via T=1 WTX while waiting for a touch, a same-command
   touch requirement would need this crate to detect "waiting" and retry,
-  which it doesn't do today). Unconfirmed and untested: whether touching
-  the sensor concurrently with the VERIFY command changes the result. Not
-  yet acted on in code — deliberately, since building retry/wait logic
-  around a guessed touch protocol without a trace showing what the "waiting"
-  state actually looks like on the wire (a `61xx`? a longer-than-usual
-  `transmit()`? nothing distinguishable at all?) would be exactly the kind
-  of unconfirmed guess this file's whole point is to avoid. `--pin-env`/
-  `--pin-stdin` on `keyroostctl ias status`/`export-cert`
+  which it doesn't do today). Not yet acted on in code — deliberately,
+  since building retry/wait logic around a guessed touch protocol without a
+  trace showing what the "waiting" state actually looks like on the wire (a
+  `61xx`? a longer-than-usual `transmit()`? nothing distinguishable at all?)
+  would be exactly the kind of unconfirmed guess this file exists to flag.
+  `--pin-env`/`--pin-stdin` on `keyroostctl ias status`/`export-cert`
   (`IasSession::status_with_pin`, `IasSlotStatus::pin_required`) are what
-  surfaced this finding in the first place and remain the right tool for
-  the next experiment.
+  surfaced this finding and remain the right tool for the next experiment,
+  now against the corrected encoding; `ias status`'s new `PIN encoding:`
+  line reports which one a session picked without needing `--debug`.
 - **`ADMIN_KEY_REF`** is still a placeholder. `SW 6A88` (reference data not
   found) on EXTERNAL AUTHENTICATE/CHANGE REFERENCE DATA is the first
   suspect.

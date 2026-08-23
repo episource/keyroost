@@ -161,6 +161,7 @@ mod json_out {
     pub struct IasStatusJson {
         pub aid: String,
         pub pin_retries: Option<u8>,
+        pub pin_padded: bool,
         pub slots: Vec<IasSlotJson>,
     }
 
@@ -6342,6 +6343,7 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 emit_json(&json_out::IasStatusJson {
                     aid: hex_encode(&status.aid),
                     pin_retries: status.pin_retries,
+                    pin_padded: status.pin_padded,
                     slots: status
                         .slots
                         .iter()
@@ -6362,6 +6364,14 @@ fn run_ias(cmd: &IasCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 Some(n) => println!("PIN retries: {}", n),
                 None => println!("PIN retries: (unavailable)"),
             }
+            println!(
+                "PIN encoding: {}",
+                if status.pin_padded {
+                    "16-byte 0x00-padded"
+                } else {
+                    "unpadded (exact length)"
+                }
+            );
             println!("Slots:");
             for s in &status.slots {
                 if s.cert_present {

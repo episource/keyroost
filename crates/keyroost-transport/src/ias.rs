@@ -31,6 +31,12 @@ pub struct IasStatus {
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when
     /// blocked, `None` when the card didn't report a count.
     pub pin_retries: Option<u8>,
+    /// Whether this session is encoding the PIN as a 16-byte `0x00`-padded
+    /// field (`true`) or at its own exact length (`false`) — see
+    /// [`keyroost_ias::needs_padded_pin`] for the evidence behind the
+    /// choice. Surfaced here so bring-up can see which one a session picked
+    /// without needing `--debug`.
+    pub pin_padded: bool,
     /// Per-slot certificate presence, in canonical slot order.
     pub slots: Vec<IasSlotStatus>,
 }
@@ -66,6 +72,15 @@ pub struct IasSession {
     /// needing it in a *later* session must re-supply it (see
     /// [`Self::remember_pubkey`]).
     pubkey_cache: HashMap<u8, (KeyAlg, PublicKey)>,
+    /// Whether the PIN should be encoded padded (16 bytes, `0x00`-padded) or
+    /// at its own exact length — decided once at [`Self::open`] time from
+    /// the card's ATR via [`keyroost_ias::needs_padded_pin`], defaulting to
+    /// unpadded (`false`) for an ATR that doesn't match any known row. See
+    /// that function's doc comment for the real-hardware evidence behind
+    /// this: guessing a single global default here was the bug that made a
+    /// real IDPrime 930's own correct PIN look wrong (`63 Cx`) in an earlier
+    /// version of this crate.
+    pin_padded: bool,
 }
 
 impl IasSession {
@@ -82,12 +97,18 @@ impl IasSession {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
+        let pin_padded = card
+            .status2_owned()
+            .ok()
+            .and_then(|st| ias::needs_padded_pin(st.atr()))
+            .unwrap_or(false);
         let mut session = Self {
             card,
             debug: false,
             aid: Vec::new(),
             fids,
             pubkey_cache: HashMap::new(),
+            pin_padded,
         };
         session.select(aid_override)?;
         Ok(session)
@@ -117,6 +138,7 @@ impl IasSession {
                     aid: Vec::new(),
                     fids: FidTable::default(),
                     pubkey_cache: HashMap::new(),
+                    pin_padded: false,
                 };
                 if session.select(None).is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -164,6 +186,7 @@ impl IasSession {
         Ok(IasStatus {
             aid: self.aid.clone(),
             pin_retries,
+            pin_padded: self.pin_padded,
             slots,
         })
     }
@@ -243,10 +266,13 @@ impl IasSession {
         Ok(())
     }
 
-    /// Present the PIN. Required before private-key use.
+    /// Present the PIN. Required before private-key use. Encoded padded or
+    /// unpadded per [`Self::pin_padded`], decided once at [`Self::open`]
+    /// time — see that field's doc comment.
     pub fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
-        let apdu =
-            Zeroizing::new(ias::verify_pin(pin).map_err(|_| TransportError::IasBadPinLength)?);
+        let apdu = Zeroizing::new(
+            ias::verify_pin(pin, self.pin_padded).map_err(|_| TransportError::IasBadPinLength)?,
+        );
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
@@ -254,7 +280,8 @@ impl IasSession {
     /// Change the PIN. A wrong `old` PIN consumes a try and reports the count.
     pub fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
-            ias::change_reference_data(old, new).map_err(|_| TransportError::IasBadPinLength)?,
+            ias::change_reference_data(old, new, self.pin_padded)
+                .map_err(|_| TransportError::IasBadPinLength)?,
         );
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
@@ -266,7 +293,8 @@ impl IasSession {
     /// `CLAUDE.md`'s "Known soft spots".
     pub fn unblock_pin(&mut self, puk: &[u8], new_pin: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
-            ias::reset_retry_counter(puk, new_pin).map_err(|_| TransportError::IasBadPinLength)?,
+            ias::reset_retry_counter(puk, new_pin, self.pin_padded)
+                .map_err(|_| TransportError::IasBadPinLength)?,
         );
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
