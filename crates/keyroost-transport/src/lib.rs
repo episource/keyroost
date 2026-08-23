@@ -865,6 +865,15 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             eprintln!("[probe] reader seen: {}", probe.reader_name);
         }
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            if trace {
+                match card.status2_owned() {
+                    Ok(st) => eprintln!(
+                        "[probe]   ATR: {}",
+                        keyroost_proto::codec::hex_encode(st.atr())
+                    ),
+                    Err(e) => eprintln!("[probe]   ATR: read failed ({e})"),
+                }
+            }
             (probe.usb_bus, probe.usb_address) = read_channel_id(&card);
             // An applet SELECT counts as "present" on a 9000, and also on the
             // T=0 continuation status words 61xx ("more data available") and
