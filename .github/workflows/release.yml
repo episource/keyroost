@@ -145,6 +145,11 @@ jobs:
       attestations: write
       actions: write
     steps:
+      # Checked out only to read CHANGELOG.md for the release notes below;
+      # keep this FIRST — actions/checkout cleans the workspace, so it would
+      # delete a dist/ downloaded before it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Download all build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -168,18 +173,75 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
 
+      # Ship each archive's attestation bundle as a release asset too:
+      # SECURITY.md documents the attestations as a trust anchor, and a local
+      # bundle lets `gh attestation verify ... --bundle` work offline. The
+      # attestation API can lag the attest step by a few seconds, so retry
+      # briefly — but then fail loudly: silently publishing without the
+      # bundles would be a green run shipping less than it claims.
+      # `gh attestation download` names its output after the subject digest
+      # (sha256:<digest>.jsonl), so run it in an empty directory and rename
+      # whatever single file appears to <asset-name>.sigstore.json — pinned
+      # to observed behavior, not to gh's naming scheme.
+      - name: Download attestation bundles
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz dist/*.zip; do
+            name="$(basename "$f")"
+            abs="$(pwd)/$f"
+            tmp="$(mktemp -d)"
+            ok=false
+            for i in $(seq 1 10); do
+              if (cd "$tmp" && gh attestation download "$abs" --repo "${GITHUB_REPOSITORY}"); then
+                ok=true
+                break
+              fi
+              echo "attestation for ${name} not downloadable yet (attempt ${i}); waiting…"
+              sleep 15
+            done
+            if [ "$ok" != true ]; then
+              echo "::error::no attestation bundle for ${name} after retries — refusing to publish without it"
+              exit 1
+            fi
+            bundle="$(find "$tmp" -maxdepth 1 -type f | head -n1)"
+            if [ -z "$bundle" ]; then
+              echo "::error::gh attestation download succeeded for ${name} but produced no file"
+              exit 1
+            fi
+            mv "$bundle" "dist/${name}.sigstore.json"
+          done
+          ls -l dist/*.sigstore.json
+
+      # Release notes come from CHANGELOG.md, not --generate-notes: the
+      # changelog is the reviewed single source of release history (the
+      # AppStream metainfo is generated from the same sections), where
+      # generated notes are just commit traffic. changelog-section.py exits
+      # non-zero when the tag's section is missing or empty — the metainfo
+      # drift guard makes that near-impossible, but a release must never
+      # ship with blank notes.
+      - name: Render release notes from CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          python3 packaging/changelog-section.py "${GITHUB_REF_NAME#v}" > notes.md
+          printf '\n---\nFull changelog: https://github.com/%s/blob/%s/CHANGELOG.md\n' \
+            "${GITHUB_REPOSITORY}" "${GITHUB_REF_NAME}" >> notes.md
+
       # Publish a public GitHub Release with the three archives attached. Guarded
       # on a tag ref, so a manual workflow_dispatch still builds + collects but
       # never publishes. Uses the built-in token (no third-party action);
-      # --generate-notes writes the notes from commits/PRs since the last tag.
-      # This job downloads artifacts but never checks out the repo, so `gh` has
-      # no local git to infer the target from — pass it explicitly via --repo
-      # (GITHUB_REPOSITORY is always "owner/name" in the runner env).
+      # --notes-file carries the tag's CHANGELOG.md section rendered above.
+      # `gh` could infer the target repo from the checkout, but keep it
+      # explicit via --repo (GITHUB_REPOSITORY is always "owner/name" in the
+      # runner env) so the step never depends on git state.
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --repo "${GITHUB_REPOSITORY}" --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip dist/*.sigstore.json dist/SHA256SUMS --repo "${GITHUB_REPOSITORY}" --notes-file notes.md
 
       # publish.yml's `on: release` trigger never fires for this release:
       # GitHub suppresses workflow runs for events created with the default

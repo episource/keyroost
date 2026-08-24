@@ -50,8 +50,9 @@ bundles automatically.
 
 3. **Auto-update repo `framefilter/keyroost-flatpak` (REQUIRED for the
    auto-update remote).** The OSTree repo is hosted in a **dedicated** repo, NOT
-   this one: this repo's `main` requires verified-signed commits a CI bot can't
-   produce, so a separate repo sidesteps that and leaves the Learn site (served
+   this one: this repo's `main` takes changes only through reviewed pull
+   requests (ruleset — see SECURITY.md "Release integrity"), so a CI bot can't
+   push to it; a separate repo sidesteps that and leaves the Learn site (served
    from this repo's `docs/`) completely untouched. One-time:
    - **Create** a public repo `framefilter/keyroost-flatpak` with **one initial
      commit** (an empty `README.md` is enough — `git clone` needs a branch to
@@ -567,8 +568,9 @@ musl cross toolchain, then build libpcsclite there. See
    dedicated repo `framefilter/keyroost-flatpak`** served by its own GitHub Pages
    (`framefilter.github.io/keyroost-flatpak/`, auto-update) **PLUS** a single-file
    `.flatpak` bundle attached to each release (offline fallback). **NOT Flathub**;
-   not flat-manager. (A separate repo because this repo's `main` requires
-   verified-signed commits a CI bot can't make — see setup step 3.)
+   not flat-manager. (A separate repo because this repo's `main` takes changes
+   only through reviewed pull requests, so a CI bot can't push to it — see
+   setup step 3.)
 3. **AppImage.** **DECIDED:** build the GUI AppImage and attach it to each release.
 4. **Whether/when to automate in CI.** **DECIDED:** automated in the *new*
    `.github/workflows/linux-bundles.yml` (separate from `release.yml`/`publish.yml`).

@@ -47,8 +47,9 @@ name: Linux bundles (AppImage + Flatpak)
 #      enable its Pages (Deploy from a branch, / root), place the static descriptors
 #      (keyroost.flatpakrepo + icon) in its root, and add a fine-grained PAT scoped
 #      to that repo as the FLATPAK_REPO_TOKEN secret. A separate repo because this
-#      repo's main requires verified-signed commits a CI bot can't make; this keeps
-#      the Learn site (this repo's docs/) untouched. When the token is unset, the
+#      repo's main takes changes only through reviewed pull requests (ruleset —
+#      see SECURITY.md "Release integrity"), so a CI bot can't push to it; this
+#      keeps the Learn site (this repo's docs/) untouched. When the token is unset, the
 #      OSTree publish skips cleanly (the .flatpak bundle still attaches).
 
 on:
@@ -384,7 +385,8 @@ jobs:
       # whose own GitHub Pages serves it at https://framefilter.github.io/keyroost-flatpak/.
       #
       # Why a separate repo and NOT this repo's docs/flatpak: this repo's `main`
-      # requires verified-signed commits, so a CI bot can't push to it. A dedicated
+      # takes changes only through reviewed pull requests (ruleset — see
+      # SECURITY.md "Release integrity"), so a CI bot can't push to it. A dedicated
       # repo sidesteps that, keeps the Learn site (served from this repo's docs/)
       # completely untouched, and is the conventional way to host a Flatpak OSTree
       # repo. Needs a cross-repo write token (the default GITHUB_TOKEN is scoped to
