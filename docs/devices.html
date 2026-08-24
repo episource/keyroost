@@ -97,10 +97,12 @@
           specifies 8, so its HOTP codes won't verify against standards-compliant
           servers. TOTP is unaffected.</td></tr>
       <tr><td><strong>Nitrokey 3</strong></td>
-        <td>FIDO2, OATH, OpenPGP, PIV</td>
+        <td>FIDO2, OATH, PIV; OpenPGP detected</td>
         <td>Built around the same Trussed firmware core as Solo 2, but the final
           firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2
-          does not.</td></tr>
+          does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3),
+          contributed by episource. The OpenPGP applet is detected but not yet
+          exercised by this project.</td></tr>
     </table>
     </div>
   </section>

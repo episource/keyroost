@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`piv new-chuid`** (and a matching GUI action): write a fresh CHUID with a
+  random GUID to a PIV card. Windows' PIV minidriver caches a card's contents
+  keyed by the CHUID's GUID, so re-randomizing it makes Windows re-read a
+  reprovisioned card. Encoding matches `yubico-piv-tool`'s template; the GUID
+  comes from the OS's secure random source. Contributed by @episource. ([#102])
+- **Nitrokey 3 PIV support.** keyroost's PIV surface now works on the
+  Nitrokey 3, whose applet omits several Yubico extensions — the differences
+  are detected from the card's own responses, never from its make or model.
+  Verified end-to-end on a Nitrokey 3A NFC by the contributor, @episource,
+  and cross-checked against Nitrokey's published firmware source. ([#102])
+
 ### Changed
 - **`piv generate-key --pin-policy` / `--touch-policy` now explain
   themselves.** The flags have chosen the key-generation PIN/touch policy
@@ -16,6 +28,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the GUI/CLI parity itself turned out to already exist. ([#97])
 
 ### Fixed
+- **PIV commands with large payloads now work on cards that only speak
+  short APDUs.** Signing and certificate import used extended-length APDUs
+  unconditionally; cards that reject those (the Token2 PIN+ contact
+  interface among them) now get the same bytes as a chained sequence of
+  short commands instead. Cards that accept extended-length see identical
+  traffic to before, pinned by tests. Contributed by @episource. ([#101])
 - **The app now says which version it is.** The GUI shows a small version
   next to the wordmark in the top bar, and the AppImage embeds its version in
   the bundle metadata (`X-AppImage-Version`) so AppImage managers such as
@@ -861,6 +879,8 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#96]: https://github.com/framefilter/keyroost/pull/96
 [#97]: https://github.com/framefilter/keyroost/pull/97
 [#98]: https://github.com/framefilter/keyroost/issues/98
+[#101]: https://github.com/framefilter/keyroost/pull/101
+[#102]: https://github.com/framefilter/keyroost/pull/102
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.8...HEAD
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7

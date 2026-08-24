@@ -12,4 +12,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::parse_general_auth(data, 0x82);
     let _ = keyroost_piv::parse_public_key(data);
     let _ = keyroost_piv::parse_metadata(data);
+    // CHUID read-back (#102): the card hands back the object new-chuid wrote,
+    // and `piv status` parses whatever any card serves under that tag.
+    let _ = keyroost_piv::parse_chuid(data);
 });
