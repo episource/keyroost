@@ -55,34 +55,6 @@ Being worked on right now — check with whoever holds it before starting.
     protection deferred until stable") need to say afterwards — this work IS
     that deferred protection, arriving from the friendlier direction.
 
-- **Capabilities need a third state: unknown.** `Caps` is a bitset, so a
-  capability is either present or absent and there is nowhere to record "we
-  could not check". On a USB-HID-only enumeration nothing has been sent to the
-  device, so with no way to say *unknown*, absence of evidence gets written down
-  as absence of the feature — and something has to invent that answer.
-  That is the whole of the v0.7.7 OTP argument. It did not cause a user-facing
-  regression (capabilities are insert-only, so a real probe always wins), but it
-  is why a guess was needed at all. Where a capability does go missing it bites
-  hard: no GUI tab, and `--key <name>` cannot find the device.
-  What exists to build on: `keyroost-transport` (`src/lib.rs`, the `answers(...)`
-  block) `SELECT`s each applet AID over a reader — ground truth. The CLI already
-  models the third state elsewhere: `otp_feature_capability` returns
-  `Option<bool>` with `None` meaning "can't tell, so go ahead". The device list
-  never got the same treatment.
-  Shape to aim for: present / absent / unverified per capability, surfaces
-  driven off it, and the difference rendered — "OTP — not verified, no reader
-  available" rather than no tab at all. Unverified always behaves as "offer it";
-  the attempt then produces a real answer, which is now a decent message rather
-  than a raw protocol error.
-  Note a HID probe is not the fix on its own: it costs an open plus up to a 3 s
-  wait per key on a listing meant to be instant, it can collide with another
-  process holding the hidraw node, and it only answers whether the applet is
-  reachable *over HID* — Token2's Bio3 carries OTP over CCID with HID disabled,
-  so a HID probe returns the same wrong answer more slowly. Unverified is the
-  honest result there, not a second guess.
-  Not blocked on anyone. A data-model change across resolve, the CLI and the
-  GUI.
-
 - **Run the mandatory packaging probe before any version bump.**
   `gh workflow run linux-bundles.yml --ref <ref>` with no tag input = build-only;
   both the flatpak and AppImage jobs must go green *before* any version bump or
