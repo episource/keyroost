@@ -126,7 +126,7 @@
         request (CSR)</strong> for a certificate authority — signed by the card itself, the
         private key never leaves it — imports and exports certificates, changes the PIN,
         PUK, retry counts and management key, moves a key between slots, clears a slot's
-        certificate or key, and resets
+        certificate or key, writes a fresh CHUID, and resets
         the applet. The same controls are in the desktop app's PIV pane.</p>
     </div>
 <pre><code>keyroostctl piv status
@@ -159,6 +159,15 @@ keyroostctl piv delete-key  --slot 9a --mgmt-key-stdin --yes   # YubiKey 5.7+</c
       desktop app offers the same thing as <strong>Move key…</strong>.</p>
 <pre><code>keyroostctl piv move-key --from 9d --to 82 --mgmt-key-stdin   # archive a rotated key
 keyroostctl piv move-key --from 82 --to 9d --mgmt-key-stdin   # bring it back</code></pre>
+    <span id="new-chuid"></span>
+    <p><strong>Writing a new CHUID.</strong> <code>new-chuid</code> writes a fresh Card Holder
+      Unique Identifier with a randomly-generated GUID (or one you supply with
+      <code>--guid</code>). Windows' PIV minidriver caches a card's contents keyed by the
+      CHUID's GUID, so after reprovisioning a card Windows can keep showing stale data until
+      the GUID changes — a new CHUID forces it to re-read the card. It needs the management
+      key. The desktop app offers the same thing as <strong>New CHUID</strong> in the card
+      settings.</p>
+<pre><code>keyroostctl piv new-chuid --mgmt-key-stdin</code></pre>
   </section>
 
   <section class="kr-section">
