@@ -15,6 +15,15 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       pinned-inputs check).
 - [ ] `cargo audit` green (the audit workflow runs on pushes; check the last
       run) and the deps-outdated report reviewed.
+- [ ] **Semver check against the published crates** — with 18 library crates
+      on crates.io, Cargo treats 0.7.x -> 0.7.y as compatible, so an
+      accidental API break in a patch release ships silently and breaks
+      downstream `cargo update`:
+      `cargo semver-checks --workspace --exclude keyroost --exclude keyroostctl`
+      (install once: `cargo install cargo-semver-checks`). A reported break
+      means either fix the API or bump the minor — a decision, not an
+      accident. The binaries are excluded (nothing depends on them as
+      libraries).
 - [ ] **Publish-readiness check** (one command):
       `packaging/check-publish-readiness.sh v<prev>`
       Proves the crates.io fanout can actually run. Three failure modes, none
@@ -25,7 +34,10 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       crates.io Trusted Publishing entry added after;
       (b) a member missing from `publish.yml`'s list, which then silently
       never publishes;
-      (c) a NEW inter-crate dependency edge that the publish order does not
+      (c) a stale path-dep version pin (checked against the workspace
+      version — invisible inside a series, wrong-series the moment 0.8.0
+      happens);
+      (d) a NEW inter-crate dependency edge that the publish order does not
       respect — cargo refuses to publish a crate whose path-dep sibling is not
       yet on crates.io at the pinned version, and the run dies with half the
       workspace released.
@@ -43,22 +55,20 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       Packaging pulls from upstreams that drift on their own schedule — the
       v0.7.3 flatpak broke at release time because an upstream source was
       pruned. Probes catch that; release runs must not.
-- [ ] **Packaged-crate asset check** — every file a crate *references* must be
-      a file it *ships*:
-      `cargo package -p keyroost --no-verify --offline`
-      `tar tzf target/package/keyroost-*.crate | grep -i '\.ico'`
-      Confirm every path `build.rs` reads (and any `include_str!`/
-      `include_bytes!` across the workspace) is inside the tarball. Cargo
-      packages only files beneath the package root, so a path reaching outside
-      it — `../../packaging/...` — silently vanishes from the published crate
-      while still resolving fine in a git checkout. That is how the Windows
-      icon broke `cargo install keyroost` before v0.7.7: nothing catches it,
-      because `cargo publish` runs its verification build on Linux where
-      `build.rs` is a `#[cfg(not(windows))]` no-op, and no workflow builds the
-      packaged tarball at all. Hence `crates/keyroost/assets/keyroost.ico`.
-      Note you cannot *build* the unpacked tarball at this stage: it resolves
-      its sibling `keyroost-*` deps from crates.io at the new version, which is
-      not published yet. Contents are the check here; the build is step 6.
+- [ ] **Packaged-crate asset check** (one command):
+      `packaging/check-packaged-assets.sh`
+      Every file a crate *references* (`include_str!`, `include_bytes!`,
+      anything `build.rs` reads) must be a file its published tarball
+      *ships*. Cargo packages only files beneath the package root, so a path
+      reaching outside it silently vanishes from the crate while resolving
+      fine in a git checkout — that is how the Windows icon broke
+      `cargo install keyroost` before v0.7.7, and nothing else catches it:
+      `cargo publish`'s verification build runs on Linux where `build.rs` is
+      a no-op, and no workflow builds the packaged tarball. The script
+      checks every referencing macro in every publishable crate, not just
+      the asset that already bit. (You cannot *build* the tarball at this
+      stage — it resolves sibling crates from crates.io at the unpublished
+      new version; contents here, build in step 6.)
 
 ## 2. Version bump + changelog (prep branch)
 
@@ -74,29 +84,37 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       flag, moves a command, or changes a library signature, add its section
       (exact before → after) — the README points users there as the canonical
       record, and the Pages deploy rides on the `docs/**` change.
-- [ ] **Full documentation audit — EVERYTHING, not a diff review.** Audit all
-      of it against the code as it will ship: every `docs/*.html` Learn page,
-      `README.md` top to bottom, and the meta-docs (`SECURITY.md`,
-      `CONTRIBUTING.md`, `TODO.md`, `packaging/*.md`, `docs/*.md`,
-      `CHANGELOG.md` link integrity). Reviewing only what changed since last
-      time is exactly how the v0.7.8 audit's findings accumulated: pages
-      claiming the inverse of shipped behavior (the Settings-tab gating),
-      contributor credit trailing by five PRs, a binaries table missing the
-      signed assets for three releases, and TODO items describing defects
-      already fixed. Documentation drifts wherever code changed *around* it,
-      so the untouched files are the ones that rot.
-      The mechanical core: verify every CLI invocation in every page against
-      the release binary's real `--help` tree (not the source); check
-      contributor credit against `git log --format='%an' | sort -u` and the
-      PRs since the last release; confirm every claim a page makes about GUI
-      gating/behavior against the code; and walk every link FROM the app TO
-      the site — the `learn_url(...)` callers in `crates/keyroost/src/ui/`
-      are the inventory, and each slug must resolve against `docs/`. That
-      direction is the one the audit never used to check, which is how the
-      GUI shipped three releases linking a /devices page that did not exist
-      (#99). Parallel audit agents (Learn pages /
-      README / meta-docs) cover this in one pass; findings are fixed on the
-      prep branch so the release ships accurate docs.
+- [ ] **Mechanical documentation checks** (one command, before any agent):
+      `packaging/check-docs-mechanical.sh`
+      Deterministic and exhaustive — a script cannot decide not to read a
+      file. Validates every `keyroostctl` invocation in every page against
+      the release binary's real `--help` tree, every `learn_url(...)` slug
+      against `docs/`, every internal link and anchor, the CHANGELOG's
+      reference/link integrity, and contributor credit against
+      `git log`. Anything it can check, agents no longer audit by hand.
+- [ ] **Semantic documentation audit — every release, every file, no
+      sampling.** What no script can check: whether the claims a page makes
+      about behavior are TRUE (the v0.7.8 audit's worst finding — a page
+      stating the inverse of the shipped Settings-tab gating — was
+      grammatical, plausible, and wrong). Protocol, learned from the misses:
+      * **Audit from the inventory, not from memory**: the in-scope set is
+        every `docs/*.html`, `README.md`, `SECURITY.md`, `CONTRIBUTING.md`,
+        `TODO.md`, `packaging/*.md`, `docs/*.md`. Regenerate the file list
+        with `ls`, hand it to the audit agents whole, and add a line here
+        whenever a new documentation surface appears — scope gaps, not
+        laziness alone, caused the #99 miss.
+      * **Per-file verdict required**: each agent's report carries one line
+        per inventory file — read in full + accurate, or read in full +
+        findings. A file with no line means the audit did not happen; treat
+        it as red. "Unchanged since last release" is an explicitly
+        forbidden reason to skip a file — documentation rots where the code
+        changed AROUND it.
+      * **Claim-by-claim for behavior statements**: every sentence
+        asserting what the app does must be traced to the code that does
+        it, with a file:line citation in the report.
+      * Findings are fixed on the prep branch, so the release ships
+        accurate docs. Parallel agents (Learn pages / README / meta-docs)
+        keep the pass tractable.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
 - [ ] Land on main: push the prep branch directly —
       `git push origin <branch>:main` (the require-PR rule's admin bypass
@@ -131,43 +149,29 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 ## 4. Fanout (publish.yml)
 
 - [ ] Approve the fanout's release-publish gate.
-- [ ] **Verify each channel actually PUBLISHED — a green job can mask a
-      no-op** (missing secrets skip-with-notice; caches lag):
-  - crates.io: the two binaries publish last, so this one check covers the
-    dependency chain —
-    `curl -fsSL -H "User-Agent: keyroost-release" https://crates.io/api/v1/crates/keyroostctl/X.Y.Z`
-  - Homebrew: `curl -fsSL https://raw.githubusercontent.com/framefilter/homebrew-keyroost/main/Formula/keyroost.rb | grep version`
-  - AUR: check the **push line in the job log** first
-    (`master -> master` to aur.archlinux.org); the RPC
-    (`https://aur.archlinux.org/rpc/v5/info?arg[]=keyroost-bin`) lags a few
-    minutes behind and reads stale right after the push.
-    The job now **tolerates the upstream freeze specifically**: that one
-    message logs a `::warning` and exits 0, so a frozen AUR no longer reds a
-    release in which every other channel published. Any other clone failure
-    is still fatal. A warning here means `keyroost-bin` was NOT updated —
-    re-run the job once pushes reopen.
-    **`The AUR is down due to maintenance. We will be back soon.` is not
-    our bug and not worth retrying.** It comes from `aurweb/git/serve.py`
-    *after* our deploy key authenticates, and has exactly one trigger: an
-    operator set the maintenance flag and our source IP is not in the
-    exception list. An IP ban would say something else ("The SSH interface
-    is disabled for your IP address"), so this message never means we were
-    blocked. The AUR froze *all* pushes on 2026-08-01 during a supply-chain
-    malware incident and v0.7.7 shipped without it.
-    Two traps: the freeze is announced **only on the aur-general mailing
-    list** (not archlinux.org/news, no web banner), and the web UI, RPC and
-    git-over-HTTPS reads all stay up throughout — so "the site works" tells
-    you nothing about whether pushes do. Check
-    <https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/>
-    before assuming it is transient. AUR is independent of every other
-    channel and can land late.
-  - Flatpak remote (a machine with the remote configured):
-    `flatpak update --appstream && flatpak remote-info keyroost io.github.framefilter.keyroost`
-    must show the new version.
-  - **winget: a skip with the "HOLDING for the Token2-signed build" notice
-    is the DESIGNED outcome at this stage** — see step 5. A hard failure
-    here means the `WINGET_TOKEN` PAT died (the job fails loudly on an
-    expired token; renew the classic PAT, `public_repo` scope).
+- [ ] **Verify each channel actually PUBLISHED** (one command):
+      `packaging/check-release-live.sh vX.Y.Z`
+      A green job can mask a no-op (missing secrets skip-with-notice; caches
+      lag), so the script checks the observable side effect on every
+      channel: the release asset set, both binaries on crates.io, the
+      Homebrew formula, the AUR RPC, the flatpak OSTree remote over plain
+      HTTPS (no configured remote needed), and the winget-pkgs manifest.
+      winget reporting HOLDING is the designed outcome at this stage — see
+      step 5. Re-run the script any time later; it is read-only.
+      Channel-specific diagnosis, when the script reports a failure:
+  - AUR: trust the job log's push line over the RPC (the RPC lags pushes by
+    minutes). **`The AUR is down due to maintenance. We will be back soon.`
+    is an AUR-wide push freeze, not our bug** — it is emitted after our key
+    authenticates, the freeze is announced only on the aur-general mailing
+    list, and the web UI/RPC stay up throughout, so "the site works" proves
+    nothing. The job tolerates exactly that message (warns, exits 0; any
+    other failure stays fatal); a warning means keyroost-bin was NOT
+    updated — re-run the job when pushes reopen. AUR is independent of
+    every other channel and can land late.
+  - winget: a HARD failure (not a hold) means the `WINGET_TOKEN` PAT died —
+    the job fails loudly on an expired token; renew the classic PAT.
+  - crates.io: a red crates-io job mid-chain is safe to re-dispatch —
+    the already-published probe skips completed crates.
 
 ## 5. Signed Windows build (out-of-band, Token2)
 
@@ -221,6 +225,10 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 
 ## 6. Post-release
 
+- [ ] `packaging/check-release-live.sh vX.Y.Z` once more — after step 5 it
+      should report every channel live, winget included; anything still
+      HOLDING or STALE here is a follow-through that was forgotten, which
+      is exactly what this re-run exists to catch.
 - [ ] Install-matrix spot check as machines allow: `cargo install keyroostctl`,
       flatpak update on a real install, AppImage launch, brew upgrade, winget
       after step 5.
@@ -245,3 +253,33 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       dispatch republish — `packaging/LINUX-BUNDLES.md` "Out-of-band runs".
       A republish builds from the dispatched ref into the tag's release and
       is version-guarded against tree/tag mismatch.
+
+
+## 7. When a release is bad
+
+Rare, judgment-heavy, and the worst time to improvise — decide against this
+list, in this order:
+
+- [ ] **Severity first.** A broken build or wrong metadata is an
+      inconvenience: fix forward with a patch release; nothing here applies.
+      This section is for a release that must not be installed — a security
+      defect, a data-destroying bug, a compromised artifact.
+- [ ] **Stop the spread before fixing anything.** Delete the GitHub Release
+      (keep the tag — history is not the enemy, distribution is) and mark it
+      in the successor's release notes. The registries cannot unship:
+      crates.io yank (`cargo yank -p <crate> --version X.Y.Z`) prevents NEW
+      dependents but removes nothing already vendored; OSTree cannot retract
+      a commit users pulled — the flatpak fix is publishing the successor,
+      fast. AUR/Homebrew/winget point at release assets, so deleting the
+      Release breaks their installs immediately — acceptable for a
+      must-not-install defect, and the successor restores them.
+- [ ] **Yank in REVERSE publish order** (binaries first, then the crates
+      they depend on) so no moment exists where a fetchable binary crate
+      resolves against a yanked dependency.
+- [ ] **The successor is a normal release** — full playbook, no shortcuts;
+      a rushed fix that skips the probe is how one bad release becomes two.
+      Note what happened in the CHANGELOG under the new version, plainly.
+- [ ] **If the cause was a compromise** (not a defect): rotate every
+      credential the release pipeline touches before the successor ships,
+      and say what was compromised, when, and what users should do — the
+      same candor SECURITY.md asks of reporters.
