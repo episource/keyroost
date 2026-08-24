@@ -2,7 +2,7 @@
 #
 # Release pre-flight: prove the crates.io fanout can actually run.
 #
-# Three ways a release-day publish breaks, none of which any other gate
+# Four ways a release-day publish breaks, none of which any other gate
 # catches, and all of which are silent until the fanout is already half done:
 #
 #   1. A crate was added to the workspace since the last release. Trusted
@@ -17,6 +17,12 @@
 #      does not respect. cargo refuses to publish a crate whose path-dep
 #      sibling is not yet on crates.io at the pinned version, so the run dies
 #      partway with half the workspace released and no clean way back.
+#   4. The version bump missed an inter-crate pin. Members depend on their
+#      siblings as `keyroost-* = { path = ..., version = "X" }`; a pin left
+#      at the OLD version either kills the fanout mid-run (the old version
+#      of the sibling satisfies the pin, the new crate publishes against it,
+#      later crates conflict) or quietly publishes a mixed-version dependency
+#      graph to downstream `cargo install` users.
 #
 # (3) is the subtle one: every crate can already be published and the release
 # still breaks, because what changed is the ORDER requirement, not the set.
@@ -29,7 +35,7 @@
 #   previous-tag  Release to diff the member list against.
 #                 Defaults to the newest v* tag, which at pre-flight time is
 #                 the last release (the new tag does not exist yet).
-#   --offline     Skip the crates.io probes; still runs (2) and (3).
+#   --offline     Skip the crates.io probes; still runs (2), (3) and (4).
 #
 # Exits non-zero on any problem, with the specific crate named.
 
@@ -42,7 +48,7 @@ PREV_TAG=""
 for arg in "$@"; do
   case "$arg" in
     --offline) OFFLINE=1 ;;
-    -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)         PREV_TAG="$arg" ;;
   esac
 done
@@ -155,6 +161,37 @@ for c in cur:
 if not fail:
     print(f"ok: publish order satisfies all {edges} in-tree dependency edges",
           file=sys.stderr)
+
+# 4. every inter-crate pin equals the workspace version exactly
+m = re.search(r'^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"',
+              open("Cargo.toml").read(), re.S | re.M)
+if not m:
+    bad("cannot find the workspace version under [workspace.package] in "
+        "Cargo.toml — the parser needs updating")
+else:
+    ws_ver = m.group(1)
+    pins = 0
+    bad_pins = 0
+    for c in cur:
+        try:
+            txt = open(f"crates/{c}/Cargo.toml").read()
+        except OSError:
+            continue
+        for line_no, line in enumerate(txt.splitlines(), 1):
+            pm = re.match(r'\s*(keyroost[A-Za-z0-9_-]*)\s*=\s*'
+                          r'\{(?=[^}]*path\s*=)[^}]*version\s*=\s*"([^"]+)"',
+                          line)
+            if not pm:
+                continue
+            pins += 1
+            if pm.group(2) != ws_ver:
+                bad_pins += 1
+                bad(f'crates/{c}/Cargo.toml:{line_no}: {pm.group(1)} is pinned '
+                    f'at version "{pm.group(2)}" but the workspace is '
+                    f'"{ws_ver}" — the version bump missed this pin')
+    if bad_pins == 0:
+        print(f"ok: all {pins} inter-crate pins match the workspace "
+              f"version {ws_ver}", file=sys.stderr)
 
 # member list on stdout for the caller
 print("\n".join(cur))
