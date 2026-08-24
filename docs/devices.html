@@ -107,6 +107,17 @@
     </div>
   </section>
 
+  <section class="kr-section" id="unverified">
+    <h2>When a capability shows a "?"</h2>
+    <p>keyroost verifies a device's capabilities by asking the device itself,
+      over a smart-card reader. When it can't ask — no reader is connected, or
+      the smart-card service (pcscd on Linux) isn't running — a capability the
+      device may well have shows with a question mark: <code>OTP?</code> in the
+      app's badges and in <code>keyroostctl list</code>. The feature is still
+      offered and works normally if present; the mark only means "not confirmed
+      by the device yet". A plain badge means the device answered for itself.</p>
+  </section>
+
   <section class="kr-section" id="standards">
     <h2>Any standards-compliant FIDO2 key</h2>
     <p>keyroost implements the published specs, not vendor SDKs, so the FIDO2 surface —
