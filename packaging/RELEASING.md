@@ -189,12 +189,12 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       commits" — *after* Authenticode verification passed and the manifests
       were generated, so it reads as a signing problem and is not one
       (v0.7.7).
-      If that sync step logs a warning, do it once by hand and re-run the
-      job — the warning prints the command:
+      `WINGET_TOKEN` carries the `workflow` scope (granted 2026-08-24), so
+      the CI sync step handles the fork unattended. If it ever warns anyway,
+      the manual fallback still works — the warning prints the command:
       `gh repo sync framefilter/winget-pkgs --source microsoft/winget-pkgs`
-      Syncing is lossless while the fork is 0 ahead. **Granting `workflow`
-      scope to `WINGET_TOKEN` retires the manual path for good** — the CI
-      step then succeeds unattended.
+      Syncing is lossless while the fork is 0 ahead. First unattended
+      exercise of the scoped token is the next release's step 5.
 - [ ] When it arrives: attach as **NEW** assets
       `keyroost-vX.Y.Z-windows-x86_64-signed.zip` + `.sha256` (and
       `keyroost-vX.Y.Z-macos-universal2-signed.pkg` + `.sha256`, unwrapped
