@@ -217,67 +217,85 @@ Confirmed (adopted, no longer `[GUESS]`):
   `"0000"` against the corrected encoding at time of writing).
 
 Still open (unconfirmed, isolated so a fix is a point-edit):
-- **The eToken 5300's VERIFY still fails with `SW_SECURITY_NOT_SATISFIED`
-  (`6982`), confirmed to be unrelated to PIN padding.** The corrected,
-  card-type-conditional encoding directly above was validated against a
-  real IDPrime 930 (its genuine PIN now verifies correctly) but did *not*
-  change the eToken 5300's result: a correctly-encoded, unpadded, exact-4-byte
-  VERIFY of the real PIN still gets `6982`, identical to the old wrong
-  encoding — ruling padding out entirely as this device's problem.
-  **Touch-sensor hypothesis: tested once, no observed effect** — the user
-  touched the sensor during a `status --pin-env` run and got the same `6982`
-  — downgraded from leading theory, though not fully ruled out (a touch
-  requirement could still need different timing, or could apply only to
-  key-generation/signing rather than VERIFY, which is a real, common split
-  on combo authenticators).
-  **"Uninitialized token" hypothesis: ruled out.** The user confirmed this
-  exact token is initialized and personalized — it works correctly under
-  Windows with SafeNet Authentication Client (SAC), with two certificates
-  already loaded. So the token is not blank; SAC is doing something on the
-  wire that a plain VERIFY doesn't.
-  **New leading hypothesis: this token's PIN VERIFY requires secure
-  messaging that plain-text VERIFY can never satisfy — not a byte-layer bug
-  at all, but a missing protocol layer.** Several independent pieces of
-  evidence now converge on this: (1) OpenSC's own ATR-table label for this
-  exact card is `"eToken 5110+ FIPS"`, and a FIPS 140-2 validated module
-  ("IDPrime 930/3930 FIPS 140-2 Cryptographic Module") is publicly
-  documented for this family — FIPS validation commonly *mandates* that a
-  PIN never cross the contact interface in the clear. (2) `card-idprime.c`
-  treats `SC_CARD_TYPE_IDPRIME_930_PLUS` differently from plain `_930` in
-  at least one other place already found in this file (a different private-key
-  reference formula, `0x10 + cert_id * 2`, used only for `_930_PLUS`) — i.e.
-  the FIPS variant is independently known to need special-cased handling
-  beyond just PIN padding. (3) Thales's public CC Security Target for this
-  card family (cited above, for the admin key) already told us the *general
-  shape* is DH/ECDH ephemeral session-key establishment feeding real secure
-  messaging (separate encrypt + MAC per command) — this crate assumed that
-  applied only to admin-key auth, but it may equally gate PIN VERIFY on the
-  FIPS variant. (4) `card-idprime.c` has no `pin_cmd()` override and no
-  secure-messaging code anywhere in the file — OpenSC's own IDPrime driver
-  does not implement whatever SAC does differently, which is consistent
-  with (and may be the root cause of) OpenSC issue #3486 ("Safenet 5300")
-  reporting this exact model simply refusing to cooperate with OpenSC at
-  all without SAC installed.
-  **Why this isn't implemented here yet: there is no wire-level evidence to
-  implement against, anywhere.** The CC Security Target confirms the
-  *cipher primitives* (TDES/AES) and the *general scheme* (DH/ECDH + SM),
-  not usable protocol bytes — no key-agreement command, no curve/group, no
-  KDF, no SM data-object tag layout. No open-source driver (OpenSC's own
-  IDPrime driver included) implements this for the FIPS variant to copy
-  from. Guessing a DH/ECDH secure-messaging protocol from a document that
-  explicitly doesn't give byte-level detail would be worse than any guess
-  already flagged in this file — building and shipping cryptographic
-  protocol code with zero ability to verify it against the one thing that's
-  known to work (SAC) is exactly the failure mode this project's evidence
-  discipline exists to prevent.
-  **The concrete next step, if it's ever going to happen, is a real APDU
-  capture of SAC talking to this exact token** — a USB capture (e.g.
-  Wireshark + USBPcap on Windows) of the token's CCID traffic while SAC
-  performs a PIN verify would show the actual command structure SAC sends
-  (INS/P1/P2/Lc, even if the payload itself is SM-encrypted ciphertext),
-  which is the only way to derive a correct implementation rather than a
-  guess. Without that trace, this stays an open, documented gap rather than
-  a fabricated implementation.
+- **Root cause of the eToken 5300's `SW_SECURITY_NOT_SATISFIED` (`6982`) is
+  now confirmed from a real USB capture of SAC talking to this exact
+  token, not guessed: this card never uses plain ISO 7816-4 VERIFY at all
+  in its normal security mode.** The user captured the token's full CCID
+  traffic (USBPcap) while SAC performed a login+private-key operation, and
+  the reassembled command sequence (a T=1 TPDU-level capture — CLA/INS/P1/P2
+  are always plaintext even where the data field is protected, so this
+  reassembly is exact, not guessed) shows:
+  1. Card SELECTs Microsoft's **GIDS** applet first (`A0 00 00 03 97 43 49
+     44 5F 01 00`), reads some GIDS metadata via a GIDS-proprietary `INS
+     0xA6` command, *then* separately SELECTs this crate's own confirmed
+     IDPrime AID (`A0 00 00 00 18 80 00 00 00 06 62`) directly — i.e. both
+     applets genuinely coexist on the card, and SAC/the minidriver
+     round-trips between them.
+  2. Plaintext `MSE:SET` (`00 22 41 A4 06 80 01 4F 83 01 03 00` — CRT tag
+     `A4` Authentication Template, algorithm ref `0x4F`, key ref `0x03`).
+  3. Plaintext `GENERAL AUTHENTICATE` (`INS 0x86`): host sends an
+     **ephemeral NIST P-256 public key** (uncompressed point, tag `7C`
+     Dynamic Authentication Template wrapping tag `85`, `04 ‖ X ‖ Y`, 65
+     bytes) — the card answers with its *own* ephemeral P-256 public key in
+     the identical `7C`/`85` wrapper, then `SW 90 00`. This is a genuine,
+     symmetric ephemeral ECDH key agreement, confirming the CC Security
+     Target's "DH/ECDH ephemeral session-key establishment" claim with the
+     specific curve nailed down. This 3-step handshake (steps 2–3 above)
+     repeats **three separate times** across one session (fresh ephemeral
+     keys each time) — the SM channel is re-established per logical
+     operation, not held for the whole session.
+  4. Every command after that point uses `CLA 0x0C` (ISO 7816-4 "secure
+     messaging, header not authenticated") — or `0x8C` specifically for
+     GET CHALLENGE — with two ISO 7816-4-standard SM data objects: tag
+     `87` (padding-content-indicator byte `01` + AES-CBC-shaped ciphertext)
+     for encrypted data, and tag `8E` (a **16-byte** MAC, consistent with
+     AES-CMAC-128 rather than classic 8-byte 3DES retail MAC) for
+     integrity — plus tag `97` (Le) on commands expecting a response.
+     Commands observed protected this way: `MSE:SET` (both `P2=0xB6`
+     Digital Signature Template and `P2=0xA4` Authentication Template
+     again, nested inside the now-established channel), `PSO` (`P1=00
+     P2=0xBE` — not the `9E/9A` or `90/A0` framings this crate already
+     confirmed for a *different*, non-SM card; likely a decrypt/key-use
+     operation given this capture ran during a CMS key-agreement decrypt),
+     `GET CHALLENGE`, `EXTERNAL AUTHENTICATE`, `INTERNAL AUTHENTICATE`, the
+     GIDS `0xA6` command again, and routine `SELECT`/`READ BINARY` pairs
+     (accounting for the bulk of this capture's ~8,800 tiny SM-wrapped
+     exchanges — one SELECT+READ BINARY round trip per small chunk of
+     whatever object was being read).
+  5. **`VERIFY` (`INS 0x20`) and `CHANGE REFERENCE DATA` (`INS 0x24`) never
+     appear anywhere in this entire ~9.8-second, 1,442-command-pair
+     capture.** Combined with the earlier CNG-level trace (`NCryptSetProperty(...,
+     "SmartCardPin", ...)` → `SCardAudit(SCARD_AUDIT_CHV_SUCCESS)`, i.e. the
+     PIN genuinely does get checked by *something* in this flow), the PIN
+     is not presented as a plaintext/padded data field to a VERIFY-shaped
+     command at all on this token's normal security path — whatever role it
+     plays is folded into this ECDH+SM ceremony itself (most plausibly
+     contributing to the host's side of `GENERAL AUTHENTICATE`/`EXTERNAL
+     AUTHENTICATE`, similar in spirit to a password-authenticated key
+     exchange), not sent as recognizable PIN bytes anywhere on the wire.
+     **This also fully explains why the touch-sensor and
+     padding/reference-byte theories both went nowhere**: this was never a
+     byte-layer bug to begin with, and no adjustment to a plain VERIFY
+     builder was ever going to work against this specific security mode.
+  **What's still missing, and why nothing is implemented from this yet:**
+  the exact key-derivation function from the ECDH shared secret to the SM
+  session keys, and — the piece that actually matters most — *how the PIN
+  factors into the cryptographic computation at all*. Both happen entirely
+  inside `scksp.dll` (SafeNet's CNG Key Storage Provider) before any bytes
+  reach the wire; a USB capture, however complete, cannot reveal
+  computation that never left the process. Implementing against the
+  now-confirmed wire *shape* alone — without knowing the KDF or the PIN's
+  role — would mean guessing the one part of this that was always the
+  actual point, which is exactly the failure mode this project's evidence
+  discipline exists to prevent. This code already has RustCrypto P-256/AES
+  building blocks available elsewhere in the workspace (`keyroost-ctap`
+  depends on `p256`, `aes`, `sha2`) if a real implementation is ever
+  pursued — the blocker is evidence, not tooling.
+  **Concrete next step, if this is pursued further**: reverse-engineering
+  `scksp.dll` itself (e.g. with Ghidra) to find the KDF and PIN-handling
+  code around its `GENERAL AUTHENTICATE`/`EXTERNAL AUTHENTICATE` calls —
+  the wire-level command *sequence* is no longer the missing piece, the
+  in-process *computation* is.
   `--pin-env`/`--pin-stdin` on `keyroostctl ias status`/`export-cert`
   (`IasSession::status_with_pin`, `IasSlotStatus::pin_required`) are what
   surfaced this finding and remain the right tool for the next experiment;
