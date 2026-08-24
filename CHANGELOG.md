@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-24
+
+**Why 0.8.0 and not 0.7.9:** this release changes the published library
+crates in ways that require adjustments from code built on them — a new
+`Instruction` variant in `keyroost-piv` and a new public field on
+`keyroost-resolve`'s `Device` — so the version number says so, per semver.
+Nothing else should be read into the jump: there is no 0.7.9, the 0.7
+series simply ends here, only the latest release is ever maintained, and
+the app itself is unaffected. Exact adjustments for library users are in
+the [migration notes](https://framefilter.github.io/keyroost/migration.html).
+
+
 ### Added
 - **`piv new-chuid`** (and a matching GUI action): write a fresh CHUID with a
   random GUID to a PIV card. Windows' PIV minidriver caches a card's contents
@@ -894,7 +906,8 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#98]: https://github.com/framefilter/keyroost/issues/98
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.8...HEAD
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/framefilter/keyroost/compare/v0.7.5...v0.7.6

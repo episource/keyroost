@@ -70,6 +70,12 @@ pub const PIN_REF_PUK: u8 = 0x81;
 pub const KEY_REF_MANAGEMENT: u8 = 0x9B;
 
 /// PIV / Yubico-PIV instruction bytes.
+///
+/// `#[non_exhaustive]` (since 0.8.0): vendor extensions keep appearing (Attest
+/// arrived in 0.7.x and formally broke exhaustive matches), so downstream
+/// matches must carry a catch-all arm — and future instruction additions stop
+/// being breaking changes.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Instruction {

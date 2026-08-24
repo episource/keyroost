@@ -60,6 +60,27 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-8-0">
+    <h2>v0.8.0</h2>
+    <p>No CLI or GUI changes break anything — the version jump is entirely about
+      the <strong>published library crates</strong> (there is no v0.7.9; the 0.7
+      series ends at 0.7.8). Two adjustments for library consumers:</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-piv</code></td>
+        <td><code>Instruction</code> gained the <code>Attest</code> variant and is
+          now <code>#[non_exhaustive]</code> — add a catch-all arm (<code>_ =&gt;</code>)
+          to any exhaustive <code>match</code>. Future instruction additions will
+          then no longer be breaking.</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td><code>Device</code> gained the <code>unverified: Caps</code> field
+          (the tri-state capability display). Struct literals must set it —
+          <code>Caps::default()</code> preserves the old behavior.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-7-8">
     <h2>v0.7.8</h2>
     <p class="kr-muted">Bug-fix release &mdash; no breaking changes for scripts or library
