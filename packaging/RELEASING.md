@@ -15,7 +15,7 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       pinned-inputs check).
 - [ ] `cargo audit` green (the audit workflow runs on pushes; check the last
       run) and the deps-outdated report reviewed.
-- [ ] **Semver check against the published crates** — with 18 library crates
+- [ ] **Semver check against the published crates** — with 16 library crates
       on crates.io, Cargo treats 0.7.x -> 0.7.y as compatible, so an
       accidental API break in a patch release ships silently and breaks
       downstream `cargo update`:
@@ -241,7 +241,7 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       package paths above the package directory.
 - [ ] `keyroostctl --version` prints X.Y.Z, and the GUI shows vX.Y.Z next
       to the wordmark in the top bar.
-- [ ] The AppImage carries the version in its metadata (new at v0.7.9 —
+- [ ] The AppImage carries the version in its metadata (new at v0.8.0 —
       never yet exercised by a release build):
       `./keyroost-x86_64.AppImage --appimage-extract >/dev/null && grep X-AppImage-Version squashfs-root/*.desktop`
       must print `X-AppImage-Version=X.Y.Z`. This is what AppImage managers

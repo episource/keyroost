@@ -574,16 +574,17 @@ musl cross toolchain, then build libpcsclite there. See
 3. **AppImage.** **DECIDED:** build the GUI AppImage and attach it to each release.
 4. **Whether/when to automate in CI.** **DECIDED:** automated in the *new*
    `.github/workflows/linux-bundles.yml` (separate from `release.yml`/`publish.yml`).
-5. **Flatpak repo GPG signing key.** *Open (recommended).* Sign via the
-   `FLATPAK_GPG_KEY` + `FLATPAK_GPG_KEY_ID` secrets (setup step 4). Unset = repo
-   published unsigned, signing steps no-op. Maintainer to decide whether to enable.
-6. **Icon asset.** *Open (REQUIRED).* keyroost has **no icon**. Supply
-   `packaging/icons/io.github.framefilter.keyroost.svg` + `-256.png`
-   (see `icons/README.md`). Separate design effort.
-7. **Auto-update repo + token.** *Open (REQUIRED action).* Create
-   `framefilter/keyroost-flatpak`, enable its Pages (Deploy from a branch, `/`
-   root), place the descriptors, and add the `FLATPAK_REPO_TOKEN` secret — setup
-   step 3. The main repo's Pages/Learn site is untouched.
+5. **Flatpak repo GPG signing key.** **DECIDED: enabled.** The
+   `FLATPAK_GPG_KEY` + `FLATPAK_GPG_KEY_ID` secrets are set (setup step 4) and
+   the public key is embedded in `keyroost.flatpakrepo`'s `GPGKey=` line — the
+   published remote is GPG-signed.
+6. **Icon asset.** **DONE.** The dark-on-amber `k` monogram is committed —
+   `packaging/icons/` holds the full hicolor tree + SVG master + 256px PNG
+   (see setup step 1 and `icons/README.md`).
+7. **Auto-update repo + token.** **DONE.** `framefilter/keyroost-flatpak`
+   exists, its Pages serves the remote, the descriptors are in place, and
+   `FLATPAK_REPO_TOKEN` is set — the OSTree publish runs on every release
+   (setup step 3). The main repo's Pages/Learn site is untouched.
 8. **This doc's filename.** *Open.* Keep as `packaging/LINUX-BUNDLES.md`, or
    promote to `packaging/README.md` (would need to merge with the existing
    release-fanout README)?

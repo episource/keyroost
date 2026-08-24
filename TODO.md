@@ -8,9 +8,9 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.7.8** — a bug-fix release: the #84 card reset, the #95
-error-message and capability fixes, and the #96 replug fixes (first external
-contribution). The release run is under way.
+Current work: **v0.8.0** — Nitrokey 3 PIV + `piv new-chuid` (#102), the
+short-APDU chaining fallback (#101), the tri-state capability display (#95),
+and the app-version display (#98). The release run is under way.
 
 ---
 
@@ -23,37 +23,6 @@ Being worked on right now — check with whoever holds it before starting.
 ---
 
 ## Ready to pick up
-
-- **Show the app version ([#98](https://github.com/framefilter/keyroost/issues/98)).**
-  The GUI displays its version nowhere, and the AppImage carries no embedded
-  version metadata — AppImage managers read `X-AppImage-Version` from the
-  bundled desktop file, which linuxdeploy injects from a `VERSION` env var
-  `packaging/appimage/build-appimage.sh` never sets. Fix both: surface
-  `CARGO_PKG_VERSION` in the GUI (About/settings footer), and export
-  `VERSION` in the AppImage build.
-
-- **What per-commit signatures actually protect here, and what could
-    replace them.** Release integrity already has independent guarantees:
-    signed `v*` tags (admin-only by ruleset), build-provenance attestation on
-    release assets, SHA256SUMS, and Trusted Publishing to crates.io. If those
-    carry the trust, main could accept reviewed-but-unsigned contributor
-    commits, or GitHub's own web-flow signature on squash-merges (GitHub
-    signs those; they show verified).
-  - **Ruleset changes:** require PRs + passing status checks + maintainer
-    review instead of the all-commits-signed rule; keep linear history via
-    squash or rebase-merge; keep `v*` tags admin-only and the anti-rewrite
-    rules exactly as they are.
-  - **Account security becomes the perimeter** once the merge button works:
-    the maintainer account's own protections (passkeys/2FA, no PAT sprawl)
-    and required review are then what stands between a compromised
-    contributor account and main.
-  - **CI on fork PRs:** the container jobs currently wait for approval;
-    decide what runs automatically for first-time contributors vs what stays
-    gated (secrets exposure is the constraint).
-  - What CONTRIBUTING.md and the branch-protection standing decision
-    ([[branch-protection-light-applied]] in the agent memory; "full PR-required
-    protection deferred until stable") need to say afterwards — this work IS
-    that deferred protection, arriving from the friendlier direction.
 
 - **Run the mandatory packaging probe before any version bump.**
   `gh workflow run linux-bundles.yml --ref <ref>` with no tag input = build-only;
