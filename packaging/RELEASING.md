@@ -98,8 +98,10 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       README / meta-docs) cover this in one pass; findings are fixed on the
       prep branch so the release ships accurate docs.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
-- [ ] Land on main via the signing flow (rebase over origin/main re-creates
-      the commit signed; push `HEAD:main`).
+- [ ] Land on main: push the prep branch directly —
+      `git push origin <branch>:main` (the require-PR rule's admin bypass
+      covers the maintainer; no rebase, no commit signing — the release is
+      signed at the tag, not per commit).
 
 ## 3. Tag and watch the build
 
@@ -229,7 +231,14 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       asset check for why it cannot run earlier). If this ever fails, the fix
       belongs under the crate root, not in a wider `include`: cargo cannot
       package paths above the package directory.
-- [ ] `keyroostctl --version` / GUI About shows X.Y.Z.
+- [ ] `keyroostctl --version` prints X.Y.Z, and the GUI shows vX.Y.Z next
+      to the wordmark in the top bar.
+- [ ] The AppImage carries the version in its metadata (new at v0.7.9 —
+      never yet exercised by a release build):
+      `./keyroost-x86_64.AppImage --appimage-extract >/dev/null && grep X-AppImage-Version squashfs-root/*.desktop`
+      must print `X-AppImage-Version=X.Y.Z`. This is what AppImage managers
+      (Gear Lever et al.) display; it comes from the `VERSION` export in
+      `build-appimage.sh` (#98).
 - [ ] Close/comment the issues the release fixes (drafts usually prepared
       during the work); announcement if any.
 - [ ] Out-of-band corrections later (metadata fixes, asset re-attach): use the
