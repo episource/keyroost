@@ -32,27 +32,6 @@ Being worked on right now — check with whoever holds it before starting.
   `CARGO_PKG_VERSION` in the GUI (About/settings footer), and export
   `VERSION` in the AppImage build.
 
-- **Contribution model rework — DECIDED 2026-08-14, target: next release.**
-  The model: squash-only button merges, required PR + required status checks,
-  strict fork-CI approval, per-commit signature rule dropped; the hardware key
-  moves to per-release attestation (before tagging, review the full
-  `git diff <last-tag>..HEAD`, then the signed tag covers the whole delta);
-  SECURITY.md gains an explicit trust-anchor statement (signed tags,
-  provenance attestations, SHA256SUMS, Trusted Publishing; main signatures
-  best-effort). Grounding: a survey of 11 comparable projects found none
-  requiring signed commits, and GitHub's rules make button-merges of others'
-  PRs structurally impossible under the current ruleset; the xz postmortem
-  shows release provenance, not commit signing, is what catches the real
-  attack.
-  **Still to design before flipping anything: the review model for other
-  people's commits.** Hard requirement from the maintainer: first-time
-  contributors must not get anywhere without manual intervention. Partly
-  satisfied structurally (only the maintainer can merge, and fork-CI approval
-  set to "require for all outside collaborators" gates CI runs too); what
-  needs designing is the review discipline itself — what a security review of
-  a contributor commit checks, and whether it is written down as a checklist
-  the way the release playbook is. No ruleset changes until that is settled.
-
 - **What per-commit signatures actually protect here, and what could
     replace them.** Release integrity already has independent guarantees:
     signed `v*` tags (admin-only by ruleset), build-provenance attestation on
@@ -261,6 +240,18 @@ plan's two-key manual steps were never executed):
 ## Standing decisions
 
 Not tasks. Kept so they are not re-litigated or re-researched.
+
+- **The contribution model (decided 2026-08-14, in force 2026-08-24).**
+  Commits on `main` are not signed; the ruleset requires a PR (admin bypass
+  for the maintainer), linear history, squash-only merges. External PRs are
+  reviewed against `packaging/REVIEWING.md` and squash-merged with the
+  contributor's authorship; fork CI runs only after maintainer approval, for
+  ALL outside collaborators. Release `v*` tags remain hardware-signed and
+  admin-only, made after the RELEASING.md pre-tag delta review — the tag
+  signature is the release trust anchor (SECURITY.md, "Release integrity").
+  Per-commit signing was retired deliberately: it blocked the merge button
+  and does not address the attack class that matters (a malicious committer
+  signs validly — xz). Do not re-litigate from either direction.
 
 - **No HID workarounds for Token2 R3.2+/R3.3+ keys — the channel is off by
   design.** The "no-status-word HID dialect" that #82 and #95 were both filed
