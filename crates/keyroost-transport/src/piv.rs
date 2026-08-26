@@ -156,6 +156,15 @@ pub struct PivSlotStatus {
 pub struct PivSession {
     card: Card,
     debug: bool,
+    /// True when the reader negotiated T=0 with the card. T=0 cannot carry
+    /// extended-length APDUs at all (ISO 7816-3 — the protocol has no way to
+    /// frame them), so every large-payload command must be chained from the
+    /// start on such links. Learned from the connection, never from the
+    /// card's make: a T=0 contact card that receives an extended-length APDU
+    /// may simply go silent (issue #103 — the reader reported "transaction
+    /// failed" and the #101 status-word fallback never got a status word to
+    /// act on), so waiting for a refusal is not a strategy there.
+    t0: bool,
     /// Algorithm + public key of any slot this session itself generated a key
     /// in, keyed by key reference. This is a fallback source only, for cards
     /// that don't answer GET METADATA (pre-5.3 firmware, or non-Yubico PIV):
@@ -255,9 +264,11 @@ impl PivSession {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
+        let t0 = negotiated_t0(&card);
         let mut session = Self {
             card,
             debug: false,
+            t0,
             pubkey_cache: PubkeyCache::new(),
         };
         session.select()?;
@@ -281,9 +292,11 @@ impl PivSession {
         let mut out = Vec::new();
         for name in names {
             if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+                let t0 = negotiated_t0(&card);
                 let mut session = PivSession {
                     card,
                     debug: false,
+                    t0,
                     pubkey_cache: PubkeyCache::new(),
                 };
                 if session.select().is_ok() {
@@ -602,9 +615,12 @@ impl PivSession {
         let value = piv::encode_certificate(der);
         let tag = slot.cert_object_tag();
         let apdu = piv::put_data(&tag, &value);
-        let sw = if force_chaining() {
+        let sw = if self.chain_upfront() {
             if self.debug {
-                eprintln!("! piv import certificate: forcing command chaining (env override)");
+                eprintln!(
+                    "! piv import certificate: command chaining up front ({})",
+                    self.chain_reason()
+                );
             }
             self.transmit_chain(
                 "piv import certificate",
@@ -825,9 +841,12 @@ impl PivSession {
     ) -> Result<Vec<u8>, TransportError> {
         let key_ref = slot.key_ref();
         let apdu = piv::general_auth_sign(alg, key_ref, prepared);
-        let (data, sw) = if force_chaining() {
+        let (data, sw) = if self.chain_upfront() {
             if self.debug {
-                eprintln!("! piv sign: forcing command chaining (env override)");
+                eprintln!(
+                    "! piv sign: command chaining up front ({})",
+                    self.chain_reason()
+                );
             }
             self.transmit_chain(
                 "piv sign",
@@ -1232,6 +1251,41 @@ fn uses_extended_length(apdu: &[u8]) -> bool {
 /// mirrors `KEYROOST_OPENPGP_FORCE_CHAINING`).
 fn force_chaining() -> bool {
     std::env::var_os("KEYROOST_PIV_FORCE_CHAINING").is_some()
+}
+
+/// Whether the connection to `card` negotiated T=0. Fails open: if the
+/// status query itself fails, report "not T=0" so behaviour stays exactly
+/// what it was before this check existed (extended-length first, status-word
+/// fallback second) — a wrong "T=0" answer would silently downgrade every
+/// large command on a perfectly good T=1 link.
+fn negotiated_t0(card: &Card) -> bool {
+    let mut names = [0u8; 256];
+    let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+    match card.status2(&mut names, &mut atr) {
+        Ok(status) => status.protocol2() == Some(pcsc::Protocol::T0),
+        Err(_) => false,
+    }
+}
+
+/// The chain-up-front decision as a pure function, so the rule is testable
+/// without a card: chain when the operator forces it, or when the link is
+/// T=0 and therefore cannot carry extended-length APDUs at all.
+fn chain_upfront_for(t0: bool, forced: bool) -> bool {
+    forced || t0
+}
+
+impl PivSession {
+    fn chain_upfront(&self) -> bool {
+        chain_upfront_for(self.t0, force_chaining())
+    }
+
+    fn chain_reason(&self) -> &'static str {
+        if force_chaining() {
+            "env override"
+        } else {
+            "T=0 link: extended-length APDUs are not possible on this protocol"
+        }
+    }
 }
 
 /// Turn to-be-signed bytes into the block the card's GENERAL AUTHENTICATE
@@ -1795,5 +1849,32 @@ mod tests {
             let before = e.to_string();
             assert_eq!(map_reset_stage_error(e).to_string(), before);
         }
+    }
+}
+
+/// Issue #103: a T=0 contact card cannot receive extended-length APDUs and
+/// may go silent when handed one, so the status-word fallback (#101) never
+/// gets a status word to act on. On T=0 links, chaining must be the FIRST
+/// choice, not the fallback.
+#[cfg(test)]
+mod chain_upfront_rule {
+    use super::chain_upfront_for;
+
+    #[test]
+    fn t0_links_chain_from_the_start() {
+        assert!(chain_upfront_for(true, false));
+    }
+
+    #[test]
+    fn the_env_override_still_forces_chaining_on_any_link() {
+        assert!(chain_upfront_for(false, true));
+        assert!(chain_upfront_for(true, true));
+    }
+
+    #[test]
+    fn t1_links_keep_extended_length_first() {
+        // The #101 fallback covers a T=1 card that refuses extended length
+        // with a status word; nothing here may pre-empt that path.
+        assert!(!chain_upfront_for(false, false));
     }
 }

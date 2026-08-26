@@ -7,6 +7,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Certificate import and signing now work on contact (T=0) smart-card
+  readers.** Large PIV commands were sent as extended-length APDUs first,
+  with chaining only as a fallback after the card refused. A T=0 link cannot
+  carry extended-length APDUs at all, and a Token2 PIN+ card on such a reader
+  went silent instead of refusing — so the fallback never triggered and the
+  command failed with a PC/SC "transaction failed" error. keyroost now reads
+  the negotiated protocol and chains from the start on T=0; T=1 links are
+  unchanged. Reported by @mdedonno1337, who also confirmed the chained path
+  works on the affected card. ([#103])
 - **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet
   answers management-key authentication without the final card-to-host
   proof, which keyroost treated as a failure. A card that accepts the
@@ -915,6 +924,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#98]: https://github.com/framefilter/keyroost/issues/98
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
+[#103]: https://github.com/framefilter/keyroost/issues/103
 [#104]: https://github.com/framefilter/keyroost/pull/104
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
