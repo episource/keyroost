@@ -447,6 +447,16 @@ impl PivSession {
         // card that blindly answers success. So: treat this as authenticated
         // rather than erroring on an 0x82 template that was never coming.
         if resp2.is_empty() {
+            // Say so in the trace: the assurance on this card is one-sided,
+            // and a reviewer (or a user wondering why a swapped card was
+            // accepted) should be able to see that the weaker path was taken.
+            if self.debug {
+                eprintln!(
+                    "! piv authenticate: card returned no 0x82 challenge response; \
+                     accepting host-only (client) authentication — this card cannot \
+                     prove it holds the management key"
+                );
+            }
             return Ok(());
         }
         // Verify the card encrypted our challenge correctly (authenticates the

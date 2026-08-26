@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet
+  answers management-key authentication without the final card-to-host
+  proof, which keyroost treated as a failure. A card that accepts the
+  host's proof but sends none of its own is now accepted; every card that
+  does send its proof is verified exactly as before. The reduced assurance
+  on such cards is reported in `--debug` output. Contributed by @episource.
+  ([#104])
+
 ## [0.8.0] - 2026-08-24
 
 **Why 0.8.0 and not 0.7.9:** this release changes the published library
@@ -906,6 +915,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#98]: https://github.com/framefilter/keyroost/issues/98
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
+[#104]: https://github.com/framefilter/keyroost/pull/104
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
