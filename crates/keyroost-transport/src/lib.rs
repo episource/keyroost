@@ -50,7 +50,11 @@ pub use token2otp::{
 
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
-pub use keyroost_openpgp::{KeyCrt, RsaPrivateKeyParts};
+pub use keyroost_openpgp::{
+    describe_algorithm_attributes, parse_algorithm_attributes, AlgorithmAttributes,
+    AlgorithmInformation, Curve, EccKind, KeyAlg as OpenPgpKeyAlg, KeyCrt,
+    PublicKey as OpenPgpPublicKey, RsaPrivateKeyParts, SlotMismatch,
+};
 
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
@@ -151,6 +155,13 @@ pub enum TransportError {
     /// builder would otherwise panic); guards against a malformed card
     /// attribute as well as a genuine key/card mismatch.
     OpenPgpExponentTooWide,
+    /// The requested OpenPGP key algorithm cannot live in the requested slot
+    /// (Ed25519 only signs; X25519 only agrees keys).
+    OpenPgpSlotMismatch(keyroost_openpgp::SlotMismatch),
+    /// An RSA-only operation (RSA key import) found the slot already holds an
+    /// ECC key instead. `slot` is the CLI's `--slot` value (`sign` / `decrypt`
+    /// / `auth`); `label` is the ECC algorithm's display label.
+    OpenPgpSlotNotRsa { slot: &'static str, label: String },
 }
 
 impl fmt::Display for TransportError {
@@ -294,6 +305,12 @@ impl fmt::Display for TransportError {
                 "the key's RSA public exponent is wider than this OpenPGP card's \
                  declared exponent field"
             ),
+            TransportError::OpenPgpSlotMismatch(e) => write!(f, "{e}"),
+            TransportError::OpenPgpSlotNotRsa { slot, label } => write!(
+                f,
+                "the {slot} slot holds an ECC key ({label}); RSA import needs an RSA \
+                 slot — run `openpgp generate-key --slot {slot} --algorithm rsa2048` first"
+            ),
         }
     }
 }
@@ -305,6 +322,7 @@ impl std::error::Error for TransportError {
             TransportError::PublicData(e) => Some(e),
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
+            TransportError::OpenPgpSlotMismatch(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
             TransportError::X509(e) => Some(e),
             _ => None,

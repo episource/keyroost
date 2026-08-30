@@ -209,6 +209,10 @@ pub const TAG_FINGERPRINTS: u16 = 0x00C5;
 pub const TAG_CA_FINGERPRINTS: u16 = 0x00C6;
 /// Key generation timestamps.
 pub const TAG_GENERATION_TIMES: u16 = 0x00CD;
+/// Algorithm Information (`FA`, spec v3.4 §4.4.3.11): the algorithm-attribute
+/// values each slot *accepts*, as repeated `C1`/`C2`/`C3` objects. Optional —
+/// cards before 3.4 don't have it.
+pub const TAG_ALGORITHM_INFORMATION: u16 = 0x00FA;
 
 /// Fingerprint — signature key (`C7`, 20 bytes); a standalone PUT DATA target.
 pub const TAG_FPR_SIGN: u16 = 0x00C7;
@@ -267,6 +271,12 @@ pub fn get_data(tag: u16) -> Vec<u8> {
 #[must_use]
 pub fn get_application_related_data() -> Vec<u8> {
     get_data(TAG_APPLICATION_RELATED_DATA)
+}
+
+/// `GET DATA 00FA` — the Algorithm Information object: `00 CA 00 FA 00`.
+#[must_use]
+pub fn get_algorithm_information() -> Vec<u8> {
+    get_data(TAG_ALGORITHM_INFORMATION)
 }
 
 /// `GET DATA 00C4` — the standalone PW status bytes: `00 CA 00 C4 00`.
@@ -377,6 +387,18 @@ impl KeyCrt {
             KeyCrt::Sign => TAG_TIME_SIGN,
             KeyCrt::Decrypt => TAG_TIME_DEC,
             KeyCrt::Auth => TAG_TIME_AUTH,
+        }
+    }
+
+    /// The data-object tag of this slot's algorithm attributes (`C1`/`C2`/`C3`),
+    /// the target for a [`put_algorithm_attributes`] PUT DATA (and the tag
+    /// under which the card reports them inside `6E`/`73`).
+    #[must_use]
+    pub const fn algo_attr_tag(self) -> u16 {
+        match self {
+            KeyCrt::Sign => TAG_ALGO_ATTR_SIG,
+            KeyCrt::Decrypt => TAG_ALGO_ATTR_DEC,
+            KeyCrt::Auth => TAG_ALGO_ATTR_AUT,
         }
     }
 }
@@ -548,6 +570,25 @@ pub fn pso_decipher_chained(data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Cipher DO tag for ECDH decipher: the `A6` template (spec v3.4 §7.2.11).
+const TAG_CIPHER_DO_ECDH: u16 = 0x00A6;
+
+/// The ECDH cipher Data Object for PSO:DECIPHER — `A6 { 7F49 { 86 <point> } }`,
+/// where `ephemeral_point` is the sender's ephemeral public point (raw, as the
+/// card wants it: `04||X||Y` for Weierstrass curves, the bare 32 bytes for
+/// X25519 — a leading OpenPGP `0x40` prefix must be stripped by the caller).
+/// The card returns the shared secret (the x-coordinate / the 32-byte X25519
+/// output); the RFC 6637 KDF and key unwrap are the OpenPGP tool's job, as
+/// with the RSA path, where the card returns the raw PKCS#1 payload.
+/// Feed the result to [`pso_decipher`] — there is no `0x00` padding-indicator
+/// byte in the ECDH form.
+#[must_use]
+pub fn ecdh_cipher_do(ephemeral_point: &[u8]) -> Vec<u8> {
+    let point = ber_tlv(TAG_EC_PUBLIC_POINT, ephemeral_point);
+    let pk = ber_tlv(TAG_PUBLIC_KEY, &point);
+    ber_tlv(TAG_CIPHER_DO_ECDH, &pk)
+}
+
 /// `CHANGE REFERENCE DATA` (INS `24`) — change a PIN from `old` to `new`.
 ///
 /// `pw_ref` is the password reference in P2: [`PW1_SIGN`] (`0x81`) changes PW1,
@@ -637,8 +678,9 @@ pub fn put_url(url: &[u8]) -> Vec<u8> {
 ///
 /// After an on-card GENERATE the applet knows the key material but not the
 /// OpenPGP v4 fingerprint (which folds in the host-chosen creation timestamp);
-/// the host computes it with [`rsa_v4_fingerprint`] and registers it here so
-/// that `gpg` and the card agree on the key's identity.
+/// the host computes it with [`v4_fingerprint`] (RSA: [`rsa_v4_fingerprint`];
+/// ECC: [`ecc_v4_fingerprint`]) and registers it here so that `gpg` and the
+/// card agree on the key's identity.
 #[must_use]
 pub fn put_fingerprint(crt: KeyCrt, fpr: &[u8; 20]) -> Vec<u8> {
     put_data(crt.fpr_tag(), fpr)
@@ -647,9 +689,10 @@ pub fn put_fingerprint(crt: KeyCrt, fpr: &[u8; 20]) -> Vec<u8> {
 /// `PUT DATA CE`/`CF`/`D0` — write the 4-byte big-endian Unix generation
 /// timestamp of the key in `crt`'s slot (see [`KeyCrt::time_tag`]).
 ///
-/// This timestamp *must* match the `creation_time` fed to
-/// [`rsa_v4_fingerprint`]: the v4 fingerprint hashes the creation time, so a
-/// mismatch yields a fingerprint the card and `gpg` disagree on.
+/// This timestamp *must* match the `creation_time` fed to [`v4_fingerprint`]
+/// (RSA: [`rsa_v4_fingerprint`]; ECC: [`ecc_v4_fingerprint`]): the v4
+/// fingerprint hashes the creation time, so a mismatch yields a fingerprint
+/// the card and `gpg` disagree on.
 #[must_use]
 pub fn put_generation_time(crt: KeyCrt, unix_time: u32) -> Vec<u8> {
     put_data(crt.time_tag(), &unix_time.to_be_bytes())
@@ -708,21 +751,408 @@ pub fn rsa_v4_fingerprint(modulus: &[u8], exponent: &[u8], creation_time: u32) -
     body.extend_from_slice(&m);
     body.extend_from_slice(&e);
 
+    v4_fingerprint_envelope(&body)
+}
+
+/// Wrap a v4 public-key packet `body` in the old-format CTB envelope and
+/// hash it: `SHA1(0x99 || len16 || body)`. Shared by [`rsa_v4_fingerprint`]
+/// and [`ecc_v4_fingerprint`].
+fn v4_fingerprint_envelope(body: &[u8]) -> [u8; 20] {
     let len = body.len() as u16;
     let mut hashed = Vec::with_capacity(3 + body.len());
     hashed.push(0x99); // old-format CTB: public-key packet, two-octet length
     hashed.push((len >> 8) as u8);
     hashed.push((len & 0xFF) as u8);
-    hashed.extend_from_slice(&body);
+    hashed.extend_from_slice(body);
 
     keyroost_proto::sha1::sha1(&hashed)
 }
 
-/// Convenience wrapper around [`rsa_v4_fingerprint`] taking a parsed
-/// [`PublicKey`] (e.g. straight from [`parse_generated_public_key`]).
+/// RFC 6637 §9 KDF parameters an ECDH key's public-key packet carries:
+/// `03 01 <hash id> <cipher id>`, chosen by curve size exactly as GnuPG's
+/// `ecdh_params()` does (SHA-256/AES-128 up to 256 bits, SHA-384/AES-192 up
+/// to 384, SHA-512/AES-256 above). The card does not store these, yet the v4
+/// fingerprint hashes them — so keyroost must pick what gpg will pick, or the
+/// two disagree on the key's identity.
 #[must_use]
-pub fn rsa_v4_fingerprint_from(key: &PublicKey, creation_time: u32) -> [u8; 20] {
-    rsa_v4_fingerprint(&key.modulus, &key.exponent, creation_time)
+pub const fn ecdh_kdf_params(curve: Curve) -> [u8; 4] {
+    let bits = curve.bits();
+    if bits <= 256 {
+        [0x03, 0x01, 0x08, 0x07]
+    } else if bits <= 384 {
+        [0x03, 0x01, 0x09, 0x08]
+    } else {
+        [0x03, 0x01, 0x0A, 0x09]
+    }
+}
+
+/// Compute the OpenPGP **v4 fingerprint** of an ECC public key.
+///
+/// Body: `04` || creation time || algorithm id ([`EccKind::id`]) || OID length
+/// || curve OID || MPI(point) || (ECDH only) [`ecdh_kdf_params`]. For the
+/// 25519 curves the MPI is over `0x40 || point` (RFC 7748 form as OpenPGP
+/// carries it); a `point` that already starts with `0x40` and is 33 bytes is
+/// used as-is. The envelope (`SHA1(0x99 || len16 || body)`) is shared with
+/// [`rsa_v4_fingerprint`].
+#[must_use]
+pub fn ecc_v4_fingerprint(
+    kind: EccKind,
+    curve: Curve,
+    point: &[u8],
+    creation_time: u32,
+) -> [u8; 20] {
+    let packet_point: Vec<u8> = if curve.is_25519() && point.len() == 32 {
+        let mut p = Vec::with_capacity(33);
+        p.push(0x40);
+        p.extend_from_slice(point);
+        p
+    } else {
+        point.to_vec()
+    };
+    let oid = curve.oid();
+    let p = mpi(&packet_point);
+    let mut body = Vec::with_capacity(1 + 4 + 1 + 1 + oid.len() + p.len() + 4);
+    body.push(0x04);
+    body.extend_from_slice(&creation_time.to_be_bytes());
+    body.push(kind.id());
+    body.push(oid.len() as u8);
+    body.extend_from_slice(oid);
+    body.extend_from_slice(&p);
+    if kind == EccKind::Ecdh {
+        body.extend_from_slice(&ecdh_kdf_params(curve));
+    }
+    v4_fingerprint_envelope(&body)
+}
+
+/// Fingerprint of `key` under the slot's `attrs`: RSA via
+/// [`rsa_v4_fingerprint`], ECC via [`ecc_v4_fingerprint`]. A key whose shape
+/// doesn't match the attributes (an RSA key with ECC attributes or vice
+/// versa) is [`ParseError::UnsupportedAlgorithm`] — a wrong fingerprint must
+/// never be written to the card.
+pub fn v4_fingerprint(
+    key: &PublicKey,
+    attrs: &AlgorithmAttributes,
+    creation_time: u32,
+) -> Result<[u8; 20], ParseError> {
+    match (key, attrs) {
+        (PublicKey::Rsa { modulus, exponent }, AlgorithmAttributes::Rsa(_)) => {
+            Ok(rsa_v4_fingerprint(modulus, exponent, creation_time))
+        }
+        (PublicKey::Ecc { point }, AlgorithmAttributes::Ecc { kind, curve, .. }) => {
+            Ok(ecc_v4_fingerprint(*kind, *curve, point, creation_time))
+        }
+        _ => Err(ParseError::UnsupportedAlgorithm),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key algorithms (algorithm attributes, OpenPGP Card spec v3.4 §4.4.3.9-11)
+// ---------------------------------------------------------------------------
+
+/// An elliptic curve an OpenPGP card can hold a key on, identified on the wire
+/// by its bare OID body (no DER `06 len` header) inside the slot's algorithm
+/// attributes. The 25519 pair is split by *use* — Ed25519 signs, X25519 agrees
+/// keys — so each is its own curve here, as in the OID registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Curve {
+    Ed25519,
+    X25519,
+    NistP256,
+    NistP384,
+    NistP521,
+    Secp256k1,
+    BrainpoolP256r1,
+    BrainpoolP384r1,
+    BrainpoolP512r1,
+}
+
+impl Curve {
+    /// Every curve this crate models, in display order.
+    pub const ALL: [Curve; 9] = [
+        Curve::Ed25519,
+        Curve::X25519,
+        Curve::NistP256,
+        Curve::NistP384,
+        Curve::NistP521,
+        Curve::Secp256k1,
+        Curve::BrainpoolP256r1,
+        Curve::BrainpoolP384r1,
+        Curve::BrainpoolP512r1,
+    ];
+
+    /// The curve's OID body as the card stores it after the algorithm id.
+    #[must_use]
+    pub const fn oid(self) -> &'static [u8] {
+        match self {
+            // 1.3.6.1.4.1.11591.15.1
+            Curve::Ed25519 => &[0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+            // 1.3.6.1.4.1.3029.1.5.1
+            Curve::X25519 => &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01],
+            // 1.2.840.10045.3.1.7
+            Curve::NistP256 => &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+            // 1.3.132.0.34
+            Curve::NistP384 => &[0x2B, 0x81, 0x04, 0x00, 0x22],
+            // 1.3.132.0.35
+            Curve::NistP521 => &[0x2B, 0x81, 0x04, 0x00, 0x23],
+            // 1.3.132.0.10
+            Curve::Secp256k1 => &[0x2B, 0x81, 0x04, 0x00, 0x0A],
+            // 1.3.36.3.3.2.8.1.1.7 / .11 / .13
+            Curve::BrainpoolP256r1 => &[0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07],
+            Curve::BrainpoolP384r1 => &[0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0B],
+            Curve::BrainpoolP512r1 => &[0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0D],
+        }
+    }
+
+    /// Resolve a bare OID body to a curve.
+    #[must_use]
+    pub fn from_oid(oid: &[u8]) -> Option<Curve> {
+        Curve::ALL.into_iter().find(|c| c.oid() == oid)
+    }
+
+    /// Human label (GnuPG's spelling where it has one).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Curve::Ed25519 => "Ed25519",
+            Curve::X25519 => "X25519",
+            Curve::NistP256 => "NIST P-256",
+            Curve::NistP384 => "NIST P-384",
+            Curve::NistP521 => "NIST P-521",
+            Curve::Secp256k1 => "secp256k1",
+            Curve::BrainpoolP256r1 => "brainpoolP256r1",
+            Curve::BrainpoolP384r1 => "brainpoolP384r1",
+            Curve::BrainpoolP512r1 => "brainpoolP512r1",
+        }
+    }
+
+    /// Field size in bits — selects the RFC 6637 ECDH KDF parameters.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        match self {
+            Curve::Ed25519 | Curve::X25519 => 255,
+            Curve::NistP256 | Curve::Secp256k1 | Curve::BrainpoolP256r1 => 256,
+            Curve::NistP384 | Curve::BrainpoolP384r1 => 384,
+            Curve::NistP521 => 521,
+            Curve::BrainpoolP512r1 => 512,
+        }
+    }
+
+    /// Whether the public point is the 32-byte 25519 form (which the OpenPGP
+    /// packet prefixes with `0x40`) rather than an uncompressed `04||X||Y`.
+    #[must_use]
+    pub const fn is_25519(self) -> bool {
+        matches!(self, Curve::Ed25519 | Curve::X25519)
+    }
+}
+
+/// The ECC algorithm id an attributes object starts with — which of the three
+/// ECC operations the slot performs. The values coincide with the OpenPGP
+/// public-key algorithm ids (RFC 4880 §9.1 / RFC 6637 §5), so the same byte
+/// goes into the v4 fingerprint packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EccKind {
+    /// `0x12` — ECDH (decryption slot).
+    Ecdh,
+    /// `0x13` — ECDSA (signature / authentication slots, Weierstrass curves).
+    Ecdsa,
+    /// `0x16` — EdDSA (signature / authentication slots, Ed25519).
+    EdDsa,
+}
+
+impl EccKind {
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            EccKind::Ecdh => 0x12,
+            EccKind::Ecdsa => 0x13,
+            EccKind::EdDsa => 0x16,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<EccKind> {
+        match id {
+            0x12 => Some(EccKind::Ecdh),
+            0x13 => Some(EccKind::Ecdsa),
+            0x16 => Some(EccKind::EdDsa),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            EccKind::Ecdh => "ECDH",
+            EccKind::Ecdsa => "ECDSA",
+            EccKind::EdDsa => "EdDSA",
+        }
+    }
+}
+
+/// A key algorithm a user can ask a slot to be set to. RSA sizes plus every
+/// [`Curve`]; the ECC *kind* (ECDH vs ECDSA/EdDSA) follows from the slot, see
+/// [`KeyAlg::attributes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAlg {
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    Ed25519,
+    X25519,
+    NistP256,
+    NistP384,
+    NistP521,
+    Secp256k1,
+    BrainpoolP256r1,
+    BrainpoolP384r1,
+    BrainpoolP512r1,
+}
+
+/// The requested algorithm cannot live in the requested slot: Ed25519 is a
+/// signing curve (signature / authentication only) and X25519 a key-agreement
+/// curve (decryption only). Reported rather than silently substituted, because
+/// the substitute would be a different key than the one asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotMismatch {
+    pub alg: KeyAlg,
+    pub crt: KeyCrt,
+}
+
+impl core::fmt::Display for SlotMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.alg {
+            KeyAlg::Ed25519 => write!(
+                f,
+                "Ed25519 is a signing curve and cannot go in the decryption slot; use X25519 there"
+            ),
+            KeyAlg::X25519 => write!(
+                f,
+                "X25519 is a key-agreement curve and only fits the decryption slot; use Ed25519 for signing or authentication"
+            ),
+            _ => write!(f, "{} cannot be used in the {:?} slot", self.alg.label(), self.crt),
+        }
+    }
+}
+
+impl std::error::Error for SlotMismatch {}
+
+impl KeyAlg {
+    /// Every algorithm, in menu order: RSA sizes first, then the curves.
+    pub const ALL: [KeyAlg; 12] = [
+        KeyAlg::Rsa2048,
+        KeyAlg::Rsa3072,
+        KeyAlg::Rsa4096,
+        KeyAlg::Ed25519,
+        KeyAlg::X25519,
+        KeyAlg::NistP256,
+        KeyAlg::NistP384,
+        KeyAlg::NistP521,
+        KeyAlg::Secp256k1,
+        KeyAlg::BrainpoolP256r1,
+        KeyAlg::BrainpoolP384r1,
+        KeyAlg::BrainpoolP512r1,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            KeyAlg::Rsa2048 => "RSA-2048",
+            KeyAlg::Rsa3072 => "RSA-3072",
+            KeyAlg::Rsa4096 => "RSA-4096",
+            KeyAlg::Ed25519 => Curve::Ed25519.label(),
+            KeyAlg::X25519 => Curve::X25519.label(),
+            KeyAlg::NistP256 => Curve::NistP256.label(),
+            KeyAlg::NistP384 => Curve::NistP384.label(),
+            KeyAlg::NistP521 => Curve::NistP521.label(),
+            KeyAlg::Secp256k1 => Curve::Secp256k1.label(),
+            KeyAlg::BrainpoolP256r1 => Curve::BrainpoolP256r1.label(),
+            KeyAlg::BrainpoolP384r1 => Curve::BrainpoolP384r1.label(),
+            KeyAlg::BrainpoolP512r1 => Curve::BrainpoolP512r1.label(),
+        }
+    }
+
+    /// The curve, for the ECC algorithms; `None` for RSA.
+    #[must_use]
+    pub const fn curve(self) -> Option<Curve> {
+        match self {
+            KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => None,
+            KeyAlg::Ed25519 => Some(Curve::Ed25519),
+            KeyAlg::X25519 => Some(Curve::X25519),
+            KeyAlg::NistP256 => Some(Curve::NistP256),
+            KeyAlg::NistP384 => Some(Curve::NistP384),
+            KeyAlg::NistP521 => Some(Curve::NistP521),
+            KeyAlg::Secp256k1 => Some(Curve::Secp256k1),
+            KeyAlg::BrainpoolP256r1 => Some(Curve::BrainpoolP256r1),
+            KeyAlg::BrainpoolP384r1 => Some(Curve::BrainpoolP384r1),
+            KeyAlg::BrainpoolP512r1 => Some(Curve::BrainpoolP512r1),
+        }
+    }
+
+    /// Modulus size, for the RSA algorithms; `None` for the curves.
+    #[must_use]
+    pub const fn rsa_bits(self) -> Option<u16> {
+        match self {
+            KeyAlg::Rsa2048 => Some(2048),
+            KeyAlg::Rsa3072 => Some(3072),
+            KeyAlg::Rsa4096 => Some(4096),
+            _ => None,
+        }
+    }
+
+    /// Which ECC operation this algorithm performs in `crt`'s slot: ECDH in the
+    /// decryption slot, EdDSA for Ed25519 elsewhere, ECDSA for the Weierstrass
+    /// curves elsewhere. Errors for RSA (no ECC kind) are not possible — RSA is
+    /// handled by [`KeyAlg::attributes`] directly; this returns [`SlotMismatch`]
+    /// for the 25519 curve/slot combinations that don't exist.
+    pub fn ecc_kind(self, crt: KeyCrt) -> Result<EccKind, SlotMismatch> {
+        let mismatch = SlotMismatch { alg: self, crt };
+        match (self, crt) {
+            (KeyAlg::Ed25519, KeyCrt::Decrypt) | (KeyAlg::X25519, KeyCrt::Sign | KeyCrt::Auth) => {
+                Err(mismatch)
+            }
+            (KeyAlg::Ed25519, _) => Ok(EccKind::EdDsa),
+            (_, KeyCrt::Decrypt) => Ok(EccKind::Ecdh),
+            (_, _) => Ok(EccKind::Ecdsa),
+        }
+    }
+
+    /// The algorithm-attributes value to PUT DATA into `crt`'s `C1`/`C2`/`C3`
+    /// so the next GENERATE produces this kind of key.
+    ///
+    /// RSA: `01 | n_bits(2) | e_bits = 0x0020 | format = 0x00` — the shape GnuPG
+    /// writes; the card may answer a later read with its own import-format
+    /// byte, which [`parse_algorithm_attributes`] reports faithfully. ECC:
+    /// `<ecc kind id> | <curve OID body>`.
+    pub fn attributes(self, crt: KeyCrt) -> Result<Vec<u8>, SlotMismatch> {
+        if let Some(bits) = self.rsa_bits() {
+            return Ok(vec![
+                0x01,
+                (bits >> 8) as u8,
+                (bits & 0xFF) as u8,
+                0x00,
+                0x20,
+                0x00,
+            ]);
+        }
+        let kind = self.ecc_kind(crt)?;
+        let curve = self.curve().expect("non-RSA KeyAlg has a curve");
+        let mut out = Vec::with_capacity(1 + curve.oid().len());
+        out.push(kind.id());
+        out.extend_from_slice(curve.oid());
+        Ok(out)
+    }
+}
+
+/// `PUT DATA C1`/`C2`/`C3` — write the algorithm attributes of `crt`'s slot
+/// (see [`KeyCrt::algo_attr_tag`]; build `attr` with [`KeyAlg::attributes`]).
+///
+/// Requires PW3. **Changing a slot's algorithm wipes the key in that slot** on
+/// every card that allows the change at all (OpenPGP Card spec v3.4 §4.4.3.9);
+/// the transport only does this immediately before a GENERATE that overwrites
+/// the slot anyway. Cards that don't allow it answer with an error status.
+#[must_use]
+pub fn put_algorithm_attributes(crt: KeyCrt, attr: &[u8]) -> Vec<u8> {
+    put_data(crt.algo_attr_tag(), attr)
 }
 
 // ---------------------------------------------------------------------------
@@ -842,6 +1272,114 @@ pub fn parse_rsa_algorithm_attributes(attr: &[u8]) -> Result<RsaAttributes, Pars
         e_bits,
         format,
     })
+}
+
+/// A slot's algorithm attributes (`C1`/`C2`/`C3`), decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlgorithmAttributes {
+    /// `01 | n_bits | e_bits | [format]`.
+    Rsa(RsaAttributes),
+    /// `<12|13|16> | <curve OID body> | [FF]`. The optional trailing `FF` means
+    /// the card wants ECC private-key imports to carry the public point too
+    /// (spec §4.4.3.10) — recorded, not acted on: ECC import is not in this
+    /// crate.
+    Ecc {
+        kind: EccKind,
+        curve: Curve,
+        import_with_public_key: bool,
+    },
+}
+
+impl AlgorithmAttributes {
+    /// The [`KeyAlg`] this is, if it's one keyroost offers (RSA 2048/3072/4096
+    /// or a modelled curve); `None` for e.g. RSA-1024.
+    #[must_use]
+    pub fn key_alg(&self) -> Option<KeyAlg> {
+        match *self {
+            AlgorithmAttributes::Rsa(r) => match r.n_bits {
+                2048 => Some(KeyAlg::Rsa2048),
+                3072 => Some(KeyAlg::Rsa3072),
+                4096 => Some(KeyAlg::Rsa4096),
+                _ => None,
+            },
+            AlgorithmAttributes::Ecc { curve, .. } => {
+                KeyAlg::ALL.into_iter().find(|a| a.curve() == Some(curve))
+            }
+        }
+    }
+
+    /// Display form: `RSA-2048`, `EdDSA Ed25519`, `ECDH X25519`, `ECDSA NIST P-256`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            AlgorithmAttributes::Rsa(r) => format!("RSA-{}", r.n_bits),
+            AlgorithmAttributes::Ecc { kind, curve, .. } => {
+                format!("{} {}", kind.label(), curve.label())
+            }
+        }
+    }
+}
+
+/// Parse a slot's algorithm attributes of any algorithm this crate models.
+///
+/// Errors: [`ParseError::UnexpectedLength`] for an empty object or a short RSA
+/// one; [`ParseError::UnsupportedAlgorithm`] for an unknown algorithm id or an
+/// ECC OID that isn't a modelled [`Curve`]. Use
+/// [`describe_algorithm_attributes`] where a failure must still render.
+pub fn parse_algorithm_attributes(attr: &[u8]) -> Result<AlgorithmAttributes, ParseError> {
+    let Some(&id) = attr.first() else {
+        return Err(ParseError::UnexpectedLength);
+    };
+    if id == 0x01 {
+        return parse_rsa_algorithm_attributes(attr).map(AlgorithmAttributes::Rsa);
+    }
+    let kind = EccKind::from_id(id).ok_or(ParseError::UnsupportedAlgorithm)?;
+    let oid = &attr[1..];
+    // The optional trailing import-format byte is `00` or `FF` (spec
+    // §4.4.3.10); GnuPG (scd/app-openpgp.c) strips either, and its YubiKey
+    // branch additionally tolerates a bogus trailing byte on 5.2 firmware by
+    // retrying with the last byte dropped. Mirror that: try the OID as-is
+    // first, and only if that fails, retry with the last byte dropped —
+    // remembering "with public key" only when the dropped byte was actually
+    // `FF`. No modelled OID ends in `00` or `FF` (OID last arcs are < 0x80),
+    // so neither strip is ambiguous.
+    let (curve, import_with_public_key) = match Curve::from_oid(oid) {
+        Some(curve) => (curve, false),
+        None => {
+            let Some((&last, rest)) = oid.split_last() else {
+                return Err(ParseError::UnsupportedAlgorithm);
+            };
+            let curve = Curve::from_oid(rest).ok_or(ParseError::UnsupportedAlgorithm)?;
+            (curve, last == 0xFF)
+        }
+    };
+    Ok(AlgorithmAttributes::Ecc {
+        kind,
+        curve,
+        import_with_public_key,
+    })
+}
+
+/// Best-effort display of raw algorithm attributes for status lines: the
+/// [`AlgorithmAttributes::label`] when they parse, otherwise an honest
+/// "unknown" rendering (`ECDSA (unknown curve <hex>)`, `algorithm 0x2A`), and
+/// `none` for an empty object.
+#[must_use]
+pub fn describe_algorithm_attributes(attr: &[u8]) -> String {
+    if let Ok(a) = parse_algorithm_attributes(attr) {
+        return a.label();
+    }
+    match attr.first() {
+        None => "none".to_string(),
+        Some(&id) => match EccKind::from_id(id) {
+            Some(kind) => {
+                let hex: String = attr[1..].iter().map(|b| format!("{b:02x}")).collect();
+                format!("{} (unknown curve {})", kind.label(), hex)
+            }
+            None if id == 0x01 => "RSA (malformed attributes)".to_string(),
+            None => format!("algorithm 0x{id:02X}"),
+        },
+    }
 }
 
 /// Encode `n` as a minimal big-endian byte sequence (no leading zeros).
@@ -1490,6 +2028,69 @@ pub fn parse_application_related_data(buf: &[u8]) -> Result<AppRelatedData, Pars
     })
 }
 
+/// The algorithms a card reports each slot accepts (from `FA`), as raw
+/// attribute values in the card's order. This is the device-driven answer to
+/// "what can I generate here" — no vendor table is consulted anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AlgorithmInformation {
+    pub sig: Vec<Vec<u8>>,
+    pub dec: Vec<Vec<u8>>,
+    pub aut: Vec<Vec<u8>>,
+}
+
+impl AlgorithmInformation {
+    /// Raw attribute values the card listed for `crt`'s slot.
+    #[must_use]
+    pub fn raw(&self, crt: KeyCrt) -> &[Vec<u8>] {
+        match crt {
+            KeyCrt::Sign => &self.sig,
+            KeyCrt::Decrypt => &self.dec,
+            KeyCrt::Auth => &self.aut,
+        }
+    }
+
+    /// The modelled [`KeyAlg`]s among them, deduplicated, in card order.
+    /// Entries keyroost can't offer (an unmodelled curve, RSA-1024) are left
+    /// out here but remain visible via [`raw`](Self::raw).
+    #[must_use]
+    pub fn key_algs(&self, crt: KeyCrt) -> Vec<KeyAlg> {
+        let mut out: Vec<KeyAlg> = Vec::new();
+        for attr in self.raw(crt) {
+            if let Some(alg) = parse_algorithm_attributes(attr)
+                .ok()
+                .and_then(|a| a.key_alg())
+            {
+                if !out.contains(&alg) {
+                    out.push(alg);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Parse the Algorithm Information (`FA`) object. `buf` may be the bare value
+/// or the full `FA` envelope. An object with no `C1`/`C2`/`C3` entries at all is
+/// reported as [`ParseError::MissingTag`] for [`TAG_ALGORITHM_INFORMATION`].
+pub fn parse_algorithm_information(buf: &[u8]) -> Result<AlgorithmInformation, ParseError> {
+    let top = parse_tlvs(buf)?;
+    let inner: &[u8] = find_tag(&top, TAG_ALGORITHM_INFORMATION).unwrap_or(buf);
+    let tlvs = parse_tlvs(inner)?;
+    let mut info = AlgorithmInformation::default();
+    for t in &tlvs {
+        match t.tag {
+            TAG_ALGO_ATTR_SIG => info.sig.push(t.value.to_vec()),
+            TAG_ALGO_ATTR_DEC => info.dec.push(t.value.to_vec()),
+            TAG_ALGO_ATTR_AUT => info.aut.push(t.value.to_vec()),
+            _ => {}
+        }
+    }
+    if info.sig.is_empty() && info.dec.is_empty() && info.aut.is_empty() {
+        return Err(ParseError::MissingTag(TAG_ALGORITHM_INFORMATION));
+    }
+    Ok(info)
+}
+
 /// Parse the digital-signature counter from a Security Support Template (`7A`).
 ///
 /// The counter is a 3-byte big-endian value carried in the `93` object nested
@@ -1505,36 +2106,36 @@ pub fn parse_signature_counter(buf: &[u8]) -> Result<u32, ParseError> {
     Ok((u32::from(v[0]) << 16) | (u32::from(v[1]) << 8) | u32::from(v[2]))
 }
 
-/// The RSA public key parsed from a GENERATE / READ PUBLIC KEY response.
-///
-/// The card returns a `7F49` constructed object; for an RSA key it carries the
-/// modulus *n* (tag `81`) and the public exponent *e* (tag `82`). Both are kept
-/// as raw big-endian bytes (a 2048-bit modulus is 256 bytes — note the card may
-/// or may not include a leading zero byte; we surface the value verbatim).
+/// The public key parsed from a GENERATE / READ PUBLIC KEY response (`7F49`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicKey {
-    /// RSA modulus *n* (`81`), big-endian.
-    pub modulus: Vec<u8>,
-    /// RSA public exponent *e* (`82`), big-endian (commonly `01 00 01`).
-    pub exponent: Vec<u8>,
+pub enum PublicKey {
+    /// RSA: modulus *n* (`81`) and public exponent *e* (`82`), big-endian
+    /// (the card may or may not include a leading zero byte; surfaced verbatim).
+    Rsa { modulus: Vec<u8>, exponent: Vec<u8> },
+    /// ECC: the public point (`86`) — uncompressed `04 || X || Y` for the
+    /// Weierstrass curves, the raw 32-byte point for Ed25519 / X25519.
+    Ecc { point: Vec<u8> },
 }
 
 /// Parse the public key from a GENERATE / READ PUBLIC KEY response.
 ///
 /// `buf` may be either the raw value of the `7F49` object *or* the full `7F49`
-/// envelope; both are accepted. Only the **RSA** case is decoded: the `81`
-/// modulus and `82` exponent are pulled out (a 2048-bit modulus forces a
-/// long-form `82` length, which [`parse_tlvs`] handles).
-///
-/// An ECC key carries an `86` public point instead of `81`/`82`; that case is
-/// reported as [`ParseError::MissingTag`] for [`TAG_RSA_MODULUS`] — callers that
-/// expect ECC should read the raw `86` value via [`parse_tlvs`]/[`find_nested`]
-/// against [`TAG_EC_PUBLIC_POINT`].
+/// envelope; both are accepted. An ECC key carries an `86` public point, which
+/// takes priority if present; otherwise the `81` modulus and `82` exponent of
+/// an RSA key are pulled out (a 2048-bit modulus forces a long-form `82`
+/// length, which [`parse_tlvs`] handles). Neither shape present is
+/// [`ParseError::MissingTag`] for [`TAG_RSA_MODULUS`].
 pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
     let top = parse_tlvs(buf)?;
     // Accept either the bare value or the wrapping 7F49 envelope.
     let inner: &[u8] = find_tag(&top, TAG_PUBLIC_KEY).unwrap_or(buf);
     let tlvs = parse_tlvs(inner)?;
+
+    if let Some(point) = find_nested(&tlvs, TAG_EC_PUBLIC_POINT) {
+        return Ok(PublicKey::Ecc {
+            point: point.to_vec(),
+        });
+    }
 
     let modulus = find_nested(&tlvs, TAG_RSA_MODULUS)
         .ok_or(ParseError::MissingTag(TAG_RSA_MODULUS))?
@@ -1543,7 +2144,7 @@ pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
         .ok_or(ParseError::MissingTag(TAG_RSA_EXPONENT))?
         .to_vec();
 
-    Ok(PublicKey { modulus, exponent })
+    Ok(PublicKey::Rsa { modulus, exponent })
 }
 
 #[cfg(test)]
@@ -1993,6 +2594,26 @@ mod tests {
     }
 
     #[test]
+    fn ecdh_cipher_do_exact_bytes() {
+        // A6 25 { 7F49 22 { 86 20 <32-byte point> } }
+        let point = [0x33u8; 32];
+        let d = ecdh_cipher_do(&point);
+        assert_eq!(&d[..2], &[0xA6, 0x25]);
+        assert_eq!(&d[2..5], &[0x7F, 0x49, 0x22]);
+        assert_eq!(&d[5..7], &[0x86, 0x20]);
+        assert_eq!(&d[7..], &point[..]);
+        assert_eq!(d.len(), 0x27);
+        // A 65-byte uncompressed P-256 point: A6 46 { 7F49 43 { 86 41 ... } }
+        let mut p256 = vec![0x04];
+        p256.extend_from_slice(&[0x55; 64]);
+        let d = ecdh_cipher_do(&p256);
+        assert_eq!(&d[..7], &[0xA6, 0x46, 0x7F, 0x49, 0x43, 0x86, 0x41]);
+        // The DO stays inside a short APDU: pso_decipher must emit the short form.
+        assert!(pso_decipher(&d).len() < 200);
+        assert_eq!(pso_decipher(&d)[4], d.len() as u8);
+    }
+
+    #[test]
     fn change_reference_data_bytes() {
         // Change PW1 (P2=81): old "123456" || new "654321".
         // 00 24 00 81 <Lc=0C> 31..36 36..31
@@ -2055,17 +2676,33 @@ mod tests {
         blob.extend_from_slice(&inner);
 
         let pk = parse_generated_public_key(&blob).expect("RSA public key parses");
-        assert_eq!(pk.modulus, modulus);
-        assert_eq!(pk.exponent, exponent.to_vec());
+        match pk {
+            PublicKey::Rsa {
+                modulus: m,
+                exponent: e,
+            } => {
+                assert_eq!(m, modulus);
+                assert_eq!(e, exponent.to_vec());
+            }
+            PublicKey::Ecc { .. } => panic!("expected RSA key"),
+        }
 
         // Bare value (without the 7F49 envelope) also works.
         let pk2 = parse_generated_public_key(&inner).expect("bare value parses");
-        assert_eq!(pk2.modulus, modulus);
-        assert_eq!(pk2.exponent, exponent.to_vec());
+        match pk2 {
+            PublicKey::Rsa {
+                modulus: m,
+                exponent: e,
+            } => {
+                assert_eq!(m, modulus);
+                assert_eq!(e, exponent.to_vec());
+            }
+            PublicKey::Ecc { .. } => panic!("expected RSA key"),
+        }
     }
 
     #[test]
-    fn parse_generated_public_key_ecc_reports_missing_modulus() {
+    fn parse_generated_public_key_ecc_point() {
         // An ECC key carries 86 (public point) instead of 81/82.
         let mut inner = Vec::new();
         inner.push(0x86);
@@ -2078,6 +2715,13 @@ mod tests {
         blob.extend_from_slice(&inner);
         assert_eq!(
             parse_generated_public_key(&blob),
+            Ok(PublicKey::Ecc {
+                point: vec![0x04; 32]
+            })
+        );
+        // A 7F49 with neither an RSA modulus nor an EC point is still an error.
+        assert_eq!(
+            parse_generated_public_key(&[0x7F, 0x49, 0x02, 0x99, 0x00]),
             Err(ParseError::MissingTag(TAG_RSA_MODULUS))
         );
     }
@@ -2195,12 +2839,104 @@ mod tests {
             ]
         );
 
-        // The PublicKey convenience wrapper agrees.
-        let key = PublicKey {
+        // The generic wrapper agrees when the attributes say RSA.
+        let key = PublicKey::Rsa {
             modulus: modulus.to_vec(),
             exponent: exponent.to_vec(),
         };
-        assert_eq!(rsa_v4_fingerprint_from(&key, 0x5D2C_0B00), fpr);
+        let attrs = AlgorithmAttributes::Rsa(RsaAttributes {
+            n_bits: 64,
+            e_bits: 17,
+            format: RsaImportFormat::Standard,
+        });
+        assert_eq!(v4_fingerprint(&key, &attrs, 0x5D2C_0B00), Ok(fpr));
+        // Key/attribute shape mismatch is an error, never a wrong fingerprint.
+        let ecc_attrs = AlgorithmAttributes::Ecc {
+            kind: EccKind::EdDsa,
+            curve: Curve::Ed25519,
+            import_with_public_key: false,
+        };
+        assert_eq!(
+            v4_fingerprint(&key, &ecc_attrs, 0),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn mpi_of_25519_point_has_263_bits() {
+        // 0x40 || 32 bytes: top byte 0x40 has 7 significant bits -> 7 + 256.
+        let mut p = vec![0x40];
+        p.extend_from_slice(&[0x42; 32]);
+        let m = mpi(&p);
+        assert_eq!(&m[..2], &[0x01, 0x07]);
+        assert_eq!(&m[2..], &p[..]);
+    }
+
+    #[test]
+    fn ecdh_kdf_params_follow_gnupg() {
+        assert_eq!(ecdh_kdf_params(Curve::X25519), [0x03, 0x01, 0x08, 0x07]);
+        assert_eq!(ecdh_kdf_params(Curve::NistP256), [0x03, 0x01, 0x08, 0x07]);
+        assert_eq!(ecdh_kdf_params(Curve::NistP384), [0x03, 0x01, 0x09, 0x08]);
+        assert_eq!(
+            ecdh_kdf_params(Curve::BrainpoolP512r1),
+            [0x03, 0x01, 0x0A, 0x09]
+        );
+        assert_eq!(ecdh_kdf_params(Curve::NistP521), [0x03, 0x01, 0x0A, 0x09]);
+    }
+
+    #[test]
+    fn ecc_v4_fingerprint_known_answers() {
+        // Vectors computed independently (SHA-1 over the RFC 4880 §12.2 packet
+        // with the RFC 6637 §9 field layout) — not derived from this code.
+        let t = 0x5D2C_0B00;
+        let p25519 = [0x42u8; 32]; // raw card form; packet form is 40||point
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::EdDsa, Curve::Ed25519, &p25519, t),
+            hex20("221e61835aa5b9db5f50718f35bf850566eec58a")
+        );
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::Ecdh, Curve::X25519, &p25519, t),
+            hex20("31645415dcaad2114d282ef24c8eded03d76cab6")
+        );
+        // A card that already prefixes 0x40 yields the same fingerprint.
+        let mut prefixed = vec![0x40];
+        prefixed.extend_from_slice(&p25519);
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::EdDsa, Curve::Ed25519, &prefixed, t),
+            hex20("221e61835aa5b9db5f50718f35bf850566eec58a")
+        );
+        let mut p256 = vec![0x04];
+        p256.extend_from_slice(&[0x11; 32]);
+        p256.extend_from_slice(&[0x22; 32]);
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::Ecdsa, Curve::NistP256, &p256, t),
+            hex20("01059cf3677f627f7b04600559ba4ab49e9e94ba")
+        );
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::Ecdh, Curve::NistP256, &p256, t),
+            hex20("d8d15006bb31e1366679a954494a35bea0a3541e")
+        );
+        // The generic wrapper routes by attributes.
+        let key = PublicKey::Ecc {
+            point: p25519.to_vec(),
+        };
+        let attrs = AlgorithmAttributes::Ecc {
+            kind: EccKind::Ecdh,
+            curve: Curve::X25519,
+            import_with_public_key: false,
+        };
+        assert_eq!(
+            v4_fingerprint(&key, &attrs, t),
+            Ok(hex20("31645415dcaad2114d282ef24c8eded03d76cab6"))
+        );
+    }
+
+    fn hex20(s: &str) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
     }
 
     // --- Key import: BER helpers -----------------------------------------
@@ -2273,6 +3009,121 @@ mod tests {
             parse_rsa_algorithm_attributes(&[0x16, 0x2B]),
             Err(ParseError::UnsupportedAlgorithm)
         );
+    }
+
+    #[test]
+    fn algorithm_attributes_parse_ecc_and_rsa() {
+        // The in-tree ARD fixture's C2 (ECDH cv25519) and C3 (EdDSA Ed25519).
+        let c2 = [
+            0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+        ];
+        assert_eq!(
+            parse_algorithm_attributes(&c2).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdh,
+                curve: Curve::X25519,
+                import_with_public_key: false
+            }
+        );
+        let c3 = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+        assert_eq!(
+            parse_algorithm_attributes(&c3).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::EdDsa,
+                curve: Curve::Ed25519,
+                import_with_public_key: false
+            }
+        );
+        // Optional trailing import-format byte FF ("import with public key").
+        let c1 = [0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0xFF];
+        assert_eq!(
+            parse_algorithm_attributes(&c1).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdsa,
+                curve: Curve::NistP256,
+                import_with_public_key: true
+            }
+        );
+        // RSA still goes through the RSA parser.
+        let rsa = [0x01, 0x08, 0x00, 0x00, 0x20, 0x02];
+        assert_eq!(
+            parse_algorithm_attributes(&rsa).unwrap(),
+            AlgorithmAttributes::Rsa(RsaAttributes {
+                n_bits: 2048,
+                e_bits: 32,
+                format: RsaImportFormat::Crt
+            })
+        );
+        // Optional trailing import-format byte 00 ("import without public key",
+        // the standard PKCS#8-ish form) parses the same as no trailing byte.
+        let c1_00 = [0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x00];
+        assert_eq!(
+            parse_algorithm_attributes(&c1_00).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdsa,
+                curve: Curve::NistP256,
+                import_with_public_key: false
+            }
+        );
+        // A bogus trailing byte (neither 00 nor FF, as seen on some YubiKey
+        // 5.2 firmware) is still tolerated by dropping it, per GnuPG.
+        let c3_bogus = [
+            0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01, 0x2A,
+        ];
+        assert_eq!(
+            parse_algorithm_attributes(&c3_bogus).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::EdDsa,
+                curve: Curve::Ed25519,
+                import_with_public_key: false
+            }
+        );
+        // Unknown curve, unknown id, empty: errors, never panics. Ed448
+        // (2B 65 70) stays unsupported even after the trailing-byte retry:
+        // dropping 70 leaves 2B 65, which is also not a modelled OID.
+        assert_eq!(
+            parse_algorithm_attributes(&[0x16, 0x2B, 0x65, 0x70]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+        assert_eq!(
+            parse_algorithm_attributes(&[0x2A, 0x00]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+        assert_eq!(
+            parse_algorithm_attributes(&[]),
+            Err(ParseError::UnexpectedLength)
+        );
+        assert_eq!(
+            parse_algorithm_attributes(&[0x16]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn algorithm_attributes_key_alg_and_labels() {
+        let a = parse_algorithm_attributes(&[0x12, 0x2B, 0x81, 0x04, 0x00, 0x22]).unwrap();
+        assert_eq!(a.key_alg(), Some(KeyAlg::NistP384));
+        assert_eq!(a.label(), "ECDH NIST P-384");
+        let r = parse_algorithm_attributes(&[0x01, 0x10, 0x00, 0x00, 0x20, 0x00]).unwrap();
+        assert_eq!(r.key_alg(), Some(KeyAlg::Rsa4096));
+        assert_eq!(r.label(), "RSA-4096");
+        // An RSA size we don't offer still labels honestly, just isn't a KeyAlg.
+        let odd = parse_algorithm_attributes(&[0x01, 0x04, 0x00, 0x00, 0x20, 0x00]).unwrap();
+        assert_eq!(odd.key_alg(), None);
+        assert_eq!(odd.label(), "RSA-1024");
+        // describe() never fails: the status line must render any card.
+        assert_eq!(
+            describe_algorithm_attributes(&[
+                0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01
+            ]),
+            "EdDSA Ed25519"
+        );
+        assert_eq!(
+            describe_algorithm_attributes(&[0x13, 0x2B, 0x65, 0x70]),
+            "ECDSA (unknown curve 2b6570)"
+        );
+        assert_eq!(describe_algorithm_attributes(&[0x2A]), "algorithm 0x2A");
+        assert_eq!(describe_algorithm_attributes(&[]), "none");
     }
 
     #[test]
@@ -2612,5 +3463,153 @@ mod manufacturer_tests {
         assert_eq!(manufacturer_name(0x0000), None); // test card
         assert_eq!(manufacturer_name(0xFFFF), None); // test card
         assert_eq!(manufacturer_name(0xFF42), None); // unmanaged S/N range
+    }
+
+    // --- Key algorithms: curves, attribute bytes ------------------------
+
+    #[test]
+    fn curve_oids_round_trip() {
+        for c in Curve::ALL {
+            assert_eq!(Curve::from_oid(c.oid()), Some(c), "{}", c.label());
+        }
+        assert_eq!(Curve::from_oid(&[0x2B, 0x65, 0x70]), None); // Ed448: not modelled
+        assert_eq!(Curve::from_oid(&[]), None);
+    }
+
+    #[test]
+    fn key_alg_attribute_bytes_exact() {
+        // EdDSA (16) + Ed25519 OID in the signature slot.
+        assert_eq!(
+            KeyAlg::Ed25519.attributes(KeyCrt::Sign).unwrap(),
+            vec![0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01]
+        );
+        // ECDH (12) + cv25519 OID in the decryption slot — the exact bytes of
+        // the in-tree ARD fixture's C2.
+        assert_eq!(
+            KeyAlg::X25519.attributes(KeyCrt::Decrypt).unwrap(),
+            vec![0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01]
+        );
+        // NIST curves: ECDSA (13) for sign/auth, ECDH (12) for decrypt.
+        assert_eq!(
+            KeyAlg::NistP256.attributes(KeyCrt::Auth).unwrap(),
+            vec![0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+        );
+        assert_eq!(
+            KeyAlg::NistP256.attributes(KeyCrt::Decrypt).unwrap(),
+            vec![0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+        );
+        assert_eq!(
+            KeyAlg::NistP384.attributes(KeyCrt::Sign).unwrap(),
+            vec![0x13, 0x2B, 0x81, 0x04, 0x00, 0x22]
+        );
+        // RSA: 01 | n_bits | e_bits=0020 | format=00 (standard), as GnuPG writes it.
+        assert_eq!(
+            KeyAlg::Rsa3072.attributes(KeyCrt::Sign).unwrap(),
+            vec![0x01, 0x0C, 0x00, 0x00, 0x20, 0x00]
+        );
+        assert_eq!(
+            KeyAlg::Rsa4096.attributes(KeyCrt::Decrypt).unwrap(),
+            vec![0x01, 0x10, 0x00, 0x00, 0x20, 0x00]
+        );
+    }
+
+    #[test]
+    fn key_alg_slot_mismatch_is_an_error_not_a_guess() {
+        // Ed25519 only signs; X25519 only agrees keys. Silently swapping one
+        // for the other would generate a different key than asked for.
+        let e = KeyAlg::Ed25519.attributes(KeyCrt::Decrypt).unwrap_err();
+        assert_eq!(
+            e,
+            SlotMismatch {
+                alg: KeyAlg::Ed25519,
+                crt: KeyCrt::Decrypt
+            }
+        );
+        assert!(e.to_string().contains("X25519"));
+        assert!(KeyAlg::X25519.attributes(KeyCrt::Sign).is_err());
+        assert!(KeyAlg::X25519.attributes(KeyCrt::Auth).is_err());
+        // Every other algorithm fits every slot.
+        for alg in KeyAlg::ALL {
+            if matches!(alg, KeyAlg::Ed25519 | KeyAlg::X25519) {
+                continue;
+            }
+            for crt in [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth] {
+                assert!(alg.attributes(crt).is_ok(), "{} in {:?}", alg.label(), crt);
+            }
+        }
+    }
+
+    #[test]
+    fn put_algorithm_attributes_bytes() {
+        // 00 DA 00 C2 <Lc> <attr>
+        let attr = KeyAlg::X25519.attributes(KeyCrt::Decrypt).unwrap();
+        let apdu = put_algorithm_attributes(KeyCrt::Decrypt, &attr);
+        assert_eq!(&apdu[..5], &[0x00, 0xDA, 0x00, 0xC2, 0x0B]);
+        assert_eq!(&apdu[5..], &attr[..]);
+        assert_eq!(KeyCrt::Sign.algo_attr_tag(), TAG_ALGO_ATTR_SIG);
+        assert_eq!(KeyCrt::Auth.algo_attr_tag(), TAG_ALGO_ATTR_AUT);
+    }
+
+    #[test]
+    fn algorithm_information_parses_per_slot_lists() {
+        // FA { C1 rsa2048, C1 ed25519, C2 rsa2048, C2 x25519, C2 p256-ecdh, C3 ed25519, C3 rsa1024 }
+        let mut v = Vec::new();
+        let mut add = |tag: u8, val: &[u8]| {
+            v.push(tag);
+            v.push(val.len() as u8);
+            v.extend_from_slice(val);
+        };
+        add(0xC1, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+        add(
+            0xC1,
+            &[0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+        );
+        add(0xC2, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+        add(
+            0xC2,
+            &[
+                0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+            ],
+        );
+        add(
+            0xC2,
+            &[0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+        );
+        add(
+            0xC3,
+            &[0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+        );
+        add(0xC3, &[0x01, 0x04, 0x00, 0x00, 0x20, 0x00]); // RSA-1024: reported raw, not a KeyAlg
+        let mut blob = vec![0xFA, v.len() as u8];
+        blob.extend_from_slice(&v);
+
+        let info = parse_algorithm_information(&blob).unwrap();
+        assert_eq!(info.sig.len(), 2);
+        assert_eq!(info.dec.len(), 3);
+        assert_eq!(info.aut.len(), 2);
+        assert_eq!(
+            info.key_algs(KeyCrt::Sign),
+            vec![KeyAlg::Rsa2048, KeyAlg::Ed25519]
+        );
+        assert_eq!(
+            info.key_algs(KeyCrt::Decrypt),
+            vec![KeyAlg::Rsa2048, KeyAlg::X25519, KeyAlg::NistP256]
+        );
+        assert_eq!(info.key_algs(KeyCrt::Auth), vec![KeyAlg::Ed25519]);
+        assert_eq!(
+            info.raw(KeyCrt::Auth)[1],
+            vec![0x01, 0x04, 0x00, 0x00, 0x20, 0x00]
+        );
+        // Bare value (no FA envelope) parses the same.
+        assert_eq!(parse_algorithm_information(&v).unwrap(), info);
+        // Nothing usable: error.
+        assert_eq!(
+            parse_algorithm_information(&[0x99, 0x01, 0x00]),
+            Err(ParseError::MissingTag(TAG_ALGORITHM_INFORMATION))
+        );
+        assert_eq!(
+            get_algorithm_information(),
+            vec![0x00, 0xCA, 0x00, 0xFA, 0x00]
+        );
     }
 }

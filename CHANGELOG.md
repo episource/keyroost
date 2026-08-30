@@ -7,6 +7,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **OpenPGP keys in modern algorithms.** `openpgp generate-key --algorithm`
+  (and the GUI's Generate dialog) can set a slot to Ed25519, X25519, NIST
+  P-256/384/521, secp256k1, brainpool 256/384/512, or RSA 2048/3072/4096
+  before generating; previously a slot could only ever produce its factory
+  default (RSA-2048). The menu comes from the card's own algorithm list
+  (`openpgp algorithms`, new) when it publishes one. `sign`/`authenticate`
+  frame input correctly for ECC slots, `decrypt` performs ECDH on an ECDH
+  slot, and `status` names the curve. Verified on a YubiKey 5.7. Requested
+  by @mdedonno1337. ([#106])
+
 - **OTP codes on a Token2 key can be put behind a PIN.** Keys running the
   R3.4 OTP applet can require a PIN before they hand out codes: `otp
   set-pin` protects a key, `otp verify` opens the read window,
@@ -26,8 +36,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behaves exactly as before. Contributed by @token2. ([#107])
 
 ### Changed
+- Library API (`keyroost-openpgp`, `keyroost-transport`): `PublicKey` is now
+  an enum (`Rsa` / `Ecc`), `OpenPgpSession::generate_key` takes an optional
+  algorithm, `rsa_v4_fingerprint_from` is replaced by `v4_fingerprint`, and
+  `OpenPgpStatus` carries each slot's raw algorithm attributes. The CLI's
+  `openpgp status` (and its `--json` `*_algo` fields) now report
+  `RSA-2048` / `EdDSA Ed25519` rather than the bare family name.
+  `TransportError` gains two new variants — `OpenPgpSlotMismatch` (a
+  requested algorithm that can't live in the requested slot) and
+  `OpenPgpSlotNotRsa` (an RSA-only operation, i.e. key import, run against a
+  slot that holds an ECC key) — so an exhaustive match over `TransportError`
+  needs new arms.
+
 - Library API (`keyroost-token2otp`): `EncryptError` gains a `BadLength`
   variant (an exhaustive `match` needs a new arm).
+
 ### Fixed
 - **PIV cards that answer GET VERSION with more than three bytes can now be
   managed.** The Swissbit iShield Key 2 Pro replies to the Yubico version
@@ -945,6 +968,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
 [#104]: https://github.com/framefilter/keyroost/pull/104
+[#106]: https://github.com/framefilter/keyroost/issues/106
 [#107]: https://github.com/framefilter/keyroost/issues/107
 [#110]: https://github.com/framefilter/keyroost/pull/110
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
