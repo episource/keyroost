@@ -1452,23 +1452,24 @@ impl PivCredModal {
 struct PivState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::PivStatus>,
-    /// Per-slot detail, in canonical slot order, gathered on each refresh: the
-    /// key algorithm (see [`keyroost_transport::PivSession::slot_key_algorithm`]
-    /// — GET METADATA where authoritative, else the slot certificate's
+    /// Per-slot detail, in canonical slot order, from the single
+    /// [`keyroost_transport::PivSession::status_detailed`] call each refresh
+    /// makes: the key algorithm (GET METADATA where authoritative, else a key
+    /// generated this app run, else the slot certificate's
     /// SubjectPublicKeyInfo; `None` means no key in the slot, on any PIV
     /// card), and the certificate's Subject DN (`None` if the slot has no
-    /// certificate or its DN failed to parse — degraded silently).
+    /// certificate or its DN failed to parse — degraded silently). Split out
+    /// of [`keyroost_transport::PivSlotDetail`] into the shape the pane draws.
     slot_keys: Vec<(
         keyroost_piv::Slot,
         Option<keyroost_piv::KeyAlg>,
         Option<String>,
     )>,
-    /// Per-slot PIN/touch policy, gathered alongside `slot_keys` on each
-    /// refresh (GET VERSION, then GET METADATA on firmware 5.3+ or the
-    /// ATTEST certificate's key-policy extension on older firmware — see
-    /// [`keyroost_transport::PivSession::slot_policy`]). `None` per-slot means
-    /// unavailable: no YubiKey-compatible extensions answered, not
-    /// necessarily an empty slot.
+    /// Per-slot PIN/touch policy, from the same `status_detailed` call that
+    /// fills `slot_keys` (GET METADATA's policy bytes on firmware 5.3+, else
+    /// the ATTEST certificate's key-policy extension on older firmware).
+    /// `None` per-slot means unavailable: no YubiKey-compatible extensions
+    /// answered, not necessarily an empty slot.
     slot_policies: Vec<(
         keyroost_piv::Slot,
         Option<(keyroost_piv::PinPolicy, keyroost_piv::TouchPolicy)>,
@@ -1563,11 +1564,11 @@ struct PivState {
     /// ([`keyroost_transport::PivSession::remember_pubkey`]) can't bridge
     /// "generate" to "sign a CSR with it" on its own; this map is what lets
     /// this pane still do that within one running app, on cards that don't
-    /// answer GET METADATA. Populated by `piv_generate_key`, consumed (via
+    /// answer GET METADATA. Populated by `piv_generate_key`; consumed (via
     /// `remember_pubkey`, seeded into a freshly-opened session before it needs
-    /// the key) by `load_piv_status`, `piv_self_sign`, and
-    /// `piv_request_csr`; invalidated by `piv_delete_key`, carried across by
-    /// `piv_move_key`, and cleared wholesale by `piv_reset`.
+    /// the key) by `load_piv_status`, `piv_self_sign`, and `piv_request_csr`;
+    /// invalidated by `piv_delete_key`, carried across by `piv_move_key`, and
+    /// cleared wholesale by `piv_reset`.
     pubkey_cache: std::collections::HashMap<u8, (keyroost_piv::KeyAlg, keyroost_piv::PublicKey)>,
 }
 
@@ -6485,64 +6486,48 @@ impl App {
             return;
         };
         let for_device = self.selected_device.clone();
-        // Snapshot before crossing the thread boundary: the job below opens a
-        // fresh `PivSession`, whose own in-session cache starts empty, so a
-        // slot generated earlier this app run needs to be handed back in via
-        // `remember_pubkey` — see `PivState::pubkey_cache`.
+        // Snapshot before crossing the thread boundary: the job opens a fresh
+        // `PivSession` that knows nothing of keys generated earlier this app
+        // run, so they are handed back via `remember_pubkey` for
+        // `status_detailed`'s algorithm fallback to name a slot GET METADATA
+        // can't describe yet — see `PivState::pubkey_cache`.
         let pubkey_cache = self.piv.pubkey_cache.clone();
         self.spawn_job("Reading PIV status\u{2026}", move || {
-            // Alongside the status, probe each slot's key algorithm —
-            // `PivSession::slot_key_algorithm` prefers GET METADATA (firmware
-            // 5.3+), then this session's key cache (seeded below from
-            // `pubkey_cache` on metadata-less firmware), and finally falls
-            // back to parsing the algorithm out of the slot certificate's
-            // SubjectPublicKeyInfo, so this works on any PIV card, not just a
-            // recent-enough YubiKey.
+            // One transport call gathers the snapshot and every slot's
+            // algorithm / Subject DN / PIN-touch policy, reading each slot's
+            // GET METADATA and certificate object exactly once. Doing this
+            // pane-side with `slot_key_algorithm` + `read_certificate` +
+            // `slot_policy` per slot re-read the certificate two or three
+            // times and GET METADATA twice (`PivSession` keeps no read cache).
             let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
-                let status = s.status();
-                let mut slot_keys = Vec::with_capacity(4);
-                let mut slot_policies = Vec::with_capacity(4);
                 for slot in keyroost_piv::Slot::all() {
                     if let Some((alg, key)) = pubkey_cache.get(&slot.key_ref()) {
                         s.remember_pubkey(slot, *alg, key.clone());
                     }
-                    let alg = s.slot_key_algorithm(slot);
-                    // Pull the slot's certificate (if any) and extract its
-                    // Subject DN for display. Any failure — no cert, read
-                    // error, or unparseable DER — degrades to `None` so the
-                    // pane never breaks on a malformed certificate.
-                    let subject = s
-                        .read_certificate(slot)
-                        .ok()
-                        .flatten()
-                        .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
-                        .map(|dn| dn.to_string());
-                    slot_keys.push((slot, alg, subject));
-                    // PIN/touch policy for display — GET VERSION, then GET
-                    // METADATA (fw 5.3+) or the ATTEST certificate's
-                    // key-policy extension (older fw). `None` means
-                    // unavailable, not necessarily an empty slot.
-                    slot_policies.push((slot, s.slot_policy(slot)));
                 }
-                (status, slot_keys, slot_policies)
+                s.status_detailed()
             });
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok((Ok(status), slot_keys, slot_policies)) => {
+                    Ok(Ok(detailed)) => {
+                        let keyroost_transport::PivStatusDetailed { status, slots } = detailed;
                         app.log_kind(
                             Severity::Ok,
                             kind,
-                            format!("PIV status read ({} slots)", slot_keys.len()),
+                            format!("PIV status read ({} slots)", slots.len()),
                         );
+                        app.piv.slot_keys = slots
+                            .iter()
+                            .map(|d| (d.slot, d.algorithm, d.subject.clone()))
+                            .collect();
+                        app.piv.slot_policies = slots.iter().map(|d| (d.slot, d.policy)).collect();
                         app.piv.status = Some(status);
-                        app.piv.slot_keys = slot_keys;
-                        app.piv.slot_policies = slot_policies;
                         app.piv.loaded = true;
                     }
-                    Ok((Err(e), _, _)) | Err(e) => {
+                    Ok(Err(e)) | Err(e) => {
                         app.log_kind(Severity::Err, kind, format!("PIV status read: {e}"));
                         app.piv.error = Some(e.to_string());
                     }
