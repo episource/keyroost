@@ -6,6 +6,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`piv self-sign` and `piv request-cert` can generate the key first.**
+  `--generate-key` folds a fresh `generate-key` into the signing command,
+  with the same `--algorithm`, `--pin-policy` and `--touch-policy` options,
+  so cards without GET METADATA no longer need the `--save-pubkey` /
+  `--load-pubkey` detour. Contributed by @episource. ([#116])
+- **The activity log now covers PIV.** User actions and background reads
+  are told apart, and with tracing on each APDU appears by name (for example
+  `GET DATA 5FC105`) with the same redaction as `--debug`. The log can be
+  detached into its own window and cleared. Contributed by @episource.
+  ([#114])
+- **OpenPGP keys in modern algorithms.** `openpgp generate-key --algorithm`
+  (and the GUI's Generate dialog) can set a slot to Ed25519, X25519, NIST
+  P-256/384/521, secp256k1, brainpool 256/384/512, or RSA 2048/3072/4096
+  before generating; previously a slot could only ever produce its factory
+  default (RSA-2048). The menu comes from the card's own algorithm list
+  (`openpgp algorithms`, new) when it publishes one. `sign`/`authenticate`
+  frame input correctly for ECC slots, `decrypt` performs ECDH on an ECDH
+  slot, and `status` names the curve. Verified on a YubiKey 5.7. Requested
+  by @mdedonno1337. ([#106])
+
+- **OTP codes on a Token2 key can be put behind a PIN.** Keys running the
+  R3.4 OTP applet can require a PIN before they hand out codes: `otp
+  set-pin` protects a key, `otp verify` opens the read window,
+  `otp change-pin` / `otp remove-pin` manage it, `otp pin-status` reports
+  whether one is set and how many attempts remain, and `list` / `add` /
+  `delete` take `--pin-env` or `--pin-stdin` to unlock in passing (the
+  PIN is never an argument). The GUI's OTP pane grows an unlock prompt, a
+  set/change/remove dialog and a "Lock now" action. The PIN travels
+  encrypted under a per-connection ECDH session and is never sent in the
+  clear. Two things to know before setting one: there is no reset — an
+  exhausted retry counter is recoverable only by erasing every OTP entry
+  on the key — and keyroost does not verify the device's P-521 agreement
+  signature, so over NFC an attacker who runs the key agreement can take
+  one verify blob away and brute-force a numeric PIN offline without
+  touching the retry counter. Keys without the feature are unaffected:
+  they answer the capability probe with "no such command" and everything
+  behaves exactly as before. Contributed by @token2. ([#107])
+
+### Changed
+- Library API (`keyroost-openpgp`, `keyroost-transport`): `PublicKey` is now
+  an enum (`Rsa` / `Ecc`), `OpenPgpSession::generate_key` takes an optional
+  algorithm, `rsa_v4_fingerprint_from` is replaced by `v4_fingerprint`, and
+  `OpenPgpStatus` carries each slot's raw algorithm attributes. The CLI's
+  `openpgp status` (and its `--json` `*_algo` fields) now report
+  `RSA-2048` / `EdDSA Ed25519` rather than the bare family name.
+  `TransportError` gains two new variants — `OpenPgpSlotMismatch` (a
+  requested algorithm that can't live in the requested slot) and
+  `OpenPgpSlotNotRsa` (an RSA-only operation, i.e. key import, run against a
+  slot that holds an ECC key) — so an exhaustive match over `TransportError`
+  needs new arms.
+
+- Library API (`keyroost-token2otp`): `EncryptError` gains a `BadLength`
+  variant (an exhaustive `match` needs a new arm).
+
 ### Fixed
 - **Certificate import and signing now work on contact (T=0) smart-card
   readers.** Large PIV commands were sent as extended-length APDUs first,
@@ -16,6 +71,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the negotiated protocol and chains from the start on T=0; T=1 links are
   unchanged. Reported by @mdedonno1337, who also confirmed the chained path
   works on the affected card. ([#103])
+- The PIV slot tabs wrap instead of overflowing in a narrow window.
+  Contributed by @episource. ([#114])
+- **PIV cards that answer GET VERSION with more than three bytes can now be
+  managed.** The Swissbit iShield Key 2 Pro replies to the Yubico version
+  extension with four bytes; keyroost rejected the reply and with it the
+  card. The version is now kept as the card sent it and shown as-is (dotted
+  for up to four bytes, hex beyond), and the firmware checks that gate
+  YubiKey-specific behaviour compare the leading bytes exactly as before.
+  Contributed by @episource. ([#110])
 - **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet
   answers management-key authentication without the final card-to-host
   proof, which keyroost treated as a failure. A card that accepts the
@@ -926,6 +990,11 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#102]: https://github.com/framefilter/keyroost/pull/102
 [#103]: https://github.com/framefilter/keyroost/issues/103
 [#104]: https://github.com/framefilter/keyroost/pull/104
+[#106]: https://github.com/framefilter/keyroost/issues/106
+[#107]: https://github.com/framefilter/keyroost/issues/107
+[#110]: https://github.com/framefilter/keyroost/pull/110
+[#114]: https://github.com/framefilter/keyroost/pull/114
+[#116]: https://github.com/framefilter/keyroost/pull/116
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8

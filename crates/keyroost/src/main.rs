@@ -566,6 +566,12 @@ struct OpenPgpState {
     /// Every per-key action — generate on-card, import — targets this key, the
     /// same way the PIV pane's `selected_slot` drives its per-slot cards.
     selected_key: OpenPgpSlotSel,
+    /// Algorithm chosen in the Generate-key modal for the selected slot.
+    gen_alg: OpenPgpKeyAlgSel,
+    /// The card's own Algorithm Information (`FA`) object, when it publishes
+    /// one — feeds the Generate-key modal's algorithm choices. `None` means
+    /// the card didn't publish one (pre-3.4 cards), not that it has none.
+    supported: Option<keyroost_transport::AlgorithmInformation>,
     /// Path to an RSA key file for import-from-file (text-entered).
     import_path: String,
     /// Change-user-PIN (PW1) old/new entries. Cleared after use.
@@ -1264,14 +1270,61 @@ impl OpenPgpSlotSel {
             OpenPgpSlotSel::Auth => "Authentication",
         }
     }
-    /// This key's algorithm id and fingerprint out of an `OpenPgpStatus`,
-    /// so the per-key state line can read directly from the selected key.
-    fn status_fields(self, st: &keyroost_transport::OpenPgpStatus) -> (Option<u8>, &[u8; 20]) {
+    /// This key's raw algorithm attributes and fingerprint out of an
+    /// `OpenPgpStatus`, so the per-key state line can read directly from the
+    /// selected key.
+    fn status_fields(self, st: &keyroost_transport::OpenPgpStatus) -> (&[u8], &[u8; 20]) {
         match self {
-            OpenPgpSlotSel::Sign => (st.sig_algo_id, &st.fingerprint_sig),
-            OpenPgpSlotSel::Decrypt => (st.dec_algo_id, &st.fingerprint_dec),
-            OpenPgpSlotSel::Auth => (st.aut_algo_id, &st.fingerprint_aut),
+            OpenPgpSlotSel::Sign => (&st.sig_attrs, &st.fingerprint_sig),
+            OpenPgpSlotSel::Decrypt => (&st.dec_attrs, &st.fingerprint_dec),
+            OpenPgpSlotSel::Auth => (&st.aut_attrs, &st.fingerprint_aut),
         }
+    }
+}
+
+/// OpenPGP key-generation algorithm selector: the slot's current algorithm
+/// ("card default"), or an explicit one.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum OpenPgpKeyAlgSel {
+    #[default]
+    CardDefault,
+    Alg(keyroost_transport::OpenPgpKeyAlg),
+}
+
+impl OpenPgpKeyAlgSel {
+    fn to_alg(self) -> Option<keyroost_transport::OpenPgpKeyAlg> {
+        match self {
+            OpenPgpKeyAlgSel::CardDefault => None,
+            OpenPgpKeyAlgSel::Alg(a) => Some(a),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            OpenPgpKeyAlgSel::CardDefault => "Card default",
+            OpenPgpKeyAlgSel::Alg(a) => a.label(),
+        }
+    }
+    /// The menu for `crt`'s slot: what the card lists in its Algorithm
+    /// Information when it publishes one for that slot, else every algorithm
+    /// that fits the slot — unknown means offer the surface and let the card
+    /// answer, never a vendor table.
+    fn choices(
+        supported: Option<&keyroost_transport::AlgorithmInformation>,
+        crt: keyroost_transport::KeyCrt,
+    ) -> Vec<OpenPgpKeyAlgSel> {
+        let mut out = vec![OpenPgpKeyAlgSel::CardDefault];
+        let listed = supported.map(|i| i.key_algs(crt)).unwrap_or_default();
+        if !listed.is_empty() {
+            out.extend(listed.into_iter().map(OpenPgpKeyAlgSel::Alg));
+        } else {
+            out.extend(
+                keyroost_transport::OpenPgpKeyAlg::ALL
+                    .into_iter()
+                    .filter(|a| a.attributes(crt).is_ok())
+                    .map(OpenPgpKeyAlgSel::Alg),
+            );
+        }
+        out
     }
 }
 
@@ -1701,13 +1754,29 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(ctx: egui::Context) -> Self {
+    /// `apdu_trace`: shared with the "APDU trace" checkbox in the activity
+    /// log pane (see `App::activity_log`), read fresh at the start of every
+    /// job rather than fixed at spawn time, so toggling it takes effect on
+    /// the very next device operation. When on for a given job, that job's
+    /// APDU trace is captured (see `keyroost_transport::trace`) and handed to
+    /// its apply closure via `App::pending_trace`, for the next `log`/`log_bg`
+    /// call inside it to attach. One capture per job — this thread runs jobs
+    /// one at a time, start to finish, so "everything recorded between begin
+    /// and take" is exactly "everything this job's device I/O did".
+    fn spawn(
+        ctx: egui::Context,
+        apdu_trace: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let (result_tx, result_rx) = std::sync::mpsc::channel::<ApplyFn>();
         std::thread::Builder::new()
             .name("keyroost-worker".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
+                    let debug = apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
+                    if debug {
+                        keyroost_transport::trace::begin();
+                    }
                     // A panicking job must not kill the worker: that would
                     // disconnect the result channel and wedge the busy guard
                     // (spawn_job would reject every future job forever). Catch
@@ -1722,6 +1791,14 @@ impl Worker {
                                  re-plug the key if it stops responding",
                             );
                         }) as ApplyFn,
+                    };
+                    let apply = match debug.then(keyroost_transport::trace::take).flatten() {
+                        Some(trace) if !trace.is_empty() => Box::new(move |app: &mut App| {
+                            app.pending_trace = Some(trace);
+                            apply(app);
+                            app.pending_trace = None; // in case `apply` never logged
+                        }) as ApplyFn,
+                        _ => apply,
                     };
                     if result_tx.send(apply).is_err() {
                         break; // UI gone
@@ -1748,6 +1825,13 @@ fn main() -> eframe::Result<()> {
     if std::env::var_os("KEYROOST_X11").is_some() {
         std::env::remove_var("WAYLAND_DISPLAY");
     }
+
+    // Backs the "APDU trace" checkbox in the activity log pane (see
+    // `App::activity_log`): shared with the worker thread so a toggle takes
+    // effect on the very next device operation, off by default. Not a CLI
+    // flag — this is a runtime setting the user flips from the pane, not
+    // something decided once at launch.
+    let apdu_trace = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1805,11 +1889,12 @@ fn main() -> eframe::Result<()> {
                     accent: accent_idx,
                     colorblind,
                 }),
-                worker: Some(Worker::spawn(cc.egui_ctx.clone())),
+                worker: Some(Worker::spawn(cc.egui_ctx.clone(), apdu_trace.clone())),
                 egui_ctx: Some(cc.egui_ctx.clone()),
                 devices_dirty,
                 reader_watch: Some(reader_watch),
                 mds: ui::mds::MdsDb::load_bundled(),
+                apdu_trace,
                 ..Default::default()
             };
             Ok(Box::new(app))
@@ -1865,6 +1950,17 @@ struct App {
     draft: Draft,
     /// Rolling log of operations (newest last).
     log: Vec<LogLine>,
+    /// Backs the "APDU trace" checkbox in the activity log pane. Shared with
+    /// the worker thread (see `Worker::spawn`), which reads it fresh at the
+    /// start of every job — toggling the checkbox takes effect on the very
+    /// next device operation, not just future app runs.
+    apdu_trace: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The APDU trace captured for the job whose result is being applied
+    /// right now, if the checkbox was on and that job recorded anything.
+    /// Consumed (and cleared) by the first `log`/`log_bg` call in the apply closure;
+    /// `Worker::spawn` also clears it after the apply closure returns, so it
+    /// never bleeds into an unrelated, later log line.
+    pending_trace: Option<Vec<String>>,
     /// otpauth:// import dialog state.
     import_dialog: ImportDialog,
     /// Bulk-import dialog state.
@@ -1914,6 +2010,11 @@ struct App {
     colorblind: bool,
     /// Whether the activity-log drawer is open.
     log_open: bool,
+    /// Whether the activity log is popped out into its own OS window (viewport)
+    /// instead of the docked bottom drawer. Set by the header's detach icon,
+    /// cleared by "Reattach"; the window's own close button clears this *and*
+    /// `log_open` (collapsing the log). Only meaningful while `log_open` is true.
+    log_detached: bool,
     /// Open help topic id, or `None` when the popover is closed.
     help_open: Option<&'static str>,
     /// Anchor point (the clicked "?" button's left-bottom) for the popover.
@@ -2335,7 +2436,14 @@ struct BulkDialog {
 
 struct LogLine {
     severity: Severity,
+    kind: LogKind,
     text: String,
+    /// The APDU trace behind this entry, captured on the worker thread while
+    /// the "APDU trace" checkbox (see `App::activity_log`) was on. `None`
+    /// with the checkbox off, for an entry with no device I/O behind it, or
+    /// when a job recorded nothing. Printed in full under the entry —
+    /// exactly the lines the CLI's own `--debug` would print.
+    trace: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2344,6 +2452,19 @@ enum Severity {
     Ok,
     Warn,
     Err,
+}
+
+/// Whether a log entry reports something the user directly asked for (a
+/// button click that writes to, authenticates against, or otherwise acts on
+/// a device) or something the app did on its own — a device scan, a status
+/// sweep triggered by opening a tab or by selecting a device, a re-read that
+/// follows a write to refresh the pane. Rendered with distinct weight (see
+/// `App::activity_log`) so a quiet background poll never reads as though the
+/// user had just done something.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogKind {
+    User,
+    Background,
 }
 
 impl App {
@@ -2422,7 +2543,11 @@ impl App {
             // execution if there's no egui context, e.g. in tests).
             self.busy_jobs = 0;
             self.busy_label = None;
-            self.worker = self.egui_ctx.clone().map(Worker::spawn);
+            let apdu_trace = self.apdu_trace.clone();
+            self.worker = self
+                .egui_ctx
+                .clone()
+                .map(|ctx| Worker::spawn(ctx, apdu_trace));
             self.log(
                 Severity::Err,
                 "the background worker stopped unexpectedly and was restarted",
@@ -2499,10 +2624,55 @@ impl App {
         }
     }
 
+    /// Log something the user directly asked for: a write, an auth attempt,
+    /// an export — anything that happened because of a specific click.
+    /// Rendered at full weight (see `activity_log`). This is the visualization
+    /// every explicit Molto2 action already used; every other module's
+    /// explicit actions should log through this same entry point.
     fn log(&mut self, severity: Severity, text: impl Into<String>) {
+        self.log_kind(severity, LogKind::User, text);
+    }
+
+    /// Log something the app did on its own — a device scan, a status sweep
+    /// triggered by opening a tab or selecting a device, a re-read that
+    /// follows a write to refresh the pane. Rendered muted (see
+    /// `activity_log`) so it never competes visually with a user action.
+    fn log_bg(&mut self, severity: Severity, text: impl Into<String>) {
+        self.log_kind(severity, LogKind::Background, text);
+    }
+
+    fn log_kind(&mut self, severity: Severity, kind: LogKind, text: impl Into<String>) {
+        // The activity log is device-centric: nearly every entry reports
+        // something read from or done to the token currently in focus — a
+        // status sweep, a write, an auth attempt. Prefix that token's display
+        // name so the log stays legible when a session touches several keys.
+        // Fleet-level lines (device-scan counts, "selection moved on" reset
+        // notices) go through `log_global`, which skips the prefix.
+        let text = match self.selected_device() {
+            Some(d) => format!("{}: {}", d.title(), text.into()),
+            None => text.into(),
+        };
+        self.push_log(severity, kind, text);
+    }
+
+    /// Log without the selected-token prefix `log_kind` adds — for entries that
+    /// are about the device *fleet* or about a key that is no longer the
+    /// selection (so its name would be the wrong one to show).
+    fn log_global(&mut self, severity: Severity, kind: LogKind, text: impl Into<String>) {
+        self.push_log(severity, kind, text.into());
+    }
+
+    fn push_log(&mut self, severity: Severity, kind: LogKind, text: String) {
+        // The trace captured for whichever job's apply closure is running
+        // right now (see `Worker::spawn`), if any — attached to the first log
+        // line that closure produces, then consumed so a later, unrelated log
+        // call in the same frame doesn't also claim it.
+        let trace = self.pending_trace.take().filter(|t| !t.is_empty());
         self.log.push(LogLine {
             severity,
-            text: text.into(),
+            kind,
+            text,
+            trace,
         });
         // Keep the log bounded; oldest entries are least interesting.
         if self.log.len() > 200 {
@@ -2650,7 +2820,7 @@ impl App {
                             }
                         }
                         if app.slot_meta.is_none() {
-                            app.resweep_slot_meta();
+                            app.resweep_slot_meta(LogKind::Background);
                         }
                         app.log(Severity::Ok, format!("profile #{} written", p));
                     }
@@ -2690,7 +2860,7 @@ impl App {
                             }
                         }
                         if app.slot_meta.is_none() {
-                            app.resweep_slot_meta();
+                            app.resweep_slot_meta(LogKind::Background);
                         }
                         app.log(Severity::Ok, format!("title written on slot #{}", p));
                     }
@@ -2723,7 +2893,7 @@ impl App {
                             }
                         }
                         if app.slot_meta.is_none() {
-                            app.resweep_slot_meta();
+                            app.resweep_slot_meta(LogKind::Background);
                         }
                         match outcome {
                             SeedDeleteOutcome::Deleted => app.log(
@@ -2877,20 +3047,27 @@ impl App {
 
     /// Re-read all 100 public blocks and replace the slot list. Recovers the
     /// metadata display when a write found no existing list to patch (the
-    /// open-time sweep had failed, leaving `slot_meta` `None`).
-    fn resweep_slot_meta(&mut self) {
+    /// open-time sweep had failed, leaving `slot_meta` `None`). `kind` should
+    /// be `User` when this runs because the user clicked "Refresh slots", and
+    /// `Background` for every other caller — a write's own fallback re-sweep,
+    /// or any future automatic trigger — so the activity log renders each the
+    /// way it actually happened.
+    fn resweep_slot_meta(&mut self, kind: LogKind) {
         let Some(mut s) = self.take_molto_session() else {
             return;
         };
         self.spawn_job("Refreshing slots\u{2026}", move || {
             let meta = (0..PROFILES)
                 .map(|p| s.read_public_data(p))
-                .collect::<Result<Vec<_>, _>>()
-                .ok();
+                .collect::<Result<Vec<_>, _>>();
             Box::new(move |app: &mut App| {
                 app.session = Some(s);
-                if let Some(m) = meta {
-                    app.slot_meta = Some(m);
+                match meta {
+                    Ok(m) => {
+                        app.log_kind(Severity::Ok, kind, format!("{} slots read", m.len()));
+                        app.slot_meta = Some(m);
+                    }
+                    Err(e) => app.log_kind(Severity::Warn, kind, format!("slot refresh: {e}")),
                 }
             })
         });
@@ -4893,8 +5070,9 @@ impl App {
             } else {
                 String::new()
             };
-            app.log(
+            app.log_global(
                 Severity::Warn,
+                LogKind::User,
                 format!(
                     "a factory reset finished after the selection moved on \u{2014} wiped: \
                      {wiped_txt}; not wiped: {failed_txt}.{fido_txt} Re-select that key to see \
@@ -5282,8 +5460,9 @@ impl App {
             completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
         }) {
             if self.reset_arm.take().is_some() {
-                self.log(
+                self.log_global(
                     Severity::Warn,
+                    LogKind::User,
                     "the armed reset was cancelled \u{2014} the key it was armed for is no longer \
                      the one selected. Re-open \u{201C}Reset key\u{201D} on the key you want to \
                      wipe.",
@@ -5380,17 +5559,26 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OpenPGP status\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+            let result = (|| -> Result<
+                (
+                    keyroost_transport::OpenPgpStatus,
+                    Option<keyroost_transport::AlgorithmInformation>,
+                ),
+                TransportError,
+            > {
                 let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-                session.status()
+                let status = session.status()?;
+                let supported = session.supported_algorithms().unwrap_or(None);
+                Ok((status, supported))
             })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(status) => {
+                    Ok((status, supported)) => {
                         app.openpgp.status = Some(status);
+                        app.openpgp.supported = supported;
                         app.openpgp.loaded = true;
                     }
                     Err(e) => app.openpgp.error = Some(e.to_string()),
@@ -5508,12 +5696,13 @@ impl App {
         };
         let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let slot = self.openpgp.selected_key;
+        let alg = self.openpgp.gen_alg.to_alg();
         let creation_time = unix_now();
         self.openpgp.notice = None;
         self.spawn_job("Generating key… (touch the key if it blinks)", move || {
             let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, [u8; 20]), TransportError> {
                 let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                let _ = s.generate_key(slot.to_crt())?;
+                let _ = s.generate_key(slot.to_crt(), alg)?;
                 let fpr = s.register_key(slot.to_crt(), creation_time)?;
                 Ok((s.status()?, fpr))
             })();
@@ -5777,18 +5966,6 @@ fn typed_reset_modal(
     }
 }
 
-/// Map an OpenPGP algorithm id (first attribute byte) to a short label.
-fn algo_id_label(id: Option<u8>) -> &'static str {
-    match id {
-        Some(0x01) => "RSA",
-        Some(0x12) => "ECDH",
-        Some(0x13) => "ECDSA",
-        Some(0x16) => "EdDSA",
-        Some(_) => "other",
-        None => "none",
-    }
-}
-
 /// Lowercase hex of a byte slice.
 fn hex_lower(bytes: &[u8]) -> String {
     keyroost_proto::codec::hex_encode(bytes)
@@ -6027,12 +6204,34 @@ impl App {
                             .filter(|d| d.kind == DeviceKind::Key && !d.serial.is_empty())
                             .map(|d| d.serial.as_str()),
                     );
+                    // Background: every scan funnels through here, whether it
+                    // was kicked off by a hotplug event, the first-frame
+                    // auto-scan, or a "Refresh"/"Scan for devices" click — the
+                    // staggered burst that follows any of them (`pending_scans`)
+                    // makes "which scan did the user actually ask for" moot in
+                    // practice, so all of them log at the same, muted weight.
+                    app.log_global(
+                        Severity::Info,
+                        LogKind::Background,
+                        format!(
+                            "device scan: {} device{} found",
+                            devices.len(),
+                            if devices.len() == 1 { "" } else { "s" }
+                        ),
+                    );
                     app.devices = devices;
                     if changed {
                         app.on_device_selected();
                     }
                 }
-                Err(e) => App::apply_device_scan_failure(app, e),
+                Err(e) => {
+                    app.log_global(
+                        Severity::Warn,
+                        LogKind::Background,
+                        format!("device scan failed: {e}"),
+                    );
+                    App::apply_device_scan_failure(app, e);
+                }
             })
         });
     }
@@ -6119,6 +6318,8 @@ impl App {
         self.openpgp.notice = None;
         self.openpgp.name_input.clear();
         self.openpgp.url_input.clear();
+        self.openpgp.supported = None;
+        self.openpgp.gen_alg = OpenPgpKeyAlgSel::CardDefault;
         self.piv = PivState::default();
         // Typed secrets must never survive a selection change — a PIN entered
         // for one key would otherwise be sent to another (the OATH pane even
@@ -6148,8 +6349,9 @@ impl App {
         // key — and the outcome would land in whatever report is on screen.
         // An armed ceremony must not outlive the selection it was armed for.
         if self.reset_arm.take().is_some() {
-            self.log(
+            self.log_global(
                 Severity::Warn,
+                LogKind::User,
                 "the armed reset was cancelled \u{2014} selecting another key ends the ceremony. \
                  Re-open \u{201C}Reset key\u{201D} on the key you want to wipe.",
             );
@@ -6206,7 +6408,11 @@ impl App {
                 }
                 match result {
                     Ok((s, info, meta)) => {
-                        app.log(Severity::Ok, format!("opened Molto2 {}", info.serial));
+                        // Background: this fires automatically whenever a
+                        // Molto2 is selected, never from a click of the
+                        // user's own — same treatment as the device scan
+                        // that usually precedes it.
+                        app.log_bg(Severity::Ok, format!("opened Molto2 {}", info.serial));
                         // Enumeration's gentle probe usually fills these already;
                         // refresh them here as a fallback in case that read failed.
                         if let Some(id) = for_device.clone() {
@@ -6226,7 +6432,7 @@ impl App {
                         app.slot_meta = meta;
                         app.authenticated = false;
                     }
-                    Err(e) => app.log(Severity::Err, format!("open Molto2: {e}")),
+                    Err(e) => app.log_bg(Severity::Err, format!("open Molto2: {e}")),
                 }
             })
         });
@@ -6266,8 +6472,14 @@ impl App {
         });
     }
 
-    /// Read the selected card's read-only PIV status snapshot.
-    fn load_piv_status(&mut self) {
+    /// Read the selected card's read-only PIV status snapshot: status + every
+    /// slot's algorithm/subject/policy. `kind` should be `User` only when
+    /// this runs because the user clicked "Refresh" — the initial read when
+    /// the PIV tab is first opened, and the re-read every write triggers
+    /// afterwards to pick up what it changed, both pass `Background` so the
+    /// activity log renders them the way they actually happened (see
+    /// `LogKind`).
+    fn load_piv_status(&mut self, kind: LogKind) {
         self.piv.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             return;
@@ -6320,19 +6532,30 @@ impl App {
                 }
                 match result {
                     Ok((Ok(status), slot_keys, slot_policies)) => {
+                        app.log_kind(
+                            Severity::Ok,
+                            kind,
+                            format!("PIV status read ({} slots)", slot_keys.len()),
+                        );
                         app.piv.status = Some(status);
                         app.piv.slot_keys = slot_keys;
                         app.piv.slot_policies = slot_policies;
                         app.piv.loaded = true;
                     }
-                    Ok((Err(e), _, _)) | Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok((Err(e), _, _)) | Err(e) => {
+                        app.log_kind(Severity::Err, kind, format!("PIV status read: {e}"));
+                        app.piv.error = Some(e.to_string());
+                    }
                 }
             })
         });
     }
 
     /// Apply a PIV write result: on success store the notice and refreshed
-    /// status; on error store the message. Shared by every PIV write action.
+    /// status; on error store the message. Shared by every PIV write action —
+    /// also where every one of them logs, User-weight (the caller's `notice`
+    /// already says what happened in plain terms; a click landed here to
+    /// produce it).
     fn apply_piv_write(
         app: &mut App,
         result: Result<keyroost_transport::PivStatus, TransportError>,
@@ -6340,12 +6563,15 @@ impl App {
     ) {
         match result {
             Ok(status) => {
+                app.log(Severity::Ok, notice.clone());
                 app.piv.status = Some(status);
                 app.piv.error = None;
                 app.piv.notice = Some(notice);
                 // Re-read so per-slot key algorithms (and anything the write
-                // touched) reflect the new state without a manual Refresh.
-                app.load_piv_status();
+                // touched) reflect the new state without a manual Refresh —
+                // background: it's a side-effect re-read, not the action the
+                // user asked for (that's the log line just above).
+                app.load_piv_status(LogKind::Background);
                 // Any successful PIV write (delete, reset, move, ...) can change
                 // retired-slot occupancy; drop the cache so the retired tab
                 // re-reads fresh on its next open instead of showing stale
@@ -6362,6 +6588,7 @@ impl App {
                 }
             }
             Err(e) => {
+                app.log(Severity::Err, e.to_string());
                 app.piv.notice = None;
                 app.piv.error = Some(e.to_string());
             }
@@ -6546,6 +6773,10 @@ impl App {
                 wipe(&mut app.piv.mgmt_key_input);
                 match result {
                     Ok((pubkey, status)) => {
+                        app.log(
+                            Severity::Ok,
+                            format!("generated {} key in {}", alg.label(), slot.label()),
+                        );
                         app.piv.status = Some(status);
                         app.piv.error = None;
                         // Remember it for this app run so a later self-sign/CSR
@@ -6577,7 +6808,7 @@ impl App {
                         // generating and still doesn't), so without this
                         // refresh the pane would keep showing "empty" until
                         // some *other* write happened to trigger one.
-                        app.load_piv_status();
+                        app.load_piv_status(LogKind::Background);
                         // A retired slot's occupancy cache may now be stale
                         // (generation can target a retired slot); drop it so
                         // it re-reads fresh rather than keeping a cached
@@ -6589,6 +6820,7 @@ impl App {
                         app.piv.retired_occupancy = None;
                     }
                     Err(e) => {
+                        app.log(Severity::Err, e.to_string());
                         app.piv.notice = None;
                         app.piv.error = Some(e.to_string());
                     }
@@ -6850,8 +7082,21 @@ impl App {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(v) => app.piv.retired_occupancy = Some(v),
-                    Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok(v) => {
+                        // Background: this fires the first time the retired
+                        // slots section is expanded, or the move-key modal is
+                        // opened — neither is "the user asked to read retired
+                        // occupancy", it's incidental to something else.
+                        app.log_bg(
+                            Severity::Ok,
+                            format!("retired slot occupancy read ({} slots)", v.len()),
+                        );
+                        app.piv.retired_occupancy = Some(v);
+                    }
+                    Err(e) => {
+                        app.log_bg(Severity::Warn, format!("retired slot occupancy: {e}"));
+                        app.piv.error = Some(e.to_string());
+                    }
                 }
             })
         })
@@ -6984,10 +7229,15 @@ impl App {
                     wipe(&mut app.piv.sign_pin);
                     match result {
                         Ok(()) => {
+                            app.log(
+                                Severity::Ok,
+                                format!("certificate request signed for {}", slot.label()),
+                            );
                             app.piv.error = None;
                             app.piv.notice = Some("Certificate request signed and saved.".into());
                         }
                         Err(e) => {
+                            app.log(Severity::Err, e.to_string());
                             app.piv.notice = None;
                             app.piv.error = Some(e.to_string());
                         }
@@ -7032,10 +7282,15 @@ impl App {
             })();
             Box::new(move |app: &mut App| match result {
                 Ok(n) => {
+                    app.log(
+                        Severity::Ok,
+                        format!("exported {}-byte certificate from {}", n, slot.label()),
+                    );
                     app.piv.error = None;
                     app.piv.notice = Some(format!("Exported {}-byte DER certificate.", n));
                 }
                 Err(e) => {
+                    app.log(Severity::Err, e.to_string());
                     app.piv.notice = None;
                     app.piv.error = Some(e.to_string());
                 }
@@ -7183,11 +7438,21 @@ impl App {
                 return; // keep the field open so the user can correct it
             }
         }
-        let vendor = self
-            .devices
-            .iter()
-            .find(|d| d.serial == target.serial)
-            .map(|d| d.vendor.to_ascii_lowercase());
+        let live = self.devices.iter().find(|d| d.serial == target.serial);
+        let vendor = live.map(|d| d.vendor.to_ascii_lowercase());
+        // A key without an explicit friendly name still shows one — its model
+        // (see `DeviceView::title`). Resolving both sides of the change to a
+        // concrete display name means one message covers rename, first naming
+        // and clearing alike, with no special cases.
+        let implicit = live
+            .map(|d| d.model.clone())
+            .unwrap_or_else(|| "this key".to_string());
+        let old_display = target
+            .name_at_open
+            .clone()
+            .unwrap_or_else(|| implicit.clone());
+        let cleared = name.is_empty();
+        let new_display = if cleared { implicit } else { name.clone() };
         let mut keyring = keyroost_keyring::Keyring::load_default().unwrap_or_default();
         // Drop the target's prior name — by the name pinned at open, then by
         // serial as a belt-and-braces (covers a name changed under us). This
@@ -7214,7 +7479,18 @@ impl App {
             }
         }
         match keyring.save_default() {
-            Ok(_) => self.log(Severity::Ok, "name saved"),
+            // Name the before and after explicitly rather than leaning on the
+            // usual selected-token prefix: the device list still holds the old
+            // name here (the refresh below is what picks up the change), so the
+            // auto-prefix would show the pre-rename name.
+            Ok(_) => self.log_global(
+                Severity::Ok,
+                LogKind::User,
+                format!(
+                    "{new_display}: name {}, was {old_display}",
+                    if cleared { "cleared" } else { "saved" }
+                ),
+            ),
             Err(e) => self.log(Severity::Err, format!("save names: {e}")),
         }
         self.close_rename();
@@ -7230,6 +7506,13 @@ impl App {
             Some(topic)
         };
     }
+}
+
+/// `ViewportId` of the popped-out activity-log window — shared by the code that
+/// spawns it (`App::activity_log_window`) and the code that brings it to the
+/// front (the top bar's "Activity log" link while detached).
+fn activity_log_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("activity-log")
 }
 
 /// Current unix time as a float (for the OATH "copied" flash window).
@@ -7619,6 +7902,23 @@ fn piv_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivKeyAlgSel) {
         });
 }
 
+/// An OpenPGP key-algorithm picker combo, restricted to `choices` (the card's
+/// own Algorithm Information menu, or every algorithm that fits the slot).
+fn openpgp_keyalg_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut OpenPgpKeyAlgSel,
+    choices: &[OpenPgpKeyAlgSel],
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for &opt in choices {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
 /// A PIV PIN/touch policy value selectable in the Generate key modal's combo
 /// boxes: its display label and the full set of choices, in menu order.
 /// `Default` is always first — it's the initial selection, and the plain PIV
@@ -7925,6 +8225,57 @@ fn paint_x_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     );
 }
 
+/// The window body shared by the detach / reattach pair: a square shifted to the
+/// bottom-left with its top-right corner left open for the arrow. Drawn
+/// identically by both so the glyphs read as one control in two states. Of the
+/// 8pt top and right edges only 3pt is drawn — a deep `5.0` corner cut — so the
+/// frame stays well clear of the arrow that crosses that corner.
+fn paint_window_body(painter: &egui::Painter, center: egui::Pos2, s: egui::Stroke) {
+    let b = egui::Rect::from_min_size(center + egui::vec2(-6.0, -2.0), egui::vec2(8.0, 8.0));
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(b.right() - 5.0, b.top()),
+            b.left_top(),
+            b.left_bottom(),
+            b.right_bottom(),
+            egui::pos2(b.right(), b.top() + 5.0),
+        ],
+        s,
+    ));
+}
+
+/// A window frame with an arrow leaving its top-right corner — "pop this pane
+/// out into its own window". Mirrors the external-link affordance the top bar's
+/// "Learn \u{2197}" uses.
+fn paint_detach_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.3, color);
+    let painter = ui.painter();
+    paint_window_body(painter, center, s);
+    // Diagonal arrow crossing that corner, pointing out to the top-right.
+    let tip = center + egui::vec2(6.0, -6.0);
+    painter.line_segment([center + egui::vec2(-1.0, 1.0), tip], s);
+    painter.add(egui::Shape::line(
+        vec![tip + egui::vec2(-4.5, 0.0), tip, tip + egui::vec2(0.0, 4.5)],
+        s,
+    ));
+}
+
+/// The mirror of [`paint_detach_icon`]: same window frame, but the arrow flies
+/// *in* through the open corner — "dock this back into the main window". Its tip
+/// rests at the glyph centre, inside the body, pointing down-left; the head
+/// keeps the same clearance from the frame that the detach arrow does.
+fn paint_reattach_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.3, color);
+    let painter = ui.painter();
+    paint_window_body(painter, center, s);
+    let tip = center;
+    painter.line_segment([center + egui::vec2(6.0, -6.0), tip], s);
+    painter.add(egui::Shape::line(
+        vec![tip + egui::vec2(4.5, 0.0), tip, tip + egui::vec2(0.0, -4.5)],
+        s,
+    ));
+}
+
 /// Paint one selectable device row. The whole row is a single painter-drawn
 /// click target (no nested widgets), so clicking anywhere in it selects the
 /// device — fixing the "only the gaps are clickable" inconsistency.
@@ -8221,10 +8572,17 @@ impl eframe::App for App {
 
         self.top_bar(root_ui, &p);
         self.device_sidebar(root_ui, &p);
-        if self.log_open {
+        if self.log_open && !self.log_detached {
             self.activity_log(root_ui, &p);
         }
         self.central(root_ui, &p);
+
+        // Popped-out activity log: its own OS window, rendered every frame while
+        // detached. "Reattach" docks it back into the bottom drawer; the
+        // window's close button collapses the log entirely.
+        if self.log_open && self.log_detached {
+            self.activity_log_window(ctx, &p);
+        }
 
         // Modal dialogs (reused from the per-applet logic) + Molto2 import dialogs.
         self.render_reset_dialog(ctx);
@@ -8395,7 +8753,18 @@ impl App {
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
-                            self.log_open = !self.log_open;
+                            if self.log_detached {
+                                // The log is popped out into its own window;
+                                // the link brings that window forward rather
+                                // than toggling (and closing) the drawer that
+                                // isn't showing.
+                                ctx.send_viewport_cmd_to(
+                                    activity_log_viewport_id(),
+                                    egui::ViewportCommand::Focus,
+                                );
+                            } else {
+                                self.log_open = !self.log_open;
+                            }
                         }
                         ui.add_space(10.0);
                         ui.hyperlink_to(
@@ -8753,55 +9122,185 @@ impl App {
     /// Global activity-log drawer (bottom), replacing the Molto2-only log.
     fn activity_log(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
         egui::Panel::bottom("log")
-            .exact_size(180.0)
+            .resizable(true)
+            .default_size(180.0)
+            // Enough to still show the header when dragged down; capped so
+            // it can't swallow the whole window and crowd out the device
+            // pane above it.
+            .size_range(96.0..=560.0)
             .frame(panel_frame(p.bar, 16.0, 10.0))
             .show(root_ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("ACTIVITY LOG")
-                            .font(theme::f_bold(11.0))
-                            .color(p.txt3),
-                    );
-                    ui.add_space(6.0);
-                    theme::pill(ui, "live", p.ok, p.ok_soft());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, "Collapse").clicked() {
-                            self.log_open = false;
-                        }
-                        ui.add_space(4.0);
-                        if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
-                            let all = self
-                                .log
-                                .iter()
-                                .map(|l| l.text.clone())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            ui.ctx().copy_text(all);
-                            // The user copied non-secret log text over the
-                            // code; a pending auto-clear would clobber it.
-                            self.clipboard_clear_at = None;
-                        }
+                self.activity_log_body(ui, p, false);
+            });
+    }
+
+    /// Popped-out activity log: the same body rendered in its own OS window.
+    /// Shown every frame while `log_detached`. Closing the window collapses the
+    /// log entirely (same end state as the docked "Collapse" button); the
+    /// header's "Reattach" button docks it back into the drawer instead.
+    fn activity_log_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(
+            activity_log_viewport_id(),
+            egui::ViewportBuilder::default()
+                .with_title("keyroost \u{2014} Activity log")
+                .with_inner_size([620.0, 340.0])
+                .with_min_inner_size([340.0, 140.0]),
+            |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(panel_frame(p.bar, 16.0, 10.0))
+                    .show(ctx, |ui| {
+                        self.activity_log_body(ui, p, true);
                     });
-                });
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for line in &self.log {
-                            let color = match line.severity {
-                                Severity::Ok => p.ok,
-                                Severity::Warn => p.warn,
-                                Severity::Err => p.err,
-                                Severity::Info => p.txt2,
-                            };
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                }
+            },
+        );
+        if close_requested {
+            // The window's close button collapses the log outright, rather
+            // than dropping it back into the docked drawer.
+            self.log_open = false;
+            self.log_detached = false;
+        }
+    }
+
+    /// The activity log's contents — header row plus the scrolling entry list —
+    /// shared by the docked drawer and the popped-out window. `detached` picks
+    /// the outer-right window control: the detach icon (plus "Collapse") when
+    /// docked, its mirror image — the reattach icon — when popped out.
+    fn activity_log_body(&mut self, ui: &mut egui::Ui, p: &Palette, detached: bool) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("ACTIVITY LOG")
+                    .font(theme::f_bold(11.0))
+                    .color(p.txt3),
+            );
+            ui.add_space(6.0);
+            theme::pill(ui, "live", p.ok, p.ok_soft());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Window control at the outer right in both states: an icon-only
+                // affordance (detach glyph / its mirror) rather than a verb in
+                // the row of text actions. The hit box is a full button-height
+                // 32px tall so `Align::Center` lines the 18px glyph up with the
+                // adjacent buttons and the "APDU trace" checkbox — a bare 18px
+                // rect, allocated first in this row, centres against the row
+                // before the buttons have grown it and ends up sitting high.
+                let (wrect, wresp) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 32.0), egui::Sense::click());
+                if detached {
+                    paint_reattach_icon(ui, wrect.center(), p.txt2);
+                    if wresp
+                        .on_hover_text("Dock back into the main window")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.log_detached = false;
+                    }
+                } else {
+                    paint_detach_icon(ui, wrect.center(), p.txt2);
+                    if wresp
+                        .on_hover_text("Open in a separate window")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.log_detached = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Ghost, "Collapse").clicked() {
+                        self.log_open = false;
+                    }
+                }
+                ui.add_space(4.0);
+                if theme::button(ui, p, BtnKind::Ghost, "Clear").clicked() {
+                    // Drop every entry (and its APDU trace); the next device
+                    // operation starts the log fresh.
+                    self.log.clear();
+                }
+                ui.add_space(4.0);
+                if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
+                    // Traces ride along, indented under the entry they
+                    // belong to — the point of the APDU trace is
+                    // having the exact wire exchange to paste, not
+                    // just the summary.
+                    let all = self
+                        .log
+                        .iter()
+                        .map(|l| match &l.trace {
+                            Some(t) if !t.is_empty() => format!(
+                                "{}\n{}",
+                                l.text,
+                                t.iter()
+                                    .map(|apdu| format!("    {apdu}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                            _ => l.text.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.ctx().copy_text(all);
+                    // The user copied non-secret log text over the
+                    // code; a pending auto-clear would clobber it.
+                    self.clipboard_clear_at = None;
+                }
+                ui.add_space(10.0);
+                // Runtime toggle for the worker thread's APDU capture
+                // (see `Worker::spawn`) — no CLI flag, no restart:
+                // flip it, and the very next device operation's trace
+                // shows up under its log entry.
+                let mut trace_on = self.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
+                if ui.checkbox(&mut trace_on, "APDU trace").changed() {
+                    self.apdu_trace
+                        .store(trace_on, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        });
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for line in self.log.iter_mut() {
+                    let base = match line.severity {
+                        Severity::Ok => p.ok,
+                        Severity::Warn => p.warn,
+                        Severity::Err => p.err,
+                        Severity::Info => p.txt2,
+                    };
+                    // User actions render exactly as every explicit
+                    // Molto2 action always has: full-strength severity
+                    // color, no prefix. Background entries — a device
+                    // scan, a tab's initial status sweep, a re-read
+                    // that follows a write — are alpha-muted toward
+                    // the panel and get a leading "·", so the
+                    // distinction survives colorblind palettes too and
+                    // never reads as though the user just did
+                    // something.
+                    let (color, prefix, size) = match line.kind {
+                        LogKind::User => (base, "", 12.0),
+                        LogKind::Background => (theme::tint(base, 130), "\u{b7} ", 11.5),
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{prefix}{}", line.text))
+                            .font(theme::f_mono(size))
+                            .color(color),
+                    );
+                    // APDU trace ("APDU trace" checkbox above):
+                    // printed exactly like the CLI's own `--debug`
+                    // output — the same formatted lines, captured
+                    // verbatim (see `keyroost_transport::trace`) —
+                    // indented under the entry they belong to.
+                    if let Some(trace) = line.trace.as_ref() {
+                        for apdu in trace {
                             ui.label(
-                                egui::RichText::new(&line.text)
-                                    .font(theme::f_mono(12.0))
-                                    .color(color),
+                                egui::RichText::new(format!("    {apdu}"))
+                                    .font(theme::f_mono(10.5))
+                                    .color(p.txt3),
                             );
                         }
-                    });
+                    }
+                }
             });
     }
 
@@ -9414,7 +9913,7 @@ impl App {
                                 ui,
                                 &format!(
                                     "Signature \u{00B7} {}",
-                                    slot_summary(st.sig_algo_id, &st.fingerprint_sig)
+                                    slot_summary(&st.sig_attrs, &st.fingerprint_sig)
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -9423,7 +9922,7 @@ impl App {
                                 ui,
                                 &format!(
                                     "Encryption \u{00B7} {}",
-                                    slot_summary(st.dec_algo_id, &st.fingerprint_dec)
+                                    slot_summary(&st.dec_attrs, &st.fingerprint_dec)
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -9432,7 +9931,7 @@ impl App {
                                 ui,
                                 &format!(
                                     "Auth \u{00B7} {}",
-                                    slot_summary(st.aut_algo_id, &st.fingerprint_aut)
+                                    slot_summary(&st.aut_attrs, &st.fingerprint_aut)
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -12513,6 +13012,34 @@ impl App {
                             card_note(ui, p, "Authorizes writing the public-key URL.");
                         }
                         OpenPgpCredKind::GenerateKey => {
+                            let crt = self.openpgp.selected_key.to_crt();
+                            let choices =
+                                OpenPgpKeyAlgSel::choices(self.openpgp.supported.as_ref(), crt);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [96.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("Algorithm")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    ),
+                                );
+                                openpgp_keyalg_combo(
+                                    ui,
+                                    "openpgp-gen-alg",
+                                    &mut self.openpgp.gen_alg,
+                                    &choices,
+                                );
+                            });
+                            ui.add_space(4.0);
+                            if self.openpgp.supported.is_none() {
+                                card_note(
+                                    ui,
+                                    p,
+                                    "This card does not list its algorithms; the card \
+                                     rejects any it cannot do.",
+                                );
+                            }
                             self.openpgp_modal_admin_field(ui, p, kind);
                             card_note(
                                 ui,
@@ -13008,11 +13535,15 @@ impl App {
         // self.
         let sel_state: String = match &self.openpgp.status {
             Some(st) => {
-                let (algo, fpr) = selected.status_fields(st);
+                let (attrs, fpr) = selected.status_fields(st);
                 if fpr.iter().all(|&b| b == 0) {
                     "no key".to_string()
                 } else {
-                    format!("{} \u{00B7} fpr {}", algo_id_label(algo), hex_lower(fpr))
+                    format!(
+                        "{} \u{00B7} fpr {}",
+                        keyroost_transport::describe_algorithm_attributes(attrs),
+                        hex_lower(fpr)
+                    )
                 }
             }
             None => "read status to view this key".to_string(),
@@ -13176,6 +13707,7 @@ impl App {
         // Apply collected intents now that the card borrows have ended.
         if let Some(key) = clicked_key {
             self.openpgp.selected_key = key;
+            self.openpgp.gen_alg = OpenPgpKeyAlgSel::CardDefault;
         }
         if do_refresh {
             self.load_openpgp_status();
@@ -13202,7 +13734,7 @@ impl App {
     fn cap_piv(&mut self, ui: &mut egui::Ui, p: &Palette) {
         if !self.piv_tried && !self.busy() {
             self.piv_tried = true;
-            self.load_piv_status();
+            self.load_piv_status(LogKind::Background);
         }
         // Intents collected inside the UI closures and applied afterwards, so a
         // submit method's `&mut self` never overlaps a card's borrow.
@@ -13262,9 +13794,16 @@ impl App {
             // Status body: version / serial / PIN retries collapsed onto one
             // dotted line.
             if let Some(st) = &self.piv.status {
+                // Tolerant of any non-empty GET VERSION reply, not just real
+                // Yubico firmware's 3 bytes — some third-party PIV applets
+                // that answer this vendor extension at all use a different
+                // byte count (observed: a Swissbit iShield Key 2 Pro replies
+                // with 4).
                 let ver = st
                     .version
-                    .map_or("\u{2014}".to_string(), |(a, b, c)| format!("{a}.{b}.{c}"));
+                    .as_deref()
+                    .map(keyroost_piv::format_version_bytes)
+                    .unwrap_or_else(|| "\u{2014}".to_string());
                 let serial = st.serial.map_or("\u{2014}".to_string(), |s| s.to_string());
                 let retries = st
                     .pin_retries
@@ -13491,8 +14030,8 @@ impl App {
         // explain) when the loaded status reports an older — or unknown —
         // version. Clearing a certificate works everywhere.
         let can_delete_key = matches!(
-            self.piv.status.as_ref().and_then(|s| s.version),
-            Some(v) if v >= (5, 7, 0)
+            self.piv.status.as_ref().and_then(|s| s.version.as_deref()),
+            Some(v) if v >= [5, 7].as_slice()
         );
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
@@ -13500,16 +14039,18 @@ impl App {
         // of bold labels, the active one underlined with a 2px accent. Clicking
         // a tab selects that slot; every action card below targets it.
         ui.add_space(14.0);
-        {
-            let top = ui.cursor().top();
-            let strip = egui::Rect::from_min_max(
-                egui::pos2(ui.max_rect().left(), top - 4.0),
-                egui::pos2(ui.max_rect().right(), top + 30.0),
-            );
-            ui.painter().rect_filled(strip, 0.0, p.surface);
-        }
-        ui.horizontal(|ui| {
+        // Opaque surface behind the tab labels. The strip wraps to more than one
+        // line when the window is too narrow to hold every tab on one row — the
+        // slot cards below would otherwise be pinned to the unwrapped width of
+        // this row and spill past the pane's right edge. Because the wrapped
+        // height isn't known until the row is laid out, reserve a paint slot
+        // here and fill it from the row's real rect afterwards.
+        let strip_bg = ui.painter().add(egui::Shape::Noop);
+        let strip_resp = ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
+            // Rows are far enough apart that a wrapped second row clears the
+            // accent underline (drawn 6px below the row above) with margin.
+            ui.spacing_mut().item_spacing.y = 22.0;
             let tab = |ui: &mut egui::Ui, label: String, active: bool| -> bool {
                 let color = if active { p.txt } else { p.txt3 };
                 let resp = ui
@@ -13519,6 +14060,9 @@ impl App {
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
+                        // Each tab is one atom: it moves to the next row whole
+                        // rather than letting its own text break across two.
+                        .wrap_mode(egui::TextWrapMode::Extend)
                         .sense(egui::Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -13566,6 +14110,15 @@ impl App {
                 self.help_dot(ui, p, "piv-retired");
             }
         });
+        {
+            let row = strip_resp.response.rect;
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), row.top() - 4.0),
+                egui::pos2(ui.max_rect().right(), row.bottom() + 6.0),
+            );
+            ui.painter()
+                .set(strip_bg, egui::Shape::rect_filled(strip, 0.0, p.surface));
+        }
         // --- Retired-slot rail (only on the retired tab) --------------------
         // All twenty slots, listed the way the Molto2 view lists its profiles:
         // one row each, a filled dot on the right for the ones holding a key,
@@ -13940,7 +14493,7 @@ impl App {
             self.piv.selected_slot = slot;
         }
         if do_refresh {
-            self.load_piv_status();
+            self.load_piv_status(LogKind::User);
         }
         // The three buttons open the centered credential modal; the modal itself
         // (rendered once per frame) runs the actual op. Opening wipes any stale
@@ -14185,7 +14738,7 @@ impl App {
                         // so it works without authenticating. Covers a factory
                         // reset (which clears the list) and a failed open-sweep.
                         if theme::button(ui, p, BtnKind::Default, "Refresh slots").clicked() {
-                            self.resweep_slot_meta();
+                            self.resweep_slot_meta(LogKind::User);
                         }
                         ui.add_space(6.0);
                         if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
@@ -15122,17 +15675,48 @@ fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut
 }
 
 /// Summarize an OpenPGP key slot: its algorithm label, or "empty" when no key.
-fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
+fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
     if fpr.iter().all(|&b| b == 0) {
-        "empty"
+        "empty".to_string()
     } else {
-        algo_id_label(algo)
+        keyroost_transport::describe_algorithm_attributes(attrs)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openpgp_algorithm_choices_are_the_cards_list_or_everything() {
+        use keyroost_transport::{KeyCrt, OpenPgpKeyAlg};
+        // No FA: card default + every algorithm that fits the slot.
+        let all = OpenPgpKeyAlgSel::choices(None, KeyCrt::Decrypt);
+        assert_eq!(all[0], OpenPgpKeyAlgSel::CardDefault);
+        assert!(all.contains(&OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::X25519)));
+        assert!(!all.contains(&OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Ed25519)));
+        assert!(OpenPgpKeyAlgSel::choices(None, KeyCrt::Sign)
+            .contains(&OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Ed25519)));
+        // FA present: exactly what the card listed (modelled entries), in card order.
+        let info = keyroost_transport::AlgorithmInformation {
+            sig: vec![
+                vec![0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+                vec![0x01, 0x08, 0x00, 0x00, 0x20, 0x00],
+            ],
+            dec: vec![],
+            aut: vec![],
+        };
+        assert_eq!(
+            OpenPgpKeyAlgSel::choices(Some(&info), KeyCrt::Sign),
+            vec![
+                OpenPgpKeyAlgSel::CardDefault,
+                OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Ed25519),
+                OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Rsa2048)
+            ]
+        );
+        // A slot the card lists nothing for still offers everything (unknown ≠ none).
+        assert!(OpenPgpKeyAlgSel::choices(Some(&info), KeyCrt::Auth).len() > 1);
+    }
 
     /// #98: the top bar's version chip is the only place the running app
     /// states its version — keep it a well-formed "vX.Y.Z" so it never
@@ -16158,7 +16742,7 @@ mod tests {
     #[test]
     fn panicking_job_clears_busy_and_worker_survives() {
         let mut app = App {
-            worker: Some(Worker::spawn(egui::Context::default())),
+            worker: Some(Worker::spawn(egui::Context::default(), Default::default())),
             ..Default::default()
         };
         // Silence the panic backtrace this test intentionally triggers.
@@ -16205,7 +16789,7 @@ mod tests {
     #[test]
     fn worker_round_trip_applies_result_and_clears_busy() {
         let mut app = App {
-            worker: Some(Worker::spawn(egui::Context::default())),
+            worker: Some(Worker::spawn(egui::Context::default(), Default::default())),
             ..Default::default()
         };
         app.spawn_job("test", || Box::new(|app: &mut App| app.slot = 42));
@@ -16230,7 +16814,7 @@ mod tests {
     #[test]
     fn spawn_job_ignored_while_busy() {
         let mut app = App {
-            worker: Some(Worker::spawn(egui::Context::default())),
+            worker: Some(Worker::spawn(egui::Context::default(), Default::default())),
             ..Default::default()
         };
         // Occupy the worker with a job whose result we don't drain.

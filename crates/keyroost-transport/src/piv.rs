@@ -9,7 +9,7 @@
 //! PIN/PUK change and unblock, set-pin-retries, set-management-key, key
 //! generation, certificate import/export, and applet reset.
 
-use crate::TransportError;
+use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
@@ -126,9 +126,18 @@ fn map_reset_stage_error(e: TransportError) -> TransportError {
 /// A read-only snapshot of a PIV application's state.
 #[derive(Debug, Clone)]
 pub struct PivStatus {
-    /// Applet/firmware version `(major, minor, patch)` from the Yubico GET
-    /// VERSION extension, if the card supports it.
-    pub version: Option<(u8, u8, u8)>,
+    /// Reply to Yubico's proprietary `GET VERSION` extension (`INS FD`), raw
+    /// bytes, any non-empty length. Real Yubico firmware answers with exactly
+    /// 3 (`major.minor.patch`) — but this extension is implemented by many
+    /// devices beyond genuine YubiKeys (observed: a Swissbit iShield Key 2
+    /// Pro, an OpenFIPS201 build, answering `9000` with 4 bytes that don't
+    /// trace back to anything in OpenFIPS201's own source), so a reply here
+    /// means "answers this Yubico extension," not "is a YubiKey." `None` if
+    /// the card doesn't answer it, or answers empty. Feature gates (e.g.
+    /// [`move_key_supported`]) compare this directly as a byte slice rather
+    /// than requiring an exact 3-byte shape. See
+    /// [`keyroost_piv::format_version_bytes`] for display formatting.
+    pub version: Option<Vec<u8>>,
     /// Device serial (Yubico GET SERIAL; firmware 5+), if supported.
     pub serial: Option<u32>,
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when blocked,
@@ -236,12 +245,17 @@ impl PubkeyCache {
     }
 }
 
-/// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
-/// fw 5.7+ (Yubico). Unknown version → allow the attempt; the card refuses if
-/// it truly can't (belt-and-suspenders with the pre-check).
-fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
+/// Whether MOVE KEY is available given the reported firmware version — fw
+/// 5.7+ (Yubico). Compared as a plain byte slice, not a fixed 3-part tuple:
+/// [`PivStatus::version`] isn't guaranteed to be exactly 3 bytes, and slice
+/// order gets a length mismatch right on its own (`[5, 7] < [5, 7, 0] <
+/// [5, 7, 1] < [5, 8]`), so `[5, 7]` alone is a correct "5.7 or newer"
+/// threshold without needing a trailing zero. Unknown version → allow the
+/// attempt; the card refuses if it truly can't (belt-and-suspenders with the
+/// pre-check).
+fn move_key_supported(version: Option<&[u8]>) -> bool {
     match version {
-        Some((major, minor, _)) => major > 5 || (major == 5 && minor >= 7),
+        Some(v) => v >= [5, 7].as_slice(),
         None => true,
     }
 }
@@ -353,13 +367,16 @@ impl PivSession {
         })
     }
 
-    /// Yubico GET VERSION; `None` if the card doesn't support the extension.
-    fn version(&mut self) -> Option<(u8, u8, u8)> {
+    /// Yubico's proprietary GET VERSION extension (`INS FD`), raw reply
+    /// bytes, tolerant of any non-empty length — see [`PivStatus::version`]
+    /// for why. `None` if the command errors, the card answers a non-`9000`
+    /// status, or the reply is empty. Feature gates (`move_key_supported`,
+    /// the `new_enough` check in [`Self::delete_key`]) call this directly and
+    /// compare the raw bytes as a slice, rather than requiring an exact
+    /// 3-byte shape like real Yubico firmware's.
+    fn version(&mut self) -> Option<Vec<u8>> {
         let (data, sw) = self.transmit_full(&piv::get_version()).ok()?;
-        if sw != piv::SW_OK {
-            return None;
-        }
-        piv::parse_version(&data).ok()
+        (sw == piv::SW_OK && !data.is_empty()).then_some(data)
     }
 
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
@@ -463,13 +480,12 @@ impl PivSession {
             // Say so in the trace: the assurance on this card is one-sided,
             // and a reviewer (or a user wondering why a swapped card was
             // accepted) should be able to see that the weaker path was taken.
-            if self.debug {
-                eprintln!(
-                    "! piv authenticate: card returned no 0x82 challenge response; \
-                     accepting host-only (client) authentication — this card cannot \
-                     prove it holds the management key"
-                );
-            }
+            trace::line(self.debug, || {
+                "! piv authenticate: card returned no 0x82 challenge response; \
+                 accepting host-only (client) authentication — this card cannot \
+                 prove it holds the management key"
+                    .to_string()
+            });
             return Ok(());
         }
         // Verify the card encrypted our challenge correctly (authenticates the
@@ -616,12 +632,12 @@ impl PivSession {
         let tag = slot.cert_object_tag();
         let apdu = piv::put_data(&tag, &value);
         let sw = if self.chain_upfront() {
-            if self.debug {
-                eprintln!(
+            trace::line(self.debug, || {
+                format!(
                     "! piv import certificate: command chaining up front ({})",
                     self.chain_reason()
-                );
-            }
+                )
+            });
             self.transmit_chain(
                 "piv import certificate",
                 &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
@@ -632,12 +648,12 @@ impl PivSession {
             if sw == piv::SW_OK || !uses_extended_length(&apdu) {
                 sw
             } else {
-                if self.debug {
-                    eprintln!(
+                trace::line(self.debug, || {
+                    format!(
                         "! piv import certificate: extended length rejected (SW={sw:04X}); \
                          retrying with command chaining"
-                    );
-                }
+                    )
+                });
                 self.transmit_chain(
                     "piv import certificate",
                     &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
@@ -706,7 +722,10 @@ impl PivSession {
     /// [`authenticate_management`]: PivSession::authenticate_management
     pub fn delete_key(&mut self, slot: Slot) -> Result<(), TransportError> {
         // Version-gate: MOVE/DELETE KEY landed in YubiKey firmware 5.7.
-        let new_enough = matches!(self.version(), Some(v) if v >= (5, 7, 0));
+        // Compared as a byte slice, not a fixed 3-part tuple — see
+        // `move_key_supported`'s doc for why `[5, 7]` alone is the right
+        // threshold.
+        let new_enough = matches!(self.version(), Some(v) if v.as_slice() >= [5, 7].as_slice());
         if !new_enough {
             return Err(TransportError::PivFirmwareTooOld(
                 "deleting a key requires YubiKey firmware 5.7 or newer (older cards can only overwrite the slot)",
@@ -842,12 +861,12 @@ impl PivSession {
         let key_ref = slot.key_ref();
         let apdu = piv::general_auth_sign(alg, key_ref, prepared);
         let (data, sw) = if self.chain_upfront() {
-            if self.debug {
-                eprintln!(
+            trace::line(self.debug, || {
+                format!(
                     "! piv sign: command chaining up front ({})",
                     self.chain_reason()
-                );
-            }
+                )
+            });
             self.transmit_chain(
                 "piv sign",
                 &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
@@ -857,12 +876,12 @@ impl PivSession {
             if sw == piv::SW_OK || !uses_extended_length(&apdu) {
                 (data, sw)
             } else {
-                if self.debug {
-                    eprintln!(
+                trace::line(self.debug, || {
+                    format!(
                         "! piv sign: extended length rejected (SW={sw:04X}); retrying with \
                          command chaining"
-                    );
-                }
+                    )
+                });
                 self.transmit_chain(
                     "piv sign",
                     &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
@@ -1002,7 +1021,7 @@ impl PivSession {
                 "source and destination slots are the same",
             ));
         }
-        if !move_key_supported(self.version()) {
+        if !move_key_supported(self.version().as_deref()) {
             return Err(TransportError::PivFirmwareTooOld(
                 "moving a key requires YubiKey firmware 5.7 or newer",
             ));
@@ -1071,8 +1090,10 @@ impl PivSession {
         // no way back from the blocked PIN and PUK this path deliberately
         // creates. GET VERSION and GET SERIAL come from the same extension
         // family, so a card that answers neither is exactly the card that must
-        // be refused. Decide here, before the first wrong VERIFY: afterwards the
-        // damage is already done.
+        // be refused. Any-length answers count: a card that replies to GET
+        // VERSION with four bytes (Swissbit iShield Key 2 Pro) is still speaking
+        // the extension family, which is what this gate is asking. Decide here,
+        // before the first wrong VERIFY: afterwards the damage is already done.
         let st = self.status()?;
         if st.version.is_none() && st.serial.is_none() {
             return Err(TransportError::PivForceResetUnsupported);
@@ -1184,10 +1205,16 @@ impl PivSession {
         // returns recovered plaintext — redact uniformly so a future caller
         // can't leak through a trace.
         let resp_sensitive = apdu.get(1) == Some(&0x87);
+        // `describe` makes `transmit_applet` bracket every transmitted APDU —
+        // the caller's command and each GET RESPONSE / Le-corrected reissue —
+        // with a `>` line naming the command and a `<` line reading its status
+        // word. The CLI's `--debug` output and the GUI activity log both take
+        // this straight from `trace`, so it covers both.
         const IO: crate::AppletIo = crate::AppletIo {
             label: "piv",
             more_data_sw: piv::SW_MORE_DATA,
             get_response: piv::get_response,
+            describe: Some(describe_apdu),
         };
         crate::transmit_applet(
             &self.card,
@@ -1244,6 +1271,73 @@ const CHAIN_CHUNK: usize = 254;
 /// so byte 4 being the `0x00` extended-length marker is unambiguous.
 fn uses_extended_length(apdu: &[u8]) -> bool {
     apdu.get(4) == Some(&0x00)
+}
+
+/// The command-name string that precedes a PIV APDU in a `--debug` /
+/// activity-log trace. Resolves `apdu[1]` via [`piv::Instruction`], names the
+/// data object GET DATA / PUT DATA is aimed at, sharpens two more cases the INS
+/// byte alone leaves ambiguous, and falls back to the raw INS for an
+/// instruction this crate never builds.
+fn describe_apdu(apdu: &[u8]) -> String {
+    let Some(&ins) = apdu.get(1) else {
+        return "(malformed APDU)".to_string();
+    };
+    match piv::Instruction::from_code(ins) {
+        // GET DATA / PUT DATA both open their body with a `5C <len> <tag>`
+        // object selector — name what's being read/written, or show the raw
+        // tag when it's one we don't have a name for. (A chained PUT DATA's
+        // continuation chunks carry no selector and stay bare.)
+        Some(verb @ (piv::Instruction::GetData | piv::Instruction::PutData)) => {
+            let verb = verb.name();
+            match object_selector_tag(apdu) {
+                Some(tag) => {
+                    let hex = crate::hex_dump(tag);
+                    match piv::data_object_name(tag) {
+                        // Raw tag first, then its name — the tag is always shown
+                        // so an unfamiliar reader can cross-check the spec.
+                        Some(name) => format!("{verb} ({hex} \u{2192} {name})"),
+                        None => format!("{verb} ({hex})"),
+                    }
+                }
+                None => verb.to_string(),
+            }
+        }
+        // 0xF6 is MOVE KEY, or DELETE KEY when P1 is the 0xFF sentinel
+        // (`piv::delete_key` builds `00 F6 FF <slot>`).
+        Some(piv::Instruction::MoveKey) if apdu.get(2) == Some(&0xFF) => {
+            "DELETE KEY (yubico extension)".to_string()
+        }
+        // A bodyless VERIFY (`00 20 00 80`, no Lc) queries the PIN retry
+        // counter rather than presenting a PIN.
+        Some(piv::Instruction::Verify) if apdu.len() <= 4 => {
+            "VERIFY (retry-counter query)".to_string()
+        }
+        Some(known) => known.name().to_string(),
+        None => format!("INS {ins:#04X}"),
+    }
+}
+
+/// The data field of an APDU, handling both the short (`Lc` in one byte) and
+/// extended (`00 Lc_hi Lc_lo`) length encodings. Any trailing `Le` is ignored.
+fn command_data(apdu: &[u8]) -> Option<&[u8]> {
+    match apdu.get(4..)? {
+        [] => None,
+        // Extended length: 0x00 marker, then a two-byte Lc, then the body.
+        [0x00, hi, lo, rest @ ..] if !rest.is_empty() => {
+            rest.get(..(usize::from(*hi) << 8 | usize::from(*lo)))
+        }
+        // Short form: one Lc byte, then the body (possibly with a trailing Le).
+        [lc, rest @ ..] => rest.get(..usize::from(*lc)).or(Some(rest)),
+    }
+}
+
+/// The `5C <len> <tag>` object selector at the head of a GET DATA / PUT DATA
+/// body, if present.
+fn object_selector_tag(apdu: &[u8]) -> Option<&[u8]> {
+    match command_data(apdu)? {
+        [0x5C, len, rest @ ..] => rest.get(..usize::from(*len)),
+        _ => None,
+    }
 }
 
 /// `KEYROOST_PIV_FORCE_CHAINING` forces the command-chaining path (so the
@@ -1490,12 +1584,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn describe_apdu_names_the_command() {
+        assert_eq!(describe_apdu(&piv::select_full()), "SELECT");
+        assert_eq!(
+            describe_apdu(&piv::get_version()),
+            "GET VERSION (yubico extension)"
+        );
+        // GET DATA / PUT DATA name the object in their 5C selector; an
+        // unknown tag falls back to raw hex; both length encodings parse.
+        assert_eq!(
+            describe_apdu(&piv::get_data(&Slot::Authentication.cert_object_tag())),
+            "GET DATA (5F C1 05 \u{2192} X.509 Certificate for PIV Authentication)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::get_data(&[0x5F, 0xC1, 0x99])),
+            "GET DATA (5F C1 99)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::put_data(
+                &Slot::Signature.cert_object_tag(),
+                &[0x53, 0x00]
+            )),
+            "PUT DATA (5F C1 0A \u{2192} X.509 Certificate for Digital Signature)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::put_data_chained(&[0x5F, 0xC1, 0x0C], &[0x01], 254)[0]),
+            "PUT DATA (5F C1 0C \u{2192} Key History Object)"
+        );
+        // 0xF6 with the P1 == 0xFF sentinel is DELETE, not MOVE.
+        assert_eq!(
+            describe_apdu(&piv::delete_key(Slot::Signature)),
+            "DELETE KEY (yubico extension)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::move_key(Slot::Retired(1), Slot::Authentication)),
+            "MOVE KEY (yubico extension)"
+        );
+        // Bodyless VERIFY is a retry-counter query.
+        assert_eq!(
+            describe_apdu(&piv::verify_pin_status()),
+            "VERIFY (retry-counter query)"
+        );
+        assert!(describe_apdu(&piv::verify_pin(b"12345678").unwrap()).starts_with("VERIFY"));
+        // Unknown / malformed fall back rather than panic.
+        assert_eq!(describe_apdu(&[0x00, 0x99, 0x00, 0x00]), "INS 0x99");
+        assert_eq!(describe_apdu(&[]), "(malformed APDU)");
+    }
+
+    #[test]
     fn move_key_firmware_gate() {
         // MOVE KEY needs fw 5.7+. Below that -> refuse.
-        assert!(!move_key_supported(Some((5, 6, 0))));
-        assert!(move_key_supported(Some((5, 7, 0))));
-        assert!(move_key_supported(Some((5, 7, 4))));
-        assert!(move_key_supported(Some((6, 0, 0))));
+        assert!(!move_key_supported(Some(&[5, 6, 0])));
+        assert!(move_key_supported(Some(&[5, 7, 0])));
+        assert!(move_key_supported(Some(&[5, 7, 4])));
+        assert!(move_key_supported(Some(&[6, 0, 0])));
+        // A bare [5, 7] itself clears the bar too — slice order puts a
+        // shorter-but-otherwise-equal reply below anything with a 3rd byte,
+        // not above it (`[5, 7] < [5, 7, 0]`), so the threshold has to be
+        // written as [5, 7] rather than [5, 7, 0] to include it.
+        assert!(move_key_supported(Some(&[5, 7])));
         // Unknown version -> allow the attempt (card will reject if unsupported).
         assert!(move_key_supported(None));
     }

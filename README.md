@@ -51,13 +51,15 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   applet (`oath reset --yes`) — the recovery path for a forgotten password. In
   the GUI, secret fields have a reveal (eye) toggle so you can check an OTP
   secret before committing it.
-- **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
-  keygen or a PKCS#1/PKCS#8 PEM/DER file) for the signature, encryption, or
-  authentication slot — each writes the v4 fingerprint and a generation timestamp
-  so GnuPG recognizes the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a
-  client/SSH signature with the Authentication key via INTERNAL AUTHENTICATE);
-  set cardholder name / URL; change the user / admin PIN and unblock a locked
-  PIN; factory-reset the applet.
+- **OpenPGP card (v3.4)** — read status; generate keys on-card in any algorithm
+  the card accepts (RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
+  secp256k1, brainpool) for the signature, encryption, or authentication slot,
+  or import an RSA-2048 key (host keygen or a PKCS#1/PKCS#8 PEM/DER file) —
+  each writes the v4 fingerprint and a generation timestamp so GnuPG recognizes
+  the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a client/SSH
+  signature with the Authentication key via INTERNAL AUTHENTICATE); set
+  cardholder name / URL; change the user / admin PIN and unblock a locked PIN;
+  factory-reset the applet.
 - **PIV (SP 800-73-4)** — full management: status (applet/firmware version,
   serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
   generation, certificate import / export, self-signed certs or a CSR for a CA,
@@ -88,6 +90,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   directly on a Token2 FIDO security key and read their codes over USB-HID, NFC,
   or CCID; configure the single HOTP-on-touch keystroke slot; read the serial;
   and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
+  On R3.4+ keys the codes can be put behind an OTP PIN (`otp set-pin`,
+  `otp verify`, `otp change-pin`, `otp remove-pin`, `otp pin-status`); note
+  there is no PIN reset — a blocked PIN is recoverable only by erasing every
+  OTP entry.
 - **One-shot factory reset** — `keyroostctl factory-reset --yes` (and a card on
   the GUI device Overview tab) resets every resettable applet on a key in turn:
   OATH, OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
@@ -176,7 +182,10 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   and QR-from-screen import ([#50](https://github.com/framefilter/keyroost/pull/50));
   and the OTP secret-reveal toggle plus a Windows key-naming / anti-spoofing
   fix ([#52](https://github.com/framefilter/keyroost/pull/52),
-  [#56](https://github.com/framefilter/keyroost/pull/56)). Signs the Windows
+  [#56](https://github.com/framefilter/keyroost/pull/56)); and OTP-PIN
+  protection for R3.4+ keys, in the CLI and the GUI
+  ([#107](https://github.com/framefilter/keyroost/issues/107),
+  [#108](https://github.com/framefilter/keyroost/pull/108)). Signs the Windows
   and macOS release builds out-of-band.
 - **[@Algoritter](https://github.com/Algoritter)** — the project's first
   external code contribution: found, fixed and hardware-verified two
@@ -561,6 +570,12 @@ for slot in 9a 9c 9d 9e; do
   keyroostctl piv self-sign --slot "$slot" --subject "CN=$USER" \
       --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --reader yubikey
 done
+# on a card without GET METADATA (non-Yubico PIV, or Yubico firmware < 5.3)
+# the two steps can't share the key by slot name across invocations; fold
+# them into one so the fresh public key never needs a temp file:
+#   keyroostctl piv self-sign --slot 9a --subject "CN=$USER" --generate-key \
+#       --algorithm eccp256 --mgmt-key-env PIV_MGMT --pin-env PIV_PIN
+# (same --generate-key convenience on `piv request-cert`)
 
 # --- Token2 Molto2 (TOTP programming) ---
 keyroostctl molto info
@@ -620,7 +635,7 @@ old script.
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | `zeroize` |
-| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption, `zeroize` |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | none |
