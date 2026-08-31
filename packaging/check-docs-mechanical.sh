@@ -20,6 +20,9 @@
 #   5. Contributor credit trailing reality (it trailed by five PRs at the
 #      v0.7.8 audit). Reported as WARN — crediting judgment (aliases, who
 #      counts as a maintainer) belongs to the maintainer, not a script.
+#   6. A malformed changelog.d/ fragment (bad filename, missing credit ref,
+#      an overlong line) going unnoticed until release, when assembling it
+#      into CHANGELOG.md would either fail or ship a broken entry.
 #
 # Usage:
 #   packaging/check-docs-mechanical.sh
@@ -374,6 +377,18 @@ for k, name in sorted(seen.items()):
              f"section (alias? maintainer judgment applies)")
 if WARNS == warns_before:
     print(f"ok: all {len(seen)} non-bot, non-maintainer authors appear in README.md")
+
+# --- (f) changelog.d/ fragment validation -----------------------------------
+
+print()
+print("== (f) changelog.d/ fragment validation ==")
+r = subprocess.run([sys.executable, "packaging/assemble-changelog.py", "--check"],
+                   capture_output=True, text=True)
+for line in (r.stdout + r.stderr).splitlines():
+    print(line)
+if r.returncode != 0:
+    fail("changelog.d/ fragment validation failed (packaging/assemble-changelog.py "
+         "--check exited non-zero — see its output above)")
 
 # --- verdict ----------------------------------------------------------------
 

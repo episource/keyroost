@@ -71,8 +71,9 @@ integrity") are the trust boundary for what ships.
       authorship.
 - [ ] Maintainer-side fixups (fmt, fuzz-target repairs) are separate commits
       under the maintainer's name, never folded into the contributor's work.
-- [ ] User-facing changes get a CHANGELOG entry crediting the contributor;
-      a first contribution adds them to the README Contributors section.
+- [ ] User-facing changes get a `changelog.d/` fragment (or a CHANGELOG
+      entry — pre-fragment PRs) crediting the contributor; a first
+      contribution adds them to the README Contributors section.
 - [ ] Merge comment: what was reviewed, what was fixed maintainer-side, what
       follow-ups went into TODO.md. Issue closes are the maintainer's,
       separately.

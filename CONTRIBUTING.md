@@ -12,6 +12,22 @@ between opening a PR and checks starting. Contributions are credited in the
 changelog and, for a first contribution, in the README's Contributors
 section.
 
+For a user-facing change, add one file to `changelog.d/` instead of editing
+`CHANGELOG.md` directly — every PR editing the same spot at the top of
+`[Unreleased]` is what used to make concurrent branches conflict. Name it
+`<section>-<ref>-<slug>.md`, where `<section>` is one of `added`, `changed`,
+`fixed`, `deprecated`, `removed`, `security`, `<ref>` is this PR's number,
+and `<slug>` is a short kebab-case description — for example
+`changelog.d/added-123-widget-export.md` containing:
+
+```
+- **Widgets can be exported.** `widget export` writes the selected widget
+  to a file. ([#123])
+```
+
+`packaging/assemble-changelog.py --check` validates fragments and runs as
+part of `packaging/check-docs-mechanical.sh`.
+
 ## Before you open a PR
 
 Run the same gates CI does:

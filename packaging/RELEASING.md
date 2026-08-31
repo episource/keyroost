@@ -76,7 +76,14 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       `version = "<old>"` in the Cargo.tomls (the workspace field plus the
       inter-crate path-dep pins — `grep -rn 'version = "<old>"' --include=Cargo.toml .`).
 - [ ] `cargo update --workspace` at the root AND in `fuzz/` (its own lock).
-- [ ] CHANGELOG: add the `## [X.Y.Z] - date` section and the compare links.
+- [ ] CHANGELOG: assemble the `changelog.d/` fragments PRs have been dropping
+      in since the fragment system landed —
+      `python3 packaging/assemble-changelog.py --release X.Y.Z` inserts the
+      `## [X.Y.Z] - date` section directly under `[Unreleased]`, adds the
+      `[#N]` link definitions and compare links, and deletes the fragments
+      it consumed (`--date YYYY-MM-DD` to override today). Run
+      `python3 packaging/assemble-changelog.py --check` first if unsure —
+      it validates every fragment and refuses to assemble a broken one.
       The top entry MUST match the new workspace version —
       `python3 packaging/flatpak/gen-metainfo-releases.py --check` proves it
       (CI enforces the same).
@@ -90,8 +97,9 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       file. Validates every `keyroostctl` invocation in every page against
       the release binary's real `--help` tree, every `learn_url(...)` slug
       against `docs/`, every internal link and anchor, the CHANGELOG's
-      reference/link integrity, and contributor credit against
-      `git log`. Anything it can check, agents no longer audit by hand.
+      reference/link integrity, every `changelog.d/` fragment (filename,
+      length, credit ref), and contributor credit against `git log`.
+      Anything it can check, agents no longer audit by hand.
 - [ ] **Semantic documentation audit — every release, every file, no
       sampling.** What no script can check: whether the claims a page makes
       about behavior are TRUE (the v0.7.8 audit's worst finding — a page
