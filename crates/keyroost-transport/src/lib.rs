@@ -1247,7 +1247,7 @@ pub(crate) fn sw_tries_remaining(sw: u16) -> Option<u8> {
 /// A short plain-language reading of an ISO 7816-4 status word, for the trace's
 /// `< … << SW = …` annotation line (emitted only for applets that opt into
 /// command labelling via [`AppletIo::describe`]). Covers the status words the
-/// PIV applets actually return; anything else is reported as non-standard
+/// the applets keyroost drives actually return; anything else is reported as non-standard
 /// rather than guessed at.
 pub(crate) fn iso_sw_summary(sw1: u8, sw2: u8) -> &'static str {
     iso_sw_description(sw1, sw2).unwrap_or("non-standard status word")
