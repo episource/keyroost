@@ -187,7 +187,11 @@ impl fmt::Display for TransportError {
             }
             TransportError::Pcsc(e) => write!(f, "PC/SC error: {}", e),
             TransportError::Apdu { label, sw1, sw2 } => {
-                write!(f, "device rejected {}: SW={:02X}{:02X}", label, sw1, sw2)
+                write!(f, "device rejected {}: SW={:02X}{:02X}", label, sw1, sw2)?;
+                if let Some(desc) = iso_sw_description(*sw1, *sw2) {
+                    write!(f, " ({desc})")?;
+                }
+                Ok(())
             }
             TransportError::AuthFailed { tries_remaining } => match tries_remaining {
                 Some(n) => write!(
@@ -1243,10 +1247,19 @@ pub(crate) fn sw_tries_remaining(sw: u16) -> Option<u8> {
 /// A short plain-language reading of an ISO 7816-4 status word, for the trace's
 /// `< … << SW = …` annotation line (emitted only for applets that opt into
 /// command labelling via [`AppletIo::describe`]). Covers the status words the
-/// PIV applets actually return; anything else is reported as non-standard
+/// the applets keyroost drives actually return; anything else is reported as non-standard
 /// rather than guessed at.
 pub(crate) fn iso_sw_summary(sw1: u8, sw2: u8) -> &'static str {
-    match (sw1, sw2) {
+    iso_sw_description(sw1, sw2).unwrap_or("non-standard status word")
+}
+
+/// The recognised-status-word half of [`iso_sw_summary`]: `Some(text)` for a
+/// status word this table knows, `None` for anything else. Error messages use
+/// this to append a parenthetical gloss only when it actually informs —
+/// `device rejected piv delete key: SW=6D00 (instruction not supported or
+/// invalid)` — and to stay terse (`SW=6AF8`) when there is nothing to add.
+pub(crate) fn iso_sw_description(sw1: u8, sw2: u8) -> Option<&'static str> {
+    Some(match (sw1, sw2) {
         (0x90, 0x00) => "success",
         (0x61, _) => "success — more response bytes pending, GET RESPONSE needed",
         (0x63, 0x00) => "verification failed",
@@ -1269,8 +1282,8 @@ pub(crate) fn iso_sw_summary(sw1: u8, sw2: u8) -> &'static str {
         (0x6E, 0x00) => "class not supported",
         (0x68, 0x82) => "secure messaging not supported",
         (0x6F, 0x00) => "no precise diagnosis",
-        _ => "non-standard status word",
-    }
+        _ => return None,
+    })
 }
 
 /// Decode the remaining-attempts counter from SW2 of a Molto2 `63xx`
@@ -1519,6 +1532,28 @@ mod redaction_tests {
         assert!(iso_sw_summary(0x63, 0xC3).starts_with("verification failed"));
         assert!(iso_sw_summary(0x6C, 0x20).starts_with("wrong Le"));
         assert_eq!(iso_sw_summary(0x12, 0x34), "non-standard status word");
+    }
+
+    #[test]
+    fn apdu_error_appends_known_sw_gloss_and_omits_unknown() {
+        // The status word the user's example is about: 6D00 gains a gloss.
+        let known = TransportError::Apdu {
+            label: "piv delete key",
+            sw1: 0x6D,
+            sw2: 0x00,
+        };
+        assert_eq!(
+            known.to_string(),
+            "device rejected piv delete key: SW=6D00 (instruction not supported or invalid)"
+        );
+
+        // A status word not in the table stays terse — no empty parens.
+        let unknown = TransportError::Apdu {
+            label: "piv sign",
+            sw1: 0x6A,
+            sw2: 0xF8,
+        };
+        assert_eq!(unknown.to_string(), "device rejected piv sign: SW=6AF8");
     }
 
     /// A `6Cxx` on the case-2 GET DATA APDU that OpenPGP `status()` sends

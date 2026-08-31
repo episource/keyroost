@@ -46,6 +46,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behaves exactly as before. Contributed by @token2. ([#107])
 
 ### Changed
+- **APDU errors now say what the status word means.** A failure like
+  `SW=6A80` carries the ISO 7816 meaning in parentheses ("incorrect
+  parameters in the command data field") when the word is a standard one;
+  unrecognised words stay bare rather than guessed at. Applies to every
+  applet's errors, CLI and GUI. Contributed by @episource. ([#118])
 - Library API (`keyroost-openpgp`, `keyroost-transport`): `PublicKey` is now
   an enum (`Rsa` / `Ecc`), `OpenPgpSession::generate_key` takes an optional
   algorithm, `rsa_v4_fingerprint_from` is replaced by `v4_fingerprint`, and
@@ -985,6 +990,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#110]: https://github.com/framefilter/keyroost/pull/110
 [#114]: https://github.com/framefilter/keyroost/pull/114
 [#116]: https://github.com/framefilter/keyroost/pull/116
+[#118]: https://github.com/framefilter/keyroost/pull/118
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
