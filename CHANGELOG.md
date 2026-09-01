@@ -63,8 +63,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slot that holds an ECC key) — so an exhaustive match over `TransportError`
   needs new arms.
 
-- Library API (`keyroost-token2otp`): `EncryptError` gains a `BadLength`
-  variant (an exhaustive `match` needs a new arm).
+- Library API (`keyroost-token2otp`): `EncryptError` gains `BadLength`,
+  `BadCiphertext` and `BadAuthTag`, and `OtpError` gains
+  `PinInvalidRetries`; in `keyroost-transport`, `OtpTransportError` gains
+  `PinRequired` and `PinSessionMissing`. An exhaustive `match` over any of
+  them needs new arms.
+- Library API (`keyroost-piv`): `parse_version` is removed; the version is
+  now kept as raw bytes and rendered with `format_version_bytes` ([#110]).
 
 ### Fixed
 - Library users enabling `keyroost-transport`'s `hidapi-backend` feature on
