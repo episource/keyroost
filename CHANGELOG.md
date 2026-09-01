@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-31
+
 ### Added
 - **`piv self-sign` and `piv request-cert` can generate the key first.**
   `--generate-key` folds a fresh `generate-key` into the signing command,
@@ -72,6 +74,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now kept as raw bytes and rendered with `format_version_bytes` ([#110]).
 
 ### Fixed
+- **The PIV pane's refresh no longer re-reads the same card objects.** It
+  gathered each slot's key algorithm, certificate Subject DN and PIN/touch
+  policy through separate transport calls, so every slot's certificate was
+  fetched two or three times and GET METADATA twice. A new
+  `PivSession::status_detailed` reads each slot's certificate object and
+  GET METADATA exactly once and shares them across all three, roughly
+  halving the refresh's APDU traffic. A slot whose certificate object
+  carries no `70` TLV now reports as empty rather than "cert present",
+  matching what `piv export-cert` already reported for it. `cert_len` in
+  `piv status` (and `--json`) now reports the certificate's DER length
+  rather than the card's object size, so it is a few bytes smaller than
+  before. Contributed by @episource. ([#119])
+
 - Library users enabling `keyroost-transport`'s `hidapi-backend` feature on
   its own no longer hit a compile error in `keyroost-ctap`: the feature now
   forwards to every crate that has a matching backend switch, not just
@@ -1011,7 +1026,9 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#114]: https://github.com/framefilter/keyroost/pull/114
 [#116]: https://github.com/framefilter/keyroost/pull/116
 [#118]: https://github.com/framefilter/keyroost/pull/118
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
+[#119]: https://github.com/framefilter/keyroost/issues/119
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/framefilter/keyroost/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/framefilter/keyroost/compare/v0.7.6...v0.7.7

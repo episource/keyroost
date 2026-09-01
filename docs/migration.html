@@ -60,6 +60,60 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-9-0">
+    <h2>v0.9.0</h2>
+    <p>Nothing changes for scripts beyond three output details, listed first.
+      The version jump is again about the <strong>published library
+      crates</strong>: the OpenPGP applet learned ECC keys and the Token2 OTP
+      applet learned PINs, and both reshaped public types.</p>
+    <h3>CLI output details</h3>
+    <ul>
+      <li><code>openpgp status</code> names the algorithm in full &mdash;
+        <code>RSA-2048</code>, <code>EdDSA Ed25519</code> &mdash; where it printed
+        the bare family (<code>RSA</code>, <code>EdDSA</code>). The
+        <code>--json</code> fields <code>sig_algo</code> / <code>dec_algo</code> /
+        <code>aut_algo</code> carry the same fuller text.</li>
+      <li><code>openpgp sign</code> and <code>openpgp authenticate</code> hand an
+        ECC slot the bare digest and an RSA slot a PKCS#1 <code>DigestInfo</code>,
+        chosen from the slot's algorithm; a slot whose algorithm cannot be read
+        is an error rather than a guess. <code>--hash sha1</code> is refused on
+        an ECC slot.</li>
+      <li><code>piv status</code>'s <code>cert_len</code> (text and
+        <code>--json</code>) is now the certificate's DER length, not the card's
+        object size &mdash; typically nine bytes smaller than before.</li>
+    </ul>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-openpgp</code></td>
+        <td><code>PublicKey</code> is an enum &mdash; <code>Rsa { modulus,
+          exponent }</code> or <code>Ecc { point }</code>; match on it instead
+          of reading fields. <code>rsa_v4_fingerprint_from</code> is gone: use
+          <code>v4_fingerprint(&amp;key, &amp;attrs, time)</code>, which routes by
+          the slot's parsed algorithm attributes.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>OpenPgpSession::generate_key(crt, alg)</code> takes an
+          <code>Option&lt;KeyAlg&gt;</code> &mdash; pass <code>None</code> for the
+          old behaviour. <code>OpenPgpStatus</code> gained
+          <code>sig_attrs</code> / <code>dec_attrs</code> / <code>aut_attrs</code>
+          (struct literals must set them). <code>TransportError</code> gained
+          <code>OpenPgpSlotMismatch</code> and <code>OpenPgpSlotNotRsa</code>;
+          <code>OtpTransportError</code> gained <code>PinRequired</code> and
+          <code>PinSessionMissing</code> &mdash; exhaustive matches need arms.</td></tr>
+      <tr><td><code>keyroost-token2otp</code></td>
+        <td><code>EncryptError</code> gained <code>BadLength</code>,
+          <code>BadCiphertext</code> and <code>BadAuthTag</code>;
+          <code>OtpError</code> gained <code>PinInvalidRetries</code>.</td></tr>
+      <tr><td><code>keyroost-piv</code></td>
+        <td><code>parse_version</code> is removed; <code>PivStatus</code> keeps the
+          GET VERSION reply as raw bytes and
+          <code>format_version_bytes</code> renders it, so cards that answer
+          with more or fewer than three bytes work.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-8-0">
     <h2>v0.8.0</h2>
     <p>No CLI or GUI changes break anything — the version jump is entirely about
