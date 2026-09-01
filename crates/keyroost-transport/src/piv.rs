@@ -157,7 +157,9 @@ pub struct PivSlotStatus {
     pub slot: piv::Slot,
     /// True when GET DATA returned a certificate object for the slot.
     pub cert_present: bool,
-    /// Length in bytes of the certificate object's value, when present.
+    /// Length in bytes of the certificate's DER encoding, as read from the
+    /// card, when present. This is the DER itself — the card's own `0x53`
+    /// object framing (the `70`/`71`/`FE` TLVs wrapping it) is not counted.
     pub cert_len: usize,
 }
 
@@ -1976,6 +1978,53 @@ mod tests {
         let occ = slot_occupancy(slot, Some(&[0xAB, 0xCD]));
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, 2);
+    }
+
+    // --- cert_len is the DER length, not the `0x53` object's value length -
+    //
+    // `PivSlotStatus::cert_len` documents the certificate's DER length as
+    // read from the card, not the size of the object wrapping it. These
+    // pin that end-to-end through the same two pure helpers `read_certificate`
+    // and `status_detailed` share: `cert_object_der` (strip the framing) then
+    // `slot_occupancy` (measure what's left).
+
+    #[test]
+    fn slot_occupancy_cert_len_is_der_length_not_object_length() {
+        // `53 <len> 70 <len> <der> 71 01 00 FE 00`: a YubiKey-shaped object —
+        // DER wrapped in `70`, followed by the `71` CertInfo and `FE`
+        // error-detection TLVs. `cert_len` must be the DER's own length (4),
+        // not the larger `70`..`FE` object span.
+        let der = [0xAA, 0xBB, 0xCC, 0xDD];
+        let inner = [
+            0x70, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, // `70` cert DER
+            0x71, 0x01, 0x00, // CertInfo
+            0xFE, 0x00, // error detection
+        ];
+        let mut body = vec![0x53, inner.len() as u8];
+        body.extend_from_slice(&inner);
+
+        let cert_der = cert_object_der(&body);
+        assert_eq!(cert_der, Some(&der[..]));
+        let occ = slot_occupancy(piv::Slot::Authentication, cert_der);
+        assert!(occ.cert_present);
+        assert_eq!(occ.cert_len, der.len());
+    }
+
+    #[test]
+    fn slot_occupancy_cert_len_is_der_length_when_71_and_fe_are_absent() {
+        // `53 <len> 70 <len> <der>`: some non-YubiKey PIV applets omit the
+        // `71`/`FE` TLVs entirely. `cert_len` is still just the DER length.
+        let der = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut inner = vec![0x70, der.len() as u8];
+        inner.extend_from_slice(&der);
+        let mut body = vec![0x53, inner.len() as u8];
+        body.extend_from_slice(&inner);
+
+        let cert_der = cert_object_der(&body);
+        assert_eq!(cert_der, Some(&der[..]));
+        let occ = slot_occupancy(piv::Slot::Authentication, cert_der);
+        assert!(occ.cert_present);
+        assert_eq!(occ.cert_len, der.len());
     }
 
     #[test]

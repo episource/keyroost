@@ -6092,16 +6092,6 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let mut session = open_piv(reader.as_deref(), debug)?;
             let status = session.status()?;
 
-            // `PivSlotStatus::cert_len` is the certificate DER length. The
-            // on-card `0x53` data object wraps that DER in a `0x70` TLV
-            // (tag + a 4-byte length for any real cert) and appends the
-            // `71` CertInfo and `FE` error-detection TLVs — nine bytes for
-            // a cert in the usual 256..65535-byte range. Report the object
-            // size, so this figure is the one earlier releases printed and
-            // matches `ykman`'s.
-            const CERT_OBJECT_FRAMING: usize = 9;
-            let cert_object_len = |der_len: usize| der_len + CERT_OBJECT_FRAMING;
-
             if json_output() {
                 emit_json(&json_out::PivStatusJson {
                     version: status
@@ -6123,11 +6113,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .map(|s| json_out::PivSlotJson {
                             slot: s.slot.label(),
                             cert_present: s.cert_present,
-                            cert_len: if s.cert_present {
-                                cert_object_len(s.cert_len)
-                            } else {
-                                0
-                            },
+                            cert_len: if s.cert_present { s.cert_len } else { 0 },
                         })
                         .collect(),
                 })?;
@@ -6172,7 +6158,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     println!(
                         "  {:<26} cert present ({} bytes)",
                         s.slot.label(),
-                        cert_object_len(s.cert_len)
+                        s.cert_len
                     );
                 } else {
                     println!("  {:<26} empty", s.slot.label());
