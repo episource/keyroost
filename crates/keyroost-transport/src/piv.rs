@@ -157,8 +157,41 @@ pub struct PivSlotStatus {
     pub slot: piv::Slot,
     /// True when GET DATA returned a certificate object for the slot.
     pub cert_present: bool,
-    /// Length in bytes of the certificate object's value, when present.
+    /// Length in bytes of the certificate's DER encoding, as read from the
+    /// card, when present. This is the DER itself — the card's own `0x53`
+    /// object framing (the `70`/`71`/`FE` TLVs wrapping it) is not counted.
     pub cert_len: usize,
+}
+
+/// [`PivStatus`] plus the per-slot key/certificate detail a status pane
+/// shows, gathered in the single pass [`PivSession::status_detailed`] makes.
+#[derive(Debug, Clone)]
+pub struct PivStatusDetailed {
+    /// The plain status snapshot — version, serial, PIN retries, CHUID, and
+    /// per-slot certificate occupancy.
+    pub status: PivStatus,
+    /// Per-slot detail, in the same canonical slot order as `status.slots`.
+    pub slots: Vec<PivSlotDetail>,
+}
+
+/// One slot's key algorithm, certificate Subject DN, and PIN/touch policy —
+/// what [`PivSession::slot_key_algorithm`] and [`PivSession::slot_policy`]
+/// each return, but read together so the slot's one GET METADATA and one
+/// certificate GET DATA are shared rather than repeated.
+#[derive(Debug, Clone)]
+pub struct PivSlotDetail {
+    pub slot: piv::Slot,
+    /// Key algorithm, or `None` when this card names no key for the slot (GET
+    /// METADATA silent, nothing generated in this session, no certificate to
+    /// parse). Same three-step fallback as [`PivSession::slot_key_algorithm`].
+    pub algorithm: Option<KeyAlg>,
+    /// The slot certificate's Subject DN, formatted; `None` when the slot has
+    /// no certificate or its DN did not parse (degraded silently, as in the
+    /// pane this feeds).
+    pub subject: Option<String>,
+    /// PIN and touch policy, or `None` when unavailable — not necessarily an
+    /// empty slot; see [`PivSession::slot_policy`].
+    pub policy: Option<(PinPolicy, TouchPolicy)>,
 }
 
 /// An open PIV applet session on one PC/SC reader.
@@ -364,6 +397,70 @@ impl PivSession {
             pin_retries,
             slots,
             chuid,
+        })
+    }
+
+    /// [`Self::status`] plus each slot's key algorithm, certificate Subject
+    /// DN, and PIN/touch policy — the full per-slot view a status pane draws.
+    ///
+    /// The saving over calling `status()` and then `slot_key_algorithm` +
+    /// `read_certificate` + `slot_policy` per slot is that each slot here
+    /// costs exactly **one GET METADATA and one [`Self::read_certificate`]**
+    /// (plus an ATTEST only as the pre-5.3-firmware policy fallback): that one
+    /// certificate read feeds occupancy, the Subject DN, and the algorithm's
+    /// step-3 fallback together, and the GET METADATA feeds both the algorithm
+    /// and the policy. Calling the methods separately re-reads the certificate
+    /// two or three times and GET METADATA twice, because [`PivSession`] holds
+    /// no read cache.
+    ///
+    /// Algorithm and policy fall back exactly as [`Self::slot_key_algorithm`]
+    /// and [`Self::slot_policy`] do (they share the resolvers), so a caller
+    /// that generated a key in this session should [`Self::remember_pubkey`]
+    /// it first to have that key named for a slot with no certificate yet.
+    pub fn status_detailed(&mut self) -> Result<PivStatusDetailed, TransportError> {
+        let version = self.version();
+        let serial = self.serial();
+        let pin_retries = self.pin_retries();
+        let chuid = self.read_chuid().unwrap_or_default();
+
+        let mut slots = Vec::with_capacity(4);
+        let mut detail = Vec::with_capacity(4);
+        for slot in piv::Slot::all() {
+            // The slot's one certificate read — its occupancy fields, its
+            // Subject DN, and the algorithm's cert fallback all come off this.
+            let cert = self.read_certificate(slot)?;
+            // The slot's one GET METADATA — shared by algorithm and policy.
+            let meta = self.metadata(slot.key_ref());
+
+            let algorithm = self
+                .algorithm_without_cert(slot, meta.as_ref())
+                .or_else(|| {
+                    cert.as_deref()
+                        .and_then(|der| piv::x509_parse::parse_key_algorithm(der).ok().flatten())
+                });
+            let subject = cert
+                .as_deref()
+                .and_then(|der| piv::x509_parse::parse_subject_dn(der).ok())
+                .map(|dn| dn.to_string());
+            let policy = self.resolve_policy(slot, meta.as_ref());
+
+            slots.push(slot_occupancy(slot, cert.as_deref()));
+            detail.push(PivSlotDetail {
+                slot,
+                algorithm,
+                subject,
+                policy,
+            });
+        }
+        Ok(PivStatusDetailed {
+            status: PivStatus {
+                version,
+                serial,
+                pin_retries,
+                slots,
+                chuid,
+            },
+            slots: detail,
         })
     }
 
@@ -738,15 +835,17 @@ impl PivSession {
     }
 
     /// Read the DER-encoded certificate stored in `slot`, or `None` when the
-    /// slot is empty. No PIN required (PIV certificates are public objects).
+    /// slot has none — `6A82` (no object), an empty `53 00` template, or a
+    /// body that isn't a `0x53` data object at all. A read-only public
+    /// object: no PIN, and a malformed body is reported as absent rather than
+    /// erroring the call (a real card doesn't produce one; `slot_status` and
+    /// `status_detailed` derive occupancy straight from this).
     pub fn read_certificate(&mut self, slot: Slot) -> Result<Option<Vec<u8>>, TransportError> {
         let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
         if sw != piv::SW_OK {
             return Ok(None);
         }
-        let inner = piv::unwrap_data_object(&data).map_err(TransportError::PivParse)?;
-        // The cert object wraps the DER in a 0x70 TLV.
-        Ok(piv::find_tlv(inner, 0x70).map(<[u8]>::to_vec))
+        Ok(cert_object_der(&data).map(<[u8]>::to_vec))
     }
 
     /// Yubico ATTEST: the self-signed attestation certificate for `slot`'s key
@@ -774,19 +873,31 @@ impl PivSession {
     /// so every failure mode (missing extension, unparsable metadata, ATTEST
     /// itself being unsupported) collapses to the same answer.
     pub fn slot_policy(&mut self, slot: Slot) -> Option<(PinPolicy, TouchPolicy)> {
-        let (pin, touch) =
-            if let Some(policy) = self.metadata(slot.key_ref()).and_then(|m| m.policy) {
-                policy
-            } else {
-                // Non-Yubico PIV cards refuse this vendor instruction outright
-                // (a status word, not `9000`) — `.ok()?` turns that refusal
-                // into the same "no policy available" `None` as every other
-                // failure mode here.
-                let cert = self.attest(slot).ok()?;
-                keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
-                    .ok()
-                    .flatten()?
-            };
+        let meta = self.metadata(slot.key_ref());
+        self.resolve_policy(slot, meta.as_ref())
+    }
+
+    /// [`Self::slot_policy`]'s two-step resolution from a GET METADATA reply
+    /// the caller already has: its `policy` bytes, else the ATTEST
+    /// certificate's key-policy extension. Split out so [`Self::status_detailed`]
+    /// shares the exact same order without a second GET METADATA.
+    fn resolve_policy(
+        &mut self,
+        slot: Slot,
+        meta: Option<&Metadata>,
+    ) -> Option<(PinPolicy, TouchPolicy)> {
+        let (pin, touch) = if let Some(policy) = meta.and_then(|m| m.policy) {
+            policy
+        } else {
+            // Non-Yubico PIV cards refuse this vendor instruction outright
+            // (a status word, not `9000`) — `.ok()?` turns that refusal
+            // into the same "no policy available" `None` as every other
+            // failure mode here.
+            let cert = self.attest(slot).ok()?;
+            keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
+                .ok()
+                .flatten()?
+        };
         Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?))
     }
 
@@ -815,20 +926,27 @@ impl PivSession {
     /// need the raw key material GET METADATA carries and stay
     /// metadata-only.
     pub fn slot_key_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
-        let alg_from_metadata = self
-            .metadata(slot.key_ref())
-            .and_then(|m| m.algorithm)
-            .and_then(KeyAlg::from_id);
-        if alg_from_metadata.is_some() {
-            return alg_from_metadata;
+        let meta = self.metadata(slot.key_ref());
+        // Steps 1–2 need no card read beyond the GET METADATA just done.
+        if let Some(alg) = self.algorithm_without_cert(slot, meta.as_ref()) {
+            return Some(alg);
         }
-        if let Some((alg, _)) = self.pubkey_cache.get(slot.key_ref()) {
-            return Some(*alg);
-        }
+        // Step 3: the slot certificate's SubjectPublicKeyInfo.
         self.read_certificate(slot)
             .ok()
             .flatten()
             .and_then(|der| piv::x509_parse::parse_key_algorithm(&der).ok().flatten())
+    }
+
+    /// The first two of [`Self::slot_key_algorithm`]'s three steps — GET
+    /// METADATA's `algorithm` (from a reply the caller already has), then
+    /// this session's generated-key cache — i.e. everything that needs no
+    /// certificate read. [`Self::status_detailed`] appends the same step-3
+    /// certificate fallback with a cert it already holds.
+    fn algorithm_without_cert(&self, slot: Slot, meta: Option<&Metadata>) -> Option<KeyAlg> {
+        meta.and_then(|m| m.algorithm)
+            .and_then(KeyAlg::from_id)
+            .or_else(|| self.pubkey_cache.get(slot.key_ref()).map(|(alg, _)| *alg))
     }
 
     /// Ask `slot`'s private key to sign a *prepared* block via GENERAL
@@ -1179,14 +1297,8 @@ impl PivSession {
 
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
     fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
-        let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
-        let raw = (sw == piv::SW_OK).then_some(data.as_slice());
-        let (cert_present, cert_len) = cert_status_from_reply(raw);
-        Ok(PivSlotStatus {
-            slot,
-            cert_present,
-            cert_len,
-        })
+        let cert = self.read_certificate(slot)?;
+        Ok(slot_occupancy(slot, cert.as_deref()))
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
@@ -1424,27 +1536,28 @@ fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
     Some((alg, raw))
 }
 
-/// `(cert_present, cert_len)` from a certificate-slot GET DATA reply: `raw` is
-/// the response body when the card answered `SW_OK`, `None` when it didn't
-/// (`6A82` and friends, which just mean the slot is empty).
-///
-/// `SW_OK` alone doesn't mean a certificate is there: some cards (Nitrokey's
-/// `piv-authenticator`, observed after `delete-cert`) answer a deleted slot
-/// with `53 00` — the `0x53` data-object template present, but with a
-/// zero-length value — rather than `6A82`. An empty value is exactly as
-/// absent as no object at all, so this gates on the unwrapped length, not
-/// just the status word; [`PivSession::read_certificate`] already reaches the
-/// same conclusion in its own way (an empty inner buffer has no `0x70` TLV to
-/// find). A body that fails to unwrap as a `0x53` template at all — not
-/// expected from a real card, but not a caller-visible error either — reports
-/// the same as empty rather than panicking or bubbling a parse error up
-/// through a read-only status call.
-fn cert_status_from_reply(raw: Option<&[u8]>) -> (bool, usize) {
-    let len = raw
-        .and_then(|d| piv::unwrap_data_object(d).ok())
-        .map(<[u8]>::len)
-        .unwrap_or(0);
-    (len > 0, len)
+/// The certificate DER inside a `9000` GET DATA body for a slot's cert
+/// object: the `0x70` TLV's value. `None` when the body carries no
+/// certificate — a `53 00` empty template (Nitrokey's `piv-authenticator`
+/// answers a deleted slot this way instead of `6A82`), a `0x53` object with
+/// no `0x70`, or a body that isn't a `0x53` data template at all (not
+/// expected from a real card, and degraded rather than errored — this feeds
+/// read-only status calls). Pure, so the byte cases stay unit-tested.
+fn cert_object_der(body: &[u8]) -> Option<&[u8]> {
+    let inner = piv::unwrap_data_object(body).ok()?;
+    piv::find_tlv(inner, 0x70)
+}
+
+/// A slot's [`PivSlotStatus`] from the certificate DER
+/// [`PivSession::read_certificate`] returned for it: present (with its byte
+/// length) when non-empty, absent otherwise.
+fn slot_occupancy(slot: piv::Slot, cert_der: Option<&[u8]>) -> PivSlotStatus {
+    let len = cert_der.map_or(0, <[u8]>::len);
+    PivSlotStatus {
+        slot,
+        cert_present: len > 0,
+        cert_len: len,
+    }
 }
 
 /// Decode the public key carried in GET METADATA tag `0x04`. Yubico encodes it
@@ -1820,38 +1933,98 @@ mod tests {
         );
     }
 
-    // --- certificate-slot occupancy from a GET DATA reply -----------------
+    // --- certificate DER out of a GET DATA reply --------------------------
     //
-    // `cert_status_from_reply` is what `slot_status` uses to decide whether a
-    // slot reports as holding a certificate. The regression this guards: a
-    // deleted slot answering SW_OK with an empty `53 00` template (Nitrokey's
-    // piv-authenticator, observed with `piv status` after `piv delete-cert`)
-    // must report as empty, not "cert present (0 bytes)".
+    // `cert_object_der` is what `read_certificate` (and, through it,
+    // `slot_status` / `status_detailed`) uses to decide whether a slot holds
+    // a certificate. The regression this guards: a deleted slot answering
+    // SW_OK with an empty `53 00` template (Nitrokey's piv-authenticator,
+    // observed with `piv status` after `piv delete-cert`) must read as empty,
+    // not "cert present (0 bytes)".
 
     #[test]
-    fn cert_status_not_found_is_absent() {
-        // 6A82 and friends: `slot_status` passes `None` for anything but SW_OK.
-        assert_eq!(cert_status_from_reply(None), (false, 0));
-    }
-
-    #[test]
-    fn cert_status_empty_template_is_absent() {
+    fn cert_object_der_empty_template_is_none() {
         // `53 00`: object present, zero-length value — the Nitrokey case.
-        assert_eq!(cert_status_from_reply(Some(&[0x53, 0x00])), (false, 0));
+        assert_eq!(cert_object_der(&[0x53, 0x00]), None);
     }
 
     #[test]
-    fn cert_status_populated_template_is_present() {
-        // `53 03 70 01 AB`: a (fake, minimal) 3-byte value wrapping a `70` TLV.
-        let data = [0x53, 0x03, 0x70, 0x01, 0xAB];
-        assert_eq!(cert_status_from_reply(Some(&data)), (true, 3));
+    fn cert_object_der_populated_template_yields_the_inner_value() {
+        // `53 03 70 01 AB`: a (fake, minimal) `70` TLV wrapping one byte.
+        assert_eq!(
+            cert_object_der(&[0x53, 0x03, 0x70, 0x01, 0xAB]),
+            Some(&[0xAB][..])
+        );
     }
 
     #[test]
-    fn cert_status_unparseable_body_is_absent_not_a_panic() {
+    fn cert_object_der_template_without_70_is_none() {
+        // `53 02 71 00`: a `0x53` object carrying only a cert-info `71` TLV.
+        assert_eq!(cert_object_der(&[0x53, 0x02, 0x71, 0x00]), None);
+    }
+
+    #[test]
+    fn cert_object_der_unparseable_body_is_none_not_a_panic() {
         // Not a `0x53` template at all — shouldn't happen on a real card, but
         // a read-only status call must degrade gracefully, not panic or error.
-        assert_eq!(cert_status_from_reply(Some(&[0xFF, 0x00])), (false, 0));
+        assert_eq!(cert_object_der(&[0xFF, 0x00]), None);
+    }
+
+    #[test]
+    fn slot_occupancy_reads_present_only_for_a_non_empty_cert() {
+        let slot = piv::Slot::Authentication;
+        assert!(!slot_occupancy(slot, None).cert_present);
+        assert!(!slot_occupancy(slot, Some(&[])).cert_present);
+        let occ = slot_occupancy(slot, Some(&[0xAB, 0xCD]));
+        assert!(occ.cert_present);
+        assert_eq!(occ.cert_len, 2);
+    }
+
+    // --- cert_len is the DER length, not the `0x53` object's value length -
+    //
+    // `PivSlotStatus::cert_len` documents the certificate's DER length as
+    // read from the card, not the size of the object wrapping it. These
+    // pin that end-to-end through the same two pure helpers `read_certificate`
+    // and `status_detailed` share: `cert_object_der` (strip the framing) then
+    // `slot_occupancy` (measure what's left).
+
+    #[test]
+    fn slot_occupancy_cert_len_is_der_length_not_object_length() {
+        // `53 <len> 70 <len> <der> 71 01 00 FE 00`: a YubiKey-shaped object —
+        // DER wrapped in `70`, followed by the `71` CertInfo and `FE`
+        // error-detection TLVs. `cert_len` must be the DER's own length (4),
+        // not the larger `70`..`FE` object span.
+        let der = [0xAA, 0xBB, 0xCC, 0xDD];
+        let inner = [
+            0x70, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, // `70` cert DER
+            0x71, 0x01, 0x00, // CertInfo
+            0xFE, 0x00, // error detection
+        ];
+        let mut body = vec![0x53, inner.len() as u8];
+        body.extend_from_slice(&inner);
+
+        let cert_der = cert_object_der(&body);
+        assert_eq!(cert_der, Some(&der[..]));
+        let occ = slot_occupancy(piv::Slot::Authentication, cert_der);
+        assert!(occ.cert_present);
+        assert_eq!(occ.cert_len, der.len());
+    }
+
+    #[test]
+    fn slot_occupancy_cert_len_is_der_length_when_71_and_fe_are_absent() {
+        // `53 <len> 70 <len> <der>`: some non-YubiKey PIV applets omit the
+        // `71`/`FE` TLVs entirely. `cert_len` is still just the DER length.
+        let der = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut inner = vec![0x70, der.len() as u8];
+        inner.extend_from_slice(&der);
+        let mut body = vec![0x53, inner.len() as u8];
+        body.extend_from_slice(&inner);
+
+        let cert_der = cert_object_der(&body);
+        assert_eq!(cert_der, Some(&der[..]));
+        let occ = slot_occupancy(piv::Slot::Authentication, cert_der);
+        assert!(occ.cert_present);
+        assert_eq!(occ.cert_len, der.len());
     }
 
     #[test]
