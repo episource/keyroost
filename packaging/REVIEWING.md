@@ -18,6 +18,9 @@ integrity") are the trust boundary for what ships.
 - [ ] `cd fuzz && cargo build` — a PR that renames or reshapes a parser
       breaks the fuzz workspace without failing any main-workspace gate
       (#100 did).
+- [ ] `python3 packaging/assemble-changelog.py --check` — validates the PR's
+      `changelog.d/` fragment (filename, section, length, credit ref) so a
+      broken one is caught at review, not at release assembly.
 - [ ] Scan every commit message for issue-closing keywords:
       `git log <base>..HEAD --format=%B | grep -inE
       '(clos|fix|resolv)[a-z]*[[:space:]]+#[0-9]+'`

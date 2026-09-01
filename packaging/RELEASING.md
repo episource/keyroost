@@ -26,7 +26,7 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       libraries).
 - [ ] **Publish-readiness check** (one command):
       `packaging/check-publish-readiness.sh v<prev>`
-      Proves the crates.io fanout can actually run. Three failure modes, none
+      Proves the crates.io fanout can actually run. Four failure modes, none
       of which any other gate catches and all of which surface only once the
       fanout is already half done:
       (a) a crate added since the last release — Trusted Publishing over OIDC
@@ -41,7 +41,7 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       respect — cargo refuses to publish a crate whose path-dep sibling is not
       yet on crates.io at the pinned version, and the run dies with half the
       workspace released.
-      (c) is the subtle one: every crate can already be published and the
+      (d) is the subtle one: every crate can already be published and the
       release still breaks, because what changed is the ORDER requirement, not
       the set. v0.7.7 added `keyroost-resolve -> keyroost-openpgp` and happened
       to be ordered correctly; nothing would have caught it if it had not been.
@@ -94,11 +94,13 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 - [ ] **Mechanical documentation checks** (one command, before any agent):
       `packaging/check-docs-mechanical.sh`
       Deterministic and exhaustive — a script cannot decide not to read a
-      file. Validates every `keyroostctl` invocation in every page against
-      the release binary's real `--help` tree, every `learn_url(...)` slug
-      against `docs/`, every internal link and anchor, the CHANGELOG's
-      reference/link integrity, every `changelog.d/` fragment (filename,
-      length, credit ref), and contributor credit against `git log`.
+      file. Validates every `keyroostctl` invocation in `docs/*.html` and
+      `README.md` against the release binary's real `--help` tree (the `.md`
+      runbooks — `docs/BRINGUP.md`, `packaging/*.md` — are not covered; they
+      stay part of the semantic pass), every `learn_url(...)` slug against
+      `docs/`, every internal link and anchor, the CHANGELOG's reference/link
+      integrity, every `changelog.d/` fragment (filename, length, credit ref),
+      and contributor credit against `git log`.
       Anything it can check, agents no longer audit by hand.
 - [ ] **Semantic documentation audit — every release, every file, no
       sampling.** What no script can check: whether the claims a page makes
@@ -107,9 +109,10 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       grammatical, plausible, and wrong). Protocol, learned from the misses:
       * **Audit from the inventory, not from memory**: the in-scope set is
         every `docs/*.html`, `README.md`, `SECURITY.md`, `CONTRIBUTING.md`,
-        `TODO.md`, `packaging/*.md`, `docs/*.md`. Regenerate the file list
-        with `ls`, hand it to the audit agents whole, and add a line here
-        whenever a new documentation surface appears — scope gaps, not
+        `TODO.md`, `CHANGELOG.md` (the new release section plus the emptied
+        `[Unreleased]` heading), `packaging/*.md`, `docs/*.md`. Regenerate the
+        file list with `ls`, hand it to the audit agents whole, and add a line
+        here whenever a new documentation surface appears — scope gaps, not
         laziness alone, caused the #99 miss.
       * **Per-file verdict required**: each agent's report carries one line
         per inventory file — read in full + accurate, or read in full +
@@ -202,7 +205,7 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       the manual fallback still works — the warning prints the command:
       `gh repo sync framefilter/winget-pkgs --source microsoft/winget-pkgs`
       Syncing is lossless while the fork is 0 ahead. First unattended
-      exercise of the scoped token is the next release's step 5.
+      exercise of the scoped token was v0.8.0's step 5.
 - [ ] When it arrives: attach as **NEW** assets
       `keyroost-vX.Y.Z-windows-x86_64-signed.zip` + `.sha256` (and
       `keyroost-vX.Y.Z-macos-universal2-signed.pkg` + `.sha256`, unwrapped
@@ -249,8 +252,8 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       package paths above the package directory.
 - [ ] `keyroostctl --version` prints X.Y.Z, and the GUI shows vX.Y.Z next
       to the wordmark in the top bar.
-- [ ] The AppImage carries the version in its metadata (new at v0.8.0 —
-      never yet exercised by a release build):
+- [ ] The AppImage carries the version in its metadata (added at v0.8.0,
+      first produced by that release's build):
       `./keyroost-x86_64.AppImage --appimage-extract >/dev/null && grep X-AppImage-Version squashfs-root/*.desktop`
       must print `X-AppImage-Version=X.Y.Z`. This is what AppImage managers
       (Gear Lever et al.) display; it comes from the `VERSION` export in

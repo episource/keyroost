@@ -197,6 +197,21 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   distro-neutrality disclaimer, install-command corrections and an intro
   rewrite ([#35](https://github.com/framefilter/keyroost/issues/35),
   [#45](https://github.com/framefilter/keyroost/issues/45)).
+- **[@episource](https://github.com/episource)** — the project's most prolific
+  external contributor: Nitrokey 3 PIV support and `piv new-chuid`
+  ([#102](https://github.com/framefilter/keyroost/pull/102)), short-APDU
+  chaining ([#101](https://github.com/framefilter/keyroost/pull/101)), Identiv
+  uTrust mutual-auth tolerance
+  ([#104](https://github.com/framefilter/keyroost/pull/104)), any-length GET
+  VERSION / Swissbit compat ([#110](https://github.com/framefilter/keyroost/pull/110)),
+  the PIV activity log and APDU trace
+  ([#114](https://github.com/framefilter/keyroost/pull/114)), `--generate-key`
+  on `self-sign` / `request-cert`
+  ([#116](https://github.com/framefilter/keyroost/pull/116)), status-word
+  meanings in errors ([#118](https://github.com/framefilter/keyroost/pull/118)),
+  and the PIV-refresh APDU deduplication
+  ([#119](https://github.com/framefilter/keyroost/pull/119)) — most of it
+  hardware-verified on their own cards.
 
 (This credits their contributions to the codebase; it does not change keyroost's
 independent status described above.)

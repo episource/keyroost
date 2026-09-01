@@ -9,7 +9,7 @@ Hardware in play (all on hand): Token2 Molto2 (`349e:0300`), YubiKey 5
 (`1050:0407`, fw 5.7.1) ×2, SoloKeys Solo 2 (`1209:beee`, Trussed, fw 2.3.196).
 Nothing here is "incoming" any more — the Solo 2 carried the first successful
 FIDO F1–F5 run (`docs/BRINGUP.md`), and the two-YubiKey case is what the
-correlation work was verified against (`PLAN.md`). Token2 PIN+ / FIDO2+ coverage
+correlation work was verified against. Token2 PIN+ / FIDO2+ coverage
 comes from the vendor rather than this bench. An OnlyKey is on order — see the
 identity note below; it is the interesting case.
 
@@ -82,7 +82,7 @@ untested because an earlier row already answered the question.
 | USB iSerial (E1) | n/a | n/a | yes | cross-interface correlatable | **not available** — most YubiKeys publish no `iSerialNumber`; the serial is only reachable over CCID (`keyroost-hid`) |
 | HID uniq (E2) | not tested | not tested | yes | none | not pursued — E4 answered it first |
 | AAGUID (E3) | yes | NO | yes | none | reject (model-level) — confirmed; the GUI treats AAGUID as a static *model* table |
-| OTP/CCID serial (E4) | yes | yes — two units told apart on hardware during the correlation work (`PLAN.md`) | yes | high (anti-tracking) — mitigated by local-only, opt-in storage | **adopted as the fallback** (`ccid_serial_for`) |
+| OTP/CCID serial (E4) | yes | yes — two units told apart on hardware during the correlation work | yes | high (anti-tracking) — mitigated by local-only, opt-in storage | **adopted as the fallback** (`ccid_serial_for`) |
 
 ### SoloKey / Solo 2 (`1209:beee`, Trussed, fw 2.3.196)
 | Candidate | Stable re-plug? | Unique per unit? | Read-only? | Privacy cost | Verdict |
@@ -138,7 +138,9 @@ Outline for a future Claude (don't over-research — breadth first, depth later)
 1. **Enumerate capabilities per device.** FIDO2/WebAuthn (passkeys, resident
    keys), U2F, OATH-TOTP/HOTP, PIV, OpenPGP, Yubico OTP / HMAC challenge-response,
    PIN & policy features. Note which the device actually supports (Solo 2 / NK3
-   differ from YubiKey — cross-check against PLAN.md's applet notes).
+   differ from YubiKey — confirm against the device's own applet responses, not
+   a stored table; see the "No device→capability matrix" standing decision in
+   `TODO.md`).
 2. **Map each capability to a day-to-day use.** Plain language, concrete:
    e.g. "phishing-resistant login to Google/GitHub" (passkey), "log into SSH
    with a hardware key" (FIDO2 SSH), "2FA codes for sites without push" (OATH),

@@ -220,7 +220,7 @@ the user to press the up-arrow button to commit. Both `factory_reset` and
 `set_customer_key` return it. Observed on real hardware during bring-up.
 
 keyroost surfaces auth failures specifically (`TransportError::AuthFailed`) so
-they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`.
+they can be retried; everything else becomes `TransportError::Apdu { label, sw1, sw2 }`.
 
 ### Response continuation (`61xx` / `6Cxx`)
 

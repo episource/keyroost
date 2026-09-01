@@ -8,9 +8,17 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.8.0** — Nitrokey 3 PIV + `piv new-chuid` (#102), the
-short-APDU chaining fallback (#101), the tri-state capability display (#95),
-and the app-version display (#98). The release run is under way.
+Current work: **v0.9.0** — OpenPGP ECC key algorithms
+([#106](https://github.com/framefilter/keyroost/issues/106)), Token2 OTP PIN
+protection ([#107](https://github.com/framefilter/keyroost/issues/107)), PIV
+any-length GET VERSION ([#110](https://github.com/framefilter/keyroost/pull/110)),
+`--generate-key` on self-sign/request-cert
+([#116](https://github.com/framefilter/keyroost/pull/116)), the PIV activity
+log + APDU trace ([#114](https://github.com/framefilter/keyroost/pull/114)),
+status-word meanings in errors
+([#118](https://github.com/framefilter/keyroost/pull/118)), the T=0 chaining
+fix ([#103](https://github.com/framefilter/keyroost/issues/103)) and the
+`changelog.d/` fragment system. The release run is under way.
 
 ---
 
@@ -170,11 +178,12 @@ plan's two-key manual steps were never executed):
   linking for the PC/SC path (and the dlopen item above changes that calculus).
   Think it through before committing.
 
-- **Full branch protection** (require PR + green CI on `main`) — deliberately
-  deferred: it ends the direct-push workflow. Adopt when release cadence slows
-  and the product is feature-complete. The light protections are already in
-  place: `v*` tag create/update/delete is admin-only, and `main` rejects
-  force-push and deletion.
+- **Require green CI on `main`** — deliberately deferred; the remaining piece
+  of full branch protection. Require-PR, linear history and squash-only merges
+  landed 2026-08-24 (see Standing decisions), with an admin bypass so the
+  release prep branch can still be pushed straight to `main`; `v*` tag
+  create/update/delete is admin-only, and `main` rejects force-push and
+  deletion. Adopt the CI gate when release cadence slows.
 
 ---
 

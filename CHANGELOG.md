@@ -1029,7 +1029,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#114]: https://github.com/framefilter/keyroost/pull/114
 [#116]: https://github.com/framefilter/keyroost/pull/116
 [#118]: https://github.com/framefilter/keyroost/pull/118
-[#119]: https://github.com/framefilter/keyroost/issues/119
+[#119]: https://github.com/framefilter/keyroost/pull/119
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.9.0...HEAD
 [0.9.0]: https://github.com/framefilter/keyroost/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0

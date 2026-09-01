@@ -159,8 +159,9 @@ applets need a running **host `pcscd`** (every target talks to the host daemon).
 ---
 
 > **Historical design notes follow.** The sections below are the original design
-> rationale for each target; they remain accurate but the actionable runbook is
-> above.
+> rationale for each target. They are a record of how the decisions were
+> reached, not a statement of current state — where one contradicts the
+> runbook above, the runbook wins. The actionable runbook is above.
 
 > **Naming note / decision:** the existing `packaging/README.md` is the
 > *release-fanout one-time-setup* doc (crates.io / AUR / Homebrew / winget).
@@ -592,8 +593,9 @@ musl cross toolchain, then build libpcsclite there. See
    is documentation only and not wired into any workflow. Revisit separately.
 10. **freedesktop runtime version** — *Open.* Manifest pins `25.08` (latest);
     `24.08` is the conservative alternative. The Flatpak CI container image
-    (`ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08`) must match
-    whatever the manifest pins.
+    (pinned by digest in `linux-bundles.yml`, currently the `freedesktop-25.08`
+    index) must match whatever the manifest pins — re-pin the digest when
+    bumping the runtime.
 11. **Flatpak `--device=all` breadth.** *Open.* Acceptable, or narrow once
     hardware testing shows what's actually required?
 12. **Bundle vs rely-on-host for `libpcsclite`** in the AppImage (recommend
