@@ -38,12 +38,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PIN is never an argument). The GUI's OTP pane grows an unlock prompt, a
   set/change/remove dialog and a "Lock now" action. The PIN travels
   encrypted under a per-connection ECDH session and is never sent in the
-  clear. Two things to know before setting one: there is no reset — an
+  clear. One thing to know before setting one: there is no reset — an
   exhausted retry counter is recoverable only by erasing every OTP entry
-  on the key — and keyroost does not verify the device's P-521 agreement
-  signature, so over NFC an attacker who runs the key agreement can take
-  one verify blob away and brute-force a numeric PIN offline without
-  touching the retry counter. Keys without the feature are unaffected:
+  on the key. Keys without the feature are unaffected:
   they answer the capability probe with "no such command" and everything
   behaves exactly as before. Contributed by @token2. ([#107])
 

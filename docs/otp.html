@@ -139,13 +139,11 @@ keyroostctl otp list --pin-stdin        # unlock in passing; same for add and de
     <div class="kr-callout note">
       <div class="kr-callout-title note">What the PIN does and does not protect</div>
       <p>The PIN never travels in the clear: host and key agree a session key first, and the
-        PIN is only ever sent encrypted under it. But the key also signs that agreement with
-        a P-521 key, and <strong>keyroost does not verify that signature</strong> &mdash; so the
-        session is confidential, not authenticated. Over NFC in particular, something that
-        can run the key agreement itself can capture one unlock attempt and try PINs against
-        it offline, at its own pace, without ever touching the key's retry counter. A short
-        numeric PIN does not survive that. Treat the PIN as protection against someone
-        picking up your key, not against someone standing between you and it.</p>
+        PIN is only ever sent encrypted under it. The key enforces the retry counter itself,
+        so guessing costs attempts on the key, not on the host. Treat the PIN as protection
+        against someone picking up your key; what it protects against beyond that is a
+        property of the key's firmware rather than of keyroost, and Token2 is the authority
+        on it.</p>
     </div>
   </section>
 
