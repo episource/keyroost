@@ -38,6 +38,7 @@ pub const IV_OTP: [u8; 16] = [
 pub const IV_HOTP: [u8; 16] = [0u8; 16];
 
 /// Errors from the ECDH+AES seal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptError {
     /// The device pubkey was not a valid 64-byte (`X || Y`) P-256 point.

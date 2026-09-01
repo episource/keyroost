@@ -50,6 +50,7 @@ impl Drop for RsaKeyParts {
 }
 
 /// Why obtaining RSA key parts failed. The `Display` strings are user-facing.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum RsaKeyError {
     /// Reading the key file failed.

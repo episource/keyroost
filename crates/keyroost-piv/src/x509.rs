@@ -18,6 +18,7 @@ use crate::spki::{der_bitstring, der_seq, der_tlv, der_uint, pem};
 use crate::KeyAlg;
 
 /// Errors building certificate structures.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum X509Error {
     /// The key algorithm cannot produce signatures (X25519).

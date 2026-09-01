@@ -514,6 +514,7 @@ pub struct Metadata {
 }
 
 /// Errors from parsing PIV responses.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
     /// A length field ran past the end of the buffer.

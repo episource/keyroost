@@ -124,7 +124,8 @@ fn map_reset_stage_error(e: TransportError) -> TransportError {
 }
 
 /// A read-only snapshot of a PIV application's state.
-#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
 pub struct PivStatus {
     /// Reply to Yubico's proprietary `GET VERSION` extension (`INS FD`), raw
     /// bytes, any non-empty length. Real Yubico firmware answers with exactly
@@ -152,6 +153,7 @@ pub struct PivStatus {
 }
 
 /// Whether a given PIV key slot holds a certificate (and its size).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PivSlotStatus {
     pub slot: piv::Slot,
@@ -165,6 +167,7 @@ pub struct PivSlotStatus {
 
 /// [`PivStatus`] plus the per-slot key/certificate detail a status pane
 /// shows, gathered in the single pass [`PivSession::status_detailed`] makes.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PivStatusDetailed {
     /// The plain status snapshot — version, serial, PIN retries, CHUID, and
@@ -178,6 +181,7 @@ pub struct PivStatusDetailed {
 /// what [`PivSession::slot_key_algorithm`] and [`PivSession::slot_policy`]
 /// each return, but read together so the slot's one GET METADATA and one
 /// certificate GET DATA are shared rather than repeated.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PivSlotDetail {
     pub slot: piv::Slot,

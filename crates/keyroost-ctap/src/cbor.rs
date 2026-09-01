@@ -43,6 +43,7 @@ pub enum Value {
     Null,
 }
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum CborError {
     UnexpectedEnd,

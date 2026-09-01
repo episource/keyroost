@@ -18,6 +18,7 @@ pub const CTAP2_RESET: u8 = 0x07;
 /// CTAP transaction.
 const RESET_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum CtapError {
     Hid(HidTransportError),

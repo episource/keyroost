@@ -97,6 +97,7 @@ pub enum Step {
 }
 
 /// Errors surfaced while assembling a HID response.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     /// The magic byte was not `0x21`.

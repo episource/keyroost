@@ -42,6 +42,7 @@ use zeroize::Zeroizing;
 /// Errors specific to the Token2 OTP applet. Kept separate from the crate-wide
 /// `TransportError` so the OTP feature can evolve without churning every other
 /// applet's error surface; the CLI maps these to exit messages.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum OtpTransportError {
     /// No Token2 OTP-capable device was found on any transport (spec §8.4

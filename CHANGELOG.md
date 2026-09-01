@@ -72,6 +72,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them needs new arms.
 - Library API (`keyroost-piv`): `parse_version` is removed; the version is
   now kept as raw bytes and rendered with `format_version_bytes` ([#110]).
+- **Public error enums and status structs are `#[non_exhaustive]`.** Adding
+  a variant or a field to them is no longer a breaking change for library
+  users; a one-time `_ =>` arm is needed in exhaustive matches.
 
 ### Fixed
 - **The PIV pane's refresh no longer re-reads the same card objects.** It

@@ -290,6 +290,7 @@ pub fn model_for_serial(serial: &str) -> Option<&'static str> {
 }
 
 /// Errors decoding a `get_info` response.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfoError {
     /// The response was shorter than the framing requires.
@@ -330,6 +331,7 @@ pub fn parse_info(body: &[u8]) -> Result<Info, InfoError> {
 }
 
 /// Errors building a seed command.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedError {
     /// Seed length must be 1..=63 bytes; carries the offending length.

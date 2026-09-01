@@ -88,6 +88,7 @@ pub struct WriteEntry<'a> {
 }
 
 /// Errors from parsing a device response or validating a write payload.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// Ran off the end of the buffer mid-record — usually a mis-framed tail.

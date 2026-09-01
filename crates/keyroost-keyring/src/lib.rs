@@ -70,6 +70,7 @@ pub struct ConnectedKey {
 }
 
 /// Errors loading, saving, or mutating the registry.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum KeyringError {
     Io(io::Error),
@@ -128,6 +129,7 @@ impl From<io::Error> for KeyringError {
 }
 
 /// Errors resolving a `--device` name to a connected device.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ResolveError {
     UnknownName {

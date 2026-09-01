@@ -89,6 +89,7 @@ impl From<OtpAuth> for BulkEntry {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum BulkError {
     Json(serde_json::Error),

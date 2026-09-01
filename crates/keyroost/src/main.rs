@@ -6513,7 +6513,7 @@ impl App {
                 }
                 match result {
                     Ok(Ok(detailed)) => {
-                        let keyroost_transport::PivStatusDetailed { status, slots } = detailed;
+                        let keyroost_transport::PivStatusDetailed { status, slots, .. } = detailed;
                         app.log_kind(
                             Severity::Ok,
                             kind,
@@ -16915,13 +16915,7 @@ mod tests {
         let mut app = App::default();
         app.piv.selected_slot = PivSlotSel::Retired(3);
         app.piv.retired_occupancy = Some(vec![(keyroost_piv::Slot::Retired(3), true)]);
-        let status = keyroost_transport::PivStatus {
-            version: None,
-            serial: None,
-            pin_retries: None,
-            chuid: None,
-            slots: vec![],
-        };
+        let status = keyroost_transport::PivStatus::default();
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
         assert_eq!(
             app.piv.selected_slot,
@@ -16937,13 +16931,7 @@ mod tests {
     fn apply_piv_write_success_leaves_standard_selection_alone() {
         let mut app = App::default();
         app.piv.selected_slot = PivSlotSel::KeyMgmt;
-        let status = keyroost_transport::PivStatus {
-            version: None,
-            serial: None,
-            pin_retries: None,
-            chuid: None,
-            slots: vec![],
-        };
+        let status = keyroost_transport::PivStatus::default();
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
         assert_eq!(app.piv.selected_slot, PivSlotSel::KeyMgmt);
     }

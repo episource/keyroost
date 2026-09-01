@@ -1,6 +1,7 @@
 //! Small encoding helpers used by the protocol layer.
 //! No external dependencies.
 
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
     InvalidLength,

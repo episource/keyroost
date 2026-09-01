@@ -22,6 +22,7 @@ use keyroost_import::{BulkEntry, OtpAuth};
 /// is ~8.3 MP) while bounding a hostile file's memory demand at 16 MiB.
 const MAX_PIXELS: u64 = 16_000_000;
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum QrError {
     /// Not a PNG or JPEG (by magic bytes).

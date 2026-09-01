@@ -9,6 +9,7 @@
 use crate::{KeyAlg, PublicKey};
 
 /// Errors building an SPKI.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpkiError {
     /// The [`PublicKey`] variant doesn't match the [`KeyAlg`] (e.g. an EC point

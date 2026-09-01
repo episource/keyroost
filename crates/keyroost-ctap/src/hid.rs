@@ -91,6 +91,7 @@ pub const CAPABILITY_WINK: u8 = 0x01;
 pub const CAPABILITY_CBOR: u8 = 0x04;
 pub const CAPABILITY_NMSG: u8 = 0x08;
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum HidTransportError {
     Io(io::Error),

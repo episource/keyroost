@@ -1711,6 +1711,7 @@ pub fn import_rsa_key_chained(
 // ---------------------------------------------------------------------------
 
 /// Error returned by the response parsers.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// A TLV claimed more bytes than the buffer contained (or a tag/length ran
@@ -1888,6 +1889,7 @@ fn find_nested_at<'a>(tlvs: &[Tlv<'a>], tag: u16, depth: usize) -> Option<&'a [u
 /// The 4-byte legacy form omits the max-length triplet; this parser requires the
 /// 7-byte form (OpenPGP Card v3.x), returning [`ParseError::UnexpectedLength`]
 /// otherwise.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PwStatus {
     /// Byte 0: whether PW1 stays valid for multiple PSO:CDS commands (`01`) or

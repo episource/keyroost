@@ -94,6 +94,7 @@ pub struct SensorInfo {
 }
 
 /// Progress of a single enrollment capture step.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureStatus {
     /// `lastEnrollSampleStatus` — 0x00 = good, others are retry hints (see

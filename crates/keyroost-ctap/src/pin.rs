@@ -35,6 +35,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const PIN_PROTOCOL_V1: u32 = 1;
 pub const PIN_PROTOCOL_V2: u32 = 2;
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum PinError {
     InvalidPublicKey,

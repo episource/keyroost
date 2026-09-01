@@ -202,6 +202,7 @@ pub const fn prefix_byte(oath_type: OathType, algorithm: Algorithm) -> u8 {
 /// `otpauth://` URIs / QR codes, *and from the card's own LIST response* — a
 /// hostile card can list a protocol-valid name too long to use in a
 /// follow-up command, so overflow must be an error, never a panic.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildError {
     /// A single TLV value exceeds the 255-byte short-form length. `what`
@@ -623,6 +624,7 @@ pub fn totp_challenge(unix_seconds: u64, period: u32) -> [u8; 8] {
 // ---------------------------------------------------------------------------
 
 /// Error returned by the response parsers.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// A TLV claimed more bytes than the buffer contained.

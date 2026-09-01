@@ -64,6 +64,7 @@ pub use keyroost_openpgp::{
 };
 
 /// Things that can go wrong talking to a Molto2.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum TransportError {
     /// PC/SC service unavailable (the smart-card service is not running).
@@ -512,6 +513,7 @@ impl Session {
                 got,
                 expected_min: need,
             },
+            _ => TransportError::MalformedResponse("get info: unrecognized error"),
         })?;
         Ok(DeviceInfo { serial, utc_time })
     }

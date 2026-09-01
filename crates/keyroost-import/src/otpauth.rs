@@ -10,6 +10,7 @@
 use keyroost_proto::codec::base32_decode;
 use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
 
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum OtpAuthError {
     NotOtpAuth,

@@ -40,6 +40,7 @@ pub struct FidoKeyInfo {
     pub product_id: Option<u16>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum WinWebAuthnError {
     /// Not running on Windows.

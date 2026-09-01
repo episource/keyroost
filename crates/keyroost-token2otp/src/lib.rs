@@ -161,6 +161,7 @@ pub mod sw {
 /// An expected, surface-to-the-user error from the applet, mirroring the
 /// reference client's exception hierarchy (spec §8.4). Transport-level and
 /// crypto errors are separate types in their own modules.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OtpError {
     /// `6A80` / `6A83`. Note: on a clean `ENUM_CODES` READ_ALL this means "zero
@@ -646,6 +647,7 @@ impl DeviceInfo {
 
 /// Which USB interfaces a `SET_DEVICE_TYPE` mask would leave enabled, and the
 /// guard against bricking the device (spec §6.8).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetDeviceTypeError {
     /// The supplied mask would disable every interface, leaving the device with

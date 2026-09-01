@@ -124,6 +124,7 @@ pub struct ProfilePublicData {
 /// Strict-envelope violations from [`parse_public_data`]. Anything that
 /// deviates from the captured `95 1F 70 1D <29 bytes>` shape is an error,
 /// never a guess.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicDataError {
     /// Shorter than the 4-byte TLV envelope header.
@@ -154,6 +155,7 @@ impl fmt::Display for PublicDataError {
 impl std::error::Error for PublicDataError {}
 
 /// Error decoding a `get info` (`0x41`) response body.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoError {
     /// The response was shorter than the serial-length + separator + time

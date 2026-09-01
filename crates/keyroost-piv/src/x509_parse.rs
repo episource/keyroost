@@ -26,6 +26,7 @@ use std::fmt;
 use crate::{KeyAlg, PublicKey};
 
 /// Errors from reading a Subject DN out of a DER certificate.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum X509ParseError {
     /// A TLV length field ran past the end of the buffer, or the buffer ended

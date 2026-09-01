@@ -24,6 +24,7 @@ pub const HID_USAGE_PAGE_FIDO: u16 = 0xF1D0;
 pub const HID_USAGE_FIDO_AUTHENTICATOR: u16 = 0x01;
 
 /// Things that can go wrong enumerating HID devices.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum HidError {
     /// Underlying filesystem error reading sysfs or `/dev`.

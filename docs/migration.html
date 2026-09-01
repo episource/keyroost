@@ -110,6 +110,12 @@
           GET VERSION reply as raw bytes and
           <code>format_version_bytes</code> renders it, so cards that answer
           with more or fewer than three bytes work.</td></tr>
+      <tr><td>all library crates</td>
+        <td>The public error enums and status structs are now
+          <code>#[non_exhaustive]</code> &mdash; an exhaustive <code>match</code>
+          needs a <code>_ =&gt;</code> arm and struct literals of status types are
+          no longer possible outside their crate. From now on adding a variant
+          or field is not a breaking change.</td></tr>
     </table>
     </div>
   </section>

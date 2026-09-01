@@ -20,6 +20,7 @@ const SW_FILE_NOT_FOUND: u16 = 0x6A82;
 
 /// A read-only snapshot of an OpenPGP card's state, assembled from the
 /// Application Related Data (`6E`) and the signature counter (`7A`/`93`).
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OpenPgpStatus {
     /// Full application identifier (16 bytes: RID, version, manufacturer, serial).
