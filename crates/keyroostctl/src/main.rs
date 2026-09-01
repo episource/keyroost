@@ -2315,6 +2315,11 @@ enum OtpCmd {
     },
     /// Delete the HOTP-on-button keystroke slot.
     DeleteButtonHotp,
+    /// Read and print the device configuration (interface states, capabilities).
+    ///
+    /// Useful for diagnosing why the GUI's keyboard toggle or Touch HOTP gating
+    /// behaves as it does.
+    Config,
     /// Enable or disable the key's USB interfaces (FIDO / keyboard-HID / CCID)
     /// via SET_DEVICE_TYPE.
     ///
@@ -2322,10 +2327,6 @@ enum OtpCmd {
     /// TWO must remain enabled: disabling all of them bricks the key, and leaving
     /// only one risks locking you out, so the tool refuses fewer than two. This
     /// reconfigures the hardware and requires typing a confirmation phrase.
-    /// Read and print the device configuration (interface states, capabilities).
-    /// Useful for diagnosing why the GUI's keyboard toggle or Touch HOTP gating
-    /// behaves as it does.
-    Config,
     Interface {
         /// Enable the FIDO2/U2F interface.
         #[arg(long)]

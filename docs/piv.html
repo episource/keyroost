@@ -200,9 +200,10 @@ done
 
 unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
     <p>If a certificate authority issues your certificates, replace the
-      <code>self-sign</code> step with <code>request-cert</code> — note it takes neither
-      <code>--days</code> nor a management key (the CSR is signed with the slot key, gated by
-      the PIN alone):</p>
+      <code>self-sign</code> step with <code>request-cert</code> — note it takes no
+      <code>--days</code>, and no management key unless you add <code>--generate-key</code>
+      — the CSR signature itself needs only the PIN; the management key is for the
+      key-generation step:</p>
 <pre><code>  keyroostctl piv request-cert --slot "$slot" --subject "CN=$USER" \
       --pin-env PIV_PIN --file "slot-$slot.csr" --reader yubikey</code></pre>
     <p>Import each issued certificate later with
@@ -216,6 +217,27 @@ unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
         perfectly comfortable. The CLI just earns its keep when you're scripting many slots
         or many keys and don't want to re-enter the management key each time.</p>
     </div>
+  </section>
+
+  <section class="kr-section">
+    <span id="errors"></span>
+    <h2>Errors and diagnostics</h2>
+    <p>When the card rejects a command, keyroost appends the ISO&nbsp;7816 status word's
+      plain-language meaning to the error, e.g. <code>device rejected piv delete key: SW=6D00
+      (instruction not supported or invalid)</code> — no lookup table needed to make sense of a
+      failure.</p>
+    <p>On a contact or NFC reader that negotiates the older <strong>T=0</strong> protocol,
+      certificate import and on-card signing used to fail with a PC/SC "transaction failed"
+      error, because T=0 can't carry the large commands those operations need. keyroost now
+      reads the negotiated protocol and chains large commands from the start on T=0 links, so
+      this no longer happens.</p>
+    <p class="kr-muted">The desktop app's <strong>activity log</strong> (opened from the top
+      bar, and detachable into its own window) lists every action, distinguishing what you
+      triggered from background reads. Turn on its <strong>APDU trace</strong> checkbox before
+      an operation to have it also record the exact commands and responses exchanged with the
+      card — the same detail <code>--debug</code> prints on the CLI — with
+      <strong>Clear</strong> to empty the log and <strong>Copy</strong> to take a trace
+      elsewhere.</p>
   </section>
 
   <section class="kr-section kr-res-section">

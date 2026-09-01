@@ -96,10 +96,11 @@
       clear.</p>
     <p><strong>Edit a note.</strong> keyroost's own notes have an <em>Edit</em> button that
       replaces the text in place. Relying-party entries cannot be edited.</p>
-    <p><strong>Delete an entry.</strong> Any entry can be deleted, but deleting one a relying
-      party owns may break the service that stored it — so that case is gated: the desktop app
-      asks you to confirm, and the CLI requires an explicit <code>--yes</code>. keyroost then
-      rewrites the array without the entry.</p>
+    <p><strong>Delete an entry.</strong> Any entry can be deleted, and every delete needs an
+      explicit <code>--yes</code> on the CLI (the desktop app asks you to confirm). Deleting an
+      entry a relying party owns may break the service that stored it, so that case is refused
+      with a stronger message and, once you pass <code>--yes</code>, warns before it proceeds.
+      keyroost then rewrites the array without the entry.</p>
     <p><strong>Erase everything.</strong> A separate wipe-all action clears the entire array —
       relying-party data included, not just keyroost notes. It is irreversible, needs your PIN,
       and is double-confirmed in the app (<code>--yes</code> on the CLI).</p>
@@ -126,7 +127,7 @@ keyroostctl fido large-blob add "spare key in the desk drawer" --pin-stdin
 keyroostctl fido large-blob edit 2 "moved to the safe" --pin-stdin
 keyroostctl fido large-blob export 1 entry.bin              # raw bytes, no PIN
 keyroostctl fido large-blob export 1 id_ecdsa_sk-cert.pub --as-cert
-keyroostctl fido large-blob delete 1 --pin-stdin --yes      # --yes only for RP-owned entries
+keyroostctl fido large-blob delete 1 --pin-stdin --yes      # --yes is required for every delete; RP-owned entries also print a warning
 keyroostctl fido large-blob clear --pin-stdin --yes         # wipes the whole array</code></pre>
     <p class="kr-muted">Reading (<code>list</code>, <code>get</code>, <code>export</code>) needs
       no PIN — the array is world-readable. Note that <code>add</code> and <code>edit</code>

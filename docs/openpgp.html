@@ -104,9 +104,10 @@
         a PIN without changing anything; <strong>generate</strong> keys on-card in any
         algorithm the card accepts — RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
         secp256k1, brainpool — the choice offered from the card's own algorithm list
-        (<code>keyroostctl openpgp algorithms</code>), or <strong>import</strong> an RSA key by
-        host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the sign, encrypt, or
-        <strong>auth</strong> slot (<code>--slot auth</code>); <strong>sign</strong> (SHA-256 or
+        (<code>keyroostctl openpgp algorithms</code>), or <strong>import</strong> an RSA-2048
+        key by host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the sign, decrypt, or
+        <strong>auth</strong> slot (<code>--slot decrypt</code>, <code>--slot auth</code>);
+        <strong>sign</strong> (SHA-256 or
         SHA-1), <strong>decrypt</strong>, and <strong>authenticate</strong> (client/SSH
         signature with the Authentication key); set cardholder name / URL; register a key for
         GnuPG; <strong>change the user or admin PIN</strong> and <strong>unblock a
