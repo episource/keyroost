@@ -67,6 +67,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   variant (an exhaustive `match` needs a new arm).
 
 ### Fixed
+- Library users enabling `keyroost-transport`'s `hidapi-backend` feature on
+  its own no longer hit a compile error in `keyroost-ctap`: the feature now
+  forwards to every crate that has a matching backend switch, not just
+  `keyroost-hid`. CI builds every feature at once and never saw the partial
+  combination; `cargo semver-checks` does, and did.
 - **Certificate import and signing now work on contact (T=0) smart-card
   readers.** Large PIV commands were sent as extended-length APDUs first,
   with chaining only as a fallback after the card refused. A T=0 link cannot

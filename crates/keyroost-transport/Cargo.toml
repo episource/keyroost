@@ -46,7 +46,7 @@ zeroize = "1"
 [features]
 # Forces the hidapi backend on Linux for building/testing the Token2 OTP USB-HID
 # transport there; the default Linux build uses the dependency-free hidraw path.
-hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend"]
+hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend", "keyroost-ctap/hidapi-backend"]
 
 # Auto-select the hidapi I/O backend on macOS / Windows for the Token2 OTP HID
 # transport (Linux keeps the dependency-free hidraw File backend).
