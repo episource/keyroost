@@ -115,8 +115,11 @@ pub fn encrypt_seed_payload(
     });
 
     // AES-256-CBC + PKCS#7 over the cleartext.
-    let mut work = Zeroizing::new(cleartext.to_vec());
+    // Sized for the padding up front: growing a Zeroizing<Vec> reallocates
+    // and frees the first copy of the cleartext unwiped.
     let pad_room = 16 - (cleartext.len() % 16);
+    let mut work = Zeroizing::new(Vec::with_capacity(cleartext.len() + pad_room));
+    work.extend_from_slice(cleartext);
     work.resize(cleartext.len() + pad_room, 0);
     let ct_len = cleartext.len();
     let ciphertext = Aes256CbcEnc::new(session_key.as_slice().into(), iv.into())
@@ -317,8 +320,11 @@ impl Default for HostAgreement {
 /// AES-256-CBC encrypt `cleartext` (PKCS#7) under the session key with an
 /// explicit `iv`.
 pub fn session_encrypt(key: &[u8; 32], iv: &[u8; 16], cleartext: &[u8]) -> Vec<u8> {
-    let mut work = Zeroizing::new(cleartext.to_vec());
+    // Sized for the padding up front: growing a Zeroizing<Vec> reallocates
+    // and frees the first copy of the cleartext unwiped.
     let pad_room = 16 - (cleartext.len() % 16);
+    let mut work = Zeroizing::new(Vec::with_capacity(cleartext.len() + pad_room));
+    work.extend_from_slice(cleartext);
     work.resize(cleartext.len() + pad_room, 0);
     let ct_len = cleartext.len();
     Aes256CbcEnc::new(key.into(), iv.into())
@@ -576,7 +582,10 @@ fn aes256_cbc_encrypt_nopad(
 /// wiped on drop — its only caller pads a block holding a cleartext PIN.
 fn pkcs7_pad16(data: &[u8]) -> Zeroizing<Vec<u8>> {
     let n = 16 - (data.len() % 16);
-    let mut out = Zeroizing::new(data.to_vec());
+    // Sized up front for the same reason as `session_encrypt`: a regrow would
+    // free the unpadded PIN block unwiped.
+    let mut out = Zeroizing::new(Vec::with_capacity(data.len() + n));
+    out.extend_from_slice(data);
     out.extend(std::iter::repeat_n(n as u8, n));
     out
 }
