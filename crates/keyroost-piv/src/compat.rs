@@ -66,7 +66,9 @@ impl PivExtension {
             // 5.7: unsupported at every earlier version, supported from 5.7
             // on. Token2 applet 5.112.0 has separately been observed to
             // reject both, so it carries its own blacklist row in the same
-            // table.
+            // table — as does the Swissbit iShield 2 Pro (fingerprinted
+            // `OpenFips201::SwissbitIShield2`) at applet version 1.4.1.0 and
+            // below.
             PivExtension::MoveKey | PivExtension::DeleteKey => KEY_OPS_VERDICTS,
         }
     }
@@ -139,6 +141,15 @@ pub enum PivQuirk {
 ///   authoritative (rather than softening the same way, per
 ///   [`resolve_in`]'s trailing-blacklist rule) because the 5.112.0 verdict
 ///   above it *brackets* it.
+/// * Swissbit iShield 2 Pro (`OpenFips201::SwissbitIShield2`) — applet
+///   version 1.4.1.0 and every earlier version have been observed to reject
+///   both extensions. Same two-verdict shape as Token2's row above, just
+///   with `[1, 4, 1, 0]` as the exact/bracketing version instead of
+///   `[5, 112, 0]`: the `[]` sentinel blacklists everything from the very
+///   first version, bracketed (rather than trailing) by the `[1, 4, 1, 0]`
+///   verdict above it. A version above 1.4.1.0 falls off the end of the row
+///   and resolves [`FeatureGate::Unverified`] — the blacklist deliberately
+///   doesn't extend to a future, untested version.
 const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::YubiKey,
@@ -162,6 +173,19 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
             },
             VersionVerdict {
                 version: &[5, 112, 0],
+                verdict: Verdict::Blacklisted,
+            },
+        ],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::Blacklisted,
+            },
+            VersionVerdict {
+                version: &[1, 4, 1, 0],
                 verdict: Verdict::Blacklisted,
             },
         ],
@@ -621,6 +645,62 @@ mod tests {
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             assert_eq!(
                 resolve(ext, AppletFingerprint::Token2, Some(&[5, 113, 0]), None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    // --- Swissbit iShield 2 Pro: the bracketed <= 1.4.1.0 blacklist -------
+
+    #[test]
+    fn swissbit_ishield2_at_or_below_1_4_1_0_is_unsupported() {
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2);
+            // The exact observed version: blacklisted via the direct-match
+            // rule.
+            assert_eq!(
+                resolve(ext, fp, Some(&[1, 4, 1, 0]), None),
+                FeatureGate::Unsupported
+            );
+            // Anything older: covered by the `[]` sentinel, and — unlike
+            // Token2's single-entry row — bracketed by the `[1, 4, 1, 0]`
+            // verdict above it, so it stays authoritative rather than
+            // softening to `Unverified`.
+            for older in [&[0][..], &[1][..], &[1, 4, 0][..]] {
+                assert_eq!(
+                    resolve(ext, fp, Some(older), None),
+                    FeatureGate::Unsupported
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swissbit_ishield2_above_1_4_1_0_is_unverified_not_blacklisted() {
+        // The blacklist deliberately doesn't extend to a version keyroost
+        // hasn't actually observed: `[1, 4, 1, 0]` is the last verdict in
+        // the row, so anything strictly newer softens to `Unverified` per
+        // `resolve_in`'s trailing-blacklist rule.
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2);
+            for newer in [&[1, 4, 1, 1][..], &[1, 5, 0][..], &[2, 0][..]] {
+                assert_eq!(resolve(ext, fp, Some(newer), None), FeatureGate::Unverified);
+            }
+        }
+    }
+
+    #[test]
+    fn swissbit_ishield2_other_openfips201_variant_is_unverified() {
+        // The row is keyed to the SwissbitIShield2 sub-fingerprint
+        // specifically — the generic OpenFIPS201 variant carries no data.
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            assert_eq!(
+                resolve(
+                    ext,
+                    AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                    Some(&[1, 4, 1, 0]),
+                    None,
+                ),
                 FeatureGate::Unverified
             );
         }
