@@ -30,6 +30,14 @@
 //! a blacklist verdict old enough that a later firmware might have added the
 //! extension — resolves to [`FeatureGate::Unverified`] on that axis, which
 //! keeps the control usable unless the other axis disagrees.
+//!
+//! The same per-version rows also carry [`PivQuirk`]s — observed behavioral
+//! wrinkles that need a workaround rather than gating a control. Quirks are
+//! resolved separately by [`resolve_quirks`], with simpler semantics than
+//! [`resolve`]: no whitelist/blacklist, just "take the current entry on each
+//! axis and merge whatever quirks it lists."
+
+use std::collections::BTreeSet;
 
 use crate::fingerprint::AppletFingerprint;
 
@@ -87,6 +95,25 @@ impl PivExtension {
             }
         }
     }
+}
+
+/// A version-gated behavioral wrinkle keyroost has observed on some PIV
+/// devices — distinct from [`PivExtension`]: an extension is "supported or
+/// not", a quirk is "present and needs a workaround" regardless of support.
+/// Carried on [`VersionQuirks::quirks`] and surfaced by [`resolve_quirks`].
+/// Nothing in this crate acts on a resolved quirk yet — the workaround code
+/// for each one lands separately.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PivQuirk {
+    /// The serial number returned by the Yubico extension APDU GET SERIAL
+    /// (`INS 0xF8`) is packed BCD encoded rather than a plain big-endian
+    /// integer.
+    InsF8SerialIsBcd,
+    /// The algorithm byte returned by the Yubico extension APDU GET METADATA
+    /// (`INS 0xF7`) is invalid/unreliable on this device and must be
+    /// ignored.
+    InsF7MetadataAlgorithmInvalid,
 }
 
 /// The white/blacklist shared by [`PivExtension::MoveKey`] and
@@ -269,6 +296,112 @@ fn resolve_in(
         // brackets this version, so treat it as authoritative and block.
         Verdict::Blacklisted => FeatureGate::Unsupported,
     }
+}
+
+/// One fingerprint's row in a [`PivQuirk`] table — the quirks counterpart to
+/// [`FingerprintVerdicts`], but deliberately a separate type: a quirk row has
+/// no whitelist/blacklist [`Verdict`] to carry, only a list of quirks active
+/// from each entry's version onward, so reusing [`VersionVerdict`] would
+/// leave a `verdict` field with no meaning on this axis.
+struct FingerprintQuirks {
+    fingerprint: AppletFingerprint,
+    /// This fingerprint's per-version quirks, **ascending by
+    /// [`VersionQuirks::version`]** and non-empty.
+    quirks: &'static [VersionQuirks],
+}
+
+/// "At [`Self::version`] (and, until a later entry, above it) these quirks
+/// are active." Same version-ordering convention as [`VersionVerdict`], but
+/// purely additive: there's no whitelisted/blacklisted state, so a quirk
+/// entry can never suppress a quirk an earlier entry already reported.
+struct VersionQuirks {
+    version: &'static [u8],
+    quirks: &'static [PivQuirk],
+}
+
+/// [`PivQuirk`] table keyed by the PIV applet's own version — same row shape
+/// as [`PivExtension::applet_verdicts`], but not scoped to any one
+/// extension: every fingerprint's known version-gated quirks live directly
+/// in this one table rather than being duplicated per extension. Empty
+/// today — no fingerprint has recorded applet-version quirk data yet, so
+/// [`resolve_quirks`] always resolves this axis to an empty set until an
+/// entry is added.
+const QUIRK_APPLET_TABLE: &[FingerprintQuirks] = &[];
+
+/// [`PivQuirk`] table keyed by the device's firmware version, same shape and
+/// caveats as [`QUIRK_APPLET_TABLE`] but the firmware axis.
+const QUIRK_FIRMWARE_TABLE: &[FingerprintQuirks] = &[];
+
+/// The row entry in `rows` for `fingerprint` with the greatest
+/// [`VersionQuirks::version`] `<=` `version`, if any — the "current" quirks
+/// entry for that version, ignoring anything with a higher version on
+/// record. Same lookup rule as step 3 of [`resolve_in`], but there's no
+/// whitelist/blacklist reasoning to apply once the entry is found: quirks
+/// are taken as-is.
+fn latest_quirks<'a>(
+    rows: &'a [FingerprintQuirks],
+    fingerprint: AppletFingerprint,
+    version: &[u8],
+) -> Option<&'a VersionQuirks> {
+    let row = rows.iter().find(|row| row.fingerprint == fingerprint)?;
+    let idx = row.quirks.iter().rposition(|v| v.version <= version)?;
+    Some(&row.quirks[idx])
+}
+
+/// Resolve the set of [`PivQuirk`]s active for an applet fingerprinted as
+/// `fingerprint`, reporting `applet_version` and/or `firmware_version` —
+/// either or both `None` when the card never reported that one:
+///
+/// 1. If `applet_version` is available, take the [`QUIRK_APPLET_TABLE`]
+///    entry for `fingerprint` with the highest version `<=` `applet_version`
+///    (if any).
+/// 2. If `firmware_version` is available, take the [`QUIRK_FIRMWARE_TABLE`]
+///    entry for `fingerprint` with the highest version `<=`
+///    `firmware_version` (if any).
+/// 3. Merge the [`VersionQuirks::quirks`] from whichever of (1)/(2) matched
+///    into a single set.
+///
+/// Unlike [`resolve`], there's no whitelist/blacklist reasoning here: each
+/// axis contributes at most one entry's quirks, and quirks only ever
+/// accumulate — nothing in this table can suppress a quirk another entry
+/// added.
+#[must_use]
+pub fn resolve_quirks(
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> BTreeSet<PivQuirk> {
+    resolve_quirks_in(
+        QUIRK_APPLET_TABLE,
+        QUIRK_FIRMWARE_TABLE,
+        fingerprint,
+        applet_version,
+        firmware_version,
+    )
+}
+
+/// [`resolve_quirks`] against explicit applet/firmware quirk tables, so a
+/// test can supply its own without wiring one into the const tables — same
+/// role [`resolve_in`] plays for [`resolve`].
+fn resolve_quirks_in(
+    applet_rows: &[FingerprintQuirks],
+    firmware_rows: &[FingerprintQuirks],
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> BTreeSet<PivQuirk> {
+    let mut quirks = BTreeSet::new();
+    if let Some(version) = applet_version {
+        if let Some(entry) = latest_quirks(applet_rows, fingerprint, version) {
+            quirks.extend(entry.quirks.iter().copied());
+        }
+    }
+    if let Some(version) = firmware_version {
+        if let Some(entry) = latest_quirks(firmware_rows, fingerprint, version) {
+            quirks.extend(entry.quirks.iter().copied());
+        }
+    }
+    quirks
 }
 
 #[cfg(test)]
@@ -549,6 +682,110 @@ mod tests {
                 Some(&[9, 1, 2]),
             ),
             FeatureGate::Supported
+        );
+    }
+
+    // --- resolve_quirks(): the separate, non-gating quirks axis ----------
+
+    fn quirks(
+        applet_entries: &'static [VersionQuirks],
+        firmware_entries: &'static [VersionQuirks],
+        applet_version: Option<&[u8]>,
+        firmware_version: Option<&[u8]>,
+    ) -> BTreeSet<PivQuirk> {
+        let applet_rows = [FingerprintQuirks {
+            fingerprint: AppletFingerprint::Generic,
+            quirks: applet_entries,
+        }];
+        let firmware_rows = [FingerprintQuirks {
+            fingerprint: AppletFingerprint::Generic,
+            quirks: firmware_entries,
+        }];
+        resolve_quirks_in(
+            &applet_rows,
+            &firmware_rows,
+            AppletFingerprint::Generic,
+            applet_version,
+            firmware_version,
+        )
+    }
+
+    #[test]
+    fn no_data_on_either_axis_resolves_to_no_quirks() {
+        assert_eq!(
+            resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7]), Some(&[5, 7])),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn quirk_axis_picks_the_highest_matching_version() {
+        let entries: &[VersionQuirks] = &[
+            VersionQuirks {
+                version: &[5, 0],
+                quirks: &[PivQuirk::InsF8SerialIsBcd],
+            },
+            VersionQuirks {
+                version: &[5, 7],
+                quirks: &[PivQuirk::InsF7MetadataAlgorithmInvalid],
+            },
+        ];
+        // Below every entry: no quirks at all.
+        assert_eq!(quirks(entries, &[], Some(&[4, 9]), None), BTreeSet::new());
+        // Between the two entries: only the lower one's quirk applies.
+        assert_eq!(
+            quirks(entries, &[], Some(&[5, 3]), None),
+            BTreeSet::from([PivQuirk::InsF8SerialIsBcd])
+        );
+        // At or above the higher entry: only *its* quirk — entries don't
+        // accumulate across each other, only across the two axes.
+        assert_eq!(
+            quirks(entries, &[], Some(&[6, 0]), None),
+            BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid])
+        );
+    }
+
+    #[test]
+    fn quirks_from_both_axes_merge_into_one_set() {
+        let applet_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }];
+        let firmware_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF7MetadataAlgorithmInvalid],
+        }];
+        assert_eq!(
+            quirks(
+                applet_entries,
+                firmware_entries,
+                Some(&[1, 0]),
+                Some(&[1, 0]),
+            ),
+            BTreeSet::from([
+                PivQuirk::InsF8SerialIsBcd,
+                PivQuirk::InsF7MetadataAlgorithmInvalid,
+            ])
+        );
+    }
+
+    #[test]
+    fn quirks_ignore_an_axis_with_no_reported_version() {
+        let applet_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }];
+        assert_eq!(
+            quirks(applet_entries, &[], None, Some(&[9, 9])),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn unknown_fingerprint_has_no_quirks() {
+        assert_eq!(
+            resolve_quirks(AppletFingerprint::Generic, Some(&[1, 0]), Some(&[1, 0])),
+            BTreeSet::new()
         );
     }
 }
