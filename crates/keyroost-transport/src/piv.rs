@@ -1647,10 +1647,22 @@ impl PivSession {
     /// transient failure here is reported as an empty slot; the card's own
     /// refusal to write over an occupied destination is the backstop.
     ///
+    /// A `Some` from [`metadata`] is *not* by itself "occupied": some
+    /// implementations (Nitrokey's `piv-authenticator`, and PivApplet as seen
+    /// on a Token2 fingerprint trace) answer `SW_OK` for every retired key
+    /// reference whether or not a key was ever generated there, with an empty
+    /// or key-less body for the ones that weren't. That reply is
+    /// indistinguishable from "no key" and would otherwise mark every retired
+    /// slot present — so this gates on [`metadata_key_material`], the same
+    /// "does this reply actually name the key" check [`Self::slot_key`] uses,
+    /// rather than on the GET METADATA status word alone.
+    ///
     /// [`status`]: PivSession::status
     /// [`metadata`]: PivSession::metadata
     pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
-        Ok(self.metadata(slot.key_ref()).is_some())
+        Ok(self
+            .metadata(slot.key_ref())
+            .is_some_and(|md| metadata_key_material(&md).is_some()))
     }
 
     /// Reset the PIV application to factory defaults. Only succeeds when **both**
