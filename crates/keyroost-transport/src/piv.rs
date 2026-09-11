@@ -13,7 +13,7 @@ use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use zeroize::Zeroizing;
 
 /// How many wrong-credential attempts to make when intentionally blocking a
@@ -264,6 +264,16 @@ pub struct PivSession {
     /// with nothing), never `None`: fingerprint resolution treats empty and
     /// absent the same way.
     select_response: Vec<u8>,
+    /// [`Self::quirks`]'s cache: `None` until first resolved, then the
+    /// [`keyroost_piv::compat::PivQuirk`]s active for this applet for the
+    /// rest of the session. Safe to cache — unlike the read-through data this
+    /// session deliberately doesn't cache (certs, PIN retries, slot
+    /// occupancy; see [`Self::status_detailed`]'s doc) — because the applet's
+    /// identity and reported versions cannot change while the card stays
+    /// connected, but resolving them can cost a handful of extra APDUs (some
+    /// fingerprints need a live SELECT probe), so it's worth not repeating
+    /// per slot.
+    quirks: Option<BTreeSet<keyroost_piv::compat::PivQuirk>>,
 }
 
 /// The in-session public-key cache behind `PivSession`, keyed by PIV key
@@ -399,6 +409,30 @@ fn decode_serial_if_bcd(
     }
 }
 
+/// Strip `md`'s algorithm identifier (tag `0x01`) and public key (tag `0x04`)
+/// when `quirks` contains
+/// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`] — on an
+/// applet with that quirk, GET METADATA's algorithm byte has been observed
+/// stuck and never reflecting the slot's actual key state, and the public key
+/// goes with it: a raw key blob is meaningless without a trustworthy
+/// algorithm to interpret it against (RSA vs. EC changes how those bytes are
+/// structured, e.g. in [`metadata_key_material`]). Every other field
+/// (`policy`, `origin`, `is_default`, `retries`) is untouched — the quirk is
+/// specific to tags `0x01`/`0x04`. [`PivSession::metadata`] is the sole
+/// caller; split out as a pure function, same seam style as
+/// [`decode_serial_if_bcd`], so the stripping rule is unit-testable without a
+/// card.
+fn clear_metadata_if_quirky(
+    quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
+    mut md: Metadata,
+) -> Metadata {
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid) {
+        md.algorithm = None;
+        md.public_key = None;
+    }
+    md
+}
+
 impl PivSession {
     /// Connect to `reader_name` and SELECT the PIV application. Returns
     /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
@@ -431,6 +465,7 @@ impl PivSession {
             t0,
             pubkey_cache: PubkeyCache::new(),
             select_response: Vec::new(),
+            quirks: None,
         };
         session.select()?;
         Ok(session)
@@ -462,6 +497,7 @@ impl PivSession {
                     t0,
                     pubkey_cache: PubkeyCache::new(),
                     select_response: Vec::new(),
+                    quirks: None,
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -892,14 +928,47 @@ impl PivSession {
         }
     }
 
+    /// The [`keyroost_piv::compat::PivQuirk`]s active for this session's
+    /// applet, resolved once — via [`Self::version`] and
+    /// [`Self::applet_fingerprint`], the same sources [`Self::status`] and
+    /// [`Self::status_detailed`] use — and cached in [`Self::quirks`] (the
+    /// field) for the rest of the session; see that field's doc for why
+    /// caching this particular resolution is safe. [`Self::metadata`] is the
+    /// only caller today.
+    fn quirks(&mut self) -> BTreeSet<keyroost_piv::compat::PivQuirk> {
+        if let Some(quirks) = &self.quirks {
+            return quirks.clone();
+        }
+        let version = self.version();
+        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        let quirks = keyroost_piv::compat::resolve_quirks(
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        );
+        self.quirks = Some(quirks.clone());
+        quirks
+    }
+
     /// GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a slot
     /// key ref). `None` when the firmware predates the extension (5.3-).
+    ///
+    /// Runs [`clear_metadata_if_quirky`] over the parsed reply before
+    /// returning it — see that function's doc for what it strips and why.
+    /// This is the sole place that needs to know about the quirk: every
+    /// caller of [`Self::metadata`] — [`Self::slot_key`]/
+    /// [`metadata_key_material`], [`Self::algorithm_without_cert`],
+    /// [`Self::resolve_policy`], [`Self::reported_management_key_algorithm`],
+    /// [`Self::status_detailed`] — already treats a missing algorithm/public
+    /// key as "fall back to another source", which is exactly the right
+    /// behavior on a device where GET METADATA can't be trusted for either.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
         let (data, sw) = self.transmit_full(&piv::get_metadata(key_ref)).ok()?;
         if sw != piv::SW_OK {
             return None;
         }
-        piv::parse_metadata(&data).ok()
+        let md = piv::parse_metadata(&data).ok()?;
+        Some(clear_metadata_if_quirky(&self.quirks(), md))
     }
 
     /// The card-management (9B) key's algorithm *as the card reports it* via
@@ -2249,6 +2318,39 @@ mod tests {
             decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, None),
             None
         );
+    }
+
+    #[test]
+    fn clear_metadata_if_quirky_strips_algorithm_and_public_key_together() {
+        use keyroost_piv::compat::PivQuirk;
+
+        let md = Metadata {
+            algorithm: Some(0x07),
+            policy: Some((0x01, 0x02)),
+            origin: Some(1),
+            public_key: Some(vec![0xAB, 0xCD]),
+            is_default: Some(false),
+            retries: None,
+        };
+
+        // The quirk active: algorithm and public key are gone, every other
+        // field survives untouched.
+        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid]);
+        let cleared = clear_metadata_if_quirky(&quirky, md.clone());
+        assert_eq!(
+            cleared,
+            Metadata {
+                algorithm: None,
+                public_key: None,
+                ..md.clone()
+            }
+        );
+
+        // No quirk active (empty set, or a set with an unrelated quirk):
+        // passed through unchanged.
+        assert_eq!(clear_metadata_if_quirky(&BTreeSet::new(), md.clone()), md);
+        let other = BTreeSet::from([PivQuirk::InsF8SerialIsBcd]);
+        assert_eq!(clear_metadata_if_quirky(&other, md.clone()), md);
     }
 
     #[test]

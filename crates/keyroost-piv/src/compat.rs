@@ -39,7 +39,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::fingerprint::AppletFingerprint;
+use crate::fingerprint::{AppletFingerprint, OpenFips201Variant};
 
 /// One of the non-standard, vendor-extension PIV commands keyroost exposes —
 /// nothing in SP 800-73-4 defines it, so support varies by applet and is
@@ -113,9 +113,10 @@ pub enum PivQuirk {
     /// (`INS 0xF8`) is packed BCD encoded rather than a plain big-endian
     /// integer.
     InsF8SerialIsBcd,
-    /// The algorithm byte returned by the Yubico extension APDU GET METADATA
-    /// (`INS 0xF7`) is invalid/unreliable on this device and must be
-    /// ignored.
+    /// The algorithm identifier (tag `0x01`) in the Yubico extension APDU GET
+    /// METADATA (`INS 0xF7`) response never updates on this device — it does
+    /// not reflect the slot's actual key state — and must always be ignored
+    /// when this quirk is set, regardless of what value is read.
     InsF7MetadataAlgorithmInvalid,
 }
 
@@ -353,17 +354,54 @@ struct VersionQuirks {
 /// as [`PivExtension::applet_verdicts`], but not scoped to any one
 /// extension: every fingerprint's known version-gated quirks live directly
 /// in this one table rather than being duplicated per extension.
-const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[FingerprintQuirks {
-    fingerprint: AppletFingerprint::Token2,
-    // The empty-slice version is the "from the very first version" sentinel
-    // also used by `KEY_OPS_VERDICTS`'s YubiKey row: it orders at or below
-    // every real version (`[] <= anything`), so this entry matches
-    // regardless of which applet version Token2 reports.
-    quirks: &[VersionQuirks {
-        version: &[],
-        quirks: &[PivQuirk::InsF8SerialIsBcd],
-    }],
-}];
+const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::Token2,
+        // The empty-slice version is the "from the very first version"
+        // sentinel also used by `KEY_OPS_VERDICTS`'s YubiKey row: it orders
+        // at or below every real version (`[] <= anything`), so this entry
+        // matches regardless of which applet version Token2 reports.
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+        // Older Swissbit iShield 2 Pro devices have been observed to never
+        // update GET METADATA's algorithm identifier (tag 0x01): it's stuck
+        // at whatever it first reported and doesn't reflect the slot's
+        // actual key state, so it must always be ignored while this quirk is
+        // set. The empty-slice version is the "from the very first version"
+        // sentinel (see the Token2 row above) rather than a specific version
+        // this was first observed on — the issue might already have been
+        // fixed in an earlier version than what's on record here, but no
+        // older test hardware has been available to confirm either way, so
+        // this deliberately claims no lower bound. The device actually
+        // confirmed clear of it reports applet version 1.4.1.0, but the
+        // clearing entry below is keyed to the shorter `[1, 4, 1]` on
+        // purpose: under this crate's slice-prefix version ordering a
+        // shorter version like `[1, 4, 1]` is "less than" any longer one
+        // starting with the same elements (`[1, 4, 1] < [1, 4, 1, 0]`), so
+        // `[1, 4, 1]` as a threshold covers both a bare 3-component "1.4.1"
+        // report and any of its patch releases, whereas `[1, 4, 1, 0]`
+        // itself would not match a device reporting the shorter "1.4.1".
+        // Per `latest_quirks`, entries don't accumulate across each other,
+        // only across the two axes, so a version at or above `[1, 4, 1]`
+        // picks up this entry's empty quirk list instead and reports no
+        // quirk.
+        quirks: &[
+            VersionQuirks {
+                version: &[],
+                quirks: &[PivQuirk::InsF7MetadataAlgorithmInvalid],
+            },
+            VersionQuirks {
+                version: &[1, 4, 1],
+                quirks: &[],
+            },
+        ],
+    },
+];
 
 /// [`PivQuirk`] table keyed by the device's firmware version, same shape and
 /// caveats as [`QUIRKS_BY_APPLET_TABLE`] but the firmware axis.
@@ -896,6 +934,62 @@ mod tests {
         // FeatureGate axis); the firmware axis has no Token2 data at all.
         assert_eq!(
             resolve_quirks(AppletFingerprint::Token2, None, None),
+            BTreeSet::new()
+        );
+    }
+
+    // --- Swissbit iShield 2 Pro (OpenFips201): the seeded, then-cleared, -
+    // --- GET METADATA algorithm-identifier quirk -------------------------
+
+    #[test]
+    fn swissbit_ishield2_metadata_quirk_below_1_4_1() {
+        // The sentinel version `[]` matches regardless of how old the
+        // reported version is, so this is active from the very first
+        // version on record.
+        for version in [&[0][..], &[1][..], &[1, 3, 9][..], &[1, 4, 0][..]] {
+            assert_eq!(
+                resolve_quirks(
+                    AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+                    Some(version),
+                    None,
+                ),
+                BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid])
+            );
+        }
+    }
+
+    #[test]
+    fn swissbit_ishield2_metadata_quirk_cleared_at_1_4_1() {
+        // `[1, 4, 1]` covers both a bare 3-component "1.4.1" report and the
+        // actually-confirmed-clear 4-component "1.4.1.0" — `[1, 4, 1]`
+        // orders below both under slice-prefix comparison.
+        for version in [
+            &[1, 4, 1][..],
+            &[1, 4, 1, 0][..],
+            &[1, 5, 0][..],
+            &[2, 0][..],
+        ] {
+            assert_eq!(
+                resolve_quirks(
+                    AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+                    Some(version),
+                    None,
+                ),
+                BTreeSet::new()
+            );
+        }
+    }
+
+    #[test]
+    fn swissbit_ishield2_other_openfips201_variant_has_no_quirk() {
+        // The row is keyed to the SwissbitIShield2 sub-fingerprint
+        // specifically — the generic OpenFIPS201 variant isn't covered.
+        assert_eq!(
+            resolve_quirks(
+                AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                Some(&[1]),
+                None,
+            ),
             BTreeSet::new()
         );
     }
