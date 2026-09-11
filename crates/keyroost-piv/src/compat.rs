@@ -63,8 +63,11 @@ impl PivExtension {
     fn applet_verdicts(self) -> &'static [FingerprintVerdicts] {
         match self {
             // MOVE KEY and DELETE KEY shipped together in YubiKey firmware
-            // 5.7: unsupported at every earlier version, supported from 5.7 on.
-            PivExtension::MoveKey | PivExtension::DeleteKey => YUBICO_5_7_KEY_OPS,
+            // 5.7: unsupported at every earlier version, supported from 5.7
+            // on. Token2 applet 5.112.0 has separately been observed to
+            // reject both, so it carries its own blacklist row in the same
+            // table.
+            PivExtension::MoveKey | PivExtension::DeleteKey => KEY_OPS_VERDICTS,
         }
     }
 
@@ -117,25 +120,52 @@ pub enum PivQuirk {
 }
 
 /// The white/blacklist shared by [`PivExtension::MoveKey`] and
-/// [`PivExtension::DeleteKey`]: on a YubiKey the operation is unsupported before
-/// firmware 5.7 and supported from 5.7 onward, and keyroost has no data for
-/// any other applet. The empty-slice version on the blacklist verdict is a
-/// "from the very first version" sentinel — it orders below every real
-/// version (`[] < [5, 7]`), so that verdict is the one that applies to
-/// anything older than 5.7.
-const YUBICO_5_7_KEY_OPS: &[FingerprintVerdicts] = &[FingerprintVerdicts {
-    fingerprint: AppletFingerprint::YubiKey,
-    verdicts: &[
-        VersionVerdict {
-            version: &[],
-            verdict: Verdict::Blacklisted,
-        },
-        VersionVerdict {
-            version: &[5, 7],
-            verdict: Verdict::Whitelisted,
-        },
-    ],
-}];
+/// [`PivExtension::DeleteKey`], one row per fingerprint keyroost has data for:
+///
+/// * YubiKey — the operation is unsupported before firmware 5.7 and supported
+///   from 5.7 onward. The empty-slice version on the blacklist verdict is a
+///   "from the very first version" sentinel — it orders below every real
+///   version (`[] < [5, 7]`), so that verdict is the one that applies to
+///   anything older than 5.7.
+/// * Token2 — applet version 5.112.0 has been observed to reject both
+///   extensions outright. There is no whitelist verdict on this row (unlike
+///   YubiKey's), so per [`resolve_in`] a version *above* 5.112.0 resolves
+///   [`FeatureGate::Unverified`], not [`FeatureGate::Unsupported`] — a
+///   blacklist row is deliberately never treated as covering a version it
+///   hasn't actually observed. A version *at or below* 5.112.0, though, needs
+///   two blacklist verdicts to express, not one: the `[]` sentinel
+///   blacklists everything from the very first version, and it only stays
+///   authoritative (rather than softening the same way, per
+///   [`resolve_in`]'s trailing-blacklist rule) because the 5.112.0 verdict
+///   above it *brackets* it.
+const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::Blacklisted,
+            },
+            VersionVerdict {
+                version: &[5, 7],
+                verdict: Verdict::Whitelisted,
+            },
+        ],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Token2,
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::Blacklisted,
+            },
+            VersionVerdict {
+                version: &[5, 112, 0],
+                verdict: Verdict::Blacklisted,
+            },
+        ],
+    },
+];
 
 /// One fingerprint's row in an extension's white/blacklist.
 struct FingerprintVerdicts {
@@ -326,9 +356,9 @@ struct VersionQuirks {
 const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[FingerprintQuirks {
     fingerprint: AppletFingerprint::Token2,
     // The empty-slice version is the "from the very first version" sentinel
-    // also used by `YUBICO_5_7_KEY_OPS`: it orders at or below every real
-    // version (`[] <= anything`), so this entry matches regardless of which
-    // applet version Token2 reports.
+    // also used by `KEY_OPS_VERDICTS`'s YubiKey row: it orders at or below
+    // every real version (`[] <= anything`), so this entry matches
+    // regardless of which applet version Token2 reports.
     quirks: &[VersionQuirks {
         version: &[],
         quirks: &[PivQuirk::InsF8SerialIsBcd],
@@ -514,6 +544,50 @@ mod tests {
         }
     }
 
+    // --- Token2: the seeded 5.112.0 blacklist, both extensions -----------
+
+    #[test]
+    fn token2_5_112_0_is_unsupported() {
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Token2, Some(&[5, 112, 0]), None),
+                FeatureGate::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn token2_older_versions_are_also_unsupported() {
+        // Covered by the `[]` sentinel, and bracketed by the 5.112.0 verdict
+        // above it, so it stays authoritative rather than softening to
+        // `Unverified` the way a trailing sentinel alone would.
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Token2, Some(&[5, 111, 0]), None),
+                FeatureGate::Unsupported
+            );
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Token2, Some(&[0]), None),
+                FeatureGate::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn token2_newer_versions_are_unverified_not_blacklisted() {
+        // No whitelist verdict on this row, and 5.112.0 is the last (highest)
+        // entry, so — per `resolve_in`'s "trailing stale blacklist" rule — a
+        // version above it doesn't inherit the verdict: the blacklist is
+        // deliberately never treated as covering a version it hasn't
+        // actually observed.
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Token2, Some(&[5, 113, 0]), None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
     // --- No row for the fingerprint -------------------------------------
 
     #[test]
@@ -528,10 +602,15 @@ mod tests {
                 ),
                 FeatureGate::Unverified
             );
+            // A second, real fingerprint that genuinely carries no row in
+            // `KEY_OPS_VERDICTS` at all — unlike `AppletFingerprint::Token2`,
+            // which (after the sentinel fix above) now resolves `Unsupported`
+            // for these same low versions; see
+            // `token2_older_versions_are_also_unsupported`.
             assert_eq!(
                 resolve(
                     PivExtension::MoveKey,
-                    AppletFingerprint::Token2,
+                    AppletFingerprint::UTrust,
                     version,
                     version,
                 ),

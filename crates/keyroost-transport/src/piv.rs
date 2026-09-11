@@ -2236,7 +2236,12 @@ mod tests {
         );
         // A fingerprint with no quirk-table entry at all: unchanged.
         assert_eq!(
-            decode_serial_if_bcd(AppletFingerprint::YubiKey, Some(&[5, 7]), None, Some(0x1234)),
+            decode_serial_if_bcd(
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None,
+                Some(0x1234)
+            ),
             Some(0x1234)
         );
         // No serial to begin with: still `None`, quirk or not.
