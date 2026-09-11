@@ -765,8 +765,13 @@ impl PivSession {
         feature: keyroost_piv::compat::PivExtension,
     ) -> keyroost_piv::compat::FeatureGate {
         let version = self.version();
-        let (fingerprint, ..) = self.applet_fingerprint(version.as_deref());
-        keyroost_piv::compat::resolve(feature, fingerprint, version.as_deref())
+        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        keyroost_piv::compat::resolve(
+            feature,
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        )
     }
 
     /// [`Self::status`] plus each slot's key algorithm, certificate Subject

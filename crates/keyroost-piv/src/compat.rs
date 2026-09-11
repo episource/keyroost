@@ -10,19 +10,26 @@
 //! fingerprint it knows about, a list of per-version verdicts each either
 //! [`Verdict::Whitelisted`] ("extension known to be supported at this version")
 //! or [`Verdict::Blacklisted`] ("extension known to be unsupported at this
-//! version").
+//! version"). There are two such lists per extension — one keyed by the PIV
+//! *applet's* own version, one by the *firmware's* — since the two can diverge
+//! (see [`crate` root docs][crate] / `PivStatus::version` vs
+//! `PivStatus::version_firmware` in `keyroost-transport`) and a fingerprint may
+//! have data on one axis but not the other.
 //!
-//! [`resolve`] queries that table with the live applet's fingerprint and
-//! version and returns a three-way [`FeatureGate`] a UI consumes directly:
-//! enable the control ([`FeatureGate::Supported`]), enable it but flag it
-//! ([`FeatureGate::Unverified`]), or disable it ([`FeatureGate::Unsupported`]).
-//! It is deliberately conservative about *disabling*: a control is only ever
-//! [`FeatureGate::Unsupported`] when the table has a blacklist verdict that
-//! actually covers the applet's version. Anything less certain — no verdicts
-//! for the fingerprint at all, none at or below the reported version, no
-//! reported version, or only a blacklist verdict old enough that a later
-//! firmware might have added the extension — resolves to
-//! [`FeatureGate::Unverified`], which keeps the control usable.
+//! [`resolve`] queries both tables with the live applet's fingerprint and its
+//! applet and firmware versions and returns a three-way [`FeatureGate`] a UI
+//! consumes directly: enable the control ([`FeatureGate::Supported`]), enable
+//! it but flag it ([`FeatureGate::Unverified`]), or disable it
+//! ([`FeatureGate::Unsupported`]). Each axis is queried independently with the
+//! same semantics, then the two outcomes are combined (see [`resolve`] for the
+//! combination rule). Per axis, it is deliberately conservative about
+//! *disabling*: a control is only ever [`FeatureGate::Unsupported`] on that
+//! axis when the table has a blacklist verdict that actually covers the
+//! reported version. Anything less certain — no verdicts for the fingerprint
+//! at all, none at or below the reported version, no reported version, or only
+//! a blacklist verdict old enough that a later firmware might have added the
+//! extension — resolves to [`FeatureGate::Unverified`] on that axis, which
+//! keeps the control usable unless the other axis disagrees.
 
 use crate::fingerprint::AppletFingerprint;
 
@@ -39,15 +46,29 @@ pub enum PivExtension {
 }
 
 impl PivExtension {
-    /// This extension's white/blacklist: one [`FingerprintVerdicts`] row per
-    /// fingerprint keyroost has data for. A fingerprint absent from the slice
-    /// means "no data" and [`resolve`] returns [`FeatureGate::Unverified`].
+    /// This extension's white/blacklist keyed by the PIV **applet's own**
+    /// version (Yubico's `GET VERSION` extension reply): one
+    /// [`FingerprintVerdicts`] row per fingerprint keyroost has data for on
+    /// this axis. A fingerprint absent from the slice means "no data" and
+    /// [`resolve`] treats this axis as [`FeatureGate::Unverified`].
     #[must_use]
-    fn verdicts(self) -> &'static [FingerprintVerdicts] {
+    fn applet_verdicts(self) -> &'static [FingerprintVerdicts] {
         match self {
             // MOVE KEY and DELETE KEY shipped together in YubiKey firmware
             // 5.7: unsupported at every earlier version, supported from 5.7 on.
             PivExtension::MoveKey | PivExtension::DeleteKey => YUBICO_5_7_KEY_OPS,
+        }
+    }
+
+    /// This extension's white/blacklist keyed by the device's **firmware**
+    /// version, same shape and lookup rules as [`Self::applet_verdicts`] but a
+    /// separate axis — a fingerprint can have data on one and not the other.
+    /// No fingerprint has firmware-version data yet, so every extension
+    /// resolves this axis to [`FeatureGate::Unverified`] today.
+    #[must_use]
+    fn firmware_verdicts(self) -> &'static [FingerprintVerdicts] {
+        match self {
+            PivExtension::MoveKey | PivExtension::DeleteKey => &[],
         }
     }
 
@@ -149,37 +170,70 @@ impl FeatureGate {
     pub const INCOMPATIBLE_SUFFIX: &'static str = "This device is known to be incompatible.";
 }
 
-/// Resolve `extension` for an applet fingerprinted as `fingerprint` and
-/// reporting `applet_version` (the PIV applet's own version bytes; `None` when
-/// the card never reported one).
+/// Resolve `extension` for an applet fingerprinted as `fingerprint`, reporting
+/// `applet_version` (the PIV applet's own version bytes) and/or
+/// `firmware_version` (the device firmware's version bytes) — either or both
+/// `None` when the card never reported that one.
 ///
-/// The lookup:
+/// `applet_version` is queried against [`PivExtension::applet_verdicts`] and
+/// `firmware_version` against [`PivExtension::firmware_verdicts`], **with
+/// identical per-axis lookup semantics**:
 ///
-/// 1. `applet_version` is `None` → [`FeatureGate::Unverified`] (nothing to
-///    version-match).
-/// 2. No white/blacklist row for `fingerprint` → [`FeatureGate::Unverified`]
-///    (support unknown; don't block).
-/// 3. A row exists: take the verdict with the greatest version `<=` the applet
-///    version. If there is none (the applet is older than every verdict) →
-///    [`FeatureGate::Unverified`]. Otherwise:
+/// 1. The version is `None` → that axis is [`FeatureGate::Unverified`]
+///    (nothing to version-match).
+/// 2. No white/blacklist row for `fingerprint` on that axis →
+///    [`FeatureGate::Unverified`] (support unknown; don't block).
+/// 3. A row exists: take the verdict with the greatest version `<=` the
+///    reported version. If there is none (the reported version is older than
+///    every verdict) → [`FeatureGate::Unverified`]. Otherwise:
 ///    * whitelisted → [`FeatureGate::Supported`] (covers both an exact-version
 ///      match and an earlier whitelist assumed not to have regressed);
-///    * blacklisted, verdict version **equals** the applet version →
+///    * blacklisted, verdict version **equals** the reported version →
 ///      [`FeatureGate::Unsupported`];
-///    * blacklisted, verdict version **below** the applet version, and it is
+///    * blacklisted, verdict version **below** the reported version, and it is
 ///      the last (highest) verdict in the row → [`FeatureGate::Unverified`]:
 ///      the blacklist may predate a firmware that added the extension;
-///    * blacklisted, verdict version **below** the applet version, but a later
-///      verdict exists (for a version above this applet's) → the row's
+///    * blacklisted, verdict version **below** the reported version, but a
+///      later verdict exists (for a version above this one's) → the row's
 ///      blacklist knowledge brackets this version, so it is treated as
 ///      authoritative: [`FeatureGate::Unsupported`].
+///
+/// The two per-axis outcomes are then combined, in order:
+///
+/// 1. Either axis is [`FeatureGate::Unsupported`] → combined result is
+///    [`FeatureGate::Unsupported`] (a known-incompatible verdict on either
+///    axis blocks the control).
+/// 2. Else, either axis is [`FeatureGate::Supported`] → combined result is
+///    [`FeatureGate::Supported`].
+/// 3. Else → combined result is [`FeatureGate::Unverified`].
+///
+/// This means when only one of `applet_version`/`firmware_version` carries
+/// data for `fingerprint`, the other axis resolves to
+/// [`FeatureGate::Unverified`] and — per the rule above — simply doesn't
+/// change the outcome, so the combined result equals the one axis that has an
+/// opinion.
 #[must_use]
 pub fn resolve(
     extension: PivExtension,
     fingerprint: AppletFingerprint,
     applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
 ) -> FeatureGate {
-    resolve_in(extension.verdicts(), fingerprint, applet_version)
+    let applet_gate = resolve_in(extension.applet_verdicts(), fingerprint, applet_version);
+    let firmware_gate = resolve_in(extension.firmware_verdicts(), fingerprint, firmware_version);
+    combine(applet_gate, firmware_gate)
+}
+
+/// Combine the two per-axis [`FeatureGate`]s into one, per the rule documented
+/// on [`resolve`]: [`FeatureGate::Unsupported`] wins outright; otherwise
+/// [`FeatureGate::Supported`] wins; otherwise [`FeatureGate::Unverified`].
+#[must_use]
+fn combine(a: FeatureGate, b: FeatureGate) -> FeatureGate {
+    match (a, b) {
+        (FeatureGate::Unsupported, _) | (_, FeatureGate::Unsupported) => FeatureGate::Unsupported,
+        (FeatureGate::Supported, _) | (_, FeatureGate::Supported) => FeatureGate::Supported,
+        (FeatureGate::Unverified, FeatureGate::Unverified) => FeatureGate::Unverified,
+    }
 }
 
 /// [`resolve`] against an explicit set of white/blacklist rows, so a test can
@@ -249,11 +303,11 @@ mod tests {
             // Matches the blacklist sentinel verdict (version `[]`), which is
             // not the last verdict, so the blacklist is authoritative.
             assert_eq!(
-                resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 6, 0])),
+                resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 6, 0]), None),
                 FeatureGate::Unsupported
             );
             assert_eq!(
-                resolve(ext, AppletFingerprint::YubiKey, Some(&[4, 3, 7])),
+                resolve(ext, AppletFingerprint::YubiKey, Some(&[4, 3, 7]), None),
                 FeatureGate::Unsupported
             );
         }
@@ -264,17 +318,17 @@ mod tests {
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             // Bare [5, 7] clears the bar: `[5, 7] <= [5, 7]`.
             assert_eq!(
-                resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 7])),
+                resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 7]), None),
                 FeatureGate::Supported
             );
             assert_eq!(
-                resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 7, 4])),
+                resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 7, 4]), None),
                 FeatureGate::Supported
             );
             // A later version with no verdict of its own falls to the [5, 7]
             // whitelist, assumed not to have regressed.
             assert_eq!(
-                resolve(ext, AppletFingerprint::YubiKey, Some(&[6, 0, 0])),
+                resolve(ext, AppletFingerprint::YubiKey, Some(&[6, 0, 0]), None),
                 FeatureGate::Supported
             );
         }
@@ -283,9 +337,41 @@ mod tests {
     #[test]
     fn yubikey_without_a_reported_version_is_unverified() {
         assert_eq!(
-            resolve(PivExtension::MoveKey, AppletFingerprint::YubiKey, None),
+            resolve(
+                PivExtension::MoveKey,
+                AppletFingerprint::YubiKey,
+                None,
+                None
+            ),
             FeatureGate::Unverified
         );
+    }
+
+    #[test]
+    fn firmware_version_is_ignored_when_the_extension_has_no_firmware_axis_data() {
+        // Today no `PivExtension` has firmware-version verdicts, so any
+        // firmware_version — however implausible — leaves the applet-version
+        // axis as the sole opinion.
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            assert_eq!(
+                resolve(
+                    ext,
+                    AppletFingerprint::YubiKey,
+                    Some(&[5, 7]),
+                    Some(&[9, 9, 9]),
+                ),
+                FeatureGate::Supported
+            );
+            assert_eq!(
+                resolve(
+                    ext,
+                    AppletFingerprint::YubiKey,
+                    Some(&[5, 6]),
+                    Some(&[9, 9, 9]),
+                ),
+                FeatureGate::Unsupported
+            );
+        }
     }
 
     // --- No row for the fingerprint -------------------------------------
@@ -294,13 +380,85 @@ mod tests {
     fn unknown_fingerprint_is_unverified_regardless_of_version() {
         for version in [None, Some(&[5, 7, 4][..]), Some(&[1, 0][..])] {
             assert_eq!(
-                resolve(PivExtension::DeleteKey, AppletFingerprint::Generic, version),
+                resolve(
+                    PivExtension::DeleteKey,
+                    AppletFingerprint::Generic,
+                    version,
+                    version,
+                ),
                 FeatureGate::Unverified
             );
             assert_eq!(
-                resolve(PivExtension::MoveKey, AppletFingerprint::Token2, version),
+                resolve(
+                    PivExtension::MoveKey,
+                    AppletFingerprint::Token2,
+                    version,
+                    version,
+                ),
                 FeatureGate::Unverified
             );
+        }
+    }
+
+    // --- combine(): the cross-axis rule -----------------------------------
+
+    #[test]
+    fn combine_prefers_unsupported_over_anything_else() {
+        assert_eq!(
+            combine(FeatureGate::Unsupported, FeatureGate::Supported),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            combine(FeatureGate::Supported, FeatureGate::Unsupported),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            combine(FeatureGate::Unverified, FeatureGate::Unsupported),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            combine(FeatureGate::Unsupported, FeatureGate::Unverified),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn combine_prefers_supported_over_unverified() {
+        assert_eq!(
+            combine(FeatureGate::Supported, FeatureGate::Unverified),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            combine(FeatureGate::Unverified, FeatureGate::Supported),
+            FeatureGate::Supported
+        );
+    }
+
+    #[test]
+    fn combine_of_only_unverified_is_unverified() {
+        assert_eq!(
+            combine(FeatureGate::Unverified, FeatureGate::Unverified),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn combine_is_symmetric_and_idempotent() {
+        for gate in [
+            FeatureGate::Supported,
+            FeatureGate::Unverified,
+            FeatureGate::Unsupported,
+        ] {
+            // Combining a gate with itself is that gate again...
+            assert_eq!(combine(gate, gate), gate);
+            for other in [
+                FeatureGate::Supported,
+                FeatureGate::Unverified,
+                FeatureGate::Unsupported,
+            ] {
+                // ...and argument order never matters.
+                assert_eq!(combine(gate, other), combine(other, gate));
+            }
         }
     }
 
