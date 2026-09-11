@@ -322,15 +322,22 @@ struct VersionQuirks {
 /// [`PivQuirk`] table keyed by the PIV applet's own version — same row shape
 /// as [`PivExtension::applet_verdicts`], but not scoped to any one
 /// extension: every fingerprint's known version-gated quirks live directly
-/// in this one table rather than being duplicated per extension. Empty
-/// today — no fingerprint has recorded applet-version quirk data yet, so
-/// [`resolve_quirks`] always resolves this axis to an empty set until an
-/// entry is added.
-const QUIRK_APPLET_TABLE: &[FingerprintQuirks] = &[];
+/// in this one table rather than being duplicated per extension.
+const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[FingerprintQuirks {
+    fingerprint: AppletFingerprint::Token2,
+    // The empty-slice version is the "from the very first version" sentinel
+    // also used by `YUBICO_5_7_KEY_OPS`: it orders at or below every real
+    // version (`[] <= anything`), so this entry matches regardless of which
+    // applet version Token2 reports.
+    quirks: &[VersionQuirks {
+        version: &[],
+        quirks: &[PivQuirk::InsF8SerialIsBcd],
+    }],
+}];
 
 /// [`PivQuirk`] table keyed by the device's firmware version, same shape and
-/// caveats as [`QUIRK_APPLET_TABLE`] but the firmware axis.
-const QUIRK_FIRMWARE_TABLE: &[FingerprintQuirks] = &[];
+/// caveats as [`QUIRKS_BY_APPLET_TABLE`] but the firmware axis.
+const QUIRKS_BY_FIRMWARE_TABLE: &[FingerprintQuirks] = &[];
 
 /// The row entry in `rows` for `fingerprint` with the greatest
 /// [`VersionQuirks::version`] `<=` `version`, if any — the "current" quirks
@@ -352,10 +359,10 @@ fn latest_quirks<'a>(
 /// `fingerprint`, reporting `applet_version` and/or `firmware_version` —
 /// either or both `None` when the card never reported that one:
 ///
-/// 1. If `applet_version` is available, take the [`QUIRK_APPLET_TABLE`]
+/// 1. If `applet_version` is available, take the [`QUIRKS_BY_APPLET_TABLE`]
 ///    entry for `fingerprint` with the highest version `<=` `applet_version`
 ///    (if any).
-/// 2. If `firmware_version` is available, take the [`QUIRK_FIRMWARE_TABLE`]
+/// 2. If `firmware_version` is available, take the [`QUIRKS_BY_FIRMWARE_TABLE`]
 ///    entry for `fingerprint` with the highest version `<=`
 ///    `firmware_version` (if any).
 /// 3. Merge the [`VersionQuirks::quirks`] from whichever of (1)/(2) matched
@@ -372,8 +379,8 @@ pub fn resolve_quirks(
     firmware_version: Option<&[u8]>,
 ) -> BTreeSet<PivQuirk> {
     resolve_quirks_in(
-        QUIRK_APPLET_TABLE,
-        QUIRK_FIRMWARE_TABLE,
+        QUIRKS_BY_APPLET_TABLE,
+        QUIRKS_BY_FIRMWARE_TABLE,
         fingerprint,
         applet_version,
         firmware_version,
@@ -785,6 +792,31 @@ mod tests {
     fn unknown_fingerprint_has_no_quirks() {
         assert_eq!(
             resolve_quirks(AppletFingerprint::Generic, Some(&[1, 0]), Some(&[1, 0])),
+            BTreeSet::new()
+        );
+    }
+
+    // --- Token2: the seeded BCD-serial quirk ------------------------------
+
+    #[test]
+    fn token2_bcd_serial_quirk_matches_any_reported_applet_version() {
+        // The `[]` sentinel orders at or below every real version, so this
+        // fires regardless of how old or new the reported version is.
+        for version in [&[0, 0][..], &[1, 0][..], &[9, 9, 9][..]] {
+            assert_eq!(
+                resolve_quirks(AppletFingerprint::Token2, Some(version), None),
+                BTreeSet::from([PivQuirk::InsF8SerialIsBcd])
+            );
+        }
+    }
+
+    #[test]
+    fn token2_bcd_serial_quirk_needs_a_reported_applet_version() {
+        // No applet_version → nothing to version-match against, so the
+        // applet axis contributes nothing (same "None → skip" rule as the
+        // FeatureGate axis); the firmware axis has no Token2 data at all.
+        assert_eq!(
+            resolve_quirks(AppletFingerprint::Token2, None, None),
             BTreeSet::new()
         );
     }

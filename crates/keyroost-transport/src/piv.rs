@@ -375,20 +375,23 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     Ok(guid)
 }
 
-/// Run [`crate::decode_bcd_serial`] over `serial`, but only for applets
-/// known to report their serial in BCD coding. Token2 is the only such device
-/// identified so far; others may be discovered and added here later. Every
-/// other vendor's serial is a plain integer already, and BCD-decoding one
-/// would corrupt it. Shared by [`PivSession::status`] and
-/// [`PivSession::status_detailed`].
+/// Run [`crate::decode_bcd_serial`] over `serial`, but only when
+/// [`keyroost_piv::compat::resolve_quirks`] finds
+/// [`keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd`] active for
+/// `fingerprint` at `applet_version`/`firmware_version` — Token2 is the only
+/// device seeded with that quirk so far; others may be discovered and added
+/// to `keyroost_piv::compat`'s quirk tables later. Every other vendor's
+/// serial is a plain integer already, and BCD-decoding one would corrupt it.
+/// Shared by [`PivSession::status`] and [`PivSession::status_detailed`].
 fn decode_serial_if_bcd(
     fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
     serial: Option<u128>,
 ) -> Option<u128> {
-    let reports_bcd_serial = matches!(
-        fingerprint,
-        keyroost_piv::fingerprint::AppletFingerprint::Token2
-    );
+    let reports_bcd_serial =
+        keyroost_piv::compat::resolve_quirks(fingerprint, applet_version, firmware_version)
+            .contains(&keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd);
     if reports_bcd_serial {
         serial.map(crate::decode_bcd_serial)
     } else {
@@ -723,6 +726,8 @@ impl PivSession {
             self.applet_fingerprint(version.as_deref());
         let serial = decode_serial_if_bcd(
             applet_fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
             fingerprint_serial.or_else(|| self.serial()),
         );
         let pin_retries = self.pin_retries();
@@ -798,6 +803,8 @@ impl PivSession {
             self.applet_fingerprint(version.as_deref());
         let serial = decode_serial_if_bcd(
             applet_fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
             fingerprint_serial.or_else(|| self.serial()),
         );
         let pin_retries = self.pin_retries();
@@ -2197,6 +2204,35 @@ fn block_crypt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_serial_if_bcd_applies_only_when_the_quirk_resolves() {
+        use keyroost_piv::fingerprint::AppletFingerprint;
+
+        // Token2 carries `InsF8SerialIsBcd` for any reported applet version
+        // (see `keyroost_piv::compat`'s `QUIRKS_BY_APPLET_TABLE`) — 0x1234
+        // read as packed BCD is decimal 1234.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, Some(0x1234)),
+            Some(1234)
+        );
+        // No applet_version → nothing to version-match, so the quirk never
+        // resolves and the serial passes through unchanged.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, None, None, Some(0x1234)),
+            Some(0x1234)
+        );
+        // A fingerprint with no quirk-table entry at all: unchanged.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::YubiKey, Some(&[5, 7]), None, Some(0x1234)),
+            Some(0x1234)
+        );
+        // No serial to begin with: still `None`, quirk or not.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, None),
+            None
+        );
+    }
 
     #[test]
     fn describe_apdu_names_the_command() {
