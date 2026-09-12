@@ -22,14 +22,16 @@
 //! it but flag it ([`FeatureGate::Unverified`]), or disable it
 //! ([`FeatureGate::Unsupported`]). Each axis is queried independently with the
 //! same semantics, then the two outcomes are combined (see [`resolve`] for the
-//! combination rule). Per axis, it is deliberately conservative about
-//! *disabling*: a control is only ever [`FeatureGate::Unsupported`] on that
-//! axis when the table has a blacklist verdict that actually covers the
-//! reported version. Anything less certain — no verdicts for the fingerprint
-//! at all, none at or below the reported version, no reported version, or only
-//! a blacklist verdict old enough that a later firmware might have added the
-//! extension — resolves to [`FeatureGate::Unverified`] on that axis, which
-//! keeps the control usable unless the other axis disagrees.
+//! combination rule). Per axis, a verdict extends across the untested
+//! versions adjacent to it, in both directions: a whitelist verdict extends
+//! *forward* ("known to work at this version, assumed to still work at any
+//! later, untested version") and, symmetrically, a blacklist verdict extends
+//! *backward* ("known not to work at this version, assumed not to work at any
+//! earlier, untested version either"). Anything less certain — no verdicts
+//! for the fingerprint at all, no reported version, or a blacklist verdict old
+//! enough that a later firmware might have added the extension — resolves to
+//! [`FeatureGate::Unverified`] on that axis, which keeps the control usable
+//! unless the other axis disagrees.
 //!
 //! The same per-version rows also carry [`PivQuirk`]s — observed behavioral
 //! wrinkles that need a workaround rather than gating a control. Quirks are
@@ -131,35 +133,36 @@ pub enum PivQuirk {
 ///   from 5.7 onward. The empty-slice version on the blacklist verdict is a
 ///   "from the very first version" sentinel — it orders below every real
 ///   version (`[] < [5, 7]`), so that verdict is the one that applies to
-///   anything older than 5.7.
+///   anything older than 5.7. Unlike the rows below, this sentinel is load-
+///   bearing and not implied by [`resolve_in`]'s backward-extension rule: the
+///   verdict *above* it is a whitelist ([5, 7]), not a blacklist, and a
+///   whitelist verdict says nothing about versions before it.
 /// * Token2 — applet version 5.112.0 has been observed to reject both
-///   extensions outright. There is no whitelist verdict on this row (unlike
-///   YubiKey's), so per [`resolve_in`] a version *above* 5.112.0 resolves
+///   extensions outright, and every version below it is assumed to as well
+///   per [`resolve_in`]'s backward-extension rule (no earlier hardware has
+///   been available to test, but a feature known not to work at 5.112.0 is
+///   presumed not to work in any older, untested version either). There is
+///   no whitelist verdict on this row, so a version *above* 5.112.0 resolves
 ///   [`FeatureGate::Unverified`], not [`FeatureGate::Unsupported`] — a
-///   blacklist row is deliberately never treated as covering a version it
-///   hasn't actually observed. A version *at or below* 5.112.0, though, needs
-///   two blacklist verdicts to express, not one: the `[]` sentinel
-///   blacklists everything from the very first version, and it only stays
-///   authoritative (rather than softening the same way, per
-///   [`resolve_in`]'s trailing-blacklist rule) because the 5.112.0 verdict
-///   above it *brackets* it.
+///   blacklist verdict is deliberately never treated as covering a version
+///   it hasn't actually observed on the other side either. Unlike the
+///   YubiKey row above, this one needs no explicit `[]` sentinel: the single
+///   `[5, 112, 0]` blacklist verdict is enough for [`resolve_in`] to extend
+///   backward on its own.
 /// * Swissbit iShield 2 Pro (`OpenFips201::SwissbitIShield2`) — applet
 ///   version 1.4.1.0 and every earlier version have been observed to reject
-///   both extensions. Same two-verdict shape as Token2's row above, just
-///   with `[1, 4, 1, 0]` as the exact/bracketing version instead of
-///   `[5, 112, 0]`: the `[]` sentinel blacklists everything from the very
-///   first version, bracketed (rather than trailing) by the `[1, 4, 1, 0]`
-///   verdict above it. A version above 1.4.1.0 falls off the end of the row
+///   both extensions. Same single-verdict shape as Token2's row above, just
+///   with `[1, 4, 1, 0]` as the observed/backward-extending version instead
+///   of `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row
 ///   and resolves [`FeatureGate::Unverified`] — the blacklist deliberately
 ///   doesn't extend to a future, untested version.
 /// * Thetis PRO FIDO2 Security Key with PinPlex ([`AppletFingerprint::Thetis`])
 ///   — applet version 5.112.0 and every earlier version have been observed
-///   to reject both extensions. Same two-verdict shape as the rows above:
-///   the `[]` sentinel blacklists everything from the very first version,
-///   bracketed (rather than trailing) by the `[5, 112, 0]` verdict above it.
-///   A version above 5.112.0 falls off the end of the row and resolves
-///   [`FeatureGate::Unverified`] — the blacklist deliberately doesn't extend
-///   to a future, untested version.
+///   to reject both extensions. Same single-verdict shape as the rows above:
+///   `[5, 112, 0]` is both the exact-match verdict and the one
+///   [`resolve_in`] extends backward from. A version above 5.112.0 falls off
+///   the end of the row and resolves [`FeatureGate::Unverified`] — the
+///   blacklist deliberately doesn't extend to a future, untested version.
 const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::YubiKey,
@@ -176,43 +179,25 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
     },
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::Token2,
-        verdicts: &[
-            VersionVerdict {
-                version: &[],
-                verdict: Verdict::Blacklisted,
-            },
-            VersionVerdict {
-                version: &[5, 112, 0],
-                verdict: Verdict::Blacklisted,
-            },
-        ],
+        verdicts: &[VersionVerdict {
+            version: &[5, 112, 0],
+            verdict: Verdict::Blacklisted,
+        }],
     },
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
-        verdicts: &[
-            VersionVerdict {
-                version: &[],
-                verdict: Verdict::Blacklisted,
-            },
-            VersionVerdict {
-                version: &[1, 4, 1, 0],
-                verdict: Verdict::Blacklisted,
-            },
-        ],
+        verdicts: &[VersionVerdict {
+            version: &[1, 4, 1, 0],
+            verdict: Verdict::Blacklisted,
+        }],
     },
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::Thetis,
         // See this row's bullet in the doc comment on this table.
-        verdicts: &[
-            VersionVerdict {
-                version: &[],
-                verdict: Verdict::Blacklisted,
-            },
-            VersionVerdict {
-                version: &[5, 112, 0],
-                verdict: Verdict::Blacklisted,
-            },
-        ],
+        verdicts: &[VersionVerdict {
+            version: &[5, 112, 0],
+            verdict: Verdict::Blacklisted,
+        }],
     },
 ];
 
@@ -290,8 +275,17 @@ impl FeatureGate {
 /// 2. No white/blacklist row for `fingerprint` on that axis →
 ///    [`FeatureGate::Unverified`] (support unknown; don't block).
 /// 3. A row exists: take the verdict with the greatest version `<=` the
-///    reported version. If there is none (the reported version is older than
-///    every verdict) → [`FeatureGate::Unverified`]. Otherwise:
+///    reported version. If there is none — the reported version is older
+///    than every verdict on record — fall back to the row's *first* (lowest)
+///    verdict, i.e. the nearest one *above* the reported version:
+///    * blacklisted → [`FeatureGate::Unsupported`]: a feature known not to
+///      work at that version is assumed not to work at any earlier, untested
+///      version either — the backward mirror of the "assumed not to have
+///      regressed" forward extension a whitelist verdict gets below;
+///    * whitelisted → [`FeatureGate::Unverified`]: a whitelist verdict says
+///      nothing about the versions before it, so there's nothing to extend.
+///
+///    Otherwise, with a verdict at or below the reported version in hand:
 ///    * whitelisted → [`FeatureGate::Supported`] (covers both an exact-version
 ///      match and an earlier whitelist assumed not to have regressed);
 ///    * blacklisted, verdict version **equals** the reported version →
@@ -356,7 +350,19 @@ fn resolve_in(
         return FeatureGate::Unverified;
     };
     let Some(idx) = row.verdicts.iter().rposition(|v| v.version <= version) else {
-        return FeatureGate::Unverified;
+        // The reported version is older than every verdict on record. Fall
+        // back to the nearest one *above* it — `verdicts[0]`, since rows are
+        // sorted ascending — and, if that verdict is a blacklist, extend it
+        // backward: a feature known not to work at that version is assumed
+        // not to work at any earlier, untested version either. A whitelist
+        // verdict, by contrast, says nothing about versions before it.
+        return match row.verdicts.first() {
+            Some(VersionVerdict {
+                verdict: Verdict::Blacklisted,
+                ..
+            }) => FeatureGate::Unsupported,
+            _ => FeatureGate::Unverified,
+        };
     };
     let chosen = &row.verdicts[idx];
     match chosen.verdict {
@@ -658,9 +664,9 @@ mod tests {
 
     #[test]
     fn token2_older_versions_are_also_unsupported() {
-        // Covered by the `[]` sentinel, and bracketed by the 5.112.0 verdict
-        // above it, so it stays authoritative rather than softening to
-        // `Unverified` the way a trailing sentinel alone would.
+        // No verdict at or below these versions, so `resolve_in` falls back
+        // to the row's only (and therefore nearest-above) verdict: the
+        // 5.112.0 blacklist, extended backward.
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             assert_eq!(
                 resolve(ext, AppletFingerprint::Token2, Some(&[5, 111, 0]), None),
@@ -698,8 +704,9 @@ mod tests {
                 resolve(ext, AppletFingerprint::Thetis, Some(&[5, 112, 0]), None),
                 FeatureGate::Unsupported
             );
-            // Covered by the `[]` sentinel, and bracketed by the 5.112.0
-            // verdict above it, so it stays authoritative.
+            // No verdict at or below this version, so `resolve_in` falls
+            // back to the row's only verdict — the 5.112.0 blacklist,
+            // extended backward.
             assert_eq!(
                 resolve(ext, AppletFingerprint::Thetis, Some(&[0]), None),
                 FeatureGate::Unsupported
@@ -724,10 +731,10 @@ mod tests {
                 resolve(ext, fp, Some(&[1, 4, 1, 0]), None),
                 FeatureGate::Unsupported
             );
-            // Anything older: covered by the `[]` sentinel, and — unlike
-            // Token2's single-entry row — bracketed by the `[1, 4, 1, 0]`
-            // verdict above it, so it stays authoritative rather than
-            // softening to `Unverified`.
+            // Anything older: no verdict at or below it, so `resolve_in`
+            // falls back to the row's only verdict — the `[1, 4, 1, 0]`
+            // blacklist, extended backward rather than softening to
+            // `Unverified`.
             for older in [&[0][..], &[1][..], &[1, 4, 0][..]] {
                 assert_eq!(
                     resolve(ext, fp, Some(older), None),
@@ -784,8 +791,8 @@ mod tests {
             );
             // A second, real fingerprint that genuinely carries no row in
             // `KEY_OPS_VERDICTS` at all — unlike `AppletFingerprint::Token2`,
-            // which (after the sentinel fix above) now resolves `Unsupported`
-            // for these same low versions; see
+            // whose row's single blacklist verdict extends backward to
+            // resolve `Unsupported` for these same low versions; see
             // `token2_older_versions_are_also_unsupported`.
             assert_eq!(
                 resolve(
@@ -872,13 +879,57 @@ mod tests {
     }
 
     #[test]
-    fn applet_older_than_every_verdict_is_unverified() {
+    fn applet_older_than_every_whitelisted_verdict_is_unverified() {
+        // The nearest verdict above is a whitelist, which says nothing about
+        // versions before it, so there's nothing to extend backward.
         assert_eq!(
             gate(
                 &[VersionVerdict {
                     version: &[5, 0],
                     verdict: Verdict::Whitelisted,
                 }],
+                Some(&[4, 9]),
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn applet_older_than_every_blacklisted_verdict_is_unsupported() {
+        // The nearest verdict above is a blacklist: a feature known not to
+        // work at that version is assumed not to work at any earlier,
+        // untested version either — the backward mirror of
+        // `earlier_whitelist_is_assumed_not_to_regress` below.
+        assert_eq!(
+            gate(
+                &[VersionVerdict {
+                    version: &[5, 0],
+                    verdict: Verdict::Blacklisted,
+                }],
+                Some(&[4, 9]),
+            ),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn applet_older_than_every_verdict_uses_the_nearest_one_above() {
+        // Two verdicts, both above the reported version: the fallback picks
+        // the row's first (lowest, i.e. nearest-above) entry, not just any
+        // entry — so a blacklist further above doesn't leak backward past a
+        // whitelist that's nearer.
+        assert_eq!(
+            gate(
+                &[
+                    VersionVerdict {
+                        version: &[5, 0],
+                        verdict: Verdict::Whitelisted,
+                    },
+                    VersionVerdict {
+                        version: &[6, 0],
+                        verdict: Verdict::Blacklisted,
+                    },
+                ],
                 Some(&[4, 9]),
             ),
             FeatureGate::Unverified
