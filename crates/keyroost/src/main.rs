@@ -14264,13 +14264,24 @@ impl App {
         // device), or dim. An unsupported card refuses the APDU on its own —
         // there is no transport-side version gate any more. Clearing a
         // certificate is standard PIV and works everywhere.
-        let (piv_fp, piv_ver) = self.piv.status.as_ref().map_or(
-            (keyroost_piv::fingerprint::AppletFingerprint::Generic, None),
-            |s| (s.applet_fingerprint, s.version.as_deref()),
+        let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+            (
+                keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            |s| {
+                (
+                    s.applet_fingerprint,
+                    s.version.as_deref(),
+                    s.version_firmware.as_deref(),
+                )
+            },
         );
-        let move_key_gate = keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver);
+        let move_key_gate =
+            keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
         let delete_key_gate =
-            keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver);
+            keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
         // Explanations for the non-standard slot operations when the
         // fingerprint white/blacklist can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the

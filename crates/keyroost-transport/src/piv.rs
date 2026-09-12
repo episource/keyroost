@@ -14,7 +14,7 @@ use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use zeroize::Zeroizing;
 
 /// How many wrong-credential attempts to make when intentionally blocking a
@@ -302,6 +302,16 @@ pub struct PivSession {
     /// with nothing), never `None`: fingerprint resolution treats empty and
     /// absent the same way.
     select_response: Vec<u8>,
+    /// [`Self::quirks`]'s cache: `None` until first resolved, then the
+    /// [`keyroost_piv::compat::PivQuirk`]s active for this applet for the
+    /// rest of the session. Safe to cache — unlike the read-through data this
+    /// session deliberately doesn't cache (certs, PIN retries, slot
+    /// occupancy; see [`Self::status_detailed`]'s doc) — because the applet's
+    /// identity and reported versions cannot change while the card stays
+    /// connected, but resolving them can cost a handful of extra APDUs (some
+    /// fingerprints need a live SELECT probe), so it's worth not repeating
+    /// per slot.
+    quirks: Option<BTreeSet<keyroost_piv::compat::PivQuirk>>,
 }
 
 /// The in-session public-key cache behind `PivSession`, keyed by PIV key
@@ -413,25 +423,52 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     Ok(guid)
 }
 
-/// Run [`crate::decode_bcd_serial`] over `serial`, but only for applets
-/// known to report their serial in BCD coding. Token2 is the only such device
-/// identified so far; others may be discovered and added here later. Every
-/// other vendor's serial is a plain integer already, and BCD-decoding one
-/// would corrupt it. Shared by [`PivSession::status`] and
-/// [`PivSession::status_detailed`].
+/// Run [`crate::decode_bcd_serial`] over `serial`, but only when
+/// [`keyroost_piv::compat::resolve_quirks`] finds
+/// [`keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd`] active for
+/// `fingerprint` at `applet_version`/`firmware_version` — Token2 is the only
+/// device seeded with that quirk so far; others may be discovered and added
+/// to `keyroost_piv::compat`'s quirk tables later. Every other vendor's
+/// serial is a plain integer already, and BCD-decoding one would corrupt it.
+/// Shared by [`PivSession::status`] and [`PivSession::status_detailed`].
 fn decode_serial_if_bcd(
     fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
     serial: Option<u128>,
 ) -> Option<u128> {
-    let reports_bcd_serial = matches!(
-        fingerprint,
-        keyroost_piv::fingerprint::AppletFingerprint::Token2
-    );
+    let reports_bcd_serial =
+        keyroost_piv::compat::resolve_quirks(fingerprint, applet_version, firmware_version)
+            .contains(&keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd);
     if reports_bcd_serial {
         serial.map(crate::decode_bcd_serial)
     } else {
         serial
     }
+}
+
+/// Strip `md`'s algorithm identifier (tag `0x01`) and public key (tag `0x04`)
+/// when `quirks` contains
+/// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`] — on an
+/// applet with that quirk, GET METADATA's algorithm byte has been observed
+/// stuck and never reflecting the slot's actual key state, and the public key
+/// goes with it: a raw key blob is meaningless without a trustworthy
+/// algorithm to interpret it against (RSA vs. EC changes how those bytes are
+/// structured, e.g. in [`metadata_key_material`]). Every other field
+/// (`policy`, `origin`, `is_default`, `retries`) is untouched — the quirk is
+/// specific to tags `0x01`/`0x04`. [`PivSession::metadata`] is the sole
+/// caller; split out as a pure function, same seam style as
+/// [`decode_serial_if_bcd`], so the stripping rule is unit-testable without a
+/// card.
+fn clear_metadata_if_quirky(
+    quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
+    mut md: Metadata,
+) -> Metadata {
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid) {
+        md.algorithm = None;
+        md.public_key = None;
+    }
+    md
 }
 
 impl PivSession {
@@ -466,6 +503,7 @@ impl PivSession {
             t0,
             pubkey_cache: PubkeyCache::new(),
             select_response: Vec::new(),
+            quirks: None,
         };
         session.select()?;
         Ok(session)
@@ -497,6 +535,7 @@ impl PivSession {
                     t0,
                     pubkey_cache: PubkeyCache::new(),
                     select_response: Vec::new(),
+                    quirks: None,
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -761,6 +800,8 @@ impl PivSession {
             self.applet_fingerprint(version.as_deref());
         let serial = decode_serial_if_bcd(
             applet_fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
             fingerprint_serial.or_else(|| self.serial()),
         );
         let pin_retries = self.pin_retries();
@@ -803,8 +844,13 @@ impl PivSession {
         feature: keyroost_piv::compat::PivExtension,
     ) -> keyroost_piv::compat::FeatureGate {
         let version = self.version();
-        let (fingerprint, ..) = self.applet_fingerprint(version.as_deref());
-        keyroost_piv::compat::resolve(feature, fingerprint, version.as_deref())
+        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        keyroost_piv::compat::resolve(
+            feature,
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        )
     }
 
     /// [`Self::status`] plus each slot's key algorithm, certificate Subject
@@ -831,6 +877,8 @@ impl PivSession {
             self.applet_fingerprint(version.as_deref());
         let serial = decode_serial_if_bcd(
             applet_fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
             fingerprint_serial.or_else(|| self.serial()),
         );
         let pin_retries = self.pin_retries();
@@ -921,14 +969,47 @@ impl PivSession {
         }
     }
 
+    /// The [`keyroost_piv::compat::PivQuirk`]s active for this session's
+    /// applet, resolved once — via [`Self::version`] and
+    /// [`Self::applet_fingerprint`], the same sources [`Self::status`] and
+    /// [`Self::status_detailed`] use — and cached in [`Self::quirks`] (the
+    /// field) for the rest of the session; see that field's doc for why
+    /// caching this particular resolution is safe. [`Self::metadata`] is the
+    /// only caller today.
+    fn quirks(&mut self) -> BTreeSet<keyroost_piv::compat::PivQuirk> {
+        if let Some(quirks) = &self.quirks {
+            return quirks.clone();
+        }
+        let version = self.version();
+        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        let quirks = keyroost_piv::compat::resolve_quirks(
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        );
+        self.quirks = Some(quirks.clone());
+        quirks
+    }
+
     /// GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a slot
     /// key ref). `None` when the firmware predates the extension (5.3-).
+    ///
+    /// Runs [`clear_metadata_if_quirky`] over the parsed reply before
+    /// returning it — see that function's doc for what it strips and why.
+    /// This is the sole place that needs to know about the quirk: every
+    /// caller of [`Self::metadata`] — [`Self::slot_key`]/
+    /// [`metadata_key_material`], [`Self::algorithm_without_cert`],
+    /// [`Self::resolve_policy`], [`Self::reported_management_key_algorithm`],
+    /// [`Self::status_detailed`] — already treats a missing algorithm/public
+    /// key as "fall back to another source", which is exactly the right
+    /// behavior on a device where GET METADATA can't be trusted for either.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
         let (data, sw) = self.transmit_full(&piv::get_metadata(key_ref)).ok()?;
         if sw != piv::SW_OK {
             return None;
         }
-        piv::parse_metadata(&data).ok()
+        let md = piv::parse_metadata(&data).ok()?;
+        Some(clear_metadata_if_quirky(&self.quirks(), md))
     }
 
     /// The card-management (9B) key's algorithm *as the card reports it* via
@@ -1749,10 +1830,22 @@ impl PivSession {
     /// transient failure here is reported as an empty slot; the card's own
     /// refusal to write over an occupied destination is the backstop.
     ///
+    /// A `Some` from [`metadata`] is *not* by itself "occupied": some
+    /// implementations (Nitrokey's `piv-authenticator`, and PivApplet as seen
+    /// on a Token2 fingerprint trace) answer `SW_OK` for every retired key
+    /// reference whether or not a key was ever generated there, with an empty
+    /// or key-less body for the ones that weren't. That reply is
+    /// indistinguishable from "no key" and would otherwise mark every retired
+    /// slot present — so this gates on [`metadata_key_material`], the same
+    /// "does this reply actually name the key" check [`Self::slot_key`] uses,
+    /// rather than on the GET METADATA status word alone.
+    ///
     /// [`status`]: PivSession::status
     /// [`metadata`]: PivSession::metadata
     pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
-        Ok(self.metadata(slot.key_ref()).is_some())
+        Ok(self
+            .metadata(slot.key_ref())
+            .is_some_and(|md| metadata_key_material(&md).is_some()))
     }
 
     /// Reset the PIV application to factory defaults. Only succeeds when **both**
@@ -2378,6 +2471,73 @@ fn block_crypt(
 mod tests {
     use super::*;
     use crate::gzip::MAX_CERT_DECOMPRESSED;
+
+    #[test]
+    fn decode_serial_if_bcd_applies_only_when_the_quirk_resolves() {
+        use keyroost_piv::fingerprint::AppletFingerprint;
+
+        // Token2 carries `InsF8SerialIsBcd` for any reported applet version
+        // (see `keyroost_piv::compat`'s `QUIRKS_BY_APPLET_TABLE`) — 0x1234
+        // read as packed BCD is decimal 1234.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, Some(0x1234)),
+            Some(1234)
+        );
+        // No applet_version → nothing to version-match, so the quirk never
+        // resolves and the serial passes through unchanged.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, None, None, Some(0x1234)),
+            Some(0x1234)
+        );
+        // A fingerprint with no quirk-table entry at all: unchanged.
+        assert_eq!(
+            decode_serial_if_bcd(
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None,
+                Some(0x1234)
+            ),
+            Some(0x1234)
+        );
+        // No serial to begin with: still `None`, quirk or not.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn clear_metadata_if_quirky_strips_algorithm_and_public_key_together() {
+        use keyroost_piv::compat::PivQuirk;
+
+        let md = Metadata {
+            algorithm: Some(0x07),
+            policy: Some((0x01, 0x02)),
+            origin: Some(1),
+            public_key: Some(vec![0xAB, 0xCD]),
+            is_default: Some(false),
+            retries: None,
+        };
+
+        // The quirk active: algorithm and public key are gone, every other
+        // field survives untouched.
+        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid]);
+        let cleared = clear_metadata_if_quirky(&quirky, md.clone());
+        assert_eq!(
+            cleared,
+            Metadata {
+                algorithm: None,
+                public_key: None,
+                ..md.clone()
+            }
+        );
+
+        // No quirk active (empty set, or a set with an unrelated quirk):
+        // passed through unchanged.
+        assert_eq!(clear_metadata_if_quirky(&BTreeSet::new(), md.clone()), md);
+        let other = BTreeSet::from([PivQuirk::InsF8SerialIsBcd]);
+        assert_eq!(clear_metadata_if_quirky(&other, md.clone()), md);
+    }
 
     #[test]
     fn describe_apdu_names_the_command() {
