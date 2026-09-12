@@ -68,6 +68,8 @@ impl PivExtension {
             // reject both, so it carries its own blacklist row in the same
             // table — as does the Swissbit iShield 2 Pro (fingerprinted
             // `OpenFips201::SwissbitIShield2`) at applet version 1.4.1.0 and
+            // below, and the Thetis PRO FIDO2 Security Key with PinPlex
+            // (`AppletFingerprint::Thetis`) at applet version 5.112.0 and
             // below.
             PivExtension::MoveKey | PivExtension::DeleteKey => KEY_OPS_VERDICTS,
         }
@@ -150,6 +152,14 @@ pub enum PivQuirk {
 ///   verdict above it. A version above 1.4.1.0 falls off the end of the row
 ///   and resolves [`FeatureGate::Unverified`] — the blacklist deliberately
 ///   doesn't extend to a future, untested version.
+/// * Thetis PRO FIDO2 Security Key with PinPlex ([`AppletFingerprint::Thetis`])
+///   — applet version 5.112.0 and every earlier version have been observed
+///   to reject both extensions. Same two-verdict shape as the rows above:
+///   the `[]` sentinel blacklists everything from the very first version,
+///   bracketed (rather than trailing) by the `[5, 112, 0]` verdict above it.
+///   A version above 5.112.0 falls off the end of the row and resolves
+///   [`FeatureGate::Unverified`] — the blacklist deliberately doesn't extend
+///   to a future, untested version.
 const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::YubiKey,
@@ -186,6 +196,20 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
             },
             VersionVerdict {
                 version: &[1, 4, 1, 0],
+                verdict: Verdict::Blacklisted,
+            },
+        ],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Thetis,
+        // See this row's bullet in the doc comment on this table.
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::Blacklisted,
+            },
+            VersionVerdict {
+                version: &[5, 112, 0],
                 verdict: Verdict::Blacklisted,
             },
         ],
@@ -385,6 +409,20 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
         // sentinel also used by `KEY_OPS_VERDICTS`'s YubiKey row: it orders
         // at or below every real version (`[] <= anything`), so this entry
         // matches regardless of which applet version Token2 reports.
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::Thetis,
+        // Observed on the Thetis PRO FIDO2 Security Key with PinPlex at
+        // applet version 5.112.0, the only version tested so far. Earlier
+        // versions are assumed to encode GET SERIAL's reply the same way
+        // rather than confirmed to — no earlier-version hardware has been
+        // available to test — so the empty-slice version below is a
+        // deliberate "from the very first version" assumption, not a direct
+        // observation, using the same sentinel as the row above.
         quirks: &[VersionQuirks {
             version: &[],
             quirks: &[PivQuirk::InsF8SerialIsBcd],
@@ -645,6 +683,30 @@ mod tests {
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             assert_eq!(
                 resolve(ext, AppletFingerprint::Token2, Some(&[5, 113, 0]), None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    // --- Thetis PRO FIDO2 Security Key with PinPlex: the seeded 5.112.0 -
+    // --- blacklist, both extensions ---------------------------------------
+
+    #[test]
+    fn thetis_5_112_0_is_unsupported() {
+        for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Thetis, Some(&[5, 112, 0]), None),
+                FeatureGate::Unsupported
+            );
+            // Covered by the `[]` sentinel, and bracketed by the 5.112.0
+            // verdict above it, so it stays authoritative.
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Thetis, Some(&[0]), None),
+                FeatureGate::Unsupported
+            );
+            // Same trailing-blacklist softening above the highest verdict.
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Thetis, Some(&[5, 113, 0]), None),
                 FeatureGate::Unverified
             );
         }
@@ -1014,6 +1076,28 @@ mod tests {
         // FeatureGate axis); the firmware axis has no Token2 data at all.
         assert_eq!(
             resolve_quirks(AppletFingerprint::Token2, None, None),
+            BTreeSet::new()
+        );
+    }
+
+    // --- Thetis PRO FIDO2 Security Key with PinPlex: the seeded --------
+    // --- BCD-serial quirk --------------------------------------------------
+
+    #[test]
+    fn thetis_bcd_serial_quirk_matches_any_reported_applet_version() {
+        // The `[]` sentinel orders at or below every real version, so this
+        // fires regardless of how old or new the reported version is —
+        // including versions below 5.112.0, the only one actually tested;
+        // see the row's comment on why that's an assumption, not an
+        // observation.
+        for version in [&[0, 0][..], &[1, 0][..], &[9, 9, 9][..]] {
+            assert_eq!(
+                resolve_quirks(AppletFingerprint::Thetis, Some(version), None),
+                BTreeSet::from([PivQuirk::InsF8SerialIsBcd])
+            );
+        }
+        assert_eq!(
+            resolve_quirks(AppletFingerprint::Thetis, None, None),
             BTreeSet::new()
         );
     }

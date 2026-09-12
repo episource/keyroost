@@ -173,6 +173,15 @@ pub enum AppletFingerprint {
     Trussed(TrussedVariant),
     /// Based on <https://github.com/makinako/OpenFIPS201>.
     OpenFips201(OpenFips201Variant),
+    /// Thetis' PRO FIDO2 Security Key with PinPlex — recognised by ATR
+    /// historical bytes that contain both `"PIV"` and `"8888888"`
+    /// (case-insensitively), provided the ATR didn't already fingerprint as
+    /// [`AppletFingerprint::Token2`]: Token2's own ATR signature is close
+    /// enough to this criterion that checking it alone would misclassify a
+    /// Token2 device as Thetis — see
+    /// <https://github.com/framefilter/keyroost/issues/125>. [`classify`]
+    /// enforces the exclusion by checking the Token2 branch first.
+    Thetis,
     /// Token2 PIV products — <https://token2.com/c/piv-devices>.
     Token2,
     /// Identiv/Hirsch's uTrust series — <https://www.hirschsecure.com/germany/en/products>.
@@ -245,6 +254,7 @@ impl core::fmt::Display for AppletFingerprint {
             AppletFingerprint::IdPrime => write!(f, "IdPrime"),
             AppletFingerprint::Trussed(v) => write!(f, "Trussed::{v}"),
             AppletFingerprint::OpenFips201(v) => write!(f, "OpenFips201::{v}"),
+            AppletFingerprint::Thetis => write!(f, "Thetis"),
             AppletFingerprint::Token2 => write!(f, "Token2"),
             AppletFingerprint::UTrust => write!(f, "UTrust"),
             AppletFingerprint::YubiKey => write!(f, "YubiKey"),
@@ -319,6 +329,7 @@ impl AppletFingerprint {
             AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2) => {
                 "Swissbit iShield 2 Series"
             }
+            AppletFingerprint::Thetis => "Thetis Series",
             AppletFingerprint::Token2 => "Token2 Series",
             AppletFingerprint::UTrust => "Identiv/Hirsch uTrust Series",
             AppletFingerprint::YubiKey => "Yubico YubiKey Series",
@@ -495,6 +506,8 @@ pub fn classify(
         AppletFingerprint::OpenFips201(OpenFips201Variant::Generic)
     } else if atr.is_some_and(|a| a.starts_with("tk\0piv") || a.starts_with("tk piv")) {
         AppletFingerprint::Token2
+    } else if atr.is_some_and(|a| a.contains("piv") && a.contains("8888888")) {
+        AppletFingerprint::Thetis
     } else if atr == Some("utrust") {
         AppletFingerprint::UTrust
     } else if atr == Some("yubikey") {
@@ -793,6 +806,50 @@ mod tests {
     }
 
     #[test]
+    fn classify_thetis_needs_both_substrings_case_insensitively() {
+        assert_eq!(
+            classify(Some("PIV 8888888"), None, false, false, false),
+            AppletFingerprint::Thetis
+        );
+        // Case-insensitive on the ATR identity, same as every other branch.
+        assert_eq!(
+            classify(Some("piv 8888888"), None, false, false, false),
+            AppletFingerprint::Thetis
+        );
+        // Either substring alone isn't enough.
+        assert_eq!(
+            classify(Some("PIV only"), None, false, false, false),
+            AppletFingerprint::Generic
+        );
+        assert_eq!(
+            classify(Some("8888888 only"), None, false, false, false),
+            AppletFingerprint::Generic
+        );
+    }
+
+    #[test]
+    fn token2_r3_3_historical_bytes_are_not_misclassified_as_thetis() {
+        // Real ATR historical bytes from a Token2 R3.3+ device: "TK\0PIV"
+        // (the signature `classify`'s Token2 branch matches on), followed by
+        // a 2-byte version and, coincidentally, "8888888" — the very
+        // substring `classify`'s Thetis branch looks for. This is the exact
+        // collision documented on `AppletFingerprint::Thetis` and
+        // <https://github.com/framefilter/keyroost/issues/125>: were the
+        // Thetis branch checked first (or independently of the Token2
+        // branch), this ATR would misclassify as Thetis.
+        let historical = [
+            0x54, 0x4B, 0x00, 0x50, 0x49, 0x56, 0x04, 0x02, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38,
+            0x38,
+        ];
+        let identity = atr_identity(&historical);
+        assert_eq!(identity.as_deref(), Some("TK\0PIV\u{4}\u{2}8888888"));
+        assert_eq!(
+            classify(identity.as_deref(), None, false, false, false),
+            AppletFingerprint::Token2
+        );
+    }
+
+    #[test]
     fn classify_utrust_and_yubikey() {
         assert_eq!(
             classify(Some("uTrust"), None, false, false, false),
@@ -849,6 +906,7 @@ mod tests {
                 AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
                 "Swissbit iShield 2 Series",
             ),
+            (AppletFingerprint::Thetis, "Thetis Series"),
             (AppletFingerprint::Token2, "Token2 Series"),
             (AppletFingerprint::UTrust, "Identiv/Hirsch uTrust Series"),
             (AppletFingerprint::YubiKey, "Yubico YubiKey Series"),
@@ -881,6 +939,7 @@ mod tests {
         );
         assert_eq!(AppletFingerprint::Feitian.to_string(), "Feitian");
         assert_eq!(AppletFingerprint::IdPrime.to_string(), "IdPrime");
+        assert_eq!(AppletFingerprint::Thetis.to_string(), "Thetis");
         assert_eq!(AppletFingerprint::YubiKey.to_string(), "YubiKey");
     }
 
