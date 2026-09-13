@@ -128,17 +128,22 @@ fn map_reset_stage_error(e: TransportError) -> TransportError {
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct PivStatus {
-    /// Reply to Yubico's proprietary `GET VERSION` extension (`INS FD`), raw
-    /// bytes, any non-empty length. Real Yubico firmware answers with exactly
-    /// 3 (`major.minor.patch`) — but this extension is implemented by many
+    /// The PIV applet's own version. Ordinarily the reply to Yubico's
+    /// proprietary `GET VERSION` extension (`INS FD`), raw bytes, any
+    /// non-empty length — real Yubico firmware answers with exactly 3
+    /// (`major.minor.patch`), but this extension is implemented by many
     /// devices beyond genuine YubiKeys (observed: a Swissbit iShield Key 2
     /// Pro, an OpenFIPS201 build, answering `9000` with 4 bytes that don't
     /// trace back to anything in OpenFIPS201's own source), so a reply here
-    /// means "answers this Yubico extension," not "is a YubiKey." `None` if
-    /// the card doesn't answer it, or answers empty. [`Self::feature_gate`]
-    /// (via [`keyroost_piv::compat`]) compares this directly as a byte slice
-    /// rather than requiring an exact 3-byte shape. See
-    /// [`keyroost_piv::format_version_bytes`] for display formatting.
+    /// means "answers this Yubico extension," not "is a YubiKey." When a
+    /// specific fingerprint's own probe supplies an applet version instead
+    /// (currently: HID Crescendo, via its GET PIV PROPERTIES response's own
+    /// "Applet Version Block" — that fingerprint never answers the Yubico
+    /// extension at all), that one is used instead. `None` when neither
+    /// source answers. [`Self::feature_gate`] (via [`keyroost_piv::compat`])
+    /// compares this directly as a byte slice rather than requiring an exact
+    /// 3-byte shape. See [`keyroost_piv::format_version_bytes`] for display
+    /// formatting.
     pub version: Option<Vec<u8>>,
     /// The applet's own firmware version, when a specific fingerprint's probe
     /// discovered one — currently a Nitrokey (`Trussed(NitroKey)`, via
@@ -173,9 +178,13 @@ pub struct PivStatus {
     /// [`keyroost_piv::fingerprint`] for the full scheme. `Generic` when
     /// nothing more specific matched, not when fingerprinting itself failed.
     pub applet_fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
-    /// The token's own name, when a specific one was actually discovered
-    /// (currently: a Nitrokey's admin application, for
-    /// [`AppletFingerprint::Trussed`](keyroost_piv::fingerprint::AppletFingerprint::Trussed)`(`[`NitroKey`](keyroost_piv::fingerprint::TrussedVariant::NitroKey)`)`).
+    /// The token's own name, when a specific one was actually discovered:
+    /// currently a Nitrokey's admin application (for
+    /// [`AppletFingerprint::Trussed`](keyroost_piv::fingerprint::AppletFingerprint::Trussed)`(`[`NitroKey`](keyroost_piv::fingerprint::TrussedVariant::NitroKey)`)`),
+    /// a YubiKey's own major version (for
+    /// [`AppletFingerprint::YubiKey`](keyroost_piv::fingerprint::AppletFingerprint::YubiKey)),
+    /// or HID Crescendo's SELECT response Application Label (for
+    /// [`AppletFingerprint::HidCrescendo`](keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo)`(`[`C2300`](keyroost_piv::fingerprint::HidCrescendoVariant::C2300)`)`/[`C4000`](keyroost_piv::fingerprint::HidCrescendoVariant::C4000)`)`).
     /// Empty otherwise — deliberately not backfilled with the generic
     /// [`keyroost_piv::fingerprint::AppletFingerprint::applet_name`] for
     /// `applet_fingerprint`, so a caller can tell "this card told us its own
@@ -268,6 +277,72 @@ pub struct PivSlotDetail {
     pub policy: Option<(PinPolicy, TouchPolicy)>,
 }
 
+/// [`PivSession::identity`]'s resolved shape: this applet's
+/// [`keyroost_piv::fingerprint::AppletFingerprint`] plus its reported
+/// applet-version and firmware-version byte strings (either or both `None`
+/// when the card never reported one) — everything
+/// [`keyroost_piv::compat::resolve`]/[`keyroost_piv::compat::resolve_quirks`]
+/// need to gate a [`keyroost_piv::compat::PivExtension`] or resolve a
+/// [`keyroost_piv::compat::PivQuirk`]. Named fields rather than a tuple on
+/// purpose: `version` vs. `version_firmware` is exactly the distinction that
+/// went wrong when HID Crescendo's applet version was first wired up
+/// (landed in the wrong axis, caught only in review) — a positional
+/// `.0`/`.1`/`.2` (or a same-shaped tuple destructured in the wrong order)
+/// can't fail that same way, since the compiler checks the field name at
+/// every use.
+#[derive(Clone)]
+struct SessionIdentity {
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    version: Option<Vec<u8>>,
+    version_firmware: Option<Vec<u8>>,
+}
+
+/// [`PivSession::applet_fingerprint`]'s resolved shape — see that method's
+/// doc for what each field means. Named fields for the same reason as
+/// [`SessionIdentity`]'s.
+struct AppletFingerprintResult {
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    name: String,
+    version: Option<Vec<u8>>,
+    version_firmware: Option<Vec<u8>>,
+    serial: Option<u128>,
+}
+
+/// How a caller is currently authorized to change the card-management key,
+/// passed to [`PivSession::set_management_key`]/
+/// [`PivSession::delete_management_key_hid_crescendo`]. Every fingerprint but
+/// one ignores this — the standard SET MANAGEMENT KEY round relies on the
+/// ordinary 9B security status a prior [`PivSession::authenticate_management`]/
+/// [`PivSession::authenticate_management_via_pin`] call already established,
+/// same as every other admin write in this module. The one exception is a
+/// HID Crescendo unit whose "management key" isn't a real PIV object at all
+/// (see [`PivSession::hid_crescendo_reports_management_key`]): there,
+/// installing or deleting a key happens on a *different* applet instance
+/// (the ACA), which needs its own unlock run fresh rather than assumed to
+/// still be in force — see
+/// [`PivSession::hid_crescendo_aca_put_xauth_key_op`].
+#[derive(Debug, Clone, Copy)]
+pub enum CurrentMgmtAuth<'a> {
+    /// The current management key, for the standard round or ACA XAUTH's
+    /// GET CHALLENGE / EXTERNAL AUTHENTICATE round.
+    Key(&'a [u8]),
+    /// A PIN, for a device with
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`].
+    Pin(&'a [u8]),
+}
+
+/// What [`PivSession::hid_crescendo_aca_put_xauth_key_op`] should do to XAUTH
+/// key 1 once unlocked — install a new key ([`Self::Set`], from
+/// [`PivSession::set_management_key`]) or delete it outright ([`Self::Delete`],
+/// from [`PivSession::delete_management_key_hid_crescendo`]). Private: an
+/// implementation detail of how those two public methods share one
+/// select/unlock/reselect sequence, not something a caller constructs
+/// directly.
+enum HidCrescendoXauthKeyOp<'a> {
+    Set(MgmtAlg, &'a [u8]),
+    Delete,
+}
+
 /// An open PIV applet session on one PC/SC reader.
 pub struct PivSession {
     card: Card,
@@ -302,16 +377,33 @@ pub struct PivSession {
     /// with nothing), never `None`: fingerprint resolution treats empty and
     /// absent the same way.
     select_response: Vec<u8>,
-    /// [`Self::quirks`]'s cache: `None` until first resolved, then the
-    /// [`keyroost_piv::compat::PivQuirk`]s active for this applet for the
-    /// rest of the session. Safe to cache — unlike the read-through data this
-    /// session deliberately doesn't cache (certs, PIN retries, slot
-    /// occupancy; see [`Self::status_detailed`]'s doc) — because the applet's
-    /// identity and reported versions cannot change while the card stays
-    /// connected, but resolving them can cost a handful of extra APDUs (some
-    /// fingerprints need a live SELECT probe), so it's worth not repeating
-    /// per slot.
-    quirks: Option<BTreeSet<keyroost_piv::compat::PivQuirk>>,
+    /// [`Self::identity`]'s cache: `None` until first resolved, then this
+    /// applet's [`keyroost_piv::fingerprint::AppletFingerprint`] plus its
+    /// reported applet/firmware version bytes, for the rest of the session.
+    /// Safe to cache — unlike the read-through data this session
+    /// deliberately doesn't cache (certs, PIN retries, slot occupancy; see
+    /// [`Self::status_detailed`]'s doc) — because the applet's identity and
+    /// reported versions cannot change while the card stays connected, but
+    /// resolving them can cost a handful of extra APDUs (some fingerprints
+    /// need a live SELECT probe), so it's worth not repeating per slot.
+    /// [`Self::fingerprint`], [`Self::quirks`], and [`Self::extension_gate`]
+    /// are thin accessors over this; [`keyroost_piv::compat::resolve_quirks`]
+    /// and [`keyroost_piv::compat::resolve`] are themselves cheap pure table
+    /// lookups, so there's no need to additionally cache their outputs.
+    identity: Option<SessionIdentity>,
+    /// [`Self::hid_crescendo_properties_raw`]'s cache: `None` until first
+    /// resolved, then the raw response body of a HID Crescendo GET PIV
+    /// PROPERTIES read (C2300 or C4000 — both families expose this, over
+    /// differently-framed requests but with a compatible response
+    /// structure), for the rest of the session — one read serves both the
+    /// per-slot algorithm list ([`Self::hid_crescendo_slot_key_algorithms`]) and this
+    /// applet's own version ([`Self::hid_crescendo_version`],
+    /// [`Self::applet_fingerprint`]'s HID Crescendo branch), so this exists
+    /// purely to avoid re-issuing that same read for each of those —
+    /// including once per slot [`Self::status_detailed`] asks about. A read
+    /// that fails caches as an empty `Vec`, same "resolved, with or without
+    /// data" convention as [`Self::identity`].
+    hid_crescendo_properties_raw: Option<Vec<u8>>,
 }
 
 /// The in-session public-key cache behind `PivSession`, keyed by PIV key
@@ -503,7 +595,8 @@ impl PivSession {
             t0,
             pubkey_cache: PubkeyCache::new(),
             select_response: Vec::new(),
-            quirks: None,
+            identity: None,
+            hid_crescendo_properties_raw: None,
         };
         session.select()?;
         Ok(session)
@@ -535,7 +628,8 @@ impl PivSession {
                     t0,
                     pubkey_cache: PubkeyCache::new(),
                     select_response: Vec::new(),
-                    quirks: None,
+                    identity: None,
+                    hid_crescendo_properties_raw: None,
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -604,26 +698,35 @@ impl PivSession {
     /// ([`Self::probe_idprime_aid`]) as two last resorts, each cheaper to
     /// skip than to run, tried in that order before finally settling for
     /// `Generic`. Once the fingerprint itself is resolved, at most one
-    /// further, fingerprint-specific step produces `applet_name`/serial: a
-    /// Nitrokey (`Trussed(NitroKey)`) gets [`Self::probe_nitrokey_admin`] for
-    /// its firmware, hardware variant, and serial, and a YubiKey names itself
-    /// from `version` — the reply [`Self::status`]/[`Self::status_detailed`]
-    /// already fetched via the same Yubico `GET VERSION` extension, passed
-    /// in here so this never issues that command a second time. Every probe
-    /// here always re-selects PIV afterward so the session is left exactly
-    /// as any other caller of [`Self::status`] expects, whether or not the
-    /// probe itself succeeded.
-    fn applet_fingerprint(
-        &mut self,
-        version: Option<&[u8]>,
-    ) -> (
-        keyroost_piv::fingerprint::AppletFingerprint,
-        String,
-        Option<Vec<u8>>,
-        Option<u128>,
-    ) {
+    /// further, fingerprint-specific step produces `applet_name`/version/
+    /// serial: a Nitrokey (`Trussed(NitroKey)`) gets
+    /// [`Self::probe_nitrokey_admin`] for its firmware, hardware variant, and
+    /// serial; a YubiKey names itself from its own `GET VERSION` reply; and
+    /// HID Crescendo (C2300 and C4000) names itself from its SELECT
+    /// response's Application Label (already read above as
+    /// `select_identity`) and, since neither family answers the Yubico
+    /// extension at all, gets its *applet* version from its own GET PIV
+    /// PROPERTIES response instead — see [`Self::hid_crescendo_version`]'s
+    /// doc. Every probe here always re-selects PIV afterward so the session
+    /// is left exactly as any other caller of [`Self::status`] expects,
+    /// whether or not the probe itself succeeded.
+    ///
+    /// Returns `(fingerprint, name, version, version_firmware, serial)`:
+    /// `version` fetches Yubico's own `GET VERSION` extension itself (no
+    /// caller needs to pass one in — this is the sole place that issues it),
+    /// except where a fingerprint's own probe supplies a better source
+    /// instead (HID Crescendo — see above), in which case that replaces it;
+    /// the two are never both meaningful for the same fingerprint, so there
+    /// is nothing to merge, only to prefer, and this method does that
+    /// itself rather than handing a caller two values to reconcile.
+    /// `version_firmware` is the separate, genuinely-distinct-from-the-applet
+    /// firmware version axis (currently Nitrokey only) — see
+    /// [`PivStatus::version_firmware`]'s doc for why the two axes aren't
+    /// interchangeable.
+    fn applet_fingerprint(&mut self) -> AppletFingerprintResult {
         use keyroost_piv::fingerprint;
 
+        let version = self.version();
         let atr = self.atr();
         let atr_identity =
             fingerprint::atr_historical_bytes(&atr).and_then(fingerprint::atr_identity);
@@ -671,18 +774,68 @@ impl PivSession {
         // per `PivStatus::applet_name`'s doc; `id`/its `Display`/
         // `applet_name()` are the generic fallback for a caller that wants
         // one regardless.
-        let (name, version_firmware, serial) = match id {
+        let (name, version, version_firmware, serial) = match id {
             fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::NitroKey) => {
-                self.probe_nitrokey_admin()
+                let (name, firmware, serial) = self.probe_nitrokey_admin();
+                (name, version, firmware, serial)
             }
-            fingerprint::AppletFingerprint::YubiKey => (
-                version.and_then(fingerprint::format_yubikey_name),
-                None,
-                None,
-            ),
-            _ => (None, None, None),
+            fingerprint::AppletFingerprint::YubiKey => {
+                let name = version
+                    .as_deref()
+                    .and_then(fingerprint::format_yubikey_name);
+                (name, version, None, None)
+            }
+            // HID Crescendo (either family — both are documented/observed to
+            // answer a standard PIV SELECT, so there's no reason to expect
+            // this to differ between them) names itself in its SELECT
+            // response's Application Label (tag `0x50`) — already captured
+            // above as `select_identity` (the same text `classify` matched
+            // the generic `HidCrescendo` variant on, when the ATR didn't
+            // already narrow it to a specific model): confirmed against a
+            // live C2300 unit answering "HID Global ActivID Applet 3.0.3".
+            // See <https://docs.hidglobal.com/crescendo/api/low-level/select.htm>
+            // ("Data Field Returned in the Response Message for SELECT of
+            // PIV Instance" — tag `0x50`, "Application Label"). It also
+            // doesn't answer Yubico's own GET VERSION extension (`version`
+            // above is always `None` for it), so its GET PIV PROPERTIES
+            // response's own *applet* version block — HID's own
+            // documentation names it "Applet Version Block" — is the only
+            // applet-version source keyroost has for it, replacing the
+            // empty Yubico reply as this fingerprint's `version`. Not
+            // `version_firmware`: it's the same axis `version` represents
+            // for any other fingerprint, just sourced differently, which is
+            // also what `compat`'s `GetMetadata`/`Attest` C2300 known-
+            // unsupported row is keyed on. See `Self::hid_crescendo_version`'s
+            // doc.
+            //
+            // The Application Label already embeds a truncated copy of that
+            // same version (the "3.0.3" tail above, versus GET PIV
+            // PROPERTIES' fuller "3.0.3.6") — once the real version is known,
+            // repeating a stale truncated one inside the name is just noise,
+            // so it's stripped via
+            // `fingerprint::strip_redundant_applet_version_suffix`.
+            fingerprint::AppletFingerprint::HidCrescendo(
+                variant @ (fingerprint::HidCrescendoVariant::C2300
+                | fingerprint::HidCrescendoVariant::C4000),
+            ) => {
+                let hid_version = self.hid_crescendo_version(variant);
+                let name = match (select_identity, &hid_version) {
+                    (Some(name), Some(v)) => {
+                        Some(fingerprint::strip_redundant_applet_version_suffix(&name, v))
+                    }
+                    (name, _) => name,
+                };
+                (name, hid_version, None, None)
+            }
+            _ => (None, version, None, None),
         };
-        (id, name.unwrap_or_default(), version_firmware, serial)
+        AppletFingerprintResult {
+            fingerprint: id,
+            name: name.unwrap_or_default(),
+            version,
+            version_firmware,
+            serial,
+        }
     }
 
     /// SELECT [`keyroost_piv::fingerprint::FEITIAN_RID`] and report whether the
@@ -790,14 +943,19 @@ impl PivSession {
     /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
     /// and which slots hold a certificate. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
-        let version = self.version();
-        // Fingerprint resolution runs first: some identities' own probes
-        // supply a real serial number, and when one does, the Yubico GET
-        // SERIAL extension below is skipped entirely — a card that answers
-        // it with a fake value (observed: a Nitrokey) never gets the chance
-        // to overwrite the real one.
-        let (applet_fingerprint, applet_name, version_firmware, fingerprint_serial) =
-            self.applet_fingerprint(version.as_deref());
+        // Fingerprint resolution (which also resolves `version` — see
+        // `Self::applet_fingerprint`'s doc) runs first: some identities' own
+        // probes supply a real serial number, and when one does, the Yubico
+        // GET SERIAL extension below is skipped entirely — a card that
+        // answers it with a fake value (observed: a Nitrokey) never gets the
+        // chance to overwrite the real one.
+        let AppletFingerprintResult {
+            fingerprint: applet_fingerprint,
+            name: applet_name,
+            version,
+            version_firmware,
+            serial: fingerprint_serial,
+        } = self.applet_fingerprint();
         let serial = decode_serial_if_bcd(
             applet_fingerprint,
             version.as_deref(),
@@ -825,7 +983,7 @@ impl PivSession {
         })
     }
 
-    /// Resolve the per-fingerprint white/blacklist ([`keyroost_piv::compat`])
+    /// Resolve the per-fingerprint known-support table ([`keyroost_piv::compat`])
     /// for one of the vendor-extension operations this session exposes
     /// ([`Self::move_key`], [`Self::delete_key`]), from the applet's own
     /// fingerprint and reported version.
@@ -843,8 +1001,12 @@ impl PivSession {
         &mut self,
         feature: keyroost_piv::compat::PivExtension,
     ) -> keyroost_piv::compat::FeatureGate {
-        let version = self.version();
-        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        let AppletFingerprintResult {
+            fingerprint,
+            version,
+            version_firmware,
+            ..
+        } = self.applet_fingerprint();
         keyroost_piv::compat::resolve(
             feature,
             fingerprint,
@@ -871,10 +1033,14 @@ impl PivSession {
     /// that generated a key in this session should [`Self::remember_pubkey`]
     /// it first to have that key named for a slot with no certificate yet.
     pub fn status_detailed(&mut self) -> Result<PivStatusDetailed, TransportError> {
-        let version = self.version();
         // See the identical ordering (and why) in `status`.
-        let (applet_fingerprint, applet_name, version_firmware, fingerprint_serial) =
-            self.applet_fingerprint(version.as_deref());
+        let AppletFingerprintResult {
+            fingerprint: applet_fingerprint,
+            name: applet_name,
+            version,
+            version_firmware,
+            serial: fingerprint_serial,
+        } = self.applet_fingerprint();
         let serial = decode_serial_if_bcd(
             applet_fingerprint,
             version.as_deref(),
@@ -896,6 +1062,7 @@ impl PivSession {
 
             let algorithm = self
                 .algorithm_without_cert(slot, meta.as_ref())
+                .or_else(|| self.hid_crescendo_slot_algorithm(slot))
                 .or_else(|| {
                     cert_der
                         .and_then(|der| piv::x509_parse::parse_key_algorithm(der).ok().flatten())
@@ -969,47 +1136,251 @@ impl PivSession {
         }
     }
 
-    /// The [`keyroost_piv::compat::PivQuirk`]s active for this session's
-    /// applet, resolved once — via [`Self::version`] and
-    /// [`Self::applet_fingerprint`], the same sources [`Self::status`] and
-    /// [`Self::status_detailed`] use — and cached in [`Self::quirks`] (the
-    /// field) for the rest of the session; see that field's doc for why
-    /// caching this particular resolution is safe. [`Self::metadata`] is the
-    /// only caller today.
-    fn quirks(&mut self) -> BTreeSet<keyroost_piv::compat::PivQuirk> {
-        if let Some(quirks) = &self.quirks {
-            return quirks.clone();
+    /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] plus
+    /// its reported applet/firmware version bytes, resolved together once —
+    /// via [`Self::version`] and [`Self::applet_fingerprint`], the same
+    /// sources [`Self::status`] and [`Self::status_detailed`] use — and
+    /// cached in [`Self::identity`] (the field) for the rest of the session;
+    /// see that field's doc for why caching this particular resolution is
+    /// safe. [`Self::fingerprint`], [`Self::quirks`], and
+    /// [`Self::extension_gate`] are thin accessors over this.
+    fn identity(&mut self) -> SessionIdentity {
+        if let Some(identity) = &self.identity {
+            return identity.clone();
         }
-        let version = self.version();
-        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
-        let quirks = keyroost_piv::compat::resolve_quirks(
+        let AppletFingerprintResult {
+            fingerprint,
+            version,
+            version_firmware,
+            ..
+        } = self.applet_fingerprint();
+        let identity = SessionIdentity {
+            fingerprint,
+            version,
+            version_firmware,
+        };
+        self.identity = Some(identity.clone());
+        identity
+    }
+
+    /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] — see
+    /// [`Self::identity`]. Used by [`Self::hid_crescendo_slot_algorithm`] to
+    /// find which HID Crescendo sub-variant (if any) it's talking to.
+    fn fingerprint(&mut self) -> keyroost_piv::fingerprint::AppletFingerprint {
+        self.identity().fingerprint
+    }
+
+    /// The [`keyroost_piv::compat::PivQuirk`]s active for this session's
+    /// applet — see [`Self::identity`]. [`Self::metadata`] is the only
+    /// caller today.
+    fn quirks(&mut self) -> BTreeSet<keyroost_piv::compat::PivQuirk> {
+        let SessionIdentity {
+            fingerprint,
+            version,
+            version_firmware,
+        } = self.identity();
+        keyroost_piv::compat::resolve_quirks(
             fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-        );
-        self.quirks = Some(quirks.clone());
-        quirks
+        )
+    }
+
+    /// The [`keyroost_piv::compat::FeatureGate`] for one of this session's
+    /// *internally* consumed [`keyroost_piv::compat::PivExtension`]s
+    /// ([`keyroost_piv::compat::PivExtension::GetMetadata`]/[`Attest`] —
+    /// see [`Self::metadata`]/[`Self::attest`]) — see [`Self::identity`] for
+    /// where the fingerprint/version data comes from. Distinct from the
+    /// public [`Self::feature_gate`], which resolves the same way but always
+    /// live (never cached) for the UI-facing extensions
+    /// ([`MoveKey`](keyroost_piv::compat::PivExtension::MoveKey)/
+    /// [`DeleteKey`](keyroost_piv::compat::PivExtension::DeleteKey)) — a
+    /// caller of that one relies on the live re-SELECT it performs as a side
+    /// effect (see its doc), which caching here would silently drop after
+    /// the first call.
+    fn extension_gate(
+        &mut self,
+        extension: keyroost_piv::compat::PivExtension,
+    ) -> keyroost_piv::compat::FeatureGate {
+        let SessionIdentity {
+            fingerprint,
+            version,
+            version_firmware,
+        } = self.identity();
+        keyroost_piv::compat::resolve(
+            extension,
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        )
     }
 
     /// GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a slot
-    /// key ref). `None` when the firmware predates the extension (5.3-).
+    /// key ref). `None` when the firmware predates the extension (5.3-), or
+    /// this fingerprint/version is known to never answer it at all
+    /// ([`keyroost_piv::compat::PivExtension::GetMetadata`] resolving
+    /// [`keyroost_piv::compat::FeatureGate::Unsupported`] — the HID
+    /// Crescendo C2300 family at its observed GET PIV PROPERTIES version) —
+    /// checked *before* sending anything, so this never puts the unsupported
+    /// extension APDU on the wire for those devices at all, unlike
+    /// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`]
+    /// below, which needs the reply in hand to know what to strip from it.
     ///
     /// Runs [`clear_metadata_if_quirky`] over the parsed reply before
     /// returning it — see that function's doc for what it strips and why.
-    /// This is the sole place that needs to know about the quirk: every
+    /// This is the sole place that needs to know about either check: every
     /// caller of [`Self::metadata`] — [`Self::slot_key`]/
     /// [`metadata_key_material`], [`Self::algorithm_without_cert`],
     /// [`Self::resolve_policy`], [`Self::reported_management_key_algorithm`],
     /// [`Self::status_detailed`] — already treats a missing algorithm/public
     /// key as "fall back to another source", which is exactly the right
-    /// behavior on a device where GET METADATA can't be trusted for either.
+    /// behavior on a device where GET METADATA can't be trusted, or isn't
+    /// there at all.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
+        if self.extension_gate(keyroost_piv::compat::PivExtension::GetMetadata)
+            == keyroost_piv::compat::FeatureGate::Unsupported
+        {
+            return None;
+        }
         let (data, sw) = self.transmit_full(&piv::get_metadata(key_ref)).ok()?;
         if sw != piv::SW_OK {
             return None;
         }
         let md = piv::parse_metadata(&data).ok()?;
         Some(clear_metadata_if_quirky(&self.quirks(), md))
+    }
+
+    /// The raw response body of a HID Crescendo GET PIV PROPERTIES read for
+    /// `variant` (must be [`HidCrescendoVariant::C2300`] or
+    /// [`HidCrescendoVariant::C4000`] — the two families this crate knows a
+    /// request for; [`HidCrescendoVariant::Generic`] sends nothing and
+    /// yields an empty read, since keyroost has no confirmed request shape
+    /// for an unidentified HID Crescendo model), cached once per session —
+    /// see [`Self::hid_crescendo_properties_raw`] (the field) for why this
+    /// is the single fetch both [`Self::hid_crescendo_slot_key_algorithms`] (the
+    /// per-slot algorithm list) and [`Self::hid_crescendo_version`] (this
+    /// applet's own version, consulted by [`Self::applet_fingerprint`])
+    /// derive from, rather than each issuing its own read.
+    ///
+    /// `variant` is a parameter rather than resolved internally via
+    /// [`Self::fingerprint`] on purpose: [`Self::applet_fingerprint`] (via
+    /// [`Self::identity`]) is what determines the fingerprint in the first
+    /// place, and its own HID Crescendo branch is a caller of this method —
+    /// calling back into [`Self::fingerprint`]/[`Self::identity`] from here
+    /// would recurse into a resolution that hasn't finished yet. Every
+    /// caller already has the variant in hand from its own match on
+    /// [`keyroost_piv::fingerprint::AppletFingerprint`].
+    ///
+    /// Issues the read on first call; every later call in the same session
+    /// reuses the cache regardless of which `variant` is passed (a session's
+    /// fingerprint can't change mid-connection, so this is never asked for
+    /// two different variants in the same session). A read that errors or
+    /// answers a non-`9000` status caches as an empty `Vec` — both derived
+    /// parses already treat that the same as "nothing to report".
+    fn hid_crescendo_properties_raw(
+        &mut self,
+        variant: keyroost_piv::fingerprint::HidCrescendoVariant,
+    ) -> Vec<u8> {
+        use keyroost_piv::fingerprint::{self, HidCrescendoVariant};
+
+        if let Some(raw) = &self.hid_crescendo_properties_raw {
+            return raw.clone();
+        }
+        let apdu = match variant {
+            HidCrescendoVariant::C2300 => Some(piv::get_data(
+                &fingerprint::HID_CRESCENDO_C2300_PROPERTIES_TAG,
+            )),
+            HidCrescendoVariant::C4000 => {
+                Some(fingerprint::HID_CRESCENDO_C4000_GET_PROPERTIES.to_vec())
+            }
+            // `Generic` (no confirmed request shape) and any future variant
+            // this crate doesn't know a GET PIV PROPERTIES request for yet.
+            _ => None,
+        };
+        let raw = apdu
+            .and_then(|apdu| self.transmit_full(&apdu).ok())
+            .filter(|(_, sw)| *sw == piv::SW_OK)
+            .map(|(data, _)| data)
+            .unwrap_or_default();
+        self.hid_crescendo_properties_raw = Some(raw.clone());
+        raw
+    }
+
+    /// This session's parsed `(key_ref, algorithm_id)` pairs from a HID
+    /// Crescendo GET PIV PROPERTIES read, one pair per slot that actually
+    /// has a key loaded (a slot whose PKI container exists but reports no
+    /// key generated/injected is excluded — see
+    /// [`keyroost_piv::fingerprint::parse_hid_crescendo_slot_key_algorithms`]'s doc)
+    /// — see [`Self::hid_crescendo_properties_raw`] for the shared,
+    /// once-per-session fetch this derives from. An empty list either way a
+    /// read can come up empty: the read itself failing, or a well-formed
+    /// response simply naming no slot with a key loaded.
+    fn hid_crescendo_slot_key_algorithms(
+        &mut self,
+        variant: keyroost_piv::fingerprint::HidCrescendoVariant,
+    ) -> Vec<(u8, u8)> {
+        let raw = self.hid_crescendo_properties_raw(variant);
+        keyroost_piv::fingerprint::parse_hid_crescendo_slot_key_algorithms(&raw)
+    }
+
+    /// This applet's own version, from the same HID Crescendo GET PIV
+    /// PROPERTIES read [`Self::hid_crescendo_slot_key_algorithms`] uses — see
+    /// [`Self::hid_crescendo_properties_raw`]. [`Self::applet_fingerprint`]
+    /// feeds this into the "firmware version" axis
+    /// [`keyroost_piv::compat::resolve`]/[`keyroost_piv::compat::resolve_quirks`]
+    /// compare against [`keyroost_piv::compat::PivExtension::GetMetadata`]/
+    /// [`Attest`](keyroost_piv::compat::PivExtension::Attest)'s HID-specific
+    /// known-unsupported row, since this fingerprint never answers Yubico's
+    /// own GET VERSION extension the applet axis elsewhere keys on. `None`
+    /// when the read fails or doesn't carry a version block.
+    fn hid_crescendo_version(
+        &mut self,
+        variant: keyroost_piv::fingerprint::HidCrescendoVariant,
+    ) -> Option<Vec<u8>> {
+        let raw = self.hid_crescendo_properties_raw(variant);
+        keyroost_piv::fingerprint::parse_hid_crescendo_version(&raw)
+    }
+
+    /// Whether this HID Crescendo's GET PIV PROPERTIES read names the PIV
+    /// management key (`0x9B`) as a real slot object at all — see
+    /// [`keyroost_piv::fingerprint::hid_crescendo_reports_slot`]'s doc. The
+    /// sole consumer, [`Self::authenticate_management`], uses this to decide
+    /// between the standard `0x9B` `GENERAL AUTHENTICATE` round (most PIV
+    /// applets, and the minority of HID Crescendo units HID's own Crescendo
+    /// Manager documentation says do expose `0x9B`:
+    /// <https://docs.hidglobal.com/crescendo-manager/CM/about-cm.htm>) and
+    /// the vendor ACA XAUTH fallback (most HID Crescendo units, including
+    /// every unit this crate has actually been tested against).
+    fn hid_crescendo_reports_management_key(
+        &mut self,
+        variant: keyroost_piv::fingerprint::HidCrescendoVariant,
+    ) -> bool {
+        let raw = self.hid_crescendo_properties_raw(variant);
+        keyroost_piv::fingerprint::hid_crescendo_reports_slot(&raw, piv::KEY_REF_MANAGEMENT)
+    }
+
+    /// HID Crescendo's substitute for GET METADATA's algorithm field: this
+    /// fingerprint/version resolves
+    /// [`keyroost_piv::compat::PivExtension::GetMetadata`] to
+    /// [`keyroost_piv::compat::FeatureGate::Unsupported`] (see
+    /// [`Self::metadata`]'s doc — today only confirmed for C2300, but C4000
+    /// exposes the same GET PIV PROPERTIES data too), so this reads the
+    /// vendor's own data object instead via [`Self::hid_crescendo_slot_key_algorithms`].
+    /// `None` on any other fingerprint (nothing to try), or when the read
+    /// doesn't name `slot`'s key at all.
+    fn hid_crescendo_slot_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
+        let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(variant) =
+            self.fingerprint()
+        else {
+            return None;
+        };
+        let key_ref = slot.key_ref();
+        let id = self
+            .hid_crescendo_slot_key_algorithms(variant)
+            .into_iter()
+            .find(|&(kr, _)| kr == key_ref)?
+            .1;
+        keyroost_piv::fingerprint::hid_crescendo_algorithm_from_id(id)
     }
 
     /// The card-management (9B) key's algorithm *as the card reports it* via
@@ -1107,10 +1478,42 @@ impl PivSession {
         Ok(chosen)
     }
 
-    /// Authenticate to the card-management key via the GENERAL AUTHENTICATE
-    /// witness/challenge round. Required before key generation, certificate
-    /// import, set-management-key, and set-pin-retries. `alg` must match the
-    /// card's stored management-key algorithm (see [`Self::resolve_management_key_algorithm`]).
+    /// Authenticate to unlock PIV admin operations (key generation,
+    /// certificate import, set-management-key, set-pin-retries). `alg` must
+    /// match the card's stored management-key algorithm (see
+    /// [`Self::resolve_management_key_algorithm`]) on the standard path below; the
+    /// HID Crescendo ACA path further down instead reads the real algorithm
+    /// off the card at auth time, so `alg` only bounds the initial
+    /// key-length check there.
+    ///
+    /// Two mechanisms, picked per fingerprint and per device:
+    ///
+    /// 1. **Standard PIV** — every applet except HID Crescendo, plus the
+    ///    minority of HID Crescendo units that *do* expose the management
+    ///    key (`0x9B`) as a real slot object (HID's own Crescendo Manager
+    ///    documentation: <https://docs.hidglobal.com/crescendo-manager/CM/about-cm.htm>
+    ///    — see [`Self::hid_crescendo_reports_management_key`]): the
+    ///    GENERAL AUTHENTICATE witness/challenge round below, unchanged
+    ///    from before this method knew HID Crescendo existed.
+    /// 2. **HID Crescendo ACA XAUTH** — every other HID Crescendo unit (the
+    ///    majority; every unit this crate has actually been tested against),
+    ///    which doesn't model `0x9B` as a PIV object at all (confirmed on a
+    ///    live C2300 unit: `SW = 6D 00` to a standard GENERAL AUTHENTICATE on
+    ///    `0x9B`), so the standard round has nothing to authenticate
+    ///    against. Delegates to
+    ///    [`Self::authenticate_management_hid_crescendo_aca`] — see its doc
+    ///    for the sequence and for why switching back to PIV at the end
+    ///    doesn't throw the resulting authentication away the way it would
+    ///    for the standard mechanism.
+    ///
+    /// Neither path implements HID Crescendo's separate PIN-only unlock for
+    /// most management operations (documented e.g. at
+    /// <https://docs.hidglobal.com/hid-crescendo-sdk-v1.2/API%20references/html/md_Documentation_204_8EXAMPLES.html>).
+    /// That's a different mechanism from Yubico's own PIN-unlock extension,
+    /// which retrieves the actual management key via the PIN and then still
+    /// runs the standard round below — and Yubico's own version isn't
+    /// implemented here either yet, so HID Crescendo's is left out for the
+    /// same reason, not a HID-specific gap.
     pub fn authenticate_management(
         &mut self,
         alg: MgmtAlg,
@@ -1119,6 +1522,15 @@ impl PivSession {
         if key.len() != alg.key_len() {
             return Err(TransportError::PivBadKeyLength);
         }
+
+        if let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(variant) =
+            self.fingerprint()
+        {
+            if !self.hid_crescendo_reports_management_key(variant) {
+                return self.authenticate_management_hid_crescendo_aca(key);
+            }
+        }
+
         // Step 1: ask the card for an encrypted witness.
         let (resp, sw) = self.transmit_full(&piv::general_auth_request_witness(
             alg,
@@ -1186,6 +1598,106 @@ impl PivSession {
         Ok(())
     }
 
+    /// The vendor fallback [`Self::authenticate_management`] uses for a HID
+    /// Crescendo unit whose GET PIV PROPERTIES read doesn't name the PIV
+    /// management key (`0x9B`) as a real slot object (see
+    /// [`Self::hid_crescendo_reports_management_key`]) — HID's External
+    /// Authentication sequence against the ACA (Access Control Applet)
+    /// instance's XAUTH key 1:
+    /// <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>.
+    ///
+    /// 1. Temporarily SELECT the ACA instance
+    ///    ([`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`]).
+    /// 2. GET CHALLENGE, and read XAUTH key 1's algorithm off the response's
+    ///    own length
+    ///    ([`keyroost_piv::fingerprint::hid_crescendo_xauth_key_alg`]) — the
+    ///    ground truth for what this specific card's XAUTH key actually is,
+    ///    regardless of what [`Self::authenticate_management`]'s caller
+    ///    believed when it chose the `alg` it was called with (typically a
+    ///    length-only guess here, since a card that reaches this path has
+    ///    already been established not to answer GET METADATA on `0x9B` —
+    ///    there's nothing on this path *to* report). `key`'s length must
+    ///    match this algorithm, independent of the caller's `alg`.
+    /// 3. EXTERNAL AUTHENTICATE, `key` block-encrypting the challenge
+    ///    (single-block, ECB-style — the same primitive [`block_crypt`]
+    ///    already runs for standard PIV management-key auth).
+    /// 4. Unconditionally re-SELECT PIV, success or failure — same
+    ///    discipline as every other temporary-SELECT probe in this file
+    ///    (e.g. [`Self::probe_swissbit_rid`]). Unlike those probes, though,
+    ///    this re-select isn't discarding anything: per NIST GSC-IS 2.1's
+    ///    access-condition model, the ACA's "External Authentication"
+    ///    access condition, once satisfied, is a *card-wide* grant rather
+    ///    than one scoped to the ACA instance — see
+    ///    [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`]'s doc — so
+    ///    the PIV applet is left authenticated for the same admin
+    ///    operations the standard `0x9B` round would have unlocked. Callers
+    ///    still need to run this (or the standard round) immediately before
+    ///    the admin operation it gates, same as always: any *later*
+    ///    re-select — including this method's own step 1 SELECT, on a
+    ///    second call — clears it again.
+    fn authenticate_management_hid_crescendo_aca(
+        &mut self,
+        key: &[u8],
+    ) -> Result<(), TransportError> {
+        use keyroost_piv::fingerprint;
+
+        let result: Result<(), TransportError> = (|| {
+            let (_, sw) =
+                self.transmit_full(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
+            ok_or_apdu("piv aca select", sw)?;
+            self.aca_xauth_unlock(key)
+        })();
+
+        // Step 4: always switch back to PIV — see this method's doc.
+        let _ = self.select();
+        result
+    }
+
+    /// Steps 2–3 of the External Authentication sequence
+    /// [`Self::authenticate_management_hid_crescendo_aca`]'s doc describes:
+    /// GET CHALLENGE, then EXTERNAL AUTHENTICATE with `key` block-encrypting
+    /// that challenge. Factored out (unlike that method) so
+    /// [`Self::hid_crescendo_aca_put_xauth_key_op`] can run the same
+    /// unlock immediately before PUT XAUTH KEY *without* an intervening
+    /// re-SELECT back to PIV and forward to ACA again — the caller is
+    /// responsible for having already SELECTed
+    /// [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`], and for
+    /// switching back to PIV afterward, same discipline as every other
+    /// temporary-SELECT probe in this file.
+    fn aca_xauth_unlock(&mut self, key: &[u8]) -> Result<(), TransportError> {
+        use keyroost_piv::fingerprint;
+
+        let (challenge, sw) = self.transmit_full(&fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE)?;
+        ok_or_apdu("piv aca get challenge", sw)?;
+        let alg = fingerprint::hid_crescendo_xauth_key_alg(challenge.len())
+            .ok_or(TransportError::PivBadKeyLength)?;
+        if key.len() != alg.key_len() {
+            return Err(TransportError::PivBadKeyLength);
+        }
+
+        let cryptogram = Zeroizing::new(block_crypt(alg, key, &challenge, CryptOp::Encrypt)?);
+        let apdu = Zeroizing::new(fingerprint::hid_crescendo_aca_external_authenticate(
+            &cryptogram,
+        ));
+        let (_, sw) = self.transmit_full(&apdu)?;
+        if sw != piv::SW_OK {
+            // Per HID's documentation, `SW = 6A 88` ("XAUTH 1 key has
+            // not been initialized"), `SW = 69 85` ("Get Challenge not
+            // sent before this command" — can't happen here, since the
+            // GET CHALLENGE above always runs first), and `SW = 63 00`
+            // ("invalid cryptogram") are all distinguished from success;
+            // none gets special handling — they all just mean
+            // "authentication did not succeed" — but the raw status
+            // word still reaches `--debug` output here, for whoever's
+            // diagnosing a real device against this.
+            trace::line(self.debug, || {
+                format!("piv aca external authenticate: rejected (SW {sw:04X})")
+            });
+            return Err(TransportError::PivManagementAuthFailed);
+        }
+        Ok(())
+    }
+
     /// Present the PIV application PIN. Required before private-key use and
     /// set-pin-retries. The PIN must be 6–8 bytes — the byte layer returns a
     /// typed error on anything else rather than pad/truncate, so an unchecked
@@ -1196,6 +1708,72 @@ impl PivSession {
             Zeroizing::new(piv::verify_pin(pin).map_err(|_| TransportError::PivBadPinLength)?);
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
+    }
+
+    /// [`Self::verify_pin`], but against HID Crescendo's ACA (Access Control
+    /// Applet) instance's own VERIFY PIN reference
+    /// ([`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_REF`], `P2 = 0x00`)
+    /// instead of the standard PIV application-PIN reference
+    /// (`PIN_REF_APPLICATION`, `P2 = 0x80`) [`Self::verify_pin`] always uses.
+    /// Callers must have already SELECTed
+    /// [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`] — sending the
+    /// standard reference while ACA is selected is not this command, and
+    /// sending this one while PIV is selected wouldn't be either.
+    /// [`Self::hid_crescendo_aca_put_xauth_key_op`]'s `Pin` branch is the
+    /// sole caller.
+    fn verify_pin_hid_crescendo_aca(&mut self, pin: &[u8]) -> Result<(), TransportError> {
+        let apdu = Zeroizing::new(
+            piv::verify_pin_at(keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_REF, pin)
+                .map_err(|_| TransportError::PivBadPinLength)?,
+        );
+        let (_, sw) = self.transmit_full(&apdu)?;
+        map_pin_sw(sw)
+    }
+
+    /// Unlock PIV management via
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`] instead of
+    /// the standard `0x9B` management-key round: [`Self::verify_pin`], then —
+    /// only if this fingerprint carries
+    /// [`keyroost_piv::compat::PivQuirk::PinManagementAuthProtected9BKey`] —
+    /// read the PIN-protected management key
+    /// ([`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`],
+    /// [`keyroost_piv::parse_pin_protected_management_key`]) and run
+    /// [`Self::authenticate_management`] with it, exactly as if the user had
+    /// typed that key directly. A device without the quirk needs nothing
+    /// past the PIN VERIFY — management is unlocked directly, the same way
+    /// HID Crescendo does it.
+    ///
+    /// Callers should check
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`] via
+    /// [`Self::feature_gate`] before offering this at all; this method itself
+    /// doesn't gate on it — a PIN VERIFY that the card accepts is taken as
+    /// license to try, on the same "let the card refuse it" principle
+    /// [`Self::authenticate_management`]'s own callers already follow for
+    /// MOVE KEY/DELETE KEY.
+    ///
+    /// Errors: whatever [`Self::verify_pin`] returns for a wrong/blocked PIN;
+    /// [`TransportError::PivPinProtectedKeyNotSet`] if the quirk applies and
+    /// no management key comes back from the read (the read failed, or
+    /// succeeded with no tag `0x88` / subtag `0x89` — PIN management auth was
+    /// never set up on this card); otherwise whatever
+    /// [`Self::authenticate_management`] returns for the retrieved key.
+    pub fn authenticate_management_via_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
+        self.verify_pin(pin)?;
+        if !self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::PinManagementAuthProtected9BKey)
+        {
+            return Ok(());
+        }
+        let (data, sw) =
+            self.transmit_full(&piv::get_data(&keyroost_piv::OBJECT_PIN_PROTECTED_DATA))?;
+        if sw != piv::SW_OK {
+            return Err(TransportError::PivPinProtectedKeyNotSet);
+        }
+        let key = keyroost_piv::parse_pin_protected_management_key(&data)
+            .ok_or(TransportError::PivPinProtectedKeyNotSet)?;
+        let alg = self.resolve_management_key_algorithm(key.len())?;
+        self.authenticate_management(alg, &key)
     }
 
     /// Change the PIV PIN. A wrong `old` PIN consumes a try and reports the
@@ -1237,9 +1815,21 @@ impl PivSession {
         ok_or_write("piv set pin retries", sw)
     }
 
-    /// Replace the card-management key. Requires prior management-key auth.
+    /// Replace the card-management key with `(alg, key)`. Requires prior
+    /// management-key auth ([`Self::authenticate_management`] /
+    /// [`Self::authenticate_management_via_pin`]) — **except** on a HID
+    /// Crescendo unit whose GET PIV PROPERTIES read doesn't name `0x9B` as a
+    /// real slot object (see [`Self::hid_crescendo_reports_management_key`]):
+    /// there, the "management key" is the ACA's XAUTH key 1, not a real PIV
+    /// object, changed with HID's own PUT XAUTH KEY command instead of the
+    /// standard SET MANAGEMENT KEY extension — see
+    /// [`Self::hid_crescendo_aca_put_xauth_key_op`] for that path, which
+    /// takes `current` to run its own self-contained unlock rather than
+    /// relying on a prior call's access condition still being in force.
+    /// Every other fingerprint ignores `current` entirely.
     pub fn set_management_key(
         &mut self,
+        current: CurrentMgmtAuth<'_>,
         alg: MgmtAlg,
         key: &[u8],
         require_touch: bool,
@@ -1247,9 +1837,120 @@ impl PivSession {
         if key.len() != alg.key_len() {
             return Err(TransportError::PivBadKeyLength);
         }
+        if let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(variant) =
+            self.fingerprint()
+        {
+            if !self.hid_crescendo_reports_management_key(variant) {
+                return self.hid_crescendo_aca_put_xauth_key_op(
+                    current,
+                    HidCrescendoXauthKeyOp::Set(alg, key),
+                );
+            }
+        }
         let apdu = Zeroizing::new(piv::set_management_key(alg, key, require_touch));
         let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_write("piv set management key", sw)
+    }
+
+    /// Delete HID Crescendo's ACA XAUTH key 1 outright, rather than
+    /// replacing it — the "Delete" option in the management-key rotation UI,
+    /// offered only when [`Self::fingerprint`] resolves to
+    /// [`keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo`] with no
+    /// real `0x9B` slot object (see
+    /// [`Self::hid_crescendo_reports_management_key`]) — every other applet
+    /// has no equivalent operation, since a standard PIV management key is
+    /// mandatory and can only be *replaced*, never removed. Returns
+    /// [`TransportError::PivManagementKeyDeleteUnsupported`] if `self` isn't
+    /// that specific device; a caller that only offers this option when
+    /// [`Self::fingerprint`] already says so should never actually hit that
+    /// error unless the card was swapped mid-flow.
+    ///
+    /// Runs the same select/unlock/reselect sequence
+    /// [`Self::hid_crescendo_aca_put_xauth_key_op`] documents, with
+    /// [`HidCrescendoXauthKeyOp::Delete`] in place of `Set`.
+    pub fn delete_management_key_hid_crescendo(
+        &mut self,
+        current: CurrentMgmtAuth<'_>,
+    ) -> Result<(), TransportError> {
+        let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(variant) =
+            self.fingerprint()
+        else {
+            return Err(TransportError::PivManagementKeyDeleteUnsupported);
+        };
+        if self.hid_crescendo_reports_management_key(variant) {
+            return Err(TransportError::PivManagementKeyDeleteUnsupported);
+        }
+        self.hid_crescendo_aca_put_xauth_key_op(current, HidCrescendoXauthKeyOp::Delete)
+    }
+
+    /// The vendor fallback [`Self::set_management_key`]/
+    /// [`Self::delete_management_key_hid_crescendo`] use for a HID Crescendo
+    /// unit that doesn't model the PIV management key (`0x9B`) as a real slot
+    /// object (see [`Self::hid_crescendo_reports_management_key`]): PUT XAUTH
+    /// KEY against the ACA (Access Control Applet) instance's XAUTH key 1,
+    /// per the user-provided sequence:
+    ///
+    /// 1. Temporarily SELECT the ACA instance
+    ///    ([`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`]).
+    /// 2. Unlock: [`Self::verify_pin_hid_crescendo_aca`] for
+    ///    [`CurrentMgmtAuth::Pin`] — **not** [`Self::verify_pin`], which
+    ///    uses the standard PIV application-PIN reference rather than the
+    ///    one ACA's own VERIFY PIN answers at — or
+    ///    [`Self::aca_xauth_unlock`] (the same GET CHALLENGE / EXTERNAL
+    ///    AUTHENTICATE round [`Self::authenticate_management_hid_crescendo_aca`]
+    ///    runs) for [`CurrentMgmtAuth::Key`] — this method's own unlock,
+    ///    run fresh rather than assumed still in force from an earlier
+    ///    [`Self::authenticate_management`] /
+    ///    [`Self::authenticate_management_via_pin`] call, since installing or
+    ///    deleting a XAUTH key happens on the ACA instance itself and this
+    ///    method has no way to know whether an unlock elsewhere actually
+    ///    persisted this far.
+    /// 3. [`HidCrescendoXauthKeyOp::Set`] runs
+    ///    [`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key`] with
+    ///    the new `(alg, key)` — `alg` must be
+    ///    [`MgmtAlg::TripleDes`]/[`MgmtAlg::Aes128`] — the only two
+    ///    algorithms ACA XAUTH supports —
+    ///    [`TransportError::PivBadKeyLength`] for anything else, same error
+    ///    the length mismatch in [`Self::set_management_key`] already uses.
+    ///    [`HidCrescendoXauthKeyOp::Delete`] runs
+    ///    [`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]
+    ///    instead, unconditionally.
+    /// 4. Unconditionally re-SELECT PIV, success or failure — same
+    ///    discipline as [`Self::authenticate_management_hid_crescendo_aca`]
+    ///    and every other temporary-SELECT probe in this file.
+    fn hid_crescendo_aca_put_xauth_key_op(
+        &mut self,
+        current: CurrentMgmtAuth<'_>,
+        op: HidCrescendoXauthKeyOp<'_>,
+    ) -> Result<(), TransportError> {
+        use keyroost_piv::fingerprint;
+
+        let result: Result<(), TransportError> = (|| {
+            let (_, sw) =
+                self.transmit_full(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
+            ok_or_apdu("piv aca select", sw)?;
+
+            match current {
+                CurrentMgmtAuth::Pin(pin) => self.verify_pin_hid_crescendo_aca(pin)?,
+                CurrentMgmtAuth::Key(current_key) => self.aca_xauth_unlock(current_key)?,
+            }
+
+            let apdu = Zeroizing::new(match op {
+                HidCrescendoXauthKeyOp::Set(alg, key) => {
+                    fingerprint::hid_crescendo_aca_put_xauth_key(alg, key)
+                        .ok_or(TransportError::PivBadKeyLength)?
+                }
+                HidCrescendoXauthKeyOp::Delete => {
+                    fingerprint::hid_crescendo_aca_put_xauth_key_remove()
+                }
+            });
+            let (_, sw) = self.transmit_full(&apdu)?;
+            ok_or_write("piv aca put xauth key", sw)
+        })();
+
+        // Step 4: always switch back to PIV — see this method's doc.
+        let _ = self.select();
+        result
     }
 
     /// Generate a fresh asymmetric key pair in `slot`, returning its public key.
@@ -1463,7 +2164,30 @@ impl PivSession {
     /// Yubico ATTEST: the self-signed attestation certificate for `slot`'s key
     /// (DER), proving it was generated on-card. Firmware 4.3+ (older firmware,
     /// and non-Yubico PIV cards, refuse this instruction). No PIN required.
+    ///
+    /// Checks [`keyroost_piv::compat::PivExtension::Attest`] before sending
+    /// anything, same reasoning as [`Self::metadata`]'s
+    /// [`GetMetadata`](keyroost_piv::compat::PivExtension::GetMetadata)
+    /// check — so a caller doesn't pay for a guaranteed-refused round trip
+    /// (and [`Self::resolve_policy`]'s ATTEST fallback, which every one of
+    /// this fingerprint's slots hits since GET METADATA never names a
+    /// policy either, doesn't send four of them per status read). The
+    /// synthetic `SW = 6D 00` this returns without any card I/O matches
+    /// exactly what a real unsupported-instruction refusal looks like, so
+    /// every caller of `attest` sees the same error shape either way.
     pub fn attest(&mut self, slot: Slot) -> Result<Vec<u8>, TransportError> {
+        if self.extension_gate(keyroost_piv::compat::PivExtension::Attest)
+            == keyroost_piv::compat::FeatureGate::Unsupported
+        {
+            // `6D 00` (instruction not supported) is exactly what this
+            // fingerprint's real refusal looks like — see `Self::attest`'s
+            // doc for why this is worth faking rather than sending anything.
+            return Err(TransportError::Apdu {
+                label: "piv attest",
+                sw1: 0x6D,
+                sw2: 0x00,
+            });
+        }
         let (data, sw) = self.transmit_full(&piv::attest(slot.key_ref()))?;
         ok_or_write("piv attest", sw)?;
         Ok(data)
@@ -1541,6 +2265,13 @@ impl PivSession {
         let meta = self.metadata(slot.key_ref());
         // Steps 1–2 need no card read beyond the GET METADATA just done.
         if let Some(alg) = self.algorithm_without_cert(slot, meta.as_ref()) {
+            return Some(alg);
+        }
+        // HID Crescendo C2300's live substitute for GET METADATA, which this
+        // fingerprint never answers — see
+        // `Self::hid_crescendo_slot_algorithm`'s doc. A no-op (`None`)
+        // on every other fingerprint.
+        if let Some(alg) = self.hid_crescendo_slot_algorithm(slot) {
             return Some(alg);
         }
         // Step 3: the slot certificate's SubjectPublicKeyInfo.
@@ -1983,14 +2714,7 @@ impl PivSession {
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
     /// continuations (GET RESPONSE), returning `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
-        // Redact bodies that carry secret material: VERIFY (20), CHANGE
-        // REFERENCE DATA (24), RESET RETRY COUNTER (2C) carry PINs/PUKs;
-        // GENERAL AUTHENTICATE (87) carries the decrypted witness/challenge;
-        // SET MANAGEMENT KEY (FF) carries the raw new key.
-        let cmd_sensitive = matches!(
-            apdu.get(1),
-            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x87) | Some(0xFF)
-        );
+        let cmd_sensitive = piv_cmd_sensitive(apdu);
         // GENERAL AUTHENTICATE responses today are only ciphertext (witness /
         // encrypted challenge), but the same INS in signing/decrypt mode
         // returns recovered plaintext — redact uniformly so a future caller
@@ -2122,7 +2846,39 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         _ if aid == fingerprint::SWISSBIT_RID => Some("Swissbit RID"),
         _ if aid == fingerprint::IDPRIME_SECONDARY_PIV_AID => Some("IdPrime secondary PIV AID"),
         _ if aid == fingerprint::NITROKEY_ADMIN_AID => Some("Nitrokey admin AID"),
+        _ if aid == fingerprint::HID_CRESCENDO_ACA_AID => Some("HID ActivID ACA"),
         _ => None,
+    }
+}
+
+/// Whether `apdu`'s command body carries secret material and must be
+/// redacted from a `--debug` trace ([`crate::dump_cmd`]) — the 5-byte header
+/// (CLA INS P1 P2 Lc) stays visible either way. VERIFY (`0x20`), CHANGE
+/// REFERENCE DATA (`0x24`), RESET RETRY COUNTER (`0x2C`) carry PINs/PUKs;
+/// GENERAL AUTHENTICATE (`0x87`) carries the decrypted witness/challenge;
+/// SET MANAGEMENT KEY (`0xFF`) carries the raw new key. The same VERIFY
+/// (`0x20`) INS covers HID Crescendo's ACA VERIFY PIN
+/// ([`PivSession::verify_pin_hid_crescendo_aca`]) too, just at a different
+/// P2 — see [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_REF`]. The
+/// ACA's own XAUTH sequence adds two more: EXTERNAL AUTHENTICATE (`0x82`)
+/// carries the host cryptogram, a value derived from XAUTH key 1 exactly
+/// like GENERAL AUTHENTICATE's witness; PUT XAUTH KEY (`0xD8`) carries the
+/// raw new key value when it *installs* one — but not when `Lc = 0x04`,
+/// HID's documented "delete" short form
+/// ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]),
+/// whose body is four fixed, publicly-known bytes with no key material in
+/// it at all (see that function's doc) — nothing to redact there, same
+/// reasoning as GET CHALLENGE (`0x84`) below. GET CHALLENGE itself is
+/// **not** included — its command body is empty and its response is a
+/// public nonce, not a secret.
+#[must_use]
+fn piv_cmd_sensitive(apdu: &[u8]) -> bool {
+    match apdu.get(1) {
+        Some(0xD8) => apdu.get(4) != Some(&0x04),
+        ins => matches!(
+            ins,
+            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x87) | Some(0xFF) | Some(0x82)
+        ),
     }
 }
 
@@ -2131,8 +2887,10 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
 /// data object GET DATA / PUT DATA is aimed at, names the AID/RID a SELECT
 /// targets whenever it's one this crate recognizes (the PIV applet itself,
 /// or one of its own fingerprinting probes), sharpens two more cases the INS
-/// byte alone leaves ambiguous, and falls back to the raw INS for an
-/// instruction this crate never builds.
+/// byte alone leaves ambiguous, separately names HID Crescendo's ACA
+/// instructions (not modeled in [`piv::Instruction`] at all, since they
+/// aren't PIV), and falls back to the raw INS for anything else this crate
+/// never builds.
 fn describe_apdu(apdu: &[u8]) -> String {
     let Some(&ins) = apdu.get(1) else {
         return "(malformed APDU)".to_string();
@@ -2175,6 +2933,25 @@ fn describe_apdu(apdu: &[u8]) -> String {
             "VERIFY (retry-counter query)".to_string()
         }
         Some(known) => known.name().to_string(),
+        // HID Crescendo's ACA (Access Control Applet) instructions — GSC-IS/
+        // HID vendor extensions, not PIV at all, so none of the three is
+        // modeled in `piv::Instruction` and `from_code` answers `None` for
+        // every one of them; matched here by raw INS instead. Naming them
+        // keeps a `--debug` trace legible while
+        // `authenticate_management_hid_crescendo_aca`/
+        // `hid_crescendo_aca_put_xauth_key_op` temporarily switch to the ACA
+        // applet, instead of falling through to a bare "INS 0x82"/"INS 0xD8".
+        None if ins == 0x84 => "GET CHALLENGE (HID ACA XAUTH)".to_string(),
+        None if ins == 0x82 => "EXTERNAL AUTHENTICATE (HID ACA XAUTH)".to_string(),
+        // `Lc` alone tells PUT XAUTH KEY's two forms apart: `0x04` is the
+        // documented "remove" short form
+        // ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]);
+        // every other `Lc` (`0x1D` TDES, `0x15` AES-128) installs a new key
+        // ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key`]).
+        None if ins == 0xD8 => match apdu.get(4) {
+            Some(0x04) => "PUT XAUTH KEY (HID ACA, delete)".to_string(),
+            _ => "PUT XAUTH KEY (HID ACA)".to_string(),
+        },
         None => format!("INS {ins:#04X}"),
     }
 }
@@ -2624,6 +3401,96 @@ mod tests {
             describe_apdu(&piv::select_by_aid(&[0xA0, 0x00, 0x00, 0x00, 0x03])),
             "SELECT"
         );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_hid_aca_select() {
+        // Not a fingerprinting probe like the AIDs above — the ACA instance
+        // `authenticate_management_hid_crescendo_aca`/
+        // `hid_crescendo_aca_put_xauth_key_op` temporarily SELECT into for
+        // the XAUTH unlock / PUT XAUTH KEY sequence, so a trace reader can
+        // tell it apart from an unrecognized SELECT at a glance.
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID
+            )),
+            "SELECT (HID ActivID ACA)"
+        );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_hid_aca_xauth_instructions() {
+        // GET CHALLENGE and EXTERNAL AUTHENTICATE aren't PIV at all — not
+        // modeled in `piv::Instruction` — so without this they'd fall
+        // through to a bare "INS 0x84"/"INS 0x82".
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE),
+            "GET CHALLENGE (HID ACA XAUTH)"
+        );
+        assert_eq!(
+            describe_apdu(
+                &keyroost_piv::fingerprint::hid_crescendo_aca_external_authenticate(&[0xAAu8; 8])
+            ),
+            "EXTERNAL AUTHENTICATE (HID ACA XAUTH)"
+        );
+        // PUT XAUTH KEY's two forms are told apart by Lc alone: installing a
+        // key (any algorithm) vs. HID's documented Lc=04h "delete" form.
+        assert_eq!(
+            describe_apdu(
+                &keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key(
+                    MgmtAlg::TripleDes,
+                    &[0u8; 24]
+                )
+                .unwrap()
+            ),
+            "PUT XAUTH KEY (HID ACA)"
+        );
+        assert_eq!(
+            describe_apdu(
+                &keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key(
+                    MgmtAlg::Aes128,
+                    &[0u8; 16]
+                )
+                .unwrap()
+            ),
+            "PUT XAUTH KEY (HID ACA)"
+        );
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()),
+            "PUT XAUTH KEY (HID ACA, delete)"
+        );
+    }
+
+    #[test]
+    fn piv_cmd_sensitive_covers_every_secret_bearing_ins_including_hid_aca() {
+        // Secret-bearing: PINs/PUKs, GENERAL AUTHENTICATE, SET MANAGEMENT
+        // KEY, and the two HID ACA instructions that carry key-derived or
+        // raw key material.
+        for ins in [0x20u8, 0x24, 0x2C, 0x87, 0xFF, 0x82, 0xD8] {
+            assert!(
+                piv_cmd_sensitive(&[0x00, ins, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
+                "INS {ins:#04X} should be redacted"
+            );
+        }
+        // GET CHALLENGE: empty body, public-nonce response — nothing to hide.
+        assert!(!piv_cmd_sensitive(
+            &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE
+        ));
+        // An unrelated INS (SELECT) is never sensitive either.
+        assert!(!piv_cmd_sensitive(&piv::select_full()));
+        // A real PUT XAUTH KEY install still redacts its body...
+        assert!(piv_cmd_sensitive(
+            &keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key(
+                MgmtAlg::TripleDes,
+                &[0u8; 24]
+            )
+            .unwrap()
+        ));
+        // ...but the Lc=04h "delete" form carries no key material at all —
+        // four fixed, publicly-known bytes — so it must not be redacted.
+        assert!(!piv_cmd_sensitive(
+            &keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()
+        ));
     }
 
     #[test]

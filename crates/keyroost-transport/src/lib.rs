@@ -45,8 +45,8 @@ mod gzip;
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, CertUnreadable, PivSession, PivSlotDetail, PivSlotStatus, PivStatus,
-    PivStatusDetailed,
+    random_chuid_guid, CertUnreadable, CurrentMgmtAuth, PivSession, PivSlotDetail, PivSlotStatus,
+    PivStatus, PivStatusDetailed,
 };
 
 mod token2otp;
@@ -118,6 +118,22 @@ pub enum TransportError {
     /// PIV management-key authentication failed (the card's challenge response
     /// did not verify, i.e. the supplied management key is wrong).
     PivManagementAuthFailed,
+    /// [`PivSession::authenticate_management_via_pin`]'s PIN VERIFY
+    /// succeeded, but this device carries
+    /// [`keyroost_piv::compat::PivQuirk::PinManagementAuthProtected9BKey`]
+    /// and its PIN-protected-data read came back with no management key —
+    /// either the read itself failed, or it succeeded with no tag `0x88` /
+    /// subtag `0x89` inside. Either way, PIN-based management auth simply
+    /// hasn't been set up on this card yet.
+    PivPinProtectedKeyNotSet,
+    /// [`PivSession::delete_management_key_hid_crescendo`] was called on a
+    /// device that isn't a HID Crescendo unit with no real `0x9B` slot
+    /// object — deleting the management key outright has no equivalent on
+    /// any other applet (a standard PIV management key is mandatory and can
+    /// only be replaced). A caller that only offers this option when
+    /// [`PivSession::fingerprint`] already says so should never actually see
+    /// this.
+    PivManagementKeyDeleteUnsupported,
     /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the
     /// card reported (`63 Cx`), or `None` when blocked / unknown.
     PivPinRejected { tries_remaining: Option<u8> },
@@ -269,6 +285,16 @@ impl fmt::Display for TransportError {
             TransportError::PivManagementAuthFailed => {
                 write!(f, "PIV management-key authentication failed (wrong key)")
             }
+            TransportError::PivPinProtectedKeyNotSet => write!(
+                f,
+                "PIN-based management unlock has not been set up on this card \
+                 (no PIN-protected management key found)"
+            ),
+            TransportError::PivManagementKeyDeleteUnsupported => write!(
+                f,
+                "deleting the management key outright is only supported on HID Crescendo \
+                 devices without a standard PIV management key"
+            ),
             TransportError::PivPinRejected {
                 tries_remaining: Some(n),
             } => write!(f, "PIV PIN/PUK rejected ({} tries remaining)", n),

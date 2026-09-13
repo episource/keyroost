@@ -1100,7 +1100,7 @@ enum PivCmd {
     /// management key. DESTRUCTIVE: requires `--yes`.
     ///
     /// Key deletion needs YubiKey 5.7+ or a compatible third-party device. A
-    /// per-fingerprint white/blacklist decides up front: on a device known to
+    /// per-fingerprint known-support table decides up front: on a device known to
     /// be incompatible it is refused (pass `--force` to run anyway), on an
     /// unverified device it runs with a warning that it may fail, and on a
     /// known-good device it just runs.
@@ -1124,7 +1124,7 @@ enum PivCmd {
     /// in the source slot.
     ///
     /// Moving keys between slots needs YubiKey 5.7+ or a compatible third-party
-    /// device. The same per-fingerprint white/blacklist as `delete-key`
+    /// device. The same per-fingerprint known-support table as `delete-key`
     /// applies: refused on a device known to be incompatible unless `--force`,
     /// run-with-warning on an unverified one, silent on a known-good one.
     MoveKey {
@@ -6534,7 +6534,18 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 .into());
             }
             let mut s = open_piv_authed(reader.as_deref(), debug, &old)?;
-            s.set_management_key(new_alg, &new, *touch)?;
+            // A HID Crescendo unit whose management key isn't a real PIV
+            // object runs its own self-contained unlock right before PUT
+            // XAUTH KEY (see `set_management_key`'s doc) rather than relying
+            // on `open_piv_authed`'s auth above still being in force —
+            // `current` carries the same key again for that path; every
+            // other device ignores it.
+            s.set_management_key(
+                keyroost_transport::CurrentMgmtAuth::Key(&old),
+                new_alg,
+                &new,
+                *touch,
+            )?;
             println!(
                 "Management key changed to {}{}.",
                 new_alg.label(),
@@ -7037,16 +7048,16 @@ fn authenticate_piv(
     Ok(())
 }
 
-/// Apply the per-fingerprint white/blacklist ([`keyroost_piv::compat`]) to one
-/// of the Yubico vendor-extension operations before it runs, mirroring the
+/// Apply the per-fingerprint known-support table ([`keyroost_piv::compat`]) to
+/// one of the Yubico vendor-extension operations before it runs, mirroring the
 /// GUI's three-way gate and reusing its exact wording
 /// ([`keyroost_piv::compat::PivExtension::requirement`] plus a state suffix):
 ///
-/// * whitelisted → run, no output;
+/// * known-supported → run, no output;
 /// * unverified → warn `<requirement> <UNVERIFIED_SUFFIX>`, then run;
-/// * blacklisted → fail with `<requirement> <INCOMPATIBLE_SUFFIX> Pass --force
-///   to run anyway.`; with `force`, downgrade that to the same kind of warning
-///   and run.
+/// * known-unsupported → fail with `<requirement> <INCOMPATIBLE_SUFFIX> Pass
+///   --force to run anyway.`; with `force`, downgrade that to the same kind of
+///   warning and run.
 ///
 /// Must be called on the session **before** management-key auth — it runs a
 /// fingerprint probe that re-SELECTs PIV.

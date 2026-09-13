@@ -292,6 +292,15 @@ impl Slot {
 /// CHUID (Card Holder Unique Identifier) data-object tag.
 pub const OBJECT_CHUID: [u8; 3] = [0x5F, 0xC1, 0x02];
 
+/// "Printed Information" data-object tag (`5F C1 09`). Yubico overloads this
+/// same object as its PIN-protected-data container on devices that carry
+/// [`compat::PivQuirk::PinManagementAuthProtected9BKey`], storing tag `0x88`
+/// wrapping subtag `0x89` (the plaintext management key) inside it — see
+/// [`parse_pin_protected_management_key`]. The two uses don't collide in
+/// practice: a card doing PIN-protected management-key storage has no
+/// separate use for the standard "printed information" text.
+pub const OBJECT_PIN_PROTECTED_DATA: [u8; 3] = [0x5F, 0xC1, 0x09];
+
 /// Management-key (9B) cipher algorithm. The card stores one of these; auth
 /// uses a witness/challenge round whose block size this dictates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -680,6 +689,7 @@ pub fn data_object_name(tag: &[u8]) -> Option<String> {
         [0x5F, 0xC1, 0x24] => "Pairing Code Reference Data Container",
         [0x5F, 0xFF, 0x01] => "Yubico PIV Attestation Certificate",
         [0x5F, 0xFF, 0x10] => "Yubico MSCMAP",
+        [0xFF, 0xFF, 0x7F] => "HID Crescendo C2300 GET PIV PROPERTIES",
         _ => return None,
     };
     Some(name.to_string())
@@ -688,12 +698,30 @@ pub fn data_object_name(tag: &[u8]) -> Option<String> {
 /// VERIFY the application PIN. The PIN is padded to 8 bytes with `0xFF` per
 /// SP 800-73 and must be 6–8 bytes ([`PinLengthError`] otherwise). The PIN
 /// bytes come from the caller and are never logged.
+///
+/// [`PIN_REF_APPLICATION`] (`0x80`) is the standard PIV application-PIN
+/// reference; [`verify_pin_at`] is the general form this delegates to, for a
+/// device whose currently-selected applet expects a different P2 —
+/// see that function's doc.
 pub fn verify_pin(pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    verify_pin_at(PIN_REF_APPLICATION, pin)
+}
+
+/// VERIFY a PIN against an explicit P2 `reference`, instead of always the
+/// standard [`PIN_REF_APPLICATION`] — [`verify_pin`] is this with `reference
+/// = PIN_REF_APPLICATION`. Exists because not every applet that answers
+/// VERIFY uses that reference: HID Crescendo's ACA (Access Control Applet)
+/// instance answers its own VERIFY PIN at P2 `0x00`
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/verify-pin.htm>),
+/// not the standard PIV application-PIN reference — see
+/// `fingerprint::HID_CRESCENDO_ACA_PIN_REF`. Same padding/length rules as
+/// [`verify_pin`] either way.
+pub fn verify_pin_at(reference: u8, pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
     Ok(build_apdu(
         0x00,
         Instruction::Verify.code(),
         0x00,
-        PIN_REF_APPLICATION,
+        reference,
         &pad_pin(pin)?,
     ))
 }
@@ -1500,8 +1528,27 @@ pub fn unwrap_data_object(buf: &[u8]) -> Result<&[u8], ParseError> {
     buf.get(start..end).ok_or(ParseError::Truncated)
 }
 
+/// Extract the management key from a GET DATA response on
+/// [`OBJECT_PIN_PROTECTED_DATA`]: strip the outer `0x53` template (same as
+/// [`unwrap_data_object`]), then find tag `0x88` and, inside it, subtag
+/// `0x89` — the scheme [`compat::PivQuirk::PinManagementAuthProtected9BKey`]
+/// documents. `None` on any parse failure *or* on a well-formed reply that
+/// simply carries no tag 88 / subtag 89: a card can legitimately answer this
+/// way when PIN management auth has never been set up, which callers must
+/// tell apart from "the read itself failed" only by the fact that this
+/// returns `None` either way — there's nothing more specific to report.
+/// Returned zeroizing since this is live management-key material, same
+/// handling as a key the user typed directly.
+#[must_use]
+pub fn parse_pin_protected_management_key(buf: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let inner = unwrap_data_object(buf).ok()?;
+    let tag88 = find_tlv(inner, 0x88)?;
+    let key = find_tlv(tag88, 0x89)?;
+    Some(Zeroizing::new(key.to_vec()))
+}
+
 /// Format a Yubico `GET VERSION` reply for display — tolerant of any
-/// non-empty length. The feature white/blacklist ([`compat::resolve`])
+/// non-empty length. The feature known-support table ([`compat::resolve`])
 /// compares the same raw bytes directly as a slice rather than parsing them
 /// into a fixed-width tuple first, so there's no separate strict parse to
 /// defer to here either. Up to 4 bytes still reads as a version number, so
@@ -1789,6 +1836,10 @@ mod tests {
             data_object_name(&[0x5F, 0xFF, 0x01]).as_deref(),
             Some("Yubico PIV Attestation Certificate")
         );
+        assert_eq!(
+            data_object_name(&fingerprint::HID_CRESCENDO_C2300_PROPERTIES_TAG).as_deref(),
+            Some("HID Crescendo C2300 GET PIV PROPERTIES")
+        );
         // Unassigned tags have no name.
         assert_eq!(data_object_name(&[0x5F, 0xC1, 0x99]), None);
         assert_eq!(data_object_name(&[]), None);
@@ -1864,6 +1915,23 @@ mod tests {
     }
 
     #[test]
+    fn verify_pin_at_uses_the_given_p2_reference() {
+        // Same body as `verify_pin_pads_to_eight`, but P2 = 0x00 — HID
+        // Crescendo's ACA VERIFY PIN reference
+        // (`fingerprint::HID_CRESCENDO_ACA_PIN_REF`) — instead of the
+        // standard PIV application-PIN reference.
+        assert_eq!(
+            verify_pin_at(0x00, b"123456").unwrap(),
+            vec![0x00, 0x20, 0x00, 0x00, 0x08, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF]
+        );
+        // `verify_pin` is exactly `verify_pin_at(PIN_REF_APPLICATION, ..)`.
+        assert_eq!(
+            verify_pin_at(PIN_REF_APPLICATION, b"123456").unwrap(),
+            verify_pin(b"123456").unwrap()
+        );
+    }
+
+    #[test]
     fn verify_status_is_case1() {
         assert_eq!(verify_pin_status(), vec![0x00, 0x20, 0x00, 0x80]);
     }
@@ -1903,6 +1971,38 @@ mod tests {
             unwrap_data_object(&[0x53, 0x05, 0x00]),
             Err(ParseError::Truncated)
         );
+    }
+
+    #[test]
+    fn parse_pin_protected_management_key_extracts_tag_89() {
+        // 53 <len> 88 <len> 89 <len> <key> — outer data template, tag 88
+        // (PIN-protected data), subtag 89 (the management key itself).
+        let key = [0xAAu8; 24];
+        let mut tag89 = vec![0x89, key.len() as u8];
+        tag89.extend_from_slice(&key);
+        let mut tag88 = vec![0x88, tag89.len() as u8];
+        tag88.extend_from_slice(&tag89);
+        let mut buf = vec![0x53, tag88.len() as u8];
+        buf.extend_from_slice(&tag88);
+
+        let extracted = parse_pin_protected_management_key(&buf).unwrap();
+        assert_eq!(&extracted[..], &key[..]);
+    }
+
+    #[test]
+    fn parse_pin_protected_management_key_none_when_not_set_up() {
+        // Well-formed 53/88 wrapper, but no subtag 89 inside — PIN
+        // management auth hasn't been set up on this card.
+        let tag88 = vec![0x88, 0x00];
+        let mut buf = vec![0x53, tag88.len() as u8];
+        buf.extend_from_slice(&tag88);
+        assert!(parse_pin_protected_management_key(&buf).is_none());
+
+        // No tag 88 at all.
+        assert!(parse_pin_protected_management_key(&[0x53, 0x03, 0xAA, 0xBB, 0xCC]).is_none());
+
+        // Not even a 53 template.
+        assert!(parse_pin_protected_management_key(&[0x70, 0x01, 0x00]).is_none());
     }
 
     #[test]
