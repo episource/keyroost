@@ -1,4 +1,4 @@
-//! Per-fingerprint white/blacklist for the non-standard PIV commands keyroost
+//! Per-fingerprint known-support table for the non-standard PIV commands keyroost
 //! exposes.
 //!
 //! A handful of management operations in this crate are vendor extensions, not
@@ -6,10 +6,10 @@
 //! firmware 5.7. "Speaks PIV" says nothing about whether a given applet
 //! implements them, and the answer can differ between firmware versions of the
 //! same product. This module encodes what keyroost has actually observed,
-//! keyed by [`AppletFingerprint`], as a **combined white/blacklist**: for each
+//! keyed by [`AppletFingerprint`], as a **combined known-support table**: for each
 //! fingerprint it knows about, a list of per-version verdicts each either
-//! [`Verdict::Whitelisted`] ("extension known to be supported at this version")
-//! or [`Verdict::Blacklisted`] ("extension known to be unsupported at this
+//! [`Verdict::KnownSupported`] ("extension known to be supported at this version")
+//! or [`Verdict::KnownUnsupported`] ("extension known to be unsupported at this
 //! version"). There are two such lists per extension — one keyed by the PIV
 //! *applet's* own version, one by the *firmware's* — since the two can diverge
 //! (see [`crate` root docs][crate] / `PivStatus::version` vs
@@ -23,12 +23,12 @@
 //! ([`FeatureGate::Unsupported`]). Each axis is queried independently with the
 //! same semantics, then the two outcomes are combined (see [`resolve`] for the
 //! combination rule). Per axis, a verdict extends across the untested
-//! versions adjacent to it, in both directions: a whitelist verdict extends
+//! versions adjacent to it, in both directions: a known-supported verdict extends
 //! *forward* ("known to work at this version, assumed to still work at any
-//! later, untested version") and, symmetrically, a blacklist verdict extends
+//! later, untested version") and, symmetrically, a known-unsupported verdict extends
 //! *backward* ("known not to work at this version, assumed not to work at any
 //! earlier, untested version either"). Anything less certain — no verdicts
-//! for the fingerprint at all, no reported version, or a blacklist verdict old
+//! for the fingerprint at all, no reported version, or a known-unsupported verdict old
 //! enough that a later firmware might have added the extension — resolves to
 //! [`FeatureGate::Unverified`] on that axis, which keeps the control usable
 //! unless the other axis disagrees.
@@ -36,16 +36,28 @@
 //! The same per-version rows also carry [`PivQuirk`]s — observed behavioral
 //! wrinkles that need a workaround rather than gating a control. Quirks are
 //! resolved separately by [`resolve_quirks`], with simpler semantics than
-//! [`resolve`]: no whitelist/blacklist, just "take the current entry on each
+//! [`resolve`]: no known-support distinction, just "take the current entry on each
 //! axis and merge whatever quirks it lists."
+//!
+//! [`PivExtension`] isn't limited to commands a UI puts a control in front
+//! of, either: [`PivExtension::GetMetadata`] and [`PivExtension::Attest`]
+//! are Yubico vendor extensions exactly like MOVE KEY/DELETE KEY, just
+//! consumed internally (`keyroost-transport`'s `PivSession::metadata`/
+//! `attest`) rather than gating a button — a fingerprint that has never
+//! implemented one is a plain "unsupported extension" fact, the same shape
+//! [`resolve`] already models, not a [`PivQuirk`] (which is reserved for a
+//! device that *does* implement something and gets a detail of it wrong).
 
 use std::collections::BTreeSet;
 
-use crate::fingerprint::{AppletFingerprint, OpenFips201Variant};
+use crate::fingerprint::{AppletFingerprint, HidCrescendoVariant, OpenFips201Variant};
 
 /// One of the non-standard, vendor-extension PIV commands keyroost exposes —
 /// nothing in SP 800-73-4 defines it, so support varies by applet and is
-/// gated by device fingerprint through [`resolve`].
+/// gated by device fingerprint through [`resolve`]. Not limited to commands a
+/// UI puts a control in front of: [`Self::GetMetadata`]/[`Self::Attest`] are
+/// consumed internally by `keyroost-transport`'s `PivSession`, gating
+/// whether it bothers sending the APDU at all rather than gating a button.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PivExtension {
@@ -53,10 +65,29 @@ pub enum PivExtension {
     MoveKey,
     /// Yubico DELETE KEY — erase a slot's private key in place.
     DeleteKey,
+    /// Yubico GET METADATA (`INS 0xF7`) — key/PIN algorithm, policy, origin,
+    /// retries.
+    GetMetadata,
+    /// Yubico ATTEST (`INS 0xF9`) — a slot's self-signed attestation
+    /// certificate, proving on-card key generation.
+    Attest,
+    /// Unlocking PIV management functionality (key-gen, cert import,
+    /// set-retries, management-key rotation, …) via PIN VERIFY instead of the
+    /// standard `0x9B` GENERAL AUTHENTICATE round. Some devices (HID
+    /// Crescendo) implement this directly — PIN VERIFY alone satisfies the
+    /// same access condition GENERAL AUTHENTICATE on `0x9B` would. Others
+    /// (YubiKey) implement it only indirectly, via
+    /// [`PivQuirk::PinManagementAuthProtected9BKey`]: PIN VERIFY unlocks
+    /// *reading* the actual management key off a PIN-protected data object,
+    /// and the standard `0x9B` round still has to run with that key
+    /// afterward. Either way, a caller checks this extension first and then
+    /// branches on whether the quirk is also set — see
+    /// `keyroost_transport::PivSession::authenticate_management_via_pin`.
+    PinManagementAuth,
 }
 
 impl PivExtension {
-    /// This extension's white/blacklist keyed by the PIV **applet's own**
+    /// This extension's known-support table keyed by the PIV **applet's own**
     /// version (Yubico's `GET VERSION` extension reply): one
     /// [`FingerprintVerdicts`] row per fingerprint keyroost has data for on
     /// this axis. A fingerprint absent from the slice means "no data" and
@@ -67,25 +98,38 @@ impl PivExtension {
             // MOVE KEY and DELETE KEY shipped together in YubiKey firmware
             // 5.7: unsupported at every earlier version, supported from 5.7
             // on. Token2 applet 5.112.0 has separately been observed to
-            // reject both, so it carries its own blacklist row in the same
+            // reject both, so it carries its own known-unsupported row in the same
             // table — as does the Swissbit iShield 2 Pro (fingerprinted
             // `OpenFips201::SwissbitIShield2`) at applet version 1.4.1.0 and
             // below, and the Thetis PRO FIDO2 Security Key with PinPlex
             // (`AppletFingerprint::Thetis`) at applet version 5.112.0 and
             // below.
             PivExtension::MoveKey | PivExtension::DeleteKey => KEY_OPS_VERDICTS,
+            // ATTEST and GET METADATA need separate tables, unlike MOVE
+            // KEY/DELETE KEY above: YubiKey itself gained the two at
+            // different firmware versions (4.3 vs. 5.3 — see each table's
+            // doc), so their YubiKey rows can't be shared. See
+            // `ATTEST_VERDICTS`'s and `GET_METADATA_VERDICTS`'s docs.
+            PivExtension::Attest => ATTEST_VERDICTS,
+            PivExtension::GetMetadata => GET_METADATA_VERDICTS,
+            PivExtension::PinManagementAuth => PIN_MANAGEMENT_AUTH_VERDICTS,
         }
     }
 
-    /// This extension's white/blacklist keyed by the device's **firmware**
+    /// This extension's known-support table keyed by the device's **firmware**
     /// version, same shape and lookup rules as [`Self::applet_verdicts`] but a
     /// separate axis — a fingerprint can have data on one and not the other.
-    /// No fingerprint has firmware-version data yet, so every extension
-    /// resolves this axis to [`FeatureGate::Unverified`] today.
+    /// No fingerprint has firmware-version data for any extension today: HID
+    /// Crescendo's GET PIV PROPERTIES version is an *applet* version (see
+    /// [`Self::applet_verdicts`]), not a firmware one.
     #[must_use]
     fn firmware_verdicts(self) -> &'static [FingerprintVerdicts] {
         match self {
-            PivExtension::MoveKey | PivExtension::DeleteKey => &[],
+            PivExtension::MoveKey
+            | PivExtension::DeleteKey
+            | PivExtension::GetMetadata
+            | PivExtension::Attest
+            | PivExtension::PinManagementAuth => &[],
         }
     }
 
@@ -101,6 +145,18 @@ impl PivExtension {
             }
             PivExtension::DeleteKey => {
                 "Key deletion needs YubiKey 5.7+ or a compatible third-party device."
+            }
+            PivExtension::GetMetadata => {
+                "Reading key/PIN metadata needs YubiKey firmware 5.3+ or a compatible \
+                 third-party device."
+            }
+            PivExtension::Attest => {
+                "Reading a key's attestation certificate needs YubiKey firmware 4.3+ or a \
+                 compatible third-party device."
+            }
+            PivExtension::PinManagementAuth => {
+                "Unlocking management with a PIN instead of the management key needs \
+                 YubiKey 3+ or a compatible third-party device."
             }
         }
     }
@@ -124,37 +180,50 @@ pub enum PivQuirk {
     /// not reflect the slot's actual key state — and must always be ignored
     /// when this quirk is set, regardless of what value is read.
     InsF7MetadataAlgorithmInvalid,
+    /// [`PivExtension::PinManagementAuth`] is available on this device, but
+    /// PIN VERIFY doesn't unlock management functionality by itself — it only
+    /// unlocks *reading* the real management key, which the card stores PIN-
+    /// protected in a data object (tag `0x88`, subtag `0x89`, inside PIV data
+    /// object `5F C1 09` on YubiKey — see
+    /// `keyroost_piv::parse_pin_protected_management_key`). A caller that
+    /// wants PIN-based management unlock on a device with this quirk set
+    /// still has to read that key back and run the standard `0x9B` GENERAL
+    /// AUTHENTICATE round with it — see
+    /// `keyroost_transport::PivSession::authenticate_management_via_pin`. If
+    /// the read comes back with no tag 88 / subtag 89, PIN management auth
+    /// simply hasn't been set up on this card yet.
+    PinManagementAuthProtected9BKey,
 }
 
-/// The white/blacklist shared by [`PivExtension::MoveKey`] and
+/// The known-support table shared by [`PivExtension::MoveKey`] and
 /// [`PivExtension::DeleteKey`], one row per fingerprint keyroost has data for:
 ///
 /// * YubiKey — the operation is unsupported before firmware 5.7 and supported
-///   from 5.7 onward. The empty-slice version on the blacklist verdict is a
+///   from 5.7 onward. The empty-slice version on the known-unsupported verdict is a
 ///   "from the very first version" sentinel — it orders below every real
 ///   version (`[] < [5, 7]`), so that verdict is the one that applies to
 ///   anything older than 5.7. Unlike the rows below, this sentinel is load-
 ///   bearing and not implied by [`resolve_in`]'s backward-extension rule: the
-///   verdict *above* it is a whitelist ([5, 7]), not a blacklist, and a
-///   whitelist verdict says nothing about versions before it.
+///   verdict *above* it is a known-supported verdict ([5, 7]), not known-unsupported, and a
+///   known-supported verdict says nothing about versions before it.
 /// * Token2 — applet version 5.112.0 has been observed to reject both
 ///   extensions outright, and every version below it is assumed to as well
 ///   per [`resolve_in`]'s backward-extension rule (no earlier hardware has
 ///   been available to test, but a feature known not to work at 5.112.0 is
 ///   presumed not to work in any older, untested version either). There is
-///   no whitelist verdict on this row, so a version *above* 5.112.0 resolves
+///   no known-supported verdict on this row, so a version *above* 5.112.0 resolves
 ///   [`FeatureGate::Unverified`], not [`FeatureGate::Unsupported`] — a
-///   blacklist verdict is deliberately never treated as covering a version
+///   known-unsupported verdict is deliberately never treated as covering a version
 ///   it hasn't actually observed on the other side either. Unlike the
 ///   YubiKey row above, this one needs no explicit `[]` sentinel: the single
-///   `[5, 112, 0]` blacklist verdict is enough for [`resolve_in`] to extend
+///   `[5, 112, 0]` known-unsupported verdict is enough for [`resolve_in`] to extend
 ///   backward on its own.
 /// * Swissbit iShield 2 Pro (`OpenFips201::SwissbitIShield2`) — applet
 ///   version 1.4.1.0 and every earlier version have been observed to reject
 ///   both extensions. Same single-verdict shape as Token2's row above, just
 ///   with `[1, 4, 1, 0]` as the observed/backward-extending version instead
 ///   of `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row
-///   and resolves [`FeatureGate::Unverified`] — the blacklist deliberately
+///   and resolves [`FeatureGate::Unverified`] — the known-unsupported verdict deliberately
 ///   doesn't extend to a future, untested version.
 /// * Thetis PRO FIDO2 Security Key with PinPlex ([`AppletFingerprint::Thetis`])
 ///   — applet version 5.112.0 and every earlier version have been observed
@@ -162,18 +231,18 @@ pub enum PivQuirk {
 ///   `[5, 112, 0]` is both the exact-match verdict and the one
 ///   [`resolve_in`] extends backward from. A version above 5.112.0 falls off
 ///   the end of the row and resolves [`FeatureGate::Unverified`] — the
-///   blacklist deliberately doesn't extend to a future, untested version.
+///   known-unsupported verdict deliberately doesn't extend to a future, untested version.
 const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::YubiKey,
         verdicts: &[
             VersionVerdict {
                 version: &[],
-                verdict: Verdict::Blacklisted,
+                verdict: Verdict::KnownUnsupported,
             },
             VersionVerdict {
                 version: &[5, 7],
-                verdict: Verdict::Whitelisted,
+                verdict: Verdict::KnownSupported,
             },
         ],
     },
@@ -181,14 +250,14 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
         fingerprint: AppletFingerprint::Token2,
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
-            verdict: Verdict::Blacklisted,
+            verdict: Verdict::KnownUnsupported,
         }],
     },
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
         verdicts: &[VersionVerdict {
             version: &[1, 4, 1, 0],
-            verdict: Verdict::Blacklisted,
+            verdict: Verdict::KnownUnsupported,
         }],
     },
     FingerprintVerdicts {
@@ -196,12 +265,174 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
         // See this row's bullet in the doc comment on this table.
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
-            verdict: Verdict::Blacklisted,
+            verdict: Verdict::KnownUnsupported,
         }],
     },
 ];
 
-/// One fingerprint's row in an extension's white/blacklist.
+/// [`PivExtension::Attest`]'s applet-axis known-support table:
+///
+/// * YubiKey — ATTEST shipped in firmware 4.3
+///   (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>:
+///   "Only available in YubiKey 4.3 & 5"), so this row is the same shape as
+///   [`KEY_OPS_VERDICTS`]'s YubiKey row: a [`Verdict::KnownUnsupported`] verdict at
+///   the empty-slice "from the very first version" sentinel, unsupported at
+///   every version below 4.3, and a [`Verdict::KnownSupported`] verdict at
+///   `[4, 3]` covering 4.3 and every later version, assumed not to have
+///   regressed. As on that row, the `[]` sentinel is load-bearing — the
+///   verdict above it is a known-supported verdict, which says nothing about the versions
+///   before it, so [`resolve_in`]'s backward-extension rule alone wouldn't
+///   cover them.
+/// * HID Crescendo C2300/C4000 — same two rows as
+///   [`GET_METADATA_VERDICTS`] below (kept in sync manually; there's no way
+///   to share a `&'static [FingerprintVerdicts]` slice across two tables
+///   that also each need their own distinct YubiKey row). See the doc on
+///   each row — both are [`Verdict::KnownUnsupportedSince`] at the universal
+///   `[]` version, not a version-gated [`Verdict::KnownUnsupported`] the way
+///   the YubiKey row above is.
+const ATTEST_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::KnownUnsupported,
+            },
+            VersionVerdict {
+                version: &[4, 3],
+                verdict: Verdict::KnownSupported,
+            },
+        ],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        // See the C2300 bullet on `GET_METADATA_VERDICTS`'s doc — same row.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        // See the C4000 bullet on `GET_METADATA_VERDICTS`'s doc — same row.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+];
+
+/// [`PivExtension::GetMetadata`]'s applet-axis known-support table:
+///
+/// * YubiKey — GET METADATA shipped in firmware 5.3
+///   (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>:
+///   "Only available in YubiKey 5.3"), same shape as [`ATTEST_VERDICTS`]'s
+///   YubiKey row, just with the known-supported verdict at `[5, 3]` instead of
+///   `[4, 3]`.
+/// * C2300 — [`Verdict::KnownUnsupportedSince`] at the universal `[]`
+///   version, i.e. every applet version, past or future — not a
+///   version-gated [`Verdict::KnownUnsupported`] the way the YubiKey row
+///   above is. A live unit reporting applet version `3.0.3.6` (read from its
+///   GET PIV PROPERTIES response's tag `0x01` "Applet Version Block" —
+///   [`crate::fingerprint::parse_hid_crescendo_version`] — and reported on
+///   the *applet* axis despite not coming from Yubico's own GET VERSION
+///   extension; see [`PivExtension::applet_verdicts`]) has been observed to
+///   refuse both extensions outright (`SW = 6D 00`, "instruction not
+///   supported"). That alone would only justify an ordinary
+///   [`Verdict::KnownUnsupported`] pinned to `3.0.3.6` (or, generalized, the
+///   whole `3.0.3.<any>` lineage) — but HID Crescendo has never attempted to
+///   implement *any* Yubico extension APDU, building its own proprietary
+///   alternatives instead across the whole product line: ACA XAUTH (see
+///   `keyroost_transport::PivSession::authenticate_management`) standing in
+///   for `GENERAL AUTHENTICATE` on `0x9B`, and this very GET PIV PROPERTIES
+///   read standing in for GET METADATA. That standing pattern, not just an
+///   absence observed on one firmware, is the reason to expect HID never
+///   bothers implementing Yubico's competing extension APDUs on *any*
+///   version, observed or not, past or future. That's exactly what
+///   [`Verdict::KnownUnsupportedSince`] is for, hence the universal `[]`
+///   version rather than a version-specific one.
+/// * C4000 — same [`Verdict::KnownUnsupportedSince`] at `[]`, on the same
+///   architectural reasoning as C2300 above — **but assumed from
+///   documentation, not confirmed on hardware: no C4000 test device has been
+///   available.**
+///   <https://docs.hidglobal.com/crescendo/api/c4000/get-piv-properties.htm>
+///   gives no indication this family gained support for Yubico's
+///   non-standard extension APDUs either — the C4000 GET PIV PROPERTIES
+///   command is itself HID's own proprietary replacement for the same
+///   information GET METADATA would carry, which is already reason enough
+///   to expect Yubico's extension is absent here too. Should a real C4000 —
+///   or, for that matter, C2300 — unit ever turn out to support either
+///   extension after all, this row needs a firmware sample to correct it,
+///   exactly like every other verdict here.
+const GET_METADATA_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::KnownUnsupported,
+            },
+            VersionVerdict {
+                version: &[5, 3],
+                verdict: Verdict::KnownSupported,
+            },
+        ],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        // See the C2300 bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        // See the C4000 bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+];
+
+/// [`PivExtension::PinManagementAuth`]'s applet-axis known-support table:
+///
+/// * HID Crescendo C2300/C4000 — [`Verdict::KnownSupported`] at the universal
+///   `[]` version: every unit in this family unlocks management functionality
+///   directly via PIN VERIFY, with no [`PivQuirk`] needed (unlike YubiKey
+///   below) — PIN VERIFY *is* the unlock, full stop.
+/// * YubiKey — [`Verdict::KnownSupported`] from applet version 3 on. Unlike
+///   HID Crescendo, this is the *indirect* scheme:
+///   [`PivQuirk::PinManagementAuthProtected9BKey`] is set on the same row in
+///   [`QUIRKS_BY_APPLET_TABLE`], so a caller still has to read the
+///   PIN-protected management key back and run the standard `0x9B` round with
+///   it — see [`PivExtension::PinManagementAuth`]'s doc.
+const PIN_MANAGEMENT_AUTH_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[VersionVerdict {
+            version: &[3],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+];
+
+/// One fingerprint's row in an extension's known-support table.
 struct FingerprintVerdicts {
     fingerprint: AppletFingerprint,
     /// This fingerprint's per-version verdicts, **ascending by
@@ -218,15 +449,51 @@ struct VersionVerdict {
     verdict: Verdict,
 }
 
-/// One recorded white/blacklist verdict, carried by a [`VersionVerdict`].
+/// One recorded known-support verdict, carried by a [`VersionVerdict`].
+// The shared `Known` prefix is deliberate, not accidental redundancy: it
+// groups these three as one family at a glance (in a match arm, in
+// autocomplete, in this enum's own listing) — see each variant's doc for how
+// they differ.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     /// Extension known to be supported at this version (and, by the
     /// no-regression assumption in [`resolve`], at every later one until a
-    /// contrary verdict).
-    Whitelisted,
-    /// Extension known to be unsupported at this version.
-    Blacklisted,
+    /// contrary verdict). Says nothing about versions *before* it.
+    KnownSupported,
+    /// Extension known to be unsupported at this version, and — in the
+    /// absence of a later verdict on the same row — assumed to have been
+    /// unsupported at every earlier, untested version too (the backward
+    /// mirror of [`Self::KnownSupported`]'s forward, no-regression
+    /// assumption). Unlike [`Self::KnownUnsupportedSince`], this one
+    /// *doesn't* extend forward past itself: a version newer than every
+    /// verdict on the row softens to [`FeatureGate::Unverified`], since a
+    /// later firmware may simply have added the extension.
+    KnownUnsupported,
+    /// Extension known to be unsupported at this version, and — the mirror
+    /// image of [`Self::KnownSupported`]'s extension direction rather than
+    /// [`Self::KnownUnsupported`]'s — assumed to *stay* unsupported at every
+    /// later, untested version too, with no softening to
+    /// [`FeatureGate::Unverified`] the way [`Self::KnownUnsupported`] gets.
+    /// Says nothing about versions *before* it: an earlier version might
+    /// have supported the extension, e.g. a vendor SDK generation that
+    /// implemented it before a later architectural pivot away from it.
+    ///
+    /// For a case where merely "no verdict this old has flipped yet" isn't
+    /// the reasoning — where there's a specific, standing reason to expect
+    /// the vendor never will: a vendor with a track record of never
+    /// mimicking Yubico's extension APDUs, instead consistently building its
+    /// own proprietary alternatives, is unlikely to start mimicking Yubico
+    /// now. That's a bet about the vendor's whole pattern of behavior, not
+    /// just an absence observed on one firmware, so use this instead of
+    /// [`Self::KnownUnsupported`] for it — see e.g. HID Crescendo's rows in
+    /// `GET_METADATA_VERDICTS`/`ATTEST_VERDICTS`, which apply this reasoning
+    /// to a vendor that has never implemented *any* Yubico extension APDU
+    /// and instead ships its own (ACA XAUTH in place of `GENERAL
+    /// AUTHENTICATE` on `0x9B`, GET PIV PROPERTIES in place of GET
+    /// METADATA). Use [`Self::KnownUnsupported`] instead for an ordinary "no
+    /// evidence either way yet" gap.
+    KnownUnsupportedSince,
 }
 
 /// The UI-facing resolution of a [`PivExtension`] against a live applet,
@@ -235,28 +502,28 @@ enum Verdict {
 /// (enable / enable-and-flag / dim) rather than fall through a wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureGate {
-    /// Enable the control, no warning: the extension is whitelisted at the
+    /// Enable the control, no warning: the extension is known-supported at the
     /// reported version, or at an earlier one and assumed not to have
     /// regressed.
     Supported,
-    /// Enable the control, but flag it: keyroost has no white/blacklist for
+    /// Enable the control, but flag it: keyroost has no known-support data for
     /// this fingerprint, none at or below the reported version, no reported
-    /// version to match, or only a blacklist verdict old enough that a later
+    /// version to match, or only a known-unsupported verdict old enough that a later
     /// firmware may have added the extension. See [`Self::UNVERIFIED_SUFFIX`].
     Unverified,
-    /// Disable the control (dimmed): a blacklist verdict covers the reported
+    /// Disable the control (dimmed): a known-unsupported verdict covers the reported
     /// version, so the extension is known to be unsupported here.
     Unsupported,
 }
 
 impl FeatureGate {
     /// Sentence that follows [`PivExtension::requirement`] when a control is
-    /// gated [`Unverified`](Self::Unverified): the device isn't on the
-    /// white/blacklist, so support can't be confirmed either way.
+    /// gated [`Unverified`](Self::Unverified): the device has no
+    /// known-support data, so support can't be confirmed either way.
     pub const UNVERIFIED_SUFFIX: &'static str =
         "This device is unverified; the operation may fail.";
     /// Sentence that follows [`PivExtension::requirement`] when a control is
-    /// gated [`Unsupported`](Self::Unsupported): a blacklist verdict covers
+    /// gated [`Unsupported`](Self::Unsupported): a known-unsupported verdict covers
     /// this device's version.
     pub const INCOMPATIBLE_SUFFIX: &'static str = "This device is known to be incompatible.";
 }
@@ -272,30 +539,36 @@ impl FeatureGate {
 ///
 /// 1. The version is `None` → that axis is [`FeatureGate::Unverified`]
 ///    (nothing to version-match).
-/// 2. No white/blacklist row for `fingerprint` on that axis →
+/// 2. No known-support row for `fingerprint` on that axis →
 ///    [`FeatureGate::Unverified`] (support unknown; don't block).
 /// 3. A row exists: take the verdict with the greatest version `<=` the
 ///    reported version. If there is none — the reported version is older
 ///    than every verdict on record — fall back to the row's *first* (lowest)
 ///    verdict, i.e. the nearest one *above* the reported version:
-///    * blacklisted → [`FeatureGate::Unsupported`]: a feature known not to
+///    * known-unsupported → [`FeatureGate::Unsupported`]: a feature known not to
 ///      work at that version is assumed not to work at any earlier, untested
 ///      version either — the backward mirror of the "assumed not to have
-///      regressed" forward extension a whitelist verdict gets below;
-///    * whitelisted → [`FeatureGate::Unverified`]: a whitelist verdict says
-///      nothing about the versions before it, so there's nothing to extend.
+///      regressed" forward extension a known-supported verdict gets below;
+///    * known-supported, or known-unsupported-since → [`FeatureGate::Unverified`]:
+///      neither says anything about the versions before it, so there's
+///      nothing to extend backward.
 ///
 ///    Otherwise, with a verdict at or below the reported version in hand:
-///    * whitelisted → [`FeatureGate::Supported`] (covers both an exact-version
-///      match and an earlier whitelist assumed not to have regressed);
-///    * blacklisted, verdict version **equals** the reported version →
+///    * known-supported → [`FeatureGate::Supported`] (covers both an exact-version
+///      match and an earlier known-supported verdict assumed not to have regressed);
+///    * known-unsupported-since → [`FeatureGate::Unsupported`] unconditionally
+///      (covers both an exact-version match and an earlier one) — the mirror
+///      image of known-supported's forward extension, for a feature with a
+///      standing reason to expect it never comes back (see
+///      [`Verdict::KnownUnsupportedSince`]'s doc);
+///    * known-unsupported, verdict version **equals** the reported version →
 ///      [`FeatureGate::Unsupported`];
-///    * blacklisted, verdict version **below** the reported version, and it is
+///    * known-unsupported, verdict version **below** the reported version, and it is
 ///      the last (highest) verdict in the row → [`FeatureGate::Unverified`]:
-///      the blacklist may predate a firmware that added the extension;
-///    * blacklisted, verdict version **below** the reported version, but a
+///      the known-unsupported verdict may predate a firmware that added the extension;
+///    * known-unsupported, verdict version **below** the reported version, but a
 ///      later verdict exists (for a version above this one's) → the row's
-///      blacklist knowledge brackets this version, so it is treated as
+///      known-unsupported knowledge brackets this version, so it is treated as
 ///      authoritative: [`FeatureGate::Unsupported`].
 ///
 /// The two per-axis outcomes are then combined, in order:
@@ -336,7 +609,7 @@ fn combine(a: FeatureGate, b: FeatureGate) -> FeatureGate {
     }
 }
 
-/// [`resolve`] against an explicit set of white/blacklist rows, so a test can
+/// [`resolve`] against an explicit set of known-support rows, so a test can
 /// supply its own without wiring one into the const tables.
 fn resolve_in(
     rows: &[FingerprintVerdicts],
@@ -352,13 +625,16 @@ fn resolve_in(
     let Some(idx) = row.verdicts.iter().rposition(|v| v.version <= version) else {
         // The reported version is older than every verdict on record. Fall
         // back to the nearest one *above* it — `verdicts[0]`, since rows are
-        // sorted ascending — and, if that verdict is a blacklist, extend it
-        // backward: a feature known not to work at that version is assumed
-        // not to work at any earlier, untested version either. A whitelist
-        // verdict, by contrast, says nothing about versions before it.
+        // sorted ascending — and, if that verdict is `KnownUnsupported`,
+        // extend it backward: a feature known not to work at that version is
+        // assumed not to work at any earlier, untested version either. A
+        // `KnownSupported` verdict, by contrast, says nothing about versions
+        // before it — and neither does a `KnownUnsupportedSince` one, by the
+        // same "says nothing about the past" rule that gives it its name; it
+        // falls into the same `_` arm as `KnownSupported` here.
         return match row.verdicts.first() {
             Some(VersionVerdict {
-                verdict: Verdict::Blacklisted,
+                verdict: Verdict::KnownUnsupported,
                 ..
             }) => FeatureGate::Unsupported,
             _ => FeatureGate::Unverified,
@@ -368,24 +644,32 @@ fn resolve_in(
     match chosen.verdict {
         // Known supported at or below the reported version — and assumed not
         // to have regressed in any newer version we have no verdict for.
-        Verdict::Whitelisted => FeatureGate::Supported,
-        // Blacklist verdict for exactly this version: a direct observation
+        Verdict::KnownSupported => FeatureGate::Supported,
+        // A known-unsupported verdict for exactly this version: a direct observation
         // that this build lacks the extension. Nothing softens that.
-        Verdict::Blacklisted if chosen.version == version => FeatureGate::Unsupported,
-        // Blacklist verdict from an *older* version with nothing newer on
+        Verdict::KnownUnsupported if chosen.version == version => FeatureGate::Unsupported,
+        // A known-unsupported verdict from an *older* version with nothing newer on
         // record: the extension may have been added in a firmware we haven't
         // observed, so warn rather than block.
-        Verdict::Blacklisted if idx + 1 == row.verdicts.len() => FeatureGate::Unverified,
-        // Blacklist verdict from an older version, but a later verdict exists
-        // (for a version above this applet's): our blacklist knowledge
+        Verdict::KnownUnsupported if idx + 1 == row.verdicts.len() => FeatureGate::Unverified,
+        // A known-unsupported verdict from an older version, but a later verdict exists
+        // (for a version above this applet's): our known-unsupported knowledge
         // brackets this version, so treat it as authoritative and block.
-        Verdict::Blacklisted => FeatureGate::Unsupported,
+        Verdict::KnownUnsupported => FeatureGate::Unsupported,
+        // `KnownUnsupportedSince` at or below the reported version — and,
+        // mirroring `KnownSupported`'s forward extension exactly, assumed to
+        // *stay* unsupported in any newer version we have no verdict for.
+        // Unlike plain `KnownUnsupported` above, this never softens to
+        // `Unverified` just for being the row's last (highest) verdict — the
+        // whole point of this variant is that there's a standing reason not
+        // to expect a later firmware to add the extension back.
+        Verdict::KnownUnsupportedSince => FeatureGate::Unsupported,
     }
 }
 
 /// One fingerprint's row in a [`PivQuirk`] table — the quirks counterpart to
 /// [`FingerprintVerdicts`], but deliberately a separate type: a quirk row has
-/// no whitelist/blacklist [`Verdict`] to carry, only a list of quirks active
+/// no known-support [`Verdict`] to carry, only a list of quirks active
 /// from each entry's version onward, so reusing [`VersionVerdict`] would
 /// leave a `verdict` field with no meaning on this axis.
 struct FingerprintQuirks {
@@ -397,7 +681,7 @@ struct FingerprintQuirks {
 
 /// "At [`Self::version`] (and, until a later entry, above it) these quirks
 /// are active." Same version-ordering convention as [`VersionVerdict`], but
-/// purely additive: there's no whitelisted/blacklisted state, so a quirk
+/// purely additive: there's no known-supported/known-unsupported state, so a quirk
 /// entry can never suppress a quirk an earlier entry already reported.
 struct VersionQuirks {
     version: &'static [u8],
@@ -469,6 +753,18 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
             },
         ],
     },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::YubiKey,
+        // Matches `PIN_MANAGEMENT_AUTH_VERDICTS`'s YubiKey row: applet
+        // version 3 is where `PivExtension::PinManagementAuth` becomes
+        // known-supported, and on YubiKey it's always the indirect
+        // PIN-protected-management-key scheme, never a direct PIN unlock —
+        // see this quirk's own doc.
+        quirks: &[VersionQuirks {
+            version: &[3],
+            quirks: &[PivQuirk::PinManagementAuthProtected9BKey],
+        }],
+    },
 ];
 
 /// [`PivQuirk`] table keyed by the device's firmware version, same shape and
@@ -479,7 +775,7 @@ const QUIRKS_BY_FIRMWARE_TABLE: &[FingerprintQuirks] = &[];
 /// [`VersionQuirks::version`] `<=` `version`, if any — the "current" quirks
 /// entry for that version, ignoring anything with a higher version on
 /// record. Same lookup rule as step 3 of [`resolve_in`], but there's no
-/// whitelist/blacklist reasoning to apply once the entry is found: quirks
+/// known-support reasoning to apply once the entry is found: quirks
 /// are taken as-is.
 fn latest_quirks<'a>(
     rows: &'a [FingerprintQuirks],
@@ -504,7 +800,7 @@ fn latest_quirks<'a>(
 /// 3. Merge the [`VersionQuirks::quirks`] from whichever of (1)/(2) matched
 ///    into a single set.
 ///
-/// Unlike [`resolve`], there's no whitelist/blacklist reasoning here: each
+/// Unlike [`resolve`], there's no known-support reasoning here: each
 /// axis contributes at most one entry's quirks, and quirks only ever
 /// accumulate — nothing in this table can suppress a quirk another entry
 /// added.
@@ -555,12 +851,18 @@ mod tests {
 
     #[test]
     fn requirement_is_distinct_per_extension_and_composes_with_a_suffix() {
-        let move_req = PivExtension::MoveKey.requirement();
-        let del_req = PivExtension::DeleteKey.requirement();
-        assert_ne!(move_req, del_req);
-        for req in [move_req, del_req] {
+        let reqs = [
+            PivExtension::MoveKey.requirement(),
+            PivExtension::DeleteKey.requirement(),
+            PivExtension::GetMetadata.requirement(),
+            PivExtension::Attest.requirement(),
+        ];
+        for (i, a) in reqs.iter().enumerate() {
+            for b in &reqs[i + 1..] {
+                assert_ne!(a, b);
+            }
             // Ends a sentence, so "<req> <suffix>" reads as two.
-            assert!(req.ends_with('.'), "{req:?}");
+            assert!(a.ends_with('.'), "{a:?}");
         }
         for suffix in [
             FeatureGate::UNVERIFIED_SUFFIX,
@@ -576,8 +878,8 @@ mod tests {
     #[test]
     fn yubikey_below_5_7_is_unsupported() {
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
-            // Matches the blacklist sentinel verdict (version `[]`), which is
-            // not the last verdict, so the blacklist is authoritative.
+            // Matches the known-unsupported sentinel verdict (version `[]`), which is
+            // not the last verdict, so the known-unsupported verdict is authoritative.
             assert_eq!(
                 resolve(ext, AppletFingerprint::YubiKey, Some(&[5, 6, 0]), None),
                 FeatureGate::Unsupported
@@ -602,7 +904,7 @@ mod tests {
                 FeatureGate::Supported
             );
             // A later version with no verdict of its own falls to the [5, 7]
-            // whitelist, assumed not to have regressed.
+            // known-supported verdict, assumed not to have regressed.
             assert_eq!(
                 resolve(ext, AppletFingerprint::YubiKey, Some(&[6, 0, 0]), None),
                 FeatureGate::Supported
@@ -650,7 +952,7 @@ mod tests {
         }
     }
 
-    // --- Token2: the seeded 5.112.0 blacklist, both extensions -----------
+    // --- Token2: the seeded 5.112.0 known-unsupported verdict, both extensions ---
 
     #[test]
     fn token2_5_112_0_is_unsupported() {
@@ -666,7 +968,7 @@ mod tests {
     fn token2_older_versions_are_also_unsupported() {
         // No verdict at or below these versions, so `resolve_in` falls back
         // to the row's only (and therefore nearest-above) verdict: the
-        // 5.112.0 blacklist, extended backward.
+        // 5.112.0 known-unsupported verdict, extended backward.
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             assert_eq!(
                 resolve(ext, AppletFingerprint::Token2, Some(&[5, 111, 0]), None),
@@ -680,10 +982,10 @@ mod tests {
     }
 
     #[test]
-    fn token2_newer_versions_are_unverified_not_blacklisted() {
-        // No whitelist verdict on this row, and 5.112.0 is the last (highest)
-        // entry, so — per `resolve_in`'s "trailing stale blacklist" rule — a
-        // version above it doesn't inherit the verdict: the blacklist is
+    fn token2_newer_versions_are_unverified_not_known_unsupported() {
+        // No known-supported verdict on this row, and 5.112.0 is the last (highest)
+        // entry, so — per `resolve_in`'s "trailing stale known-unsupported" rule — a
+        // version above it doesn't inherit the verdict: the known-unsupported verdict is
         // deliberately never treated as covering a version it hasn't
         // actually observed.
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
@@ -695,7 +997,7 @@ mod tests {
     }
 
     // --- Thetis PRO FIDO2 Security Key with PinPlex: the seeded 5.112.0 -
-    // --- blacklist, both extensions ---------------------------------------
+    // --- known-unsupported verdict, both extensions -----------------------
 
     #[test]
     fn thetis_5_112_0_is_unsupported() {
@@ -705,13 +1007,13 @@ mod tests {
                 FeatureGate::Unsupported
             );
             // No verdict at or below this version, so `resolve_in` falls
-            // back to the row's only verdict — the 5.112.0 blacklist,
+            // back to the row's only verdict — the 5.112.0 known-unsupported verdict,
             // extended backward.
             assert_eq!(
                 resolve(ext, AppletFingerprint::Thetis, Some(&[0]), None),
                 FeatureGate::Unsupported
             );
-            // Same trailing-blacklist softening above the highest verdict.
+            // Same trailing-known-unsupported softening above the highest verdict.
             assert_eq!(
                 resolve(ext, AppletFingerprint::Thetis, Some(&[5, 113, 0]), None),
                 FeatureGate::Unverified
@@ -719,13 +1021,13 @@ mod tests {
         }
     }
 
-    // --- Swissbit iShield 2 Pro: the bracketed <= 1.4.1.0 blacklist -------
+    // --- Swissbit iShield 2 Pro: the bracketed <= 1.4.1.0 known-unsupported verdict ---
 
     #[test]
     fn swissbit_ishield2_at_or_below_1_4_1_0_is_unsupported() {
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2);
-            // The exact observed version: blacklisted via the direct-match
+            // The exact observed version: known-unsupported via the direct-match
             // rule.
             assert_eq!(
                 resolve(ext, fp, Some(&[1, 4, 1, 0]), None),
@@ -733,7 +1035,7 @@ mod tests {
             );
             // Anything older: no verdict at or below it, so `resolve_in`
             // falls back to the row's only verdict — the `[1, 4, 1, 0]`
-            // blacklist, extended backward rather than softening to
+            // known-unsupported verdict, extended backward rather than softening to
             // `Unverified`.
             for older in [&[0][..], &[1][..], &[1, 4, 0][..]] {
                 assert_eq!(
@@ -745,11 +1047,11 @@ mod tests {
     }
 
     #[test]
-    fn swissbit_ishield2_above_1_4_1_0_is_unverified_not_blacklisted() {
-        // The blacklist deliberately doesn't extend to a version keyroost
+    fn swissbit_ishield2_above_1_4_1_0_is_unverified_not_known_unsupported() {
+        // The known-unsupported verdict deliberately doesn't extend to a version keyroost
         // hasn't actually observed: `[1, 4, 1, 0]` is the last verdict in
         // the row, so anything strictly newer softens to `Unverified` per
-        // `resolve_in`'s trailing-blacklist rule.
+        // `resolve_in`'s trailing-known-unsupported rule.
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2);
             for newer in [&[1, 4, 1, 1][..], &[1, 5, 0][..], &[2, 0][..]] {
@@ -791,7 +1093,7 @@ mod tests {
             );
             // A second, real fingerprint that genuinely carries no row in
             // `KEY_OPS_VERDICTS` at all — unlike `AppletFingerprint::Token2`,
-            // whose row's single blacklist verdict extends backward to
+            // whose row's single known-unsupported verdict extends backward to
             // resolve `Unsupported` for these same low versions; see
             // `token2_older_versions_are_also_unsupported`.
             assert_eq!(
@@ -879,14 +1181,14 @@ mod tests {
     }
 
     #[test]
-    fn applet_older_than_every_whitelisted_verdict_is_unverified() {
-        // The nearest verdict above is a whitelist, which says nothing about
+    fn applet_older_than_every_known_supported_verdict_is_unverified() {
+        // The nearest verdict above is known-supported, which says nothing about
         // versions before it, so there's nothing to extend backward.
         assert_eq!(
             gate(
                 &[VersionVerdict {
                     version: &[5, 0],
-                    verdict: Verdict::Whitelisted,
+                    verdict: Verdict::KnownSupported,
                 }],
                 Some(&[4, 9]),
             ),
@@ -895,16 +1197,16 @@ mod tests {
     }
 
     #[test]
-    fn applet_older_than_every_blacklisted_verdict_is_unsupported() {
-        // The nearest verdict above is a blacklist: a feature known not to
+    fn applet_older_than_every_known_unsupported_verdict_is_unsupported() {
+        // The nearest verdict above is known-unsupported: a feature known not to
         // work at that version is assumed not to work at any earlier,
         // untested version either — the backward mirror of
-        // `earlier_whitelist_is_assumed_not_to_regress` below.
+        // `earlier_known_supported_is_assumed_not_to_regress` below.
         assert_eq!(
             gate(
                 &[VersionVerdict {
                     version: &[5, 0],
-                    verdict: Verdict::Blacklisted,
+                    verdict: Verdict::KnownUnsupported,
                 }],
                 Some(&[4, 9]),
             ),
@@ -916,18 +1218,18 @@ mod tests {
     fn applet_older_than_every_verdict_uses_the_nearest_one_above() {
         // Two verdicts, both above the reported version: the fallback picks
         // the row's first (lowest, i.e. nearest-above) entry, not just any
-        // entry — so a blacklist further above doesn't leak backward past a
-        // whitelist that's nearer.
+        // entry — so a known-unsupported verdict further above doesn't leak backward past a
+        // known-supported verdict that's nearer.
         assert_eq!(
             gate(
                 &[
                     VersionVerdict {
                         version: &[5, 0],
-                        verdict: Verdict::Whitelisted,
+                        verdict: Verdict::KnownSupported,
                     },
                     VersionVerdict {
                         version: &[6, 0],
-                        verdict: Verdict::Blacklisted,
+                        verdict: Verdict::KnownUnsupported,
                     },
                 ],
                 Some(&[4, 9]),
@@ -937,12 +1239,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_version_blacklist_match_is_unsupported() {
+    fn exact_version_known_unsupported_match_is_unsupported() {
         assert_eq!(
             gate(
                 &[VersionVerdict {
                     version: &[5, 7],
-                    verdict: Verdict::Blacklisted,
+                    verdict: Verdict::KnownUnsupported,
                 }],
                 Some(&[5, 7]),
             ),
@@ -951,14 +1253,14 @@ mod tests {
     }
 
     #[test]
-    fn trailing_stale_blacklist_is_unverified() {
-        // Only a blacklist, from a version below the applet's, and it is the
+    fn trailing_stale_known_unsupported_is_unverified() {
+        // Only known-unsupported, from a version below the applet's, and it is the
         // last verdict — the extension might have been added since.
         assert_eq!(
             gate(
                 &[VersionVerdict {
                     version: &[5, 0],
-                    verdict: Verdict::Blacklisted,
+                    verdict: Verdict::KnownUnsupported,
                 }],
                 Some(&[5, 4]),
             ),
@@ -967,19 +1269,19 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_blacklist_stays_authoritative() {
-        // A blacklist below the applet's version, with a later verdict above
-        // it: keyroost's blacklist knowledge brackets the applet version.
+    fn bracketed_known_unsupported_stays_authoritative() {
+        // A known-unsupported verdict below the applet's version, with a later verdict above
+        // it: keyroost's known-unsupported knowledge brackets the applet version.
         assert_eq!(
             gate(
                 &[
                     VersionVerdict {
                         version: &[5, 0],
-                        verdict: Verdict::Blacklisted,
+                        verdict: Verdict::KnownUnsupported,
                     },
                     VersionVerdict {
                         version: &[6, 0],
-                        verdict: Verdict::Whitelisted,
+                        verdict: Verdict::KnownSupported,
                     },
                 ],
                 Some(&[5, 4]),
@@ -989,17 +1291,86 @@ mod tests {
     }
 
     #[test]
-    fn earlier_whitelist_is_assumed_not_to_regress() {
+    fn earlier_known_supported_is_assumed_not_to_regress() {
         assert_eq!(
             gate(
                 &[VersionVerdict {
                     version: &[5, 7],
-                    verdict: Verdict::Whitelisted,
+                    verdict: Verdict::KnownSupported,
                 }],
                 Some(&[9, 1, 2]),
             ),
             FeatureGate::Supported
         );
+    }
+
+    // --- KnownUnsupportedSince: the mirror image of KnownSupported's -----
+    // --- extension direction ----------------------------------------------
+
+    #[test]
+    fn applet_older_than_every_known_unsupported_since_verdict_is_unverified() {
+        // Same fallback shape as `applet_older_than_every_known_supported_verdict_is_unverified`:
+        // the nearest verdict above says nothing about versions before it,
+        // so there's nothing to extend backward — unlike plain
+        // `KnownUnsupported`, which *would* extend backward here.
+        assert_eq!(
+            gate(
+                &[VersionVerdict {
+                    version: &[5, 0],
+                    verdict: Verdict::KnownUnsupportedSince,
+                }],
+                Some(&[4, 9]),
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn known_unsupported_since_never_softens_to_unverified_going_forward() {
+        // Unlike plain `KnownUnsupported` (see
+        // `trailing_stale_known_unsupported_is_unverified`), being the row's
+        // last (highest) verdict doesn't soften this to `Unverified` — the
+        // whole point of this variant is that it's assumed to stay
+        // unsupported indefinitely.
+        assert_eq!(
+            gate(
+                &[VersionVerdict {
+                    version: &[5, 0],
+                    verdict: Verdict::KnownUnsupportedSince,
+                }],
+                Some(&[9, 9, 9]),
+            ),
+            FeatureGate::Unsupported
+        );
+        // Exact match on the verdict's own version, same as the fallback
+        // that fires when nothing is strictly below it.
+        assert_eq!(
+            gate(
+                &[VersionVerdict {
+                    version: &[5, 0],
+                    verdict: Verdict::KnownUnsupportedSince,
+                }],
+                Some(&[5, 0]),
+            ),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn known_unsupported_since_at_the_universal_empty_version_covers_everything() {
+        // `[]` orders at or below every real version, so a lone
+        // `KnownUnsupportedSince` verdict there is always the chosen one —
+        // never the "older than every verdict" fallback — and, per the test
+        // above, never softens going forward either. This is the exact shape
+        // `GET_METADATA_VERDICTS`/`ATTEST_VERDICTS` use for HID Crescendo
+        // C2300/C4000.
+        let verdicts: &[VersionVerdict] = &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }];
+        for version in [&[0][..], &[3, 0, 3, 6][..], &[255, 255, 255][..]] {
+            assert_eq!(gate(verdicts, Some(version)), FeatureGate::Unsupported);
+        }
     }
 
     // --- resolve_quirks(): the separate, non-gating quirks axis ----------
@@ -1029,8 +1400,11 @@ mod tests {
 
     #[test]
     fn no_data_on_either_axis_resolves_to_no_quirks() {
+        // UTrust carries no quirk row at all (unlike YubiKey, which since
+        // `PinManagementAuthProtected9BKey` has one from applet version 3 on
+        // — see `yubikey_pin_management_auth_3_and_newer_is_supported_with_the_protected_key_quirk`).
         assert_eq!(
-            resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7]), Some(&[5, 7])),
+            resolve_quirks(AppletFingerprint::UTrust, Some(&[5, 7]), Some(&[5, 7])),
             BTreeSet::new()
         );
     }
@@ -1206,6 +1580,310 @@ mod tests {
                 None,
             ),
             BTreeSet::new()
+        );
+    }
+
+    // --- HID Crescendo (C2300 and C4000): GET METADATA/ATTEST known-unsupported --
+    // --- by their own GET PIV PROPERTIES version, on the applet axis -------
+
+    #[test]
+    fn hid_crescendo_c2300_get_metadata_and_attest_known_unsupported_at_any_version() {
+        let fp = AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300);
+        for ext in [PivExtension::GetMetadata, PivExtension::Attest] {
+            // The one version actually observed (`3.0.3.6`, family byte
+            // already stripped by `parse_hid_crescendo_version`) — on the
+            // *applet* axis, since it's an applet version despite coming
+            // from GET PIV PROPERTIES rather than Yubico's GET VERSION
+            // extension.
+            assert_eq!(
+                resolve(ext, fp, Some(&[3, 0, 3, 6]), None),
+                FeatureGate::Unsupported
+            );
+            // Older and newer versions alike — `KnownUnsupportedSince` at the
+            // universal `[]` version makes no exception in either direction,
+            // unlike an ordinary `KnownUnsupported` pinned to one build.
+            assert_eq!(resolve(ext, fp, Some(&[0]), None), FeatureGate::Unsupported);
+            assert_eq!(
+                resolve(ext, fp, Some(&[9, 9, 9, 9]), None),
+                FeatureGate::Unsupported
+            );
+            // No applet version at all (HID Crescendo's own GET VERSION
+            // extension didn't answer, and its GET PIV PROPERTIES read
+            // itself hasn't happened yet either) — nothing to match against.
+            assert_eq!(resolve(ext, fp, None, None), FeatureGate::Unverified);
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_generic_has_no_get_metadata_attest_data() {
+        // Generic never selects a recognised model at all, so there's no
+        // version source for it either way.
+        let fp = AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic);
+        for ext in [PivExtension::GetMetadata, PivExtension::Attest] {
+            assert_eq!(
+                resolve(ext, fp, Some(&[3, 0, 3, 6]), None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_c4000_get_metadata_and_attest_known_unsupported_by_documentation() {
+        // Assumed from HID's own C4000 documentation, not confirmed on
+        // hardware — see `GET_METADATA_VERDICTS`'s C4000 bullet. Same
+        // `KnownUnsupportedSince` at the universal `[]` version as C2300, so
+        // no version — documented, observed, or hypothetical-future — is an
+        // exception.
+        let fp = AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000);
+        for ext in [PivExtension::GetMetadata, PivExtension::Attest] {
+            // The documented current version.
+            assert_eq!(
+                resolve(ext, fp, Some(&[4, 0, 0, 12, 34]), None),
+                FeatureGate::Unsupported
+            );
+            // Anything older than 4.0.0 altogether.
+            assert_eq!(
+                resolve(ext, fp, Some(&[3, 9, 9, 9, 9]), None),
+                FeatureGate::Unsupported
+            );
+            // A hypothetical future applet revision — unlike an ordinary
+            // `KnownUnsupported` row, this doesn't soften to `Unverified`
+            // just for being newer than anything documented so far.
+            assert_eq!(
+                resolve(ext, fp, Some(&[5, 0, 0, 0, 0]), None),
+                FeatureGate::Unsupported
+            );
+            assert_eq!(resolve(ext, fp, None, None), FeatureGate::Unverified);
+        }
+    }
+
+    #[test]
+    fn get_metadata_and_attest_data_does_not_leak_to_other_fingerprints() {
+        for ext in [PivExtension::GetMetadata, PivExtension::Attest] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Generic, None, None),
+                FeatureGate::Unverified
+            );
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Token2, Some(&[5, 112, 0]), None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    // --- YubiKey ATTEST: gained in firmware 4.3 -----------------------------
+    // See <https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>.
+
+    #[test]
+    fn yubikey_attest_below_4_3_is_unsupported() {
+        // Matches the known-unsupported sentinel verdict (version `[]`), which is not
+        // the last verdict, so the known-unsupported verdict is authoritative — same shape as
+        // `yubikey_below_5_7_is_unsupported` for MOVE KEY/DELETE KEY.
+        assert_eq!(
+            resolve(
+                PivExtension::Attest,
+                AppletFingerprint::YubiKey,
+                Some(&[4, 2]),
+                None
+            ),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::Attest,
+                AppletFingerprint::YubiKey,
+                Some(&[3, 4, 0]),
+                None,
+            ),
+            FeatureGate::Unsupported
+        );
+        // GET METADATA is a separate table with its own `[]` sentinel below
+        // its own 5.3 bar — 4.2 is below that bar too, and bracketed by the
+        // same sentinel logic, so it resolves the same way here.
+        assert_eq!(
+            resolve(
+                PivExtension::GetMetadata,
+                AppletFingerprint::YubiKey,
+                Some(&[4, 2]),
+                None,
+            ),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn yubikey_attest_4_3_and_newer_is_supported() {
+        assert_eq!(
+            resolve(
+                PivExtension::Attest,
+                AppletFingerprint::YubiKey,
+                Some(&[4, 3]),
+                None
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::Attest,
+                AppletFingerprint::YubiKey,
+                Some(&[4, 3, 7]),
+                None,
+            ),
+            FeatureGate::Supported
+        );
+        // A later version with no verdict of its own falls to the `[4, 3]`
+        // known-supported verdict, assumed not to have regressed.
+        assert_eq!(
+            resolve(
+                PivExtension::Attest,
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None,
+            ),
+            FeatureGate::Supported
+        );
+    }
+
+    // --- YubiKey GET METADATA: gained in firmware 5.3 -----------------------
+    // See <https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>.
+
+    #[test]
+    fn yubikey_get_metadata_below_5_3_is_unsupported() {
+        assert_eq!(
+            resolve(
+                PivExtension::GetMetadata,
+                AppletFingerprint::YubiKey,
+                Some(&[5, 2, 0]),
+                None,
+            ),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::GetMetadata,
+                AppletFingerprint::YubiKey,
+                Some(&[4, 3, 7]),
+                None,
+            ),
+            FeatureGate::Unsupported
+        );
+        // ATTEST is a separate, unaffected table — 4.3.7 is already at/above
+        // its own 4.3 bar.
+        assert_eq!(
+            resolve(
+                PivExtension::Attest,
+                AppletFingerprint::YubiKey,
+                Some(&[4, 3, 7]),
+                None,
+            ),
+            FeatureGate::Supported
+        );
+    }
+
+    #[test]
+    fn yubikey_get_metadata_5_3_and_newer_is_supported() {
+        assert_eq!(
+            resolve(
+                PivExtension::GetMetadata,
+                AppletFingerprint::YubiKey,
+                Some(&[5, 3]),
+                None,
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::GetMetadata,
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None,
+            ),
+            FeatureGate::Supported
+        );
+    }
+
+    #[test]
+    fn yubikey_attest_and_get_metadata_without_a_reported_version_are_unverified() {
+        for ext in [PivExtension::Attest, PivExtension::GetMetadata] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::YubiKey, None, None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    // --- PinManagementAuth: HID Crescendo direct, YubiKey indirect -------
+
+    #[test]
+    fn hid_crescendo_pin_management_auth_supported_at_any_version() {
+        // The universal `[]` sentinel: HID Crescendo's PIN-unlock is direct
+        // (no quirk needed), same shape as `KnownUnsupportedSince` at `[]` on
+        // the other tables, just the opposite verdict.
+        for variant in [HidCrescendoVariant::C2300, HidCrescendoVariant::C4000] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[1, 2, 3][..], &[9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::PinManagementAuth, fp, Some(version), None),
+                    FeatureGate::Supported
+                );
+            }
+            assert_eq!(
+                resolve(PivExtension::PinManagementAuth, fp, None, None),
+                FeatureGate::Unverified
+            );
+        }
+        // No quirk on this fingerprint — PIN VERIFY unlocks directly.
+        assert!(!resolve_quirks(
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+            Some(&[3, 0, 3, 6]),
+            None,
+        )
+        .contains(&PivQuirk::PinManagementAuthProtected9BKey));
+    }
+
+    #[test]
+    fn yubikey_pin_management_auth_below_3_is_unverified() {
+        // No known-unsupported sentinel on this row (unlike MOVE KEY/DELETE
+        // KEY's YubiKey row): a version below the first known-supported verdict
+        // just has nothing to extend backward from.
+        assert_eq!(
+            resolve(
+                PivExtension::PinManagementAuth,
+                AppletFingerprint::YubiKey,
+                Some(&[2, 9, 9]),
+                None,
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn yubikey_pin_management_auth_3_and_newer_is_supported_with_the_protected_key_quirk() {
+        for version in [&[3][..], &[3, 1, 0][..], &[5, 7][..]] {
+            assert_eq!(
+                resolve(
+                    PivExtension::PinManagementAuth,
+                    AppletFingerprint::YubiKey,
+                    Some(version),
+                    None,
+                ),
+                FeatureGate::Supported
+            );
+            // Unlike HID Crescendo, YubiKey's PIN unlock is indirect: the
+            // quirk marks that the retrieved "management key" is what
+            // actually needs to run through the standard 9B round.
+            assert!(
+                resolve_quirks(AppletFingerprint::YubiKey, Some(version), None)
+                    .contains(&PivQuirk::PinManagementAuthProtected9BKey)
+            );
+        }
+    }
+
+    #[test]
+    fn yubikey_pin_management_auth_quirk_absent_below_3() {
+        assert!(
+            !resolve_quirks(AppletFingerprint::YubiKey, Some(&[2, 9, 9]), None)
+                .contains(&PivQuirk::PinManagementAuthProtected9BKey)
         );
     }
 }

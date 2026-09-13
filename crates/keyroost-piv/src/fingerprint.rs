@@ -81,6 +81,495 @@ pub const NITROKEY_GET_VERSION_STRING: [u8; 5] = [0x00, 0x61, 0x01, 0x00, 0x00];
 /// and passes the result to [`classify`] as `swissbit_rid_selectable`.
 pub const SWISSBIT_RID: [u8; 5] = [0xD2, 0x76, 0x00, 0x01, 0x62];
 
+/// HID Crescendo C2300's GET PIV PROPERTIES data object tag — read like any
+/// other PIV data object, via [`crate::get_data`] (which frames it as `5C 03
+/// FF FF 7F`), per HID's own C2300 low-level API reference:
+/// <https://docs.hidglobal.com/crescendo/api/low-level/get-piv-properties.htm>
+/// (the APDU itself, and the response's top-level tag list, are all that
+/// page documents — see [`parse_hid_crescendo_slot_key_algorithms`]'s doc for why the
+/// C4000 API reference,
+/// <https://docs.hidglobal.com/crescendo/api/c4000/get-piv-properties.htm>,
+/// ends up being this crate's real source for what's *inside* each tag).
+/// The response repeats a `0x51` "PKI Object Properties" TLV once per PKI
+/// slot the card supports; [`parse_hid_crescendo_slot_key_algorithms`] decodes the
+/// fields this crate needs out of each.
+///
+/// The C4000 family exposes the same GET PIV PROPERTIES data — the two
+/// families' responses overlap on the handful of fields this crate actually
+/// reads, though not on their overall shape; see
+/// [`parse_hid_crescendo_slot_key_algorithms`]'s doc for the specific differences a
+/// live C2300 trace turned up against the C4000 reference — framed as a
+/// different, proprietary command instead of a standard GET DATA read — see
+/// [`HID_CRESCENDO_C4000_GET_PROPERTIES`] — so this tag/request shape is
+/// only meaningful once [`classify`] has already narrowed the device to
+/// C2300 specifically.
+pub const HID_CRESCENDO_C2300_PROPERTIES_TAG: [u8; 3] = [0xFF, 0xFF, 0x7F];
+
+/// HID Crescendo C4000's GET PIV PROPERTIES request — unlike C2300's (a
+/// standard GET DATA read for [`HID_CRESCENDO_C2300_PROPERTIES_TAG`]), this
+/// is C4000's own proprietary case-2 command: `CLA 80h INS 56h P1 00h P2
+/// 00h`, `Le` `00h` (meaning "up to 256 bytes", extended by the usual
+/// `61xx`/GET RESPONSE chain for a longer reply) — per HID's C4000 API
+/// reference: <https://docs.hidglobal.com/crescendo/api/c4000/get-piv-properties.htm>.
+/// The response is decoded by the same [`parse_hid_crescendo_slot_key_algorithms`]/
+/// [`parse_hid_crescendo_version`] C2300 uses — see those functions' docs
+/// for how this same C4000 reference also ends up documenting the fields
+/// this crate reads out of the C2300 family's own response body, which
+/// HID's dedicated C2300 reference
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/get-piv-properties.htm>)
+/// leaves undocumented — and for the response's *overall* shape, which
+/// turns out not to match between the two families nearly as closely as
+/// that one shared detail might suggest.
+pub const HID_CRESCENDO_C4000_GET_PROPERTIES: [u8; 5] = [0x80, 0x56, 0x00, 0x00, 0x00];
+
+/// The ACA (Access Control Applet) instance AID, `A0 00 00 00 79 10 00` —
+/// NIST GSC-IS 2.1's Access Control Applet, partially standardized there but
+/// carrying vendor-specific extensions on top. Most HID Crescendo units
+/// (C2300 and C4000 alike; confirmed on a live C2300 unit that answers
+/// `SW = 6D 00` "instruction not supported" to a standard PIV `GENERAL
+/// AUTHENTICATE` on key reference `0x9B` — it simply doesn't model a PIV
+/// management key as a real object at all, per
+/// [`hid_crescendo_reports_slot`]) instead gate PIV admin operations behind
+/// this applet's `EXTERNAL AUTHENTICATE` with "XAUTH key 1" — see
+/// [`HID_CRESCENDO_ACA_GET_CHALLENGE`]/[`hid_crescendo_aca_external_authenticate`]
+/// and <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>.
+/// That page's own scope note reads "applicable only to devices belonging to
+/// the Crescendo 2300 family", but nothing else in HID's documentation
+/// describes an alternative for C4000, and a C4000 unit is already assumed
+/// (undocumented, unconfirmed on hardware) to share C2300's non-support of
+/// the standard management key — see
+/// `keyroost_piv::compat`'s `GET_METADATA_VERDICTS`'s C4000 bullet for the
+/// same caveat applied there — so `keyroost_transport::PivSession` tries this
+/// same sequence for either variant, and indeed for
+/// [`HidCrescendoVariant::Generic`] too, rather than only the one family
+/// the page names.
+///
+/// Selected the same way [`SWISSBIT_RID`]/[`FEITIAN_RID`]/
+/// [`NITROKEY_ADMIN_AID`] are (`crate::select_by_aid`), but for a different
+/// reason: those probes SELECT, read one bit of information, and
+/// unconditionally re-SELECT PIV, discarding whatever state the temporary
+/// SELECT left behind. This one is not discarded — the ACA's "External
+/// Authentication" access condition, once satisfied, is a *card-wide* grant
+/// under NIST GSC-IS 2.1's access-condition model, not scoped to the ACA
+/// instance itself, so it is still in effect after switching back to PIV.
+/// That's the entire reason this mechanism can substitute for PIV's own
+/// `0x9B` `GENERAL AUTHENTICATE`: re-selecting PIV afterward is how the
+/// access condition actually reaches the PIV applet's admin commands, not a
+/// step that throws the authentication away. (Re-selecting PIV *does* still
+/// throw away a prior standard `0x9B` authentication, same as always — the
+/// two mechanisms just differ on whether a PIV re-select is itself
+/// authentication-preserving or authentication-clearing.)
+pub const HID_CRESCENDO_ACA_AID: [u8; 7] = [0xA0, 0x00, 0x00, 0x00, 0x79, 0x10, 0x00];
+
+/// ACA `GET CHALLENGE` (`CLA 00h INS 84h P1 00h P2 00h Le 00h`, a case-2
+/// APDU with no command data): the first step of the External Authentication
+/// sequence, requesting a fresh card challenge for XAUTH key 1. Only
+/// meaningful once [`HID_CRESCENDO_ACA_AID`] is selected. Per
+/// <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>,
+/// the response's own length is the only place the XAUTH key's algorithm is
+/// named — see [`hid_crescendo_xauth_key_alg`].
+pub const HID_CRESCENDO_ACA_GET_CHALLENGE: [u8; 5] = [0x00, 0x84, 0x00, 0x00, 0x00];
+
+/// The P2 reference the ACA instance's own VERIFY PIN answers, per
+/// <https://docs.hidglobal.com/crescendo/api/low-level/verify-pin.htm>:
+/// `CLA 00h INS 20h P1 00h P2 00h`. Note the `0x00` — **not**
+/// [`crate::PIN_REF_APPLICATION`] (`0x80`), the reference the standard PIV
+/// VERIFY (and every other fingerprint's [`PivExtension::PinManagementAuth`])
+/// uses. A VERIFY sent with the standard PIV reference while ACA is the
+/// currently-selected applet is not this command — pass this reference to
+/// [`crate::verify_pin_at`] instead whenever ACA is selected, e.g.
+/// immediately before PUT XAUTH KEY
+/// (`keyroost_transport::PivSession::hid_crescendo_aca_put_xauth_key_op`'s
+/// PIN-unlock branch).
+///
+/// [`PivExtension::PinManagementAuth`]: crate::compat::PivExtension::PinManagementAuth
+pub const HID_CRESCENDO_ACA_PIN_REF: u8 = 0x00;
+
+/// The XAUTH key 1 algorithm implied by a [`HID_CRESCENDO_ACA_GET_CHALLENGE`]
+/// response's length. Per HID's own documentation: "The length of the Get
+/// Challenge response indicates the key type of XAUTH key 1: 8 bytes for a
+/// TDES Administration key, 16 bytes for an AES-128 Administration key" —
+/// conveniently, both lengths already correspond to one of this crate's own
+/// [`crate::MgmtAlg`] variants ([`crate::MgmtAlg::TripleDes`]'s and
+/// [`crate::MgmtAlg::Aes128`]'s `key_len()`s respectively), so no separate
+/// key-type enum is needed here. `None` for any other length — HID's
+/// documentation names no third option.
+#[must_use]
+pub fn hid_crescendo_xauth_key_alg(challenge_len: usize) -> Option<crate::MgmtAlg> {
+    match challenge_len {
+        8 => Some(crate::MgmtAlg::TripleDes),
+        16 => Some(crate::MgmtAlg::Aes128),
+        _ => None,
+    }
+}
+
+/// ACA `EXTERNAL AUTHENTICATE` with XAUTH key 1 (`CLA 00h INS 82h P1 00h P2
+/// 01h`, `Lc` = `host_cryptogram.len()`, no `Le` — HID's own documentation:
+/// "The response message is always empty", so success or failure is carried
+/// purely by the status word): the second and final step of the sequence
+/// [`HID_CRESCENDO_ACA_GET_CHALLENGE`] starts. `host_cryptogram` is that
+/// step's card challenge, single-block ECB-encrypted under XAUTH key 1 —
+/// `keyroost_transport::PivSession` computes that with the very same
+/// block-cipher primitive it already uses for standard PIV management-key
+/// auth, keyed by the [`crate::MgmtAlg`] [`hid_crescendo_xauth_key_alg`]
+/// names. `Lc` is read off `host_cryptogram.len()` rather than taken as a
+/// separate algorithm argument here, so the two can never disagree.
+///
+/// Per HID's documentation, three failure status words are distinguished
+/// (beyond the generic "wrong key" case, `SW = 63 00`): `SW = 6A 88` ("XAUTH
+/// 1 key has not been initialized"), `SW = 69 85` ("The Get Challenge
+/// command has not been sent before the command"). Neither gets special
+/// handling here — both still mean "authentication did not succeed", which
+/// is all a caller needs to know — but a `--debug` trace still shows the raw
+/// status word for whoever's diagnosing a real device against this.
+#[must_use]
+pub fn hid_crescendo_aca_external_authenticate(host_cryptogram: &[u8]) -> Vec<u8> {
+    let mut apdu = Vec::with_capacity(5 + host_cryptogram.len());
+    apdu.extend_from_slice(&[0x00, 0x82, 0x00, 0x01, host_cryptogram.len() as u8]);
+    apdu.extend_from_slice(host_cryptogram);
+    apdu
+}
+
+/// ACA `PUT XAUTH KEY` (`CLA 00h INS D8h P1 01h` — "XAUTH key 1", the same
+/// key [`hid_crescendo_aca_external_authenticate`] authenticates against —
+/// `P2 00h`), installing a new XAUTH key value: HID's own replacement for
+/// the standard PIV SET MANAGEMENT KEY extension on a device that doesn't
+/// implement it (see [`HID_CRESCENDO_ACA_AID`]'s doc). Case 3 — no `Le`, and
+/// per HID's documentation the response data field is always empty on
+/// success, so success or failure is carried purely by the status word,
+/// same as [`hid_crescendo_aca_external_authenticate`].
+///
+/// `alg` must be [`crate::MgmtAlg::TripleDes`] or [`crate::MgmtAlg::Aes128`]
+/// — the only two algorithms HID's documentation names for XAUTH key 1
+/// (mirroring [`hid_crescendo_xauth_key_alg`]'s decode direction) — and
+/// `key` must be exactly `alg.key_len()` bytes; `None` on either mismatch,
+/// so a caller can surface the same "bad key length" error the standard PIV
+/// path already uses instead of building a malformed command.
+///
+/// Data field, per
+/// <https://docs.hidglobal.com/crescendo/api/low-level/put-xauth-key.htm>:
+///
+/// | offset | len | value | meaning |
+/// |---|---|---|---|
+/// | 0 | 1 | `0x00` | RFU |
+/// | 1 | 1 | `alg.id()` (`0x03`/`0x08` — TDES ECB / 128-AES ECB; conveniently the same byte [`crate::MgmtAlg::id`] already returns for standard PIV) | Algorithm |
+/// | 2 | 1 | `key.len() + 1` (`0x19`/`0x11`) | Key data length indicator |
+/// | 3 | 1 | `key.len()` (`0x18`/`0x10`) | Real key length |
+/// | 4 | `key.len()` | `key` | Key value |
+/// | 4+n | 1 | `0x00` | Key check value length |
+///
+/// `Lc` (`0x1D` for TDES, `0x15` for AES-128 — matching HID's documented
+/// values) falls straight out of that layout's total length, so it needs no
+/// separate table here.
+///
+/// Requires "PIN or XAUTH1" access per HID's documentation, same
+/// precondition [`hid_crescendo_aca_external_authenticate`] runs under — the
+/// ACA instance must already be selected and either a PIN VERIFY or a prior
+/// [`hid_crescendo_aca_external_authenticate`] round must have already
+/// succeeded.
+#[must_use]
+pub fn hid_crescendo_aca_put_xauth_key(alg: crate::MgmtAlg, key: &[u8]) -> Option<Vec<u8>> {
+    if !matches!(alg, crate::MgmtAlg::TripleDes | crate::MgmtAlg::Aes128) {
+        return None;
+    }
+    if key.len() != alg.key_len() {
+        return None;
+    }
+    let mut data = Vec::with_capacity(4 + key.len() + 1);
+    data.push(0x00); // RFU
+    data.push(alg.id());
+    data.push((key.len() + 1) as u8); // key data length indicator
+    data.push(key.len() as u8); // real key length
+    data.extend_from_slice(key);
+    data.push(0x00); // key check value length
+    let mut apdu = Vec::with_capacity(5 + data.len());
+    apdu.extend_from_slice(&[0x00, 0xD8, 0x01, 0x00, data.len() as u8]);
+    apdu.extend_from_slice(&data);
+    Some(apdu)
+}
+
+/// [`hid_crescendo_aca_put_xauth_key`]'s "remove" form: PUT XAUTH KEY with
+/// the documented `Lc = 0x04` short data field that deletes XAUTH key 1
+/// outright instead of installing a new one — HID's own equivalent of a PIV
+/// device having no management key at all, offered as a distinct "Delete"
+/// choice (rather than always requiring a replacement key) precisely
+/// because a HID Crescendo unit's management key isn't a real PIV object
+/// with a mandatory-key invariant to preserve.
+///
+/// Per <https://docs.hidglobal.com/crescendo/api/low-level/put-xauth-key.htm>'s
+/// data-field table, the Algorithm byte is never optional — every row of
+/// that table pairs it with a real key-data-length value, so a removal
+/// still names one, unconditionally `0x03` (TDES ECB): a "0 bytes to
+/// remove the corresponding key, in this case the following bytes are
+/// absent" length indicator makes the algorithm choice moot in practice
+/// (there's no key value left to interpret under it either way), and TDES
+/// is the algorithm this crate's own install form ([`hid_crescendo_aca_put_xauth_key`])
+/// already defaults to when a card's actual key algorithm isn't otherwise
+/// known — this removes XAUTH key 1 regardless of whether it currently
+/// holds a TDES or an AES-128 key:
+///
+/// | offset | len | value | meaning |
+/// |---|---|---|---|
+/// | 0 | 1 | `0x00` | RFU |
+/// | 1 | 1 | `0x03` | Algorithm (TDES ECB), sent unconditionally |
+/// | 2 | 1 | `0x00` | Key data length indicator (`0x00` = remove) |
+/// | 3 | 1 | `0x00` | Real key length |
+///
+/// Whether XAUTH key 1 being absent afterward disables the ACA's "PIN or
+/// XAUTH1" access condition down to PIN-only, or removes key-based unlock
+/// entirely, is undocumented and unconfirmed on hardware — same caveat as
+/// every other assumption in this module without a live-device trace to
+/// check it against.
+#[must_use]
+pub fn hid_crescendo_aca_put_xauth_key_remove() -> Vec<u8> {
+    vec![0x00, 0xD8, 0x01, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00]
+}
+
+/// Decode every `(key_ref, algorithm_id)` pair for a slot that actually
+/// holds a key out of a HID Crescendo GET PIV PROPERTIES response (C2300's
+/// [`HID_CRESCENDO_C2300_PROPERTIES_TAG`] or C4000's
+/// [`HID_CRESCENDO_C4000_GET_PROPERTIES`] — both families answer with the
+/// same TLV structure this decodes) — one pair per `0x51` "PKI Object
+/// Properties" block the response repeats (one per PKI slot the card
+/// supports), so a caller reads every slot's algorithm off a single round
+/// trip rather than needing one per slot.
+///
+/// Two HID API references cover this response, unevenly: the C2300 one
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/get-piv-properties.htm>)
+/// documents the APDU and the response's top-level tag list, but says
+/// nothing about what's inside a `0x51`/`0x50` block or a `0x43` subtag —
+/// every byte offset this function relies on instead comes from the C4000
+/// one
+/// (<https://docs.hidglobal.com/crescendo/api/c4000/get-piv-properties.htm>),
+/// which fills that gap in quite well *for the fields this function reads*.
+/// It is not, though, a faithful map of the *whole* response on either
+/// family — a live C2300 trace this crate was built and tested against
+/// diverges from the C4000 reference in more places than just subtag
+/// `0x43`'s length (the difference usually worth calling out):
+///
+/// * top level: the C2300 trace carries tags `0x3B` and `0x45`, neither of
+///   which appears anywhere in the C4000 reference's tag table; conversely
+///   the C4000 reference documents a `0x40` tag (container/PKI object
+///   counts) the C2300 trace never sends.
+/// * inside a `0x50` block ("Generic Container Object Properties"): the
+///   C2300 trace's subtags are `0x47`/`0x26`/`0x42`; the C4000 reference
+///   documents `0x47`/`0x42`/`0x4D` for the same block — `0x26` isn't in
+///   the C4000 table at all, and the C4000-documented `0x4D` (Access
+///   Control Rules) never appears in the C2300 trace.
+/// * inside a `0x51` block: the C2300 trace's subtags are `0x47`/`0x26`/
+///   `0x48`/`0x43`/`0x42`; the C4000 reference documents only `0x48`/
+///   `0x43`/`0x4D` for the same block.
+/// * subtag `0x43` itself: 4 bytes on the C2300 trace, 5 (an appended "Key
+///   Purpose" byte) per the C4000 reference — the one difference already
+///   well-known enough to get its own mention below.
+///
+/// None of that matters here, which is exactly why this function is
+/// written the way it is: [`crate::find_tlv`] looks up subtags `0x48`/
+/// `0x43` inside a `0x51` block by tag number alone, regardless of what
+/// other subtags surround them, in what order, or whether they're present
+/// at all — and the top-level walk below does the same for tag `0x51`
+/// itself among whatever else the response carries. The C4000 reference
+/// stays the right source for what's *inside* `0x43` specifically
+/// (algorithm ID, key length, the two initialization-status bytes below) —
+/// that much is confirmed compatible against real C2300 hardware — it just
+/// isn't a description of the response's shape as a whole on either
+/// family, so nothing here assumes it is.
+///
+/// The reply is a standard PIV GET DATA response shape: everything wrapped
+/// in one outer `0x53` "Discretionary Data Object" TLV, unwrapped the same
+/// way [`crate::unwrap_data_object`] does for any other PIV data object —
+/// tolerantly: the C4000 reference describes the response's top-level tags
+/// directly, without mentioning a `0x53` wrapper the way the C2300
+/// reference explicitly does, so a reply that doesn't start with `0x53` is
+/// treated as already-unwrapped discretionary data rather than rejected
+/// outright. Inside it, tag `0x51` repeats once per slot — unlike
+/// [`crate::find_tlv`], which only ever returns the *first* match for a
+/// tag, this walks the discretionary data's top level by hand to visit
+/// every `0x51` occurrence. Within each `0x51` block, subtag `0x48` ("Key
+/// Reference", 1 byte) names the slot this block describes, and subtag
+/// `0x43` ("Cryptographic parameters") carries, per the C4000 reference:
+/// byte 0 the algorithm identifier, byte 1 the key length, and bytes 2/3
+/// the private/public key *initialization status* (`0x00` = not
+/// initialized, `0x01` = generated, `0x81` = injected) — a slot's `0x51`
+/// block exists once its PKI container is allocated, which can be before a
+/// key is ever generated into it, so the algorithm byte alone doesn't say
+/// whether a key is actually present. A block whose private *and* public
+/// status are both `0x00` is skipped entirely — a container with no key
+/// loaded is exactly the same as no `0x51` block at all, to any caller —
+/// confirmed against a real (unprovisioned) C2300 unit whose five `0x51`
+/// blocks all read this way despite naming a plausible-looking algorithm
+/// byte. The C2300 family's `0x43` is one byte shorter than the C4000
+/// family's — the appended "Key Purpose" byte mentioned above — which
+/// doesn't affect any of the four bytes this reads, since both live well
+/// within the shorter length. (The Crescendo SDK's `PKIObject` class
+/// corroborates that one shared detail — `AlgorithmID` "Extracted from tag
+/// 0x43" and separate `PrivateKeyInitialized`/`PublicKeyInitialized`
+/// booleans:
+/// <https://docs.hidglobal.com/hid-crescendo-sdk-v1.2/API%20references/html/classCrescendoDLL_1_1PCSC_1_1PKIObject.html>.)
+///
+/// A `0x51` block missing subtag `0x48` or `0x43` entirely (as opposed to
+/// one that has `0x43` but reports no key loaded) is likewise skipped
+/// rather than aborting the whole parse — the same "keep whatever parsed
+/// cleanly" spirit as [`compact_tlv`]. Never `None` — an unparseable
+/// response, or one with no usable `0x51` block, is an empty `Vec`, same as
+/// a well-formed response simply naming no occupied slot.
+#[must_use]
+pub fn parse_hid_crescendo_slot_key_algorithms(data: &[u8]) -> Vec<(u8, u8)> {
+    let discretionary = crate::unwrap_data_object(data).unwrap_or(data);
+    hid_crescendo_slot_blocks(discretionary)
+        .into_iter()
+        .filter_map(|value| {
+            let key_ref = crate::find_tlv(value, 0x48).and_then(|v| v.first().copied())?;
+            let params = crate::find_tlv(value, 0x43)?;
+            let alg_id = params.first().copied()?;
+            // Bytes 2/3: private/public key initialization status. `0x00`
+            // on both means the slot's container exists but no key was
+            // ever generated or injected into it — see this function's doc.
+            let key_loaded =
+                params.get(2).is_some_and(|&b| b != 0) || params.get(3).is_some_and(|&b| b != 0);
+            key_loaded.then_some((key_ref, alg_id))
+        })
+        .collect()
+}
+
+/// Walk the (already tolerantly unwrapped) discretionary data of a HID
+/// Crescendo GET PIV PROPERTIES response and collect every top-level tag
+/// `0x51` "PKI Object Properties" block's raw value, in order. Shared by
+/// [`parse_hid_crescendo_slot_key_algorithms`] (which further filters by
+/// initialization status) and [`hid_crescendo_reports_slot`] (which only
+/// cares whether a slot's block exists at all, regardless of that status) —
+/// see the former's doc for the walk itself and the "keep whatever parsed
+/// cleanly" behavior on a malformed length.
+fn hid_crescendo_slot_blocks(discretionary: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < discretionary.len() {
+        let tag = discretionary[i];
+        let Some(len_buf) = discretionary.get(i + 1..) else {
+            break;
+        };
+        let Ok((len, header)) = crate::read_ber_len(len_buf) else {
+            break;
+        };
+        let vstart = i + 1 + header;
+        let Some(vend) = vstart.checked_add(len) else {
+            break;
+        };
+        let Some(value) = discretionary.get(vstart..vend) else {
+            break;
+        };
+        if tag == 0x51 {
+            out.push(value);
+        }
+        i = vend;
+    }
+    out
+}
+
+/// Whether a HID Crescendo GET PIV PROPERTIES response names `key_ref` in
+/// any top-level `0x51` block at all — regardless of that slot's
+/// initialization status (unlike
+/// [`parse_hid_crescendo_slot_key_algorithms`], which only returns slots
+/// with a key actually loaded, and would therefore give a false "no" for a
+/// management key block that exists but reports as uninitialized).
+///
+/// The one caller this exists for is
+/// `keyroost_transport::PivSession::authenticate_management`, checking
+/// `key_ref = `[`crate::KEY_REF_MANAGEMENT`]` (`0x9B`): most HID Crescendo
+/// units don't model the PIV management key as a real object through GET PIV
+/// PROPERTIES at all (a live C2300 unit answers `SW = 6D 00` to a standard
+/// PIV `GENERAL AUTHENTICATE` on `0x9B` outright), in which case
+/// `authenticate_management` falls back to the vendor ACA XAUTH admin-auth
+/// mechanism instead — see [`HID_CRESCENDO_ACA_AID`]'s doc. A minority are
+/// documented to expose it properly (HID's own Crescendo Manager
+/// documentation: <https://docs.hidglobal.com/crescendo-manager/CM/about-cm.htm>),
+/// in which case the standard mechanism is used unchanged, same as any other
+/// PIV applet.
+#[must_use]
+pub fn hid_crescendo_reports_slot(data: &[u8], key_ref: u8) -> bool {
+    let discretionary = crate::unwrap_data_object(data).unwrap_or(data);
+    hid_crescendo_slot_blocks(discretionary)
+        .into_iter()
+        .any(|value| crate::find_tlv(value, 0x48) == Some(&[key_ref]))
+}
+
+/// Decode a HID Crescendo GET PIV PROPERTIES response's own applet version
+/// (C2300 or C4000 alike — see [`parse_hid_crescendo_slot_key_algorithms`] for why
+/// the two families' responses are handled together, and for why the C4000
+/// API reference
+/// (<https://docs.hidglobal.com/crescendo/api/c4000/get-piv-properties.htm>)
+/// is this crate's source for tag `0x01`'s byte layout even on a C2300
+/// device, whose own reference
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/get-piv-properties.htm>)
+/// names the tag but never describes its contents) — top-level tag `0x01`,
+/// "Applet Version Block", read out of the same (tolerantly) unwrapped
+/// discretionary data [`parse_hid_crescendo_slot_key_algorithms`] reads tag `0x51`
+/// from ([`crate::find_tlv`] is enough here since `0x01` isn't repeated the
+/// way `0x51`/`0x50` are).
+///
+/// This is the only version source keyroost has for HID Crescendo: the
+/// whole product line doesn't answer Yubico's own GET VERSION extension
+/// (`INS 0xFD`) at all. It's still an *applet* version, though — HID's own
+/// documentation names the tag "Applet Version Block" — so
+/// `keyroost-transport`'s `PivSession` feeds it in as a stand-in for that
+/// missing Yubico reply, and [`crate::compat::resolve`]/
+/// [`crate::compat::resolve_quirks`] compare it on the applet version axis,
+/// not the separate firmware one.
+///
+/// Per the C4000 reference, the tag's value is 6 bytes: a family identifier
+/// (`0x21`) followed by a fixed 5-byte version (`04 00 00 XX YY`). The live
+/// C2300 unit this was confirmed against instead reports a 5-byte value,
+/// `21 03 00 03 06` — family `0x21` again, but only 4 version bytes — one
+/// more instance of the length mismatches [`parse_hid_crescendo_slot_key_algorithms`]'s
+/// doc catalogs between what the C4000 reference describes and what a real
+/// C2300 device actually sends. Rather than assume either family's exact
+/// length, this only ever treats the first byte as the family (to strip)
+/// and everything after it as "however many version-segment bytes happen to
+/// be there." This strips the leading family byte and returns just the
+/// version segment bytes (`[3, 0, 3, 6]` for that C2300 unit) — the family
+/// byte isn't itself a version component, and comparing it as one would
+/// misorder any two units that happen to share a version but not a family.
+///
+/// `None` when tag `0x01` is absent or its value is empty (no family byte
+/// to strip even) — never because the response failed to unwrap, since this
+/// tolerates a missing `0x53` wrapper the same way
+/// [`parse_hid_crescendo_slot_key_algorithms`] does.
+#[must_use]
+pub fn parse_hid_crescendo_version(data: &[u8]) -> Option<Vec<u8>> {
+    let discretionary = crate::unwrap_data_object(data).unwrap_or(data);
+    let (_family, version) = crate::find_tlv(discretionary, 0x01)?.split_first()?;
+    Some(version.to_vec())
+}
+
+/// Resolve a HID Crescendo GET PIV PROPERTIES algorithm-identifier byte
+/// (from [`parse_hid_crescendo_slot_key_algorithms`]) to a [`crate::KeyAlg`].
+///
+/// Deliberately not the same table as [`crate::KeyAlg::from_id`] (Yubico's
+/// GET METADATA encoding): both agree on RSA-2048/3072 and ECC P-256/P-384,
+/// but HID's own C4000 API reference documents RSA-4096 as `0x04` where
+/// Yubico's scheme uses `0x16` —
+/// <https://docs.hidglobal.com/crescendo/api/c4000/get-piv-properties.htm> —
+/// so this can't just defer to `from_id`. Once again the C4000 reference is
+/// doing double duty here: HID's C2300 reference
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/get-piv-properties.htm>)
+/// never lists algorithm-identifier values at all, so no C2300 hardware
+/// wide enough to cover every algorithm has been available to directly
+/// confirm the C2300 family uses this exact same byte table; it's assumed
+/// to, since both families share the same
+/// `PIVCryptographicMechanismIdentifier`-typed field in HID's own Crescendo
+/// SDK, and it's the only documented mapping keyroost has for either.
+#[must_use]
+pub fn hid_crescendo_algorithm_from_id(id: u8) -> Option<crate::KeyAlg> {
+    match id {
+        0x04 => Some(crate::KeyAlg::Rsa4096),
+        0x05 => Some(crate::KeyAlg::Rsa3072),
+        0x07 => Some(crate::KeyAlg::Rsa2048),
+        0x11 => Some(crate::KeyAlg::EccP256),
+        0x14 => Some(crate::KeyAlg::EccP384),
+        _ => None,
+    }
+}
+
 /// Decode a plain-text command response as a `String`: no TLV or other
 /// framing at all, just the raw bytes themselves, decoded here as lossy
 /// UTF-8. `None` when empty.
@@ -139,6 +628,48 @@ pub fn format_nitrokey_name(variant: &str) -> String {
 pub fn format_yubikey_name(version: &[u8]) -> Option<String> {
     let major = *version.first()?;
     Some(format!("Yubico YubiKey {major} Series"))
+}
+
+/// Strip a redundant trailing version off an applet name, when a separately
+/// retrieved `version` already covers it.
+///
+/// If `name` ends in (case-insensitively on the word `Applet`) the pattern
+/// `Applet\s+(\d+(?:\.\d+)*)` — the literal word "Applet", one or more
+/// whitespace characters, then a dotted run of decimal numbers reaching the
+/// very end of the string — and `version` starts with that same numeric
+/// sequence, the matched `Applet <version>` suffix (and any whitespace left
+/// dangling before it) is redundant with `version` and gets removed. `name`
+/// is returned unchanged in every other case: no trailing `Applet <version>`
+/// pattern, or `version` doesn't share its prefix.
+///
+/// HID Crescendo is the motivating case: its SELECT response's Application
+/// Label already embeds a truncated applet version (observed on a real
+/// C2300: `"HID Global ActivID Applet 3.0.3"`), which its GET PIV PROPERTIES
+/// response then reports more precisely (`3.0.3.6`) as this fingerprint's own
+/// `version` field — see `keyroost_transport::PivSession::applet_fingerprint`.
+/// Once that fuller version is available, repeating a truncated copy of it
+/// inside the name is redundant, so it's stripped: `"HID Global ActivID
+/// Applet 3.0.3"` + version `[3, 0, 3, 6]` becomes `"HID Global ActivID"`.
+#[must_use]
+pub fn strip_redundant_applet_version_suffix(name: &str, version: &[u8]) -> String {
+    let Some(idx) = name.to_ascii_lowercase().rfind("applet") else {
+        return name.to_string();
+    };
+    let after = &name[idx + "applet".len()..];
+    let digits = after.trim_start();
+    if digits.len() == after.len() {
+        // No whitespace between "Applet" and what follows — \s+ needs at
+        // least one.
+        return name.to_string();
+    }
+    let Some(name_version) = parse_dotted_version(digits) else {
+        return name.to_string();
+    };
+    if version.starts_with(name_version.as_slice()) {
+        name[..idx].trim_end().to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 /// A best-effort fingerprint of the PIV applet implementation behind a
@@ -1010,6 +1541,65 @@ mod tests {
         assert_eq!(format_yubikey_name(&[]), None);
     }
 
+    // --- redundant "Applet <version>" suffix stripping ----------------------
+
+    #[test]
+    fn strip_applet_suffix_when_version_starts_with_the_named_one() {
+        assert_eq!(
+            strip_redundant_applet_version_suffix("HID Global ActivID Applet 3.0.3", &[3, 0, 3, 6],),
+            "HID Global ActivID"
+        );
+    }
+
+    #[test]
+    fn strip_applet_suffix_is_case_insensitive_on_the_word_applet() {
+        assert_eq!(
+            strip_redundant_applet_version_suffix("Some Name APPLET 3.0.3", &[3, 0, 3]),
+            "Some Name"
+        );
+    }
+
+    #[test]
+    fn strip_applet_suffix_kept_when_version_does_not_match_prefix() {
+        // Same number of segments, but they diverge — not a prefix match.
+        assert_eq!(
+            strip_redundant_applet_version_suffix("HID Global ActivID Applet 3.0.3", &[3, 0, 4]),
+            "HID Global ActivID Applet 3.0.3"
+        );
+    }
+
+    #[test]
+    fn strip_applet_suffix_kept_when_no_applet_word_present() {
+        assert_eq!(
+            strip_redundant_applet_version_suffix("Yubico YubiKey 5 Series", &[5, 4, 3]),
+            "Yubico YubiKey 5 Series"
+        );
+    }
+
+    #[test]
+    fn strip_applet_suffix_kept_when_applet_has_no_trailing_version() {
+        assert_eq!(
+            strip_redundant_applet_version_suffix("Foo Applet", &[3, 0, 3]),
+            "Foo Applet"
+        );
+    }
+
+    #[test]
+    fn strip_applet_suffix_kept_when_trailing_text_is_not_purely_dotted_digits() {
+        assert_eq!(
+            strip_redundant_applet_version_suffix("Foo Applet 3.0.3-beta", &[3, 0, 3]),
+            "Foo Applet 3.0.3-beta"
+        );
+    }
+
+    #[test]
+    fn strip_applet_suffix_requires_whitespace_right_after_applet() {
+        assert_eq!(
+            strip_redundant_applet_version_suffix("Foo Applet3.0.3", &[3, 0, 3]),
+            "Foo Applet3.0.3"
+        );
+    }
+
     // --- dotted version string -> byte components --------------------------
 
     #[test]
@@ -1028,5 +1618,402 @@ mod tests {
                                                         // A component that doesn't fit in a u8 makes the whole thing
                                                         // unparsable rather than silently truncating it.
         assert_eq!(parse_dotted_version("3.999.0"), None);
+    }
+
+    // --- HID Crescendo C2300: GET PIV PROPERTIES ----------------------------
+
+    /// Build a synthetic `53 <len> [51 <len> 48 01 <key_ref> 43 04 <alg_id>
+    /// 00 01 01]*` response — one `0x51` block per `(key_ref, alg_id)` pair,
+    /// each with a 4-byte `0x43` (the C2300 length, one shorter than C4000's
+    /// documented 5).
+    fn c2300_properties_response(slots: &[(u8, u8)]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for &(key_ref, alg_id) in slots {
+            let block = [0x48, 0x01, key_ref, 0x43, 0x04, alg_id, 0x00, 0x01, 0x01];
+            inner.push(0x51);
+            inner.push(block.len() as u8);
+            inner.extend_from_slice(&block);
+        }
+        let mut resp = vec![0x53, inner.len() as u8];
+        resp.extend_from_slice(&inner);
+        resp
+    }
+
+    /// Same shape, but with C4000's documented 5-byte `0x43` (an extra
+    /// trailing "Key Purpose" byte C2300 doesn't have).
+    fn c4000_properties_response(slots: &[(u8, u8)]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for &(key_ref, alg_id) in slots {
+            let block = [
+                0x48, 0x01, key_ref, 0x43, 0x05, alg_id, 0x00, 0x01, 0x01, 0x00,
+            ];
+            inner.push(0x51);
+            inner.push(block.len() as u8);
+            inner.extend_from_slice(&block);
+        }
+        let mut resp = vec![0x53, inner.len() as u8];
+        resp.extend_from_slice(&inner);
+        resp
+    }
+
+    #[test]
+    fn c2300_properties_decodes_every_slot_from_one_response() {
+        let resp = c2300_properties_response(&[(0x9A, 0x07), (0x9C, 0x11), (0x9E, 0x14)]);
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&resp),
+            vec![(0x9A, 0x07), (0x9C, 0x11), (0x9E, 0x14)]
+        );
+    }
+
+    #[test]
+    fn c4000_shaped_properties_decode_the_same_way_as_c2300() {
+        // The one documented structural difference (`0x43` one byte longer)
+        // doesn't affect decoding, since only `0x43`'s first byte is read
+        // either way — the same function handles both families' replies.
+        let resp = c4000_properties_response(&[(0x9A, 0x07), (0x9D, 0x11)]);
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&resp),
+            vec![(0x9A, 0x07), (0x9D, 0x11)]
+        );
+    }
+
+    #[test]
+    fn c2300_properties_skips_a_block_missing_a_subtag_keeps_the_rest() {
+        // The first block has no `0x43` subtag at all (malformed/short) — it
+        // is skipped, not fatal to the other, well-formed block.
+        let bad_block = [0x48, 0x01, 0x9A];
+        let good_block = [0x48, 0x01, 0x9C, 0x43, 0x04, 0x14, 0x00, 0x01, 0x01];
+        let mut inner = vec![0x51, bad_block.len() as u8];
+        inner.extend_from_slice(&bad_block);
+        inner.push(0x51);
+        inner.push(good_block.len() as u8);
+        inner.extend_from_slice(&good_block);
+        let mut resp = vec![0x53, inner.len() as u8];
+        resp.extend_from_slice(&inner);
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&resp),
+            vec![(0x9C, 0x14)]
+        );
+    }
+
+    #[test]
+    fn c2300_properties_ignores_non_0x51_top_level_tags() {
+        // A `0x39`/`0x3A`/`0x50` neighbor tag, as HID's own documented
+        // response shape has, doesn't confuse the walk.
+        let mut inner = vec![0x39, 0x01, 0xAA];
+        let block = [0x48, 0x01, 0x9A, 0x43, 0x04, 0x07, 0x00, 0x01, 0x01];
+        inner.push(0x51);
+        inner.push(block.len() as u8);
+        inner.extend_from_slice(&block);
+        inner.extend_from_slice(&[0x45, 0x01, 0xBB]);
+        let mut resp = vec![0x53, inner.len() as u8];
+        resp.extend_from_slice(&inner);
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&resp),
+            vec![(0x9A, 0x07)]
+        );
+    }
+
+    #[test]
+    fn properties_tolerates_a_missing_0x53_wrapper() {
+        // HID's C4000 API reference describes the response's top-level tags
+        // directly, without ever mentioning a `0x53` wrapper the way the
+        // C2300 reference does — so an unwrapped reply is still decoded
+        // rather than rejected outright.
+        let block = [0x48, 0x01, 0x9A, 0x43, 0x04, 0x07, 0x00, 0x01, 0x01];
+        let mut resp = vec![0x51, block.len() as u8];
+        resp.extend_from_slice(&block);
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&resp),
+            vec![(0x9A, 0x07)]
+        );
+    }
+
+    #[test]
+    fn c2300_properties_empty_data_object_is_an_empty_vec() {
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&[0x53, 0x00]),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn properties_block_with_no_key_loaded_is_excluded() {
+        // Both private and public key initialization status are `0x00`
+        // ("not initialized") — the PKI container is allocated (the `0x51`
+        // block exists) but no key was ever generated or injected into it,
+        // so this slot must not be reported at all, regardless of the
+        // algorithm byte it happens to carry.
+        let block = [0x48, 0x01, 0x9A, 0x43, 0x04, 0x07, 0x20, 0x00, 0x00];
+        let mut inner = vec![0x51, block.len() as u8];
+        inner.extend_from_slice(&block);
+        let mut resp = vec![0x53, inner.len() as u8];
+        resp.extend_from_slice(&inner);
+        assert_eq!(parse_hid_crescendo_slot_key_algorithms(&resp), vec![]);
+    }
+
+    #[test]
+    fn properties_block_is_included_when_either_status_byte_is_nonzero() {
+        // Private generated, public still not initialized — a key exists.
+        let generated = [0x48, 0x01, 0x9A, 0x43, 0x04, 0x07, 0x20, 0x01, 0x00];
+        // Private not initialized, public injected — still a key.
+        let injected = [0x48, 0x01, 0x9C, 0x43, 0x04, 0x07, 0x20, 0x00, 0x81];
+        let mut inner = vec![0x51, generated.len() as u8];
+        inner.extend_from_slice(&generated);
+        inner.push(0x51);
+        inner.push(injected.len() as u8);
+        inner.extend_from_slice(&injected);
+        let mut resp = vec![0x53, inner.len() as u8];
+        resp.extend_from_slice(&inner);
+        assert_eq!(
+            parse_hid_crescendo_slot_key_algorithms(&resp),
+            vec![(0x9A, 0x07), (0x9C, 0x07)]
+        );
+    }
+
+    // --- HID Crescendo: does GET PIV PROPERTIES report a given slot at ------
+    // --- all, regardless of key-load status ----------------------------------
+
+    #[test]
+    fn reports_slot_true_for_a_present_block_even_with_no_key_loaded() {
+        // Both status bytes `0x00` — `parse_hid_crescendo_slot_key_algorithms`
+        // would exclude this block entirely, but `hid_crescendo_reports_slot`
+        // only cares that the block names key ref `0x9B` at all.
+        let resp = c2300_properties_response(&[]);
+        let block = [0x48, 0x01, 0x9B, 0x43, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let mut inner = vec![0x51, block.len() as u8];
+        inner.extend_from_slice(&block);
+        let mut resp2 = vec![0x53, inner.len() as u8];
+        resp2.extend_from_slice(&inner);
+        assert!(hid_crescendo_reports_slot(&resp2, 0x9B));
+        // Sanity: the empty-slots fixture above genuinely has no such block.
+        assert!(!hid_crescendo_reports_slot(&resp, 0x9B));
+    }
+
+    #[test]
+    fn reports_slot_false_when_key_ref_is_absent() {
+        let resp = c2300_properties_response(&[(0x9A, 0x07), (0x9C, 0x11)]);
+        assert!(hid_crescendo_reports_slot(&resp, 0x9A));
+        assert!(!hid_crescendo_reports_slot(&resp, 0x9B));
+    }
+
+    #[test]
+    fn reports_slot_works_on_c4000_shaped_responses_too() {
+        let resp = c4000_properties_response(&[(0x9B, 0x03)]);
+        assert!(hid_crescendo_reports_slot(&resp, 0x9B));
+        assert!(!hid_crescendo_reports_slot(&resp, 0x9A));
+    }
+
+    #[test]
+    fn reports_slot_tolerates_a_missing_0x53_wrapper() {
+        let block = [0x48, 0x01, 0x9B, 0x43, 0x04, 0x07, 0x00, 0x01, 0x01];
+        let mut resp = vec![0x51, block.len() as u8];
+        resp.extend_from_slice(&block);
+        assert!(hid_crescendo_reports_slot(&resp, 0x9B));
+    }
+
+    #[test]
+    fn reports_slot_empty_data_object_is_false() {
+        assert!(!hid_crescendo_reports_slot(&[0x53, 0x00], 0x9B));
+    }
+
+    // --- ACA (Access Control Applet) XAUTH byte layer -----------------------
+
+    #[test]
+    fn aca_aid_matches_hids_documented_select_example() {
+        // `00A4040007A0000000791000` from HID's own XAUTH documentation.
+        let apdu = crate::select_by_aid(&HID_CRESCENDO_ACA_AID);
+        assert_eq!(
+            apdu[..5],
+            [0x00, 0xA4, 0x04, 0x00, HID_CRESCENDO_ACA_AID.len() as u8]
+        );
+        assert_eq!(
+            &apdu[5..5 + HID_CRESCENDO_ACA_AID.len()],
+            &HID_CRESCENDO_ACA_AID
+        );
+    }
+
+    #[test]
+    fn xauth_key_alg_matches_get_challenge_response_length() {
+        assert_eq!(
+            hid_crescendo_xauth_key_alg(8),
+            Some(crate::MgmtAlg::TripleDes)
+        );
+        assert_eq!(
+            hid_crescendo_xauth_key_alg(16),
+            Some(crate::MgmtAlg::Aes128)
+        );
+        assert_eq!(hid_crescendo_xauth_key_alg(0), None);
+        assert_eq!(hid_crescendo_xauth_key_alg(24), None);
+    }
+
+    #[test]
+    fn external_authenticate_frames_a_tdes_cryptogram() {
+        // `0084000108 <8 bytes>` — Lc = 0x08 for an 8-byte TDES cryptogram.
+        let cryptogram = [0xE7, 0x90, 0x75, 0xFB, 0xE7, 0xCB, 0xE9, 0x2B];
+        let apdu = hid_crescendo_aca_external_authenticate(&cryptogram);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0x82, 0x00, 0x01, 0x08, 0xE7, 0x90, 0x75, 0xFB, 0xE7, 0xCB, 0xE9, 0x2B]
+        );
+    }
+
+    #[test]
+    fn external_authenticate_frames_an_aes128_cryptogram() {
+        // `0084000110 <16 bytes>` — Lc = 0x10 for a 16-byte AES-128 cryptogram.
+        let cryptogram = [0xAC; 16];
+        let apdu = hid_crescendo_aca_external_authenticate(&cryptogram);
+        assert_eq!(apdu[..5], [0x00, 0x82, 0x00, 0x01, 0x10]);
+        assert_eq!(&apdu[5..], &cryptogram);
+    }
+
+    #[test]
+    fn put_xauth_key_frames_a_tdes_key() {
+        let key = [0x11u8; 24];
+        let apdu = hid_crescendo_aca_put_xauth_key(crate::MgmtAlg::TripleDes, &key).unwrap();
+        // CLA D8 P1=01 P2=00 Lc=1D (29 bytes: RFU, alg, len-indicator, real
+        // len, 24-byte key, check-value len).
+        assert_eq!(apdu[..5], [0x00, 0xD8, 0x01, 0x00, 0x1D]);
+        assert_eq!(apdu[5], 0x00); // RFU
+        assert_eq!(apdu[6], 0x03); // TDES ECB, same as MgmtAlg::TripleDes.id()
+        assert_eq!(apdu[7], 0x19); // key data length indicator (24 + 1)
+        assert_eq!(apdu[8], 0x18); // real key length (24)
+        assert_eq!(&apdu[9..33], &key);
+        assert_eq!(apdu[33], 0x00); // key check value length
+        assert_eq!(apdu.len(), 5 + 0x1D);
+    }
+
+    #[test]
+    fn put_xauth_key_frames_an_aes128_key() {
+        let key = [0x22u8; 16];
+        let apdu = hid_crescendo_aca_put_xauth_key(crate::MgmtAlg::Aes128, &key).unwrap();
+        // Lc=15 (21 bytes: RFU, alg, len-indicator, real len, 16-byte key,
+        // check-value len).
+        assert_eq!(apdu[..5], [0x00, 0xD8, 0x01, 0x00, 0x15]);
+        assert_eq!(apdu[6], 0x08); // 128-AES ECB, same as MgmtAlg::Aes128.id()
+        assert_eq!(apdu[7], 0x11); // key data length indicator (16 + 1)
+        assert_eq!(apdu[8], 0x10); // real key length (16)
+        assert_eq!(&apdu[9..25], &key);
+        assert_eq!(apdu[25], 0x00);
+        assert_eq!(apdu.len(), 5 + 0x15);
+    }
+
+    #[test]
+    fn put_xauth_key_rejects_unsupported_algorithm_or_wrong_length() {
+        // ACA XAUTH only ever supports TDES/AES-128 — Aes192/Aes256 aren't
+        // valid here even at a plausible-looking length.
+        assert!(hid_crescendo_aca_put_xauth_key(crate::MgmtAlg::Aes192, &[0u8; 24]).is_none());
+        assert!(hid_crescendo_aca_put_xauth_key(crate::MgmtAlg::Aes256, &[0u8; 32]).is_none());
+        // Right algorithm, wrong key length.
+        assert!(hid_crescendo_aca_put_xauth_key(crate::MgmtAlg::TripleDes, &[0u8; 16]).is_none());
+        assert!(hid_crescendo_aca_put_xauth_key(crate::MgmtAlg::Aes128, &[0u8; 24]).is_none());
+    }
+
+    #[test]
+    fn put_xauth_key_remove_frames_the_documented_four_byte_short_form() {
+        // CLA D8 P1=01 P2=00 Lc=04, then RFU=0x00, algorithm=0x03 (TDES,
+        // unconditional — see this function's doc), length-indicator=0x00,
+        // real-key-length=0x00 — no key value, no check-value-length byte,
+        // matching HID's documented Lc=04h "remove" case exactly.
+        assert_eq!(
+            hid_crescendo_aca_put_xauth_key_remove(),
+            vec![0x00, 0xD8, 0x01, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn c2300_version_strips_the_leading_family_byte() {
+        // `21 03 00 03 06`: family `0x21`, version `3.0.3.6`.
+        let mut resp = vec![0x53, 0x07, 0x01, 0x05];
+        resp.extend_from_slice(&[0x21, 0x03, 0x00, 0x03, 0x06]);
+        assert_eq!(parse_hid_crescendo_version(&resp), Some(vec![3, 0, 3, 6]));
+    }
+
+    #[test]
+    fn c2300_version_family_byte_alone_is_an_empty_version() {
+        // A tag `0x01` value of just the family byte, no version segments at
+        // all — `split_first` still succeeds, leaving an empty remainder.
+        let resp = vec![0x53, 0x03, 0x01, 0x01, 0x21];
+        assert_eq!(parse_hid_crescendo_version(&resp), Some(vec![]));
+    }
+
+    #[test]
+    fn c2300_version_absent_is_none() {
+        assert_eq!(parse_hid_crescendo_version(&[0x53, 0x00]), None);
+    }
+
+    #[test]
+    fn c2300_version_empty_tag_value_is_none() {
+        // Tag `0x01` present but with a zero-length value — nothing to
+        // split a family byte off of.
+        let resp = vec![0x53, 0x02, 0x01, 0x00];
+        assert_eq!(parse_hid_crescendo_version(&resp), None);
+    }
+
+    #[test]
+    fn c2300_version_no_tag_0x01_and_no_0x53_wrapper_is_none() {
+        // Not a `0x53` object, so treated as already-unwrapped discretionary
+        // data (the tolerant fallback) — but that data has no top-level tag
+        // `0x01` either, so this is still `None`, just via a different path
+        // than a rejected unwrap.
+        assert_eq!(parse_hid_crescendo_version(&[0x70, 0x00]), None);
+    }
+
+    #[test]
+    fn c2300_properties_and_version_decode_a_real_device_response() {
+        // A live Crescendo C2300's actual GET PIV PROPERTIES reply (SW 90 00
+        // trimmed off) — 5 allocated PKI containers (9A/9C/9D/82/83, each
+        // `0x43` reading `07 20 00 00`: algorithm id 0x07, key length 0x20,
+        // but private/public init status both `0x00`), no PKI object for 9E
+        // at all, and applet version family `0x21`, version `3.0.3.6`. None
+        // of the five containers actually has a key loaded — confirmed by
+        // the same trace's certificate reads, every one of which came back
+        // empty (`53 00` / `6A 82`) — so this is the "container exists, key
+        // status says otherwise" case this function's doc describes, and
+        // the real reason it must return an empty list here despite five
+        // `0x51` blocks being present.
+        let resp: [u8; 188] = [
+            0x53, 0x81, 0xB9, 0x01, 0x05, 0x21, 0x03, 0x00, 0x03, 0x06, 0x39, 0x01, 0x15, 0x3A,
+            0x07, 0xA0, 0x00, 0x00, 0x00, 0x79, 0x10, 0x00, 0x3B, 0x00, 0x50, 0x0C, 0x47, 0x03,
+            0x5F, 0xC1, 0x02, 0x26, 0x01, 0x03, 0x42, 0x02, 0x68, 0x0B, 0x50, 0x0C, 0x47, 0x03,
+            0x5F, 0xC1, 0x09, 0x26, 0x01, 0x01, 0x42, 0x02, 0xF8, 0x00, 0x50, 0x0C, 0x47, 0x03,
+            0x5F, 0xC1, 0x0C, 0x26, 0x01, 0x01, 0x42, 0x02, 0x0A, 0x00, 0x51, 0x15, 0x47, 0x03,
+            0x5F, 0xC1, 0x05, 0x26, 0x01, 0x01, 0x48, 0x01, 0x9A, 0x43, 0x04, 0x07, 0x20, 0x00,
+            0x00, 0x42, 0x02, 0x75, 0x07, 0x51, 0x15, 0x47, 0x03, 0x5F, 0xC1, 0x0A, 0x26, 0x01,
+            0x01, 0x48, 0x01, 0x9C, 0x43, 0x04, 0x07, 0x20, 0x00, 0x00, 0x42, 0x02, 0x75, 0x07,
+            0x51, 0x15, 0x47, 0x03, 0x5F, 0xC1, 0x0B, 0x26, 0x01, 0x01, 0x48, 0x01, 0x9D, 0x43,
+            0x04, 0x07, 0x20, 0x00, 0x00, 0x42, 0x02, 0x75, 0x07, 0x51, 0x15, 0x47, 0x03, 0x5F,
+            0xC1, 0x0D, 0x26, 0x01, 0x01, 0x48, 0x01, 0x82, 0x43, 0x04, 0x07, 0x20, 0x00, 0x00,
+            0x42, 0x02, 0x75, 0x07, 0x51, 0x15, 0x47, 0x03, 0x5F, 0xC1, 0x0E, 0x26, 0x01, 0x01,
+            0x48, 0x01, 0x83, 0x43, 0x04, 0x07, 0x20, 0x00, 0x00, 0x42, 0x02, 0x75, 0x07, 0x45,
+            0x05, 0xD6, 0x88, 0x83, 0x80, 0x00,
+        ];
+        assert_eq!(parse_hid_crescendo_slot_key_algorithms(&resp), vec![]);
+        assert_eq!(parse_hid_crescendo_version(&resp), Some(vec![3, 0, 3, 6]));
+    }
+
+    #[test]
+    fn hid_crescendo_algorithm_from_id_covers_the_documented_table() {
+        assert_eq!(
+            hid_crescendo_algorithm_from_id(0x04),
+            Some(crate::KeyAlg::Rsa4096)
+        );
+        assert_eq!(
+            hid_crescendo_algorithm_from_id(0x05),
+            Some(crate::KeyAlg::Rsa3072)
+        );
+        assert_eq!(
+            hid_crescendo_algorithm_from_id(0x07),
+            Some(crate::KeyAlg::Rsa2048)
+        );
+        assert_eq!(
+            hid_crescendo_algorithm_from_id(0x11),
+            Some(crate::KeyAlg::EccP256)
+        );
+        assert_eq!(
+            hid_crescendo_algorithm_from_id(0x14),
+            Some(crate::KeyAlg::EccP384)
+        );
+        assert_eq!(hid_crescendo_algorithm_from_id(0xFF), None);
     }
 }

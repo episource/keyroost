@@ -1335,7 +1335,7 @@ impl OpenPgpKeyAlgSel {
 /// non-secret parameters (slot, algorithm, file path, subject, …) stay inline
 /// in the pane. The variant selects which secret fields the modal renders and
 /// which op Submit dispatches to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PivCredKind {
     ChangePin,
     ChangePuk,
@@ -1431,6 +1431,16 @@ impl PivCredKind {
                 | PivCredKind::NewChuid
         )
     }
+    /// True for a flow that already collects a PIN of its own further down in
+    /// the modal — `SelfSign`'s signing PIN, `SetRetries`' current PIN — for a
+    /// reason unrelated to management auth. PIV has exactly one application
+    /// PIN, so when [`PivState::use_pin`] is set on one of these,
+    /// `piv_modal_mgmt_field` doesn't render a second PIN box asking for the
+    /// same value twice: the dedicated field's PIN is reused directly for
+    /// management auth too, in [`App::piv_current_mgmt_auth`].
+    fn shares_pin_field(self) -> bool {
+        matches!(self, PivCredKind::SelfSign | PivCredKind::SetRetries)
+    }
 }
 
 /// Live state of the PIV credential-entry modal. Open iff `PivState::cred_modal`
@@ -1456,6 +1466,46 @@ impl PivCredModal {
             result: None,
             detail: None,
         }
+    }
+}
+
+/// How the management-key modal's "Use default management key" / "Use PIN"
+/// toggles are currently resolved — one canonical field instead of two
+/// independent `bool`s, so the two checkboxes can't drift into an
+/// inconsistent combination (each is a pure view onto, and setter of, this
+/// single value: checking one sets it to that variant; unchecking either
+/// always returns to [`Self::Manual`], never leaves the other variant
+/// standing from a stale toggle). [`Self::Manual`] — neither box ticked —
+/// means "read the typed hex from `PivState::mgmt_key_input`", the ordinary
+/// case this whole type exists to make unambiguous.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PivMgmtAuthMode {
+    /// Neither toggle is ticked: `PivState::mgmt_key_input` holds a typed
+    /// management-key hex string.
+    #[default]
+    Manual,
+    /// "Use default management key": the well-known factory default.
+    Default,
+    /// "Use PIN": `keyroost_piv::compat::PivExtension::PinManagementAuth`
+    /// instead of a management key — see [`App::piv_current_mgmt_auth`].
+    Pin,
+}
+
+/// What `PivState::mgmt_auth_mode` should become after one of the modal's
+/// two toggle checkboxes is clicked: `mode_if_checked` if the click checked
+/// it, `PivMgmtAuthMode::Manual` if the click unchecked it — unconditionally,
+/// regardless of which variant `mgmt_auth_mode` held before. Factored out of
+/// `App::piv_modal_mgmt_field` so this rule is unit-testable without an egui
+/// context; it's also the fix for a real reported bug where two independent
+/// `bool`s (one per checkbox), each resetting the other on check but not
+/// consulting it on uncheck, could leave `mgmt_auth_mode`-equivalent state
+/// stuck on a stale toggle after check-then-switch-then-uncheck.
+#[must_use]
+fn piv_mgmt_mode_after_toggle(checked: bool, mode_if_checked: PivMgmtAuthMode) -> PivMgmtAuthMode {
+    if checked {
+        mode_if_checked
+    } else {
+        PivMgmtAuthMode::Manual
     }
 }
 
@@ -1494,12 +1544,17 @@ struct PivState {
     /// True once a status has been fetched for the current selection.
     loaded: bool,
     /// Management key (hex) entered to authorize key-gen / cert-import /
-    /// set-retries / management-key change. Cleared after use.
+    /// set-retries / management-key change. Cleared after use. Doubles as
+    /// the PIN input when [`Self::mgmt_auth_mode`] is
+    /// [`PivMgmtAuthMode::Pin`] and the flow has no dedicated PIN field of
+    /// its own (see [`piv_cred_kind_shares_pin_field`]) — the same field,
+    /// its label and hint swapped, rather than a second box. Only actually
+    /// read when [`Self::mgmt_auth_mode`] is [`PivMgmtAuthMode::Manual`] or
+    /// [`PivMgmtAuthMode::Pin`] — see that type's doc.
     mgmt_key_input: String,
-    /// "Use default management key" toggle in the modal: when set, the standard
-    /// factory-default key is used instead of `mgmt_key_input` (the common case,
-    /// since most users never rotate the PIV management key). Reset per modal.
-    use_default_mgmt: bool,
+    /// The management-key modal's "Use default management key" / "Use PIN"
+    /// toggle state — see [`PivMgmtAuthMode`]. Reset per modal.
+    mgmt_auth_mode: PivMgmtAuthMode,
     /// Change-PIN old/new/confirm entries. Cleared after use.
     pin_old: String,
     pin_new: String,
@@ -1591,7 +1646,7 @@ struct PivState {
 impl Drop for PivState {
     fn drop(&mut self) {
         wipe(&mut self.mgmt_key_input);
-        self.use_default_mgmt = false;
+        self.mgmt_auth_mode = PivMgmtAuthMode::default();
         wipe(&mut self.pin_old);
         wipe(&mut self.pin_new);
         wipe(&mut self.pin_confirm);
@@ -1616,7 +1671,7 @@ impl Default for PivState {
             notice: None,
             loaded: false,
             mgmt_key_input: String::new(),
-            use_default_mgmt: false,
+            mgmt_auth_mode: PivMgmtAuthMode::default(),
             pin_old: String::new(),
             pin_new: String::new(),
             pin_confirm: String::new(),
@@ -1721,34 +1776,58 @@ impl PivKeyAlgSel {
     ];
 }
 
-/// PIV management-key algorithm selector (for rotation).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// PIV management-key algorithm selector (for rotation). [`Self::Delete`] is
+/// not an algorithm at all — HID Crescendo's ACA-only "management key" (see
+/// [`keyroost_transport::CurrentMgmtAuth`]'s doc) can be deleted outright
+/// instead of replaced, unlike a standard PIV management key, which is
+/// mandatory; [`piv_mgmtalg_combo`] only ever offers it alongside
+/// [`Self::HID_CRESCENDO_OPTIONS`], never in [`Self::ALL`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PivMgmtAlgSel {
     #[default]
     Aes192,
     Aes128,
     Aes256,
     TripleDes,
+    Delete,
 }
 
 impl PivMgmtAlgSel {
-    fn to_alg(self) -> keyroost_piv::MgmtAlg {
+    /// `None` for [`Self::Delete`] — see this type's doc.
+    fn to_alg(self) -> Option<keyroost_piv::MgmtAlg> {
         use keyroost_piv::MgmtAlg::*;
         match self {
-            PivMgmtAlgSel::Aes192 => Aes192,
-            PivMgmtAlgSel::Aes128 => Aes128,
-            PivMgmtAlgSel::Aes256 => Aes256,
-            PivMgmtAlgSel::TripleDes => TripleDes,
+            PivMgmtAlgSel::Aes192 => Some(Aes192),
+            PivMgmtAlgSel::Aes128 => Some(Aes128),
+            PivMgmtAlgSel::Aes256 => Some(Aes256),
+            PivMgmtAlgSel::TripleDes => Some(TripleDes),
+            PivMgmtAlgSel::Delete => None,
         }
     }
     fn label(self) -> &'static str {
-        self.to_alg().label()
+        match self {
+            PivMgmtAlgSel::Delete => "Delete",
+            other => other
+                .to_alg()
+                .expect("every non-Delete variant has an algorithm")
+                .label(),
+        }
     }
+    /// Every algorithm a standard PIV device's management key can rotate to.
     const ALL: [PivMgmtAlgSel; 4] = [
         PivMgmtAlgSel::Aes192,
         PivMgmtAlgSel::Aes128,
         PivMgmtAlgSel::Aes256,
         PivMgmtAlgSel::TripleDes,
+    ];
+    /// The combo's options for a HID Crescendo device: only the two
+    /// algorithms ACA XAUTH actually supports
+    /// ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key`]'s own
+    /// restriction), plus [`Self::Delete`] at the end.
+    const HID_CRESCENDO_OPTIONS: [PivMgmtAlgSel; 3] = [
+        PivMgmtAlgSel::TripleDes,
+        PivMgmtAlgSel::Aes128,
+        PivMgmtAlgSel::Delete,
     ];
 }
 
@@ -5667,7 +5746,8 @@ impl App {
 
     /// The admin PIN (PW3) the modal's flows send: the typed `admin_pin`, or the
     /// well-known factory default when "Use default admin PIN (PW3)" is ticked.
-    /// Mirrors the PIV `use_default_mgmt` convenience. Does not mutate state.
+    /// Mirrors the PIV `PivMgmtAuthMode::Default` convenience. Does not
+    /// mutate state.
     fn openpgp_admin_pin_value(&self) -> String {
         if self.openpgp.use_default_admin {
             OPENPGP_DEFAULT_ADMIN_PIN.to_string()
@@ -6018,6 +6098,33 @@ fn piv_default_mgmt_key_hex(is_token2: bool) -> &'static str {
         "865362865362865362865362865362865362865362865362"
     } else {
         "010203040506070801020304050607080102030405060708"
+    }
+}
+
+/// How the user authorized a PIV management operation — the standard
+/// management key (typed or the well-known default), or a PIN for
+/// `keyroost_piv::compat::PivExtension::PinManagementAuth`. Produced by
+/// `App::piv_current_mgmt_auth`, consumed by `piv_authenticate`.
+enum PivMgmtAuth {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Pin(zeroize::Zeroizing<String>),
+}
+
+/// Unlock PIV management on an already-open session per `auth`: the standard
+/// GET METADATA/GENERAL AUTHENTICATE round for `PivMgmtAuth::Key`, or
+/// `PivSession::authenticate_management_via_pin` for `PivMgmtAuth::Pin`. The
+/// single call site every management-gated PIV job in this module runs
+/// through, so the two authorization paths stay in sync.
+fn piv_authenticate(
+    s: &mut keyroost_transport::PivSession,
+    auth: &PivMgmtAuth,
+) -> Result<(), TransportError> {
+    match auth {
+        PivMgmtAuth::Key(key) => {
+            let alg = s.resolve_management_key_algorithm(key.len())?;
+            s.authenticate_management(alg, key)
+        }
+        PivMgmtAuth::Pin(pin) => s.authenticate_management_via_pin(pin.as_bytes()),
     }
 }
 
@@ -6709,7 +6816,7 @@ impl App {
     /// ticked, otherwise the hex they typed. Decoding errors are surfaced the
     /// same way the inline field's were.
     fn piv_current_mgmt_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
-        if self.piv.use_default_mgmt {
+        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
             let is_token2 = self
                 .selected_device()
                 .map(|d| d.vendor.eq_ignore_ascii_case("token2"))
@@ -6720,12 +6827,37 @@ impl App {
         }
     }
 
+    /// Resolve how the user authorized `kind`'s management operation: the
+    /// standard management key (default or typed — [`Self::piv_current_mgmt_key`])
+    /// or, with "Use PIN" ticked, a PIN for
+    /// `PivSession::authenticate_management_via_pin`. The PIN itself comes
+    /// from `mgmt_key_input` normally, or — for a flow with a dedicated PIN
+    /// field of its own (`PivCredKind::shares_pin_field`) — from that field
+    /// directly, exactly the sequence [`piv_authenticate`] would run had the
+    /// same PIN been typed into the management-key field instead: PIV has
+    /// only one application PIN, so there's nothing to gain by asking twice.
+    fn piv_current_mgmt_auth(&self, kind: PivCredKind) -> Result<PivMgmtAuth, String> {
+        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+            let pin = if kind.shares_pin_field() {
+                match kind {
+                    PivCredKind::SelfSign => &self.piv.sign_pin,
+                    PivCredKind::SetRetries => &self.piv.retries_pin_auth,
+                    _ => unreachable!("shares_pin_field() covers exactly these two kinds"),
+                }
+            } else {
+                &self.piv.mgmt_key_input
+            };
+            return Ok(PivMgmtAuth::Pin(zeroize::Zeroizing::new(pin.clone())));
+        }
+        self.piv_current_mgmt_key().map(PivMgmtAuth::Key)
+    }
+
     fn piv_set_retries(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::SetRetries) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6737,8 +6869,7 @@ impl App {
         self.spawn_job("Setting PIV retry counts\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 s.verify_pin(pin.as_bytes())?;
                 s.set_pin_retries(pin_tries, puk_tries)?;
                 s.status()
@@ -6760,8 +6891,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6778,8 +6909,7 @@ impl App {
                 TransportError,
             > {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
                 Ok((pubkey, s.status()?))
             })();
@@ -6848,8 +6978,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::ImportCert) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6866,8 +6996,7 @@ impl App {
                 let der = cert_bytes_to_der(&bytes)
                     .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 s.import_certificate(slot, &der)?;
                 s.status()
             })();
@@ -6887,8 +7016,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::DeleteCert) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6899,8 +7028,7 @@ impl App {
         self.spawn_job("Deleting certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 s.clear_certificate(slot)?;
                 s.status()
             })();
@@ -6937,8 +7065,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::NewChuid) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6963,8 +7091,7 @@ impl App {
         self.spawn_job("Writing a new CHUID\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 s.new_chuid(&guid, &expiration)?;
                 s.status()
             })();
@@ -6985,8 +7112,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::DeleteKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6997,8 +7124,7 @@ impl App {
         self.spawn_job("Deleting key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 s.delete_key(slot)?;
                 s.status()
             })();
@@ -7020,8 +7146,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::MoveKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -7036,8 +7162,7 @@ impl App {
         self.spawn_job("Moving key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
+                piv_authenticate(&mut s, &mgmt)?;
                 s.move_key(src, dest)?;
                 s.status()
             })();
@@ -7237,8 +7362,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::SelfSign) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -7260,8 +7385,7 @@ impl App {
             move || {
                 let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
-                    let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                    s.authenticate_management(mgmt_alg, &mgmt)?;
+                    piv_authenticate(&mut s, &mgmt)?;
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
                     }
@@ -7390,47 +7514,72 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let old = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let old = match self.piv_current_mgmt_auth(PivCredKind::ChangeMgmtKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
             }
         };
-        let new = match piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input) {
-            Ok(b) => b,
-            Err(e) => {
-                self.piv.error = Some(e);
-                return;
+        // "Delete" (HID Crescendo only — see `PivMgmtAlgSel`'s doc) needs no
+        // new-key input at all: an empty key goes to the card instead,
+        // deleting XAUTH key 1 rather than replacing it. Every other
+        // selection reads/validates the typed hex as usual.
+        let new = match self.piv.new_mgmt_alg.to_alg() {
+            Some(new_alg) => {
+                let new = match piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.piv.error = Some(e);
+                        return;
+                    }
+                };
+                if new.len() != new_alg.key_len() {
+                    self.piv.error = Some(format!(
+                        "new management key is {} bytes; {} needs {}",
+                        new.len(),
+                        new_alg.label(),
+                        new_alg.key_len()
+                    ));
+                    return;
+                }
+                Some((new_alg, new))
             }
+            None => None,
         };
-        let new_alg = self.piv.new_mgmt_alg.to_alg();
-        if new.len() != new_alg.key_len() {
-            self.piv.error = Some(format!(
-                "new management key is {} bytes; {} needs {}",
-                new.len(),
-                new_alg.label(),
-                new_alg.key_len()
-            ));
-            return;
-        }
         self.piv.notice = None;
         self.spawn_job("Changing management key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let cur_alg = s.resolve_management_key_algorithm(old.len())?;
-                s.authenticate_management(cur_alg, &old)?;
-                s.set_management_key(new_alg, &new, false)?;
+                piv_authenticate(&mut s, &old)?;
+                // A HID Crescendo unit whose management key isn't a real PIV
+                // object runs its own self-contained unlock right before PUT
+                // XAUTH KEY (see `set_management_key`'s doc) rather than
+                // relying on the `piv_authenticate` call above still being in
+                // force — `current` carries the same credential again for
+                // that path; every other device ignores it.
+                let current = match &old {
+                    PivMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                    PivMgmtAuth::Pin(pin) => {
+                        keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+                    }
+                };
+                match &new {
+                    Some((new_alg, new_key)) => {
+                        s.set_management_key(current, *new_alg, new_key, false)?;
+                    }
+                    None => s.delete_management_key_hid_crescendo(current)?,
+                }
                 s.status()
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 wipe(&mut app.piv.new_mgmt_key_input);
-                Self::apply_piv_write(
-                    app,
-                    result,
-                    format!("Management key changed to {}.", new_alg.label()),
-                );
+                let notice = match &new {
+                    Some((new_alg, _)) => format!("Management key changed to {}.", new_alg.label()),
+                    None => "Management key deleted.".to_string(),
+                };
+                Self::apply_piv_write(app, result, notice);
                 Self::apply_piv_cred_result(app);
             })
         });
@@ -8116,12 +8265,38 @@ fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T
         });
 }
 
+/// Snap `*sel` to `options[0]` if it isn't already one of `options` — used
+/// so [`piv_mgmtalg_combo`] never shows a selection it isn't actually
+/// offering (e.g. `*sel` left on an algorithm the previously-selected device
+/// offered but this one doesn't). Factored out of that function so the
+/// clamp rule is unit-testable without an egui context. No-op on an empty
+/// `options` — there's nothing to snap to.
+fn piv_mgmtalg_clamp(sel: &mut PivMgmtAlgSel, options: &[PivMgmtAlgSel]) {
+    if let Some(&first) = options.first() {
+        if !options.contains(sel) {
+            *sel = first;
+        }
+    }
+}
+
 /// A PIV management-key-algorithm picker combo.
-fn piv_mgmtalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivMgmtAlgSel) {
+/// `options` is the offered set — [`PivMgmtAlgSel::ALL`] for a standard
+/// device, [`PivMgmtAlgSel::HID_CRESCENDO_OPTIONS`] for a HID Crescendo one
+/// (see that type's doc). If `*sel` isn't among `options` (e.g. it was left
+/// on an algorithm the previously-selected device offered but this one
+/// doesn't), it snaps to `options[0]` before drawing — see
+/// [`piv_mgmtalg_clamp`].
+fn piv_mgmtalg_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut PivMgmtAlgSel,
+    options: &[PivMgmtAlgSel],
+) {
+    piv_mgmtalg_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
-            for opt in PivMgmtAlgSel::ALL {
+            for &opt in options {
                 ui.selectable_value(sel, opt, opt.label());
             }
         });
@@ -12571,37 +12746,100 @@ impl App {
     /// default management key" toggle (the common case — most users never rotate
     /// the well-known factory default) and, when it's off, the hex entry field.
     /// When the toggle is on the field is hidden and the op reads the default via
-    /// `piv_current_mgmt_key`.
+    /// `piv_current_mgmt_auth`.
+    ///
+    /// When this device's fingerprint resolves
+    /// `keyroost_piv::compat::PivExtension::PinManagementAuth` to `Supported`,
+    /// a second "Use PIN" toggle appears alongside it. Both toggles are pure
+    /// views onto — and setters of — the single `PivState::mgmt_auth_mode`
+    /// (see that type's doc for why): checking either sets the mode to that
+    /// variant; unchecking either always returns to `PivMgmtAuthMode::Manual`,
+    /// never leaves the other toggle's variant standing. With "Use PIN" on,
+    /// the hex field either turns into a PIN entry (label "PIN", hint "PIN")
+    /// — or, for a flow with a dedicated PIN field of its own
+    /// (`PivCredKind::shares_pin_field`), disappears entirely, since that
+    /// field's PIN is reused for management auth too (there is only one PIV
+    /// application PIN).
     fn piv_modal_mgmt_field(&mut self, ui: &mut egui::Ui, p: &Palette, kind: PivCredKind) {
         if !kind.needs_mgmt_key() {
             return;
         }
-        ui.checkbox(&mut self.piv.use_default_mgmt, "Use default management key");
-        if !self.piv.use_default_mgmt {
-            // Match the New CHUID dialog's GUID row so the two fields line
-            // up — same field width *and* same label-column width ("GUID"
-            // is short enough to fit the shared 96px label box, but
-            // "Management key" isn't, so both rows need the wider,
-            // measured column or their inputs start at different x).
-            // Every other flow keeps the narrower defaults.
-            let (label_w, width) = if kind == PivCredKind::NewChuid {
+        let pin_auth_available = {
+            let (fp, ver, fw) = self.piv.status.as_ref().map_or(
                 (
-                    chuid_label_width(ui.ctx()),
-                    chuid_guid_field_width(ui.ctx()),
-                )
-            } else {
-                (96.0, 300.0)
-            };
-            secret_field(
-                ui,
-                p,
-                "Management key",
-                &mut self.piv.mgmt_key_input,
-                "hex (48/32/64 chars)",
-                label_w,
-                width,
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
             );
+            keyroost_piv::compat::resolve(
+                keyroost_piv::compat::PivExtension::PinManagementAuth,
+                fp,
+                ver,
+                fw,
+            ) == keyroost_piv::compat::FeatureGate::Supported
+        };
+        if !pin_auth_available && self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+            // Keeps state sane if a device switch mid-modal drops support out
+            // from under an already-checked toggle.
+            self.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
         }
+        ui.horizontal(|ui| {
+            let mut is_default = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default;
+            if ui
+                .checkbox(&mut is_default, "Use default management key")
+                .changed()
+            {
+                self.piv.mgmt_auth_mode =
+                    piv_mgmt_mode_after_toggle(is_default, PivMgmtAuthMode::Default);
+            }
+            let mut is_pin = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin;
+            if pin_auth_available && ui.checkbox(&mut is_pin, "Use PIN").changed() {
+                self.piv.mgmt_auth_mode = piv_mgmt_mode_after_toggle(is_pin, PivMgmtAuthMode::Pin);
+            }
+        });
+        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
+            return;
+        }
+        let use_pin = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin;
+        if use_pin && kind.shares_pin_field() {
+            return;
+        }
+        // Match the New CHUID dialog's GUID row so the two fields line
+        // up — same field width *and* same label-column width ("GUID"
+        // is short enough to fit the shared 96px label box, but
+        // "Management key" isn't, so both rows need the wider,
+        // measured column or their inputs start at different x).
+        // Every other flow keeps the narrower defaults.
+        let (label_w, width) = if kind == PivCredKind::NewChuid {
+            (
+                chuid_label_width(ui.ctx()),
+                chuid_guid_field_width(ui.ctx()),
+            )
+        } else {
+            (96.0, 300.0)
+        };
+        let (label, hint) = if use_pin {
+            ("PIN", "PIN")
+        } else {
+            ("Management key", "hex (48/32/64 chars)")
+        };
+        secret_field(
+            ui,
+            p,
+            label,
+            &mut self.piv.mgmt_key_input,
+            hint,
+            label_w,
+            width,
+        );
     }
 
     /// PIV credential-entry modal: drives the PIN/PUK flows (Change PIN / Change
@@ -12810,8 +13048,13 @@ impl App {
                             card_note(
                                 ui,
                                 p,
-                                "Management key authorizes the import; the PIN authorizes \
-                                 the on-card signature.",
+                                if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                    "The PIN unlocks management and authorizes the \
+                                     on-card signature."
+                                } else {
+                                    "Management key authorizes the import; the PIN authorizes \
+                                     the on-card signature."
+                                },
                             );
                         }
                         PivCredKind::RequestCsr => {
@@ -12845,22 +13088,61 @@ impl App {
                             card_note(
                                 ui,
                                 p,
-                                "Resets PIN and PUK to factory defaults; needs the \
-                                 management key and the current PIN.",
+                                if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                    "Resets PIN and PUK to factory defaults; the PIN both \
+                                     unlocks management and authorizes the reset."
+                                } else {
+                                    "Resets PIN and PUK to factory defaults; needs the \
+                                     management key and the current PIN."
+                                },
                             );
                         }
                         PivCredKind::ChangeMgmtKey => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            secret_field(
-                                ui,
-                                p,
-                                "New key",
-                                &mut self.piv.new_mgmt_key_input,
-                                "hex (48/32/64 chars)",
-                                96.0,
-                                300.0,
-                            );
-                            card_note(ui, p, "Enter the current key, then the new key.");
+                            match self.piv.new_mgmt_alg.to_alg() {
+                                Some(alg) => {
+                                    let new_key_hint = format!("hex ({} chars)", alg.key_len() * 2);
+                                    secret_field(
+                                        ui,
+                                        p,
+                                        "New key",
+                                        &mut self.piv.new_mgmt_key_input,
+                                        &new_key_hint,
+                                        96.0,
+                                        300.0,
+                                    );
+                                    card_note(
+                                        ui,
+                                        p,
+                                        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                            "Enter the PIN, then the new key."
+                                        } else {
+                                            "Enter the current key, then the new key."
+                                        },
+                                    );
+                                }
+                                // "Delete" (HID Crescendo only, see
+                                // `PivMgmtAlgSel`): no new-key field at all —
+                                // an empty key is sent, deleting XAUTH key 1
+                                // instead of replacing it.
+                                None => {
+                                    card_note(
+                                        ui,
+                                        p,
+                                        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                            "Enter the PIN to unlock. This deletes the \
+                                             management key rather than replacing it, \
+                                             leaving the PIN as the only remaining \
+                                             authentication mechanism."
+                                        } else {
+                                            "Enter the current key to unlock. This deletes \
+                                             the management key rather than replacing it, \
+                                             leaving the PIN as the only remaining \
+                                             authentication mechanism."
+                                        },
+                                    );
+                                }
+                            }
                         }
                         PivCredKind::DeleteCert => {
                             let slot = self.piv.selected_slot.label();
@@ -13106,7 +13388,7 @@ impl App {
         wipe(&mut self.piv.new_mgmt_key_input);
         wipe(&mut self.piv.sign_pin);
         wipe(&mut self.piv.retries_pin_auth);
-        self.piv.use_default_mgmt = false;
+        self.piv.mgmt_auth_mode = PivMgmtAuthMode::default();
         self.piv.move_dest = None;
         self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
         self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
@@ -14130,7 +14412,26 @@ impl App {
                         open_change_mgmt = true;
                     }
                     ui.add_space(8.0);
-                    piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
+                    // HID Crescendo's ACA-only management key only ever
+                    // takes TDES/AES-128, plus the HID-specific "Delete"
+                    // choice — see `PivMgmtAlgSel`'s doc.
+                    let is_hid_crescendo = self.piv.status.as_ref().is_some_and(|s| {
+                        matches!(
+                            s.applet_fingerprint,
+                            keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
+                        )
+                    });
+                    let mgmt_alg_options = if is_hid_crescendo {
+                        &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS[..]
+                    } else {
+                        &PivMgmtAlgSel::ALL[..]
+                    };
+                    piv_mgmtalg_combo(
+                        ui,
+                        "piv-new-mgmt-alg",
+                        &mut self.piv.new_mgmt_alg,
+                        mgmt_alg_options,
+                    );
                 });
             });
 
@@ -14259,7 +14560,7 @@ impl App {
         };
         // Move key / Delete key are Yubico extensions (MOVE/DELETE KEY), not
         // SP 800-73-4. `keyroost_piv::compat` resolves a per-fingerprint
-        // white/blacklist against the applet's reported version into a
+        // known-support table against the applet's reported version into a
         // three-way gate: enable, enable-but-flag (support unverified on this
         // device), or dim. An unsupported card refuses the APDU on its own —
         // there is no transport-side version gate any more. Clearing a
@@ -14283,7 +14584,7 @@ impl App {
         let delete_key_gate =
             keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
         // Explanations for the non-standard slot operations when the
-        // fingerprint white/blacklist can't clear them — built from the shared
+        // fingerprint known-support table can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
         // same thing: the extension's `requirement()` sentence, then a state
         // suffix. Each string is a hover: on the \u{26a0} marker by the row's
@@ -14674,7 +14975,7 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match move_key_gate {
-                        // Blacklisted on this device wins over "no key": the
+                        // Known-unsupported on this device wins over "no key": the
                         // firmware reason is the one the user has to resolve
                         // first, and it holds whether or not the slot is empty.
                         FeatureGate::Unsupported => {
@@ -17264,6 +17565,59 @@ mod tests {
         assert_eq!(app.piv.gen_touch_policy, keyroost_piv::TouchPolicy::Default);
     }
 
+    /// `PivMgmtAlgSel::Delete` maps to no algorithm at all — the "delete the
+    /// management key outright" choice HID Crescendo's own combo offers,
+    /// distinct from every real `MgmtAlg`.
+    #[test]
+    fn piv_mgmt_alg_sel_delete_has_no_algorithm() {
+        assert_eq!(PivMgmtAlgSel::Delete.to_alg(), None);
+        assert_eq!(PivMgmtAlgSel::Delete.label(), "Delete");
+        for alg in [
+            PivMgmtAlgSel::Aes192,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Aes256,
+            PivMgmtAlgSel::TripleDes,
+        ] {
+            assert!(alg.to_alg().is_some());
+        }
+    }
+
+    /// The HID Crescendo combo offers exactly TDES/AES-128 (the only two
+    /// algorithms ACA XAUTH supports) plus `Delete` at the end; the standard
+    /// combo offers every algorithm and never `Delete`.
+    #[test]
+    fn hid_crescendo_mgmt_alg_options_are_tdes_aes128_then_delete() {
+        assert_eq!(
+            PivMgmtAlgSel::HID_CRESCENDO_OPTIONS,
+            [
+                PivMgmtAlgSel::TripleDes,
+                PivMgmtAlgSel::Aes128,
+                PivMgmtAlgSel::Delete,
+            ]
+        );
+        assert!(!PivMgmtAlgSel::ALL.contains(&PivMgmtAlgSel::Delete));
+    }
+
+    /// `piv_mgmtalg_clamp` snaps a selection the given options don't offer
+    /// back to the first option, and leaves an already-valid selection
+    /// alone.
+    #[test]
+    fn piv_mgmtalg_clamp_snaps_an_unoffered_selection_to_the_first_option() {
+        let mut sel = PivMgmtAlgSel::Aes256;
+        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS);
+        assert_eq!(sel, PivMgmtAlgSel::TripleDes);
+
+        // Already valid: left alone.
+        let mut sel = PivMgmtAlgSel::Delete;
+        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS);
+        assert_eq!(sel, PivMgmtAlgSel::Delete);
+
+        // Switching back to the standard list clamps `Delete` away too.
+        let mut sel = PivMgmtAlgSel::Delete;
+        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::ALL);
+        assert_eq!(sel, PivMgmtAlgSel::Aes192);
+    }
+
     /// Each flow maps to its own title, busy caption, and success text.
     #[test]
     fn piv_cred_kind_strings_are_distinct() {
@@ -17544,7 +17898,7 @@ mod tests {
         let mut app = App::default();
         // Default toggle on, hex field empty → resolves to the non-Token2 default
         // (no device selected ⇒ not Token2).
-        app.piv.use_default_mgmt = true;
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
         app.piv.mgmt_key_input.clear();
         let key = app.piv_current_mgmt_key().expect("default fills");
         assert_eq!(
@@ -17553,7 +17907,7 @@ mod tests {
         );
 
         // Toggle off → uses the typed hex.
-        app.piv.use_default_mgmt = false;
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
         app.piv.mgmt_key_input = "aabbccddeeff00112233445566778899aabbccddeeff0011".into();
         let typed = app.piv_current_mgmt_key().expect("valid hex");
         assert_eq!(typed.len(), 24);
@@ -17562,6 +17916,145 @@ mod tests {
         // Toggle off with bad hex → error surfaces.
         app.piv.mgmt_key_input = "nothex".into();
         assert!(app.piv_current_mgmt_key().is_err());
+    }
+
+    /// With "Use PIN" ticked, `piv_current_mgmt_auth` yields a `Pin`, sourced
+    /// from `mgmt_key_input` for a flow with no PIN field of its own — the
+    /// same field the checkbox turns from "Management key" into "PIN".
+    #[test]
+    fn piv_current_mgmt_auth_use_pin_reads_mgmt_key_input_by_default() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Pin;
+        app.piv.mgmt_key_input = "123456".into();
+        match app.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
+            Ok(PivMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "123456"),
+            other => panic!("expected Pin(\"123456\"), got {}", other.is_ok()),
+        }
+    }
+
+    /// For `SelfSign`/`SetRetries` — flows that already collect a PIN of
+    /// their own — "Use PIN" reuses *that* field instead of
+    /// `mgmt_key_input`: PIV has exactly one application PIN, so the two
+    /// boxes would otherwise ask for the same value twice.
+    #[test]
+    fn piv_current_mgmt_auth_use_pin_shares_the_dedicated_pin_field() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Pin;
+        // Left blank/stale on purpose — must not be what gets read.
+        app.piv.mgmt_key_input = "should-not-be-used".into();
+
+        app.piv.sign_pin = "111111".into();
+        match app.piv_current_mgmt_auth(PivCredKind::SelfSign) {
+            Ok(PivMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "111111"),
+            other => panic!("expected Pin(\"111111\"), got {}", other.is_ok()),
+        }
+
+        app.piv.retries_pin_auth = "222222".into();
+        match app.piv_current_mgmt_auth(PivCredKind::SetRetries) {
+            Ok(PivMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "222222"),
+            other => panic!("expected Pin(\"222222\"), got {}", other.is_ok()),
+        }
+    }
+
+    /// With "Use PIN" off, `piv_current_mgmt_auth` falls through to the
+    /// existing management-key resolution unchanged.
+    #[test]
+    fn piv_current_mgmt_auth_without_use_pin_falls_back_to_mgmt_key() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
+        match app.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
+            Ok(PivMgmtAuth::Key(key)) => assert_eq!(
+                &key[..],
+                &piv_mgmt_key_bytes(piv_default_mgmt_key_hex(false)).unwrap()[..]
+            ),
+            other => panic!("expected Key(default), got {}", other.is_ok()),
+        }
+    }
+
+    /// Regression test for a reported bug: check "Use PIN", check "Use
+    /// default management key" (which un-checks "Use PIN"), then un-check
+    /// "Use default management key" again. With two independent `bool`s —
+    /// each resetting the other on check but not consulting it on uncheck —
+    /// the third step left `use_pin` from step 1 stuck, so neither checkbox
+    /// was checked yet the field still asked for a PIN. `mgmt_auth_mode` is
+    /// a single field precisely to make that state unrepresentable: each
+    /// toggle is `piv_mgmt_mode_after_toggle`, applied unconditionally.
+    #[test]
+    fn mgmt_mode_toggle_sequence_ends_manual_not_stuck_on_pin() {
+        // 1. check "Use PIN". (Starting mode is Manual either way — the
+        // fresh-modal default — so the first toggle's result doesn't depend
+        // on it.)
+        let mut mode = piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Pin);
+        assert_eq!(mode, PivMgmtAuthMode::Pin);
+        // 2. check "Use default management key".
+        mode = piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Default);
+        assert_eq!(mode, PivMgmtAuthMode::Default);
+        // 3. uncheck "Use default management key" — neither box is checked
+        // now, so this must land on Manual (asking for the typed management
+        // key), not silently revert to Pin.
+        mode = piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Default);
+        assert_eq!(mode, PivMgmtAuthMode::Manual);
+    }
+
+    /// `piv_mgmt_mode_after_toggle` unconditionally: checking always lands on
+    /// the given mode, unchecking always lands on `Manual`, regardless of
+    /// which mode was current beforehand.
+    #[test]
+    fn piv_mgmt_mode_after_toggle_ignores_the_other_toggle_entirely() {
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Default),
+            PivMgmtAuthMode::Default
+        );
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Pin),
+            PivMgmtAuthMode::Pin
+        );
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Default),
+            PivMgmtAuthMode::Manual
+        );
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Pin),
+            PivMgmtAuthMode::Manual
+        );
+    }
+
+    /// `piv_cred_modal_close` resets `mgmt_auth_mode` to `Manual` — covering
+    /// both what `use_default_mgmt = false` already did and the previously
+    /// missing `use_pin` reset (a real gap the two-bool design had: closing
+    /// the modal left "Use PIN" ticked for the next flow that opens it).
+    #[test]
+    fn piv_cred_modal_close_resets_mgmt_auth_mode() {
+        let mut app = App::default();
+        for mode in [PivMgmtAuthMode::Default, PivMgmtAuthMode::Pin] {
+            app.piv.mgmt_auth_mode = mode;
+            app.piv_cred_modal_close();
+            assert_eq!(app.piv.mgmt_auth_mode, PivMgmtAuthMode::Manual);
+        }
+    }
+
+    /// `PivCredKind::shares_pin_field` covers exactly `SelfSign`/`SetRetries` —
+    /// every other management-gated flow gets its own PIN box (or none) from
+    /// `piv_modal_mgmt_field`, not a reused one.
+    #[test]
+    fn shares_pin_field_covers_exactly_self_sign_and_set_retries() {
+        for kind in [
+            PivCredKind::ChangePin,
+            PivCredKind::ChangePuk,
+            PivCredKind::UnblockPin,
+            PivCredKind::GenerateKey,
+            PivCredKind::ImportCert,
+            PivCredKind::RequestCsr,
+            PivCredKind::ChangeMgmtKey,
+            PivCredKind::DeleteCert,
+            PivCredKind::DeleteKey,
+            PivCredKind::MoveKey,
+            PivCredKind::NewChuid,
+        ] {
+            assert!(!kind.shares_pin_field(), "{kind:?} should not share");
+        }
+        assert!(PivCredKind::SelfSign.shares_pin_field());
+        assert!(PivCredKind::SetRetries.shares_pin_field());
     }
 
     /// `apply_piv_cred_result` mirrors the pane outcome into the open modal:
