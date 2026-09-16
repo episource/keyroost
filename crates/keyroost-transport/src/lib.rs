@@ -45,8 +45,8 @@ mod gzip;
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, CertUnreadable, CurrentMgmtAuth, PivSession, PivSlotDetail, PivSlotStatus,
-    PivStatus, PivStatusDetailed,
+    random_chuid_guid, CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan,
+    PivResetPreview, PivSession, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
 };
 
 mod token2otp;
@@ -148,18 +148,51 @@ pub enum TransportError {
     /// PIV reset refused by the card: the PIN and PUK must both be blocked
     /// before the applet allows a factory reset (`SW 6983`).
     PivResetNotAllowed,
-    /// A forced PIV factory reset was refused before it started: the card does
-    /// not answer the vendor extensions that carry the RESET instruction, so
-    /// blocking its PIN and PUK (which the forced path does deliberately) would
-    /// have no way back.
-    PivForceResetUnsupported,
-    /// A forced PIV factory reset stopped part-way: a blocking loop hit its
-    /// attempt cap without the card reporting the credential blocked, so RESET
-    /// was never sent. Carries the state the card is actually in.
-    PivForceResetIncomplete(&'static str),
-    /// A deliberately-wrong PUK guess in the forced factory reset was
-    /// *accepted*: RESET RETRY COUNTER really ran, so the card's PIN was
-    /// rewritten to a known value and unblocked.
+    /// `PivSession::factory_reset` was refused before it started: this
+    /// fingerprint's [`keyroost_piv::compat::PivExtension::Reset`] gate
+    /// resolves [`keyroost_piv::compat::FeatureGate::Unsupported`], so
+    /// blocking its PIN and PUK (which the burn-dance path does
+    /// deliberately) would have no way back.
+    PivResetUnsupported,
+    /// `PivSession::factory_reset` was refused before it started: this
+    /// fingerprint carries [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]
+    /// and no credential was supplied — RESET needs an authenticated
+    /// management-key session here, not the PIN/PUK-blocked precondition the
+    /// burn-dance path automates. Burning the PIN and PUK anyway would only
+    /// leave the card locked with no working RESET behind it.
+    PivResetNeedsManagementAuth,
+    /// `PivSession::factory_reset`'s RESET attempt failed on a card whose
+    /// [`keyroost_piv::compat::PivExtension::Reset`] support resolves
+    /// [`keyroost_piv::compat::FeatureGate::Unverified`] — it deliberately
+    /// skipped its usual PIN/PUK pre-blocking here (blocking both counters
+    /// on a device that might not actually implement RESET risks leaving it
+    /// permanently locked), so this is what the bare attempt got back from
+    /// the card.
+    PivResetUnverifiedFailed(Box<TransportError>),
+    /// `PivSession::factory_reset`'s device-wide mechanism
+    /// ([`keyroost_piv::compat::PivExtension::ResetGlobal`] — HID
+    /// Crescendo's ACA RESET CARD today) failed: the SELECT, the
+    /// authentication, or RESET CARD itself. No PIN or PUK was ever touched
+    /// on this path — unlike a burn-dance failure
+    /// ([`Self::PivResetIncomplete`]), a caller must not append the "PIV
+    /// may now be locked" caveat that one gets.
+    PivResetGlobalFailed(Box<TransportError>),
+    /// `PivSession::factory_reset` authenticated a management-key session
+    /// (because this fingerprint carries
+    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`] and a
+    /// credential was supplied — see [`Self::PivResetNeedsManagementAuth`]
+    /// for the no-credential refusal instead) but the authentication itself,
+    /// or the RESET attempt right after it, failed. No PIN or PUK was ever
+    /// touched on this path either.
+    PivResetManagementAuthFailed(Box<TransportError>),
+    /// `PivSession::factory_reset`'s burn-dance path stopped part-way: a
+    /// blocking loop hit its attempt cap without the card reporting the
+    /// credential blocked, so RESET was never sent. Carries the state the
+    /// card is actually in.
+    PivResetIncomplete(&'static str),
+    /// A deliberately-wrong PUK guess in `PivSession::factory_reset`'s
+    /// burn-dance path was *accepted*: RESET RETRY COUNTER really ran, so
+    /// the card's PIN was rewritten to a known value and unblocked.
     PivPukGuessAccepted,
     /// A PIV MOVE KEY refused because the destination slot already holds a key
     /// (GET METADATA pre-check, ahead of the card's own refusal).
@@ -320,16 +353,64 @@ impl fmt::Display for TransportError {
                     "PIV reset refused: the PIN and PUK must both be blocked first"
                 )
             }
-            TransportError::PivForceResetUnsupported => write!(
+            TransportError::PivResetUnsupported => write!(
                 f,
-                "this card does not implement the RESET instruction a forced \
-                 factory reset depends on (it is a vendor extension, not part of \
+                "this card does not implement the RESET instruction a factory \
+                 reset depends on (it is a vendor extension, not part of \
                  the PIV standard). Getting there means deliberately blocking the \
                  PIN and the PUK, and on this card nothing could unblock them \
                  afterwards, so keyroost will not do it. A card like this has to \
                  be reset by whoever issued it."
             ),
-            TransportError::PivForceResetIncomplete(state) => write!(f, "{}", state),
+            TransportError::PivResetNeedsManagementAuth => write!(
+                f,
+                "this card's RESET needs an authenticated management-key session, \
+                 not the PIN/PUK-blocked precondition a factory reset otherwise \
+                 automates \u{2014} and no such credential was supplied. \
+                 Deliberately blocking the PIN and PUK anyway would only leave the \
+                 card locked with no working RESET behind it, so keyroost refuses \
+                 without a credential in hand."
+            ),
+            TransportError::PivResetUnverifiedFailed(inner) => {
+                write!(
+                    f,
+                    "PIV RESET support on this card is unverified, so the factory \
+                     reset attempted it without first blocking the PIN and PUK \
+                     (doing so blindly risks a permanent lock if RESET turns out \
+                     unsupported here) \u{2014} and the card refused: {inner}."
+                )?;
+                // `PivResetNotAllowed`'s own message already states the exact
+                // precondition the card reported (SW_AUTH_BLOCKED /
+                // SW_CONDITIONS_NOT_SATISFIED); repeating a hedge to "consult
+                // the documentation, commonly PIN+PUK blocked" would just say
+                // the same thing a third time. Any other inner failure means
+                // the card refused for some other reason this crate doesn't
+                // recognize, so the generic pointer at the device's own docs
+                // still earns its place there.
+                if matches!(inner.as_ref(), TransportError::PivResetNotAllowed) {
+                    write!(f, " Block both manually, then retry the factory reset.")
+                } else {
+                    write!(
+                        f,
+                        " Consult this device's own PIV documentation for RESET's \
+                         precondition (commonly: the PIN and PUK both blocked, or \
+                         an authenticated session) and perform it manually, then \
+                         retry the factory reset."
+                    )
+                }
+            }
+            TransportError::PivResetGlobalFailed(inner) => write!(
+                f,
+                "this device's device-wide reset mechanism failed: {inner}. No PIN \
+                 or PUK was touched \u{2014} PIV, and whatever else that mechanism \
+                 covers, is untouched too."
+            ),
+            TransportError::PivResetManagementAuthFailed(inner) => write!(
+                f,
+                "the management-key session for this device's PIV RESET failed: \
+                 {inner}. No PIN or PUK was touched."
+            ),
+            TransportError::PivResetIncomplete(state) => write!(f, "{}", state),
             TransportError::PivPukGuessAccepted => write!(
                 f,
                 "the factory reset's throwaway PUK guess turned out to be this \
@@ -394,6 +475,9 @@ impl std::error::Error for TransportError {
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
+            TransportError::PivResetUnverifiedFailed(e)
+            | TransportError::PivResetGlobalFailed(e)
+            | TransportError::PivResetManagementAuthFailed(e) => Some(e.as_ref()),
             TransportError::X509(e) => Some(e),
             _ => None,
         }

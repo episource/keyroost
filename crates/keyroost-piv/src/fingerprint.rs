@@ -131,13 +131,17 @@ pub const HID_CRESCENDO_C4000_GET_PROPERTIES: [u8; 5] = [0x80, 0x56, 0x00, 0x00,
 /// management key as a real object at all, per
 /// [`hid_crescendo_reports_slot`]) instead gate PIV admin operations behind
 /// this applet's `EXTERNAL AUTHENTICATE` with "XAUTH key 1" — see
-/// [`HID_CRESCENDO_ACA_GET_CHALLENGE`]/[`hid_crescendo_aca_external_authenticate`]
-/// and <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>.
-/// That page's own scope note reads "applicable only to devices belonging to
-/// the Crescendo 2300 family", but nothing else in HID's documentation
-/// describes an alternative for C4000, and a C4000 unit is already assumed
-/// (undocumented, unconfirmed on hardware) to share C2300's non-support of
-/// the standard management key — see
+/// [`HID_CRESCENDO_ACA_GET_CHALLENGE`]/[`hid_crescendo_aca_external_authenticate`],
+/// documented separately for each family:
+/// <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>
+/// (scoped by that page's own note to "devices belonging to the Crescendo
+/// 2300 family") and
+/// <https://docs.hidglobal.com/crescendo/api/c4000/external-auth-xauth.htm>.
+/// The two disagree on `GET CHALLENGE`'s `P2` — see
+/// [`HID_CRESCENDO_ACA_GET_CHALLENGE`]'s own doc for how that's reconciled —
+/// but a C4000 unit is otherwise already assumed (undocumented, unconfirmed
+/// on hardware) to share C2300's non-support of the standard management
+/// key — see
 /// `keyroost_piv::compat`'s `GET_METADATA_VERDICTS`'s C4000 bullet for the
 /// same caveat applied there — so `keyroost_transport::PivSession` tries this
 /// same sequence for either variant, and indeed for
@@ -161,14 +165,26 @@ pub const HID_CRESCENDO_C4000_GET_PROPERTIES: [u8; 5] = [0x80, 0x56, 0x00, 0x00,
 /// authentication-preserving or authentication-clearing.)
 pub const HID_CRESCENDO_ACA_AID: [u8; 7] = [0xA0, 0x00, 0x00, 0x00, 0x79, 0x10, 0x00];
 
-/// ACA `GET CHALLENGE` (`CLA 00h INS 84h P1 00h P2 00h Le 00h`, a case-2
+/// ACA `GET CHALLENGE` (`CLA 00h INS 84h P1 00h P2 01h Le 00h`, a case-2
 /// APDU with no command data): the first step of the External Authentication
 /// sequence, requesting a fresh card challenge for XAUTH key 1. Only
-/// meaningful once [`HID_CRESCENDO_ACA_AID`] is selected. Per
-/// <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>,
-/// the response's own length is the only place the XAUTH key's algorithm is
-/// named — see [`hid_crescendo_xauth_key_alg`].
-pub const HID_CRESCENDO_ACA_GET_CHALLENGE: [u8; 5] = [0x00, 0x84, 0x00, 0x00, 0x00];
+/// meaningful once [`HID_CRESCENDO_ACA_AID`] is selected.
+///
+/// The two documented families disagree on `P2` here: C2300's page
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>)
+/// gives `P2 00h`, while C4000's own page
+/// (<https://docs.hidglobal.com/crescendo/api/c4000/external-auth-xauth.htm>)
+/// gives `P2 01h` for the identical command. Confirmed by experiment against
+/// live C2300 hardware that `P2 01h` — C4000's value — works there too, so
+/// this crate sends `01h` unconditionally rather than branching on variant;
+/// one wire form for both rather than two untested-in-the-other-direction
+/// ones. (`EXTERNAL AUTHENTICATE`'s own `P2` — see
+/// [`hid_crescendo_aca_external_authenticate`] — is `01h` on both pages
+/// already and needed no such reconciliation.)
+///
+/// Per either page, the response's own length is the only place the XAUTH
+/// key's algorithm is named — see [`hid_crescendo_xauth_key_alg`].
+pub const HID_CRESCENDO_ACA_GET_CHALLENGE: [u8; 5] = [0x00, 0x84, 0x00, 0x01, 0x00];
 
 /// The P2 reference the ACA instance's own VERIFY PIN answers, per
 /// <https://docs.hidglobal.com/crescendo/api/low-level/verify-pin.htm>:
@@ -324,6 +340,59 @@ pub fn hid_crescendo_aca_put_xauth_key(alg: crate::MgmtAlg, key: &[u8]) -> Optio
 pub fn hid_crescendo_aca_put_xauth_key_remove() -> Vec<u8> {
     vec![0x00, 0xD8, 0x01, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00]
 }
+
+/// ACA `RESET CARD` (`CLA 00h INS 38h P1 00h P2 00h`, case 1 — no `Lc`, no
+/// data, no `Le`): HID's device-wide reset, backing
+/// [`crate::compat::PivExtension::ResetGlobal`]. Confirmed identical on both
+/// documented families —
+/// <https://docs.hidglobal.com/crescendo/api/low-level/reset-card.htm>
+/// (scoped by that page's own note to "devices belonging to the Crescendo
+/// 2300 family") and
+/// <https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm> — same
+/// APDU, same "PIN or XAUTH1" access condition
+/// [`hid_crescendo_aca_external_authenticate`]/[`HID_CRESCENDO_ACA_PIN_REF`]
+/// already satisfy, same `SW = 69 82` ("access condition not satisfied") /
+/// `SW = 90 00` pair.
+///
+/// What it clears, per those two pages (the C4000 page states each item
+/// unconditionally; the C2300 page's OATH line reads "(HID Crescendo Key
+/// only)", and only the C4000 page claims FIDO at all — see
+/// [`crate::compat::PivExtension::ResetGlobal`]'s doc for how a caller
+/// should read that split): XAUTH key 1 itself, the PIV PIN (reset to a
+/// documented default — `000000` per the C4000 page, `00000000` per the
+/// C2300 page), every PKI key and PIV data container, OATH keys/config, and
+/// (C4000 only, as documented) FIDO credentials. The device is left in
+/// HID's own "manufacturing state" language.
+///
+/// Only meaningful once [`HID_CRESCENDO_ACA_AID`] is selected and
+/// authenticated — same precondition, same discipline as every other ACA
+/// command in this module.
+pub const HID_CRESCENDO_ACA_RESET_CARD: [u8; 4] = [0x00, 0x38, 0x00, 0x00];
+
+/// HID's documented factory-delivery value for XAUTH key 1: 24 zero bytes,
+/// 3DES ([`crate::MgmtAlg::TripleDes`]). [`HID_CRESCENDO_ACA_RESET_CARD`]
+/// clears XAUTH key 1 outright rather than restoring it to this value on
+/// its own, but every unit ships with it already set to this all-zero key —
+/// a caller that wants the device back at its as-delivered state, not
+/// merely "wiped", has to `PUT XAUTH KEY`
+/// ([`hid_crescendo_aca_put_xauth_key`]) with this value explicitly right
+/// after. It matters practically too, not just cosmetically: XAUTH1 is the
+/// *other* half of RESET CARD's own "PIN or XAUTH1" access condition, so
+/// restoring a known key is what keeps the device recoverable by XAUTH
+/// alone if a later mistake ever blocks the ACA's own PIN.
+pub const HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY: [u8; 24] = [0u8; 24];
+
+/// The ACA's own PIN immediately after [`HID_CRESCENDO_ACA_RESET_CARD`] —
+/// confirmed on hardware to be `00000000` (eight ASCII `'0'`s), the C2300
+/// page's documented value. [`HID_CRESCENDO_ACA_RESET_CARD`]'s own security
+/// status does not survive RESET CARD (also confirmed on hardware, resolving
+/// the "unverified" caveat this constant's callers used to carry), so a
+/// caller that wants to run any further ACA command in the same session —
+/// [`hid_crescendo_aca_put_xauth_key`] to restore
+/// [`HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY`], most notably — has to
+/// re-authenticate against this PIN first, not against whatever credential
+/// unlocked the session before RESET CARD ran.
+pub const HID_CRESCENDO_ACA_PIN_AFTER_RESET: &[u8] = b"00000000";
 
 /// Decode every `(key_ref, algorithm_id)` pair for a slot that actually
 /// holds a key out of a HID Crescendo GET PIV PROPERTIES response (C2300's
@@ -1919,6 +1988,23 @@ mod tests {
             hid_crescendo_aca_put_xauth_key_remove(),
             vec![0x00, 0xD8, 0x01, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn reset_card_is_the_documented_case_1_apdu() {
+        assert_eq!(HID_CRESCENDO_ACA_RESET_CARD, [0x00, 0x38, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn factory_xauth_key_is_24_zero_bytes_and_builds_a_valid_put_xauth_key() {
+        assert_eq!(HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY, [0u8; 24]);
+        // Matches TripleDes's key_len() exactly, so building the restore
+        // APDU from it can never hit the None branch in practice.
+        assert!(hid_crescendo_aca_put_xauth_key(
+            crate::MgmtAlg::TripleDes,
+            &HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY
+        )
+        .is_some());
     }
 
     #[test]

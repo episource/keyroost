@@ -565,6 +565,44 @@ enum Cmd {
         /// Confirm the wipe. Required — without it the command refuses.
         #[arg(long)]
         yes: bool,
+        /// Some cards protect reset behind management auth, checked just
+        /// before the PIV step. Whether that applies to the selected device
+        /// is only known once it's fingerprinted: running this command
+        /// without a management key (or, depending on the card, a PIN)
+        /// either succeeds outright, or refuses and asks you to re-run it
+        /// with --mgmt-key-env/--mgmt-key-stdin or --pin-env/--pin-stdin
+        /// supplied. This flag is the management key, as hex, read from
+        /// this environment variable. Mutually exclusive with the PIN
+        /// options below — pick whichever credential you actually have.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_stdin", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_env: Option<String>,
+        /// Same credential, read from stdin (one line, hex) instead of an
+        /// environment variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_stdin: bool,
+        /// Same requirement, satisfied with a PIN instead of the management
+        /// key — only useful when the selected card actually accepts a PIN
+        /// for it. Read from this environment variable.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_stdin"]
+        )]
+        pin_env: Option<String>,
+        /// Same PIN, read from stdin (one line) instead of an environment
+        /// variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env"]
+        )]
+        pin_stdin: bool,
     },
 }
 
@@ -1072,13 +1110,64 @@ enum PivCmd {
         #[arg(long, value_name = "HEX")]
         guid: Option<String>,
     },
-    /// Reset the PIV application to factory defaults. Only works when BOTH the
-    /// PIN and PUK are already blocked. Wipes all keys, certs, and PINs.
+    /// Reset the PIV application to factory defaults (Yubico RESET, `INS
+    /// 0xFB`). On most devices this follows the common convention and only
+    /// works when BOTH the PIN and PUK are already blocked (every retry
+    /// exhausted) — this command does nothing to arrange that itself. Wipes
+    /// all keys, certs, and PINs.
+    ///
+    /// Resetting the PIV applet needs a YubiKey or a compatible third-party
+    /// device: refused on a device known to be incompatible unless
+    /// `--force`, runs with a warning on an unverified one, silent on a
+    /// known-good one.
+    ///
+    /// Some cards protect reset behind management auth instead of the
+    /// PIN/PUK convention above. Whether that applies to the selected device
+    /// is only known once it's fingerprinted: running this command without a
+    /// management key (or, depending on the card, a PIN) either succeeds
+    /// outright, or refuses and asks you to re-run it with
+    /// --mgmt-key-env/--mgmt-key-stdin or --pin-env/--pin-stdin supplied.
     Reset {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
         #[arg(long)]
         yes: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
+        /// The management key, as hex, read from this environment variable
+        /// — only consulted when the selected device turns out to need one.
+        /// Mutually exclusive with the PIN options below — pick whichever
+        /// credential you actually have.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_stdin", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_env: Option<String>,
+        /// Same credential, read from stdin (one line, hex) instead of an
+        /// environment variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_stdin: bool,
+        /// Same requirement, satisfied with a PIN instead of the management
+        /// key — only useful when the selected card actually accepts a PIN
+        /// for it. Read from this environment variable.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_stdin"]
+        )]
+        pin_env: Option<String>,
+        /// Same PIN, read from stdin (one line) instead of an environment
+        /// variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env"]
+        )]
+        pin_stdin: bool,
     },
     /// Clear a slot's certificate object (standard PIV; works on every card).
     /// Removes ONLY the X.509 certificate — the slot's private key is left in
@@ -1099,11 +1188,10 @@ enum PivCmd {
     /// key material — the certificate object is left in place. Needs the
     /// management key. DESTRUCTIVE: requires `--yes`.
     ///
-    /// Key deletion needs YubiKey 5.7+ or a compatible third-party device. A
-    /// per-fingerprint known-support table decides up front: on a device known to
-    /// be incompatible it is refused (pass `--force` to run anyway), on an
-    /// unverified device it runs with a warning that it may fail, and on a
-    /// known-good device it just runs.
+    /// Key deletion needs YubiKey 5.7+ or a compatible third-party device: on
+    /// a device known to be incompatible it is refused (pass `--force` to
+    /// run anyway), on an unverified device it runs with a warning that it
+    /// may fail, and on a known-good device it just runs.
     DeleteKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1123,10 +1211,10 @@ enum PivCmd {
     /// Non-destructive; refuses an occupied destination. The certificate stays
     /// in the source slot.
     ///
-    /// Moving keys between slots needs YubiKey 5.7+ or a compatible third-party
-    /// device. The same per-fingerprint known-support table as `delete-key`
-    /// applies: refused on a device known to be incompatible unless `--force`,
-    /// run-with-warning on an unverified one, silent on a known-good one.
+    /// Moving keys between slots needs YubiKey 5.7+ or a compatible
+    /// third-party device: refused on a device known to be incompatible
+    /// unless `--force`, runs with a warning on an unverified one, silent on a
+    /// known-good one.
     MoveKey {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
@@ -2922,8 +3010,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Whole-device factory reset: wipe every resettable applet in planner order.
-    if let Cmd::FactoryReset { reader, yes } = cmd {
-        return run_factory_reset(reader.as_deref(), *yes, cli.debug);
+    if let Cmd::FactoryReset {
+        reader,
+        yes,
+        mgmt_key_env,
+        mgmt_key_stdin,
+        pin_env,
+        pin_stdin,
+    } = cmd
+    {
+        return run_factory_reset(
+            reader.as_deref(),
+            *yes,
+            cli.debug,
+            mgmt_key_env.as_deref(),
+            *mgmt_key_stdin,
+            pin_env.as_deref(),
+            *pin_stdin,
+        );
     }
 
     unreachable!("every subcommand is handled above");
@@ -4322,6 +4426,10 @@ fn run_factory_reset(
     reader: Option<&str>,
     yes: bool,
     debug: bool,
+    mgmt_key_env: Option<&str>,
+    mgmt_key_stdin: bool,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_resolve::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
 
@@ -4350,10 +4458,77 @@ fn run_factory_reset(
         dev.hid_path.as_deref(),
         &keyroost_hid::enumerate().unwrap_or_default(),
     );
-    let plan = factory_reset_plan(dev.caps);
+    let mut plan = factory_reset_plan(dev.caps);
     if plan.is_empty() {
         return Err(format!(
             "'{}' exposes no resettable applet (nothing to factory-reset)",
+            sanitize_terminal(&dev.model)
+        )
+        .into());
+    }
+
+    // Fingerprint PIV before running anything destructive — mirrors the GUI's
+    // `App::start_factory_reset_confirm`, just synchronous (the CLI has no
+    // worker thread to keep this off of). Two separate questions, not one:
+    // whether PIV can be reset at all (`PivSession::preview_factory_reset`,
+    // which checks `PivExtension::ResetGlobal` first and falls back to
+    // `PivExtension::Reset`'s own shape — `Unsupported` means neither is
+    // available, so `ResetStep::Piv` is dropped from the plan entirely
+    // rather than offered for a step `factory_reset` would only refuse), and
+    // whether a credential is needed for whichever mechanism does run
+    // (`PivSession::global_reset_available` — `PivQuirk::
+    // ResetNeedsManagementAuth` applying, ORed across either extension not
+    // being a confirmed dead end). `factory_reset` itself decides which
+    // mechanism actually consumes the resolved credential; a device that
+    // can't be probed (no reader, transport fault) is treated as needing
+    // neither — the PIV step below still runs and reports its own, real
+    // error if the device is genuinely unreachable.
+    let mut piv_resettable = true;
+    let reset_auth = if plan.contains(&ResetStep::Piv) {
+        match dev
+            .reader
+            .as_deref()
+            .and_then(|r| keyroost_transport::PivSession::open(r).ok())
+        {
+            Some(mut s) => {
+                piv_resettable = !matches!(
+                    s.preview_factory_reset(),
+                    keyroost_transport::PivResetPreview::Unsupported
+                );
+                if s.global_reset_available() {
+                    // Ask before the PIN gate is consulted below: whichever
+                    // mechanism actually runs, both need `current`, so this
+                    // is the one place `PivQuirk::ResetNeedsManagementAuth`
+                    // applying is handled — abort here, before anything
+                    // destructive, rather than let the PIV step discover it
+                    // partway through the plan.
+                    Some(resolve_reset_cli_auth(
+                        mgmt_key_env,
+                        mgmt_key_stdin,
+                        pin_env,
+                        pin_stdin,
+                        s.pin_management_auth_gate(),
+                    )?)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if !piv_resettable {
+        keyroost_resolve::exclude_unresettable_piv(&mut plan);
+    }
+    // Re-check: a device offering only `Caps::PIV` (the check above only
+    // catches an empty plan built from caps, before this exclusion) can
+    // still end up with nothing left to reset once a live fingerprint rules
+    // PIV out too.
+    if plan.is_empty() {
+        return Err(format!(
+            "'{}' has no reset mechanism available for any of its applets \
+             (nothing to factory-reset)",
             sanitize_terminal(&dev.model)
         )
         .into());
@@ -4397,13 +4572,19 @@ fn run_factory_reset(
                     }
                 }
             }
-            other => reset_one_card_applet(*other, reader, debug),
+            other => reset_one_card_applet(*other, reader, debug, reset_auth.as_ref()),
         };
         let label = step.label();
         match &outcome {
             StepOutcome::Wiped => println!("{label:<8} wiped"),
+            // Device-wide mechanism, not confined to PIV alone — name the
+            // whole device instead of just the applet that triggered it.
+            StepOutcome::WipedGlobal => {
+                println!("{:<8} wiped", keyroost_resolve::PIV_GLOBAL_RESET_LABEL)
+            }
+            StepOutcome::WipedWithWarning(e) => println!("{label:<8} wiped (warning: {e})"),
             StepOutcome::Failed(e) => println!("{label:<8} failed: {e}"),
-            StepOutcome::Skipped => println!("{label:<8} skipped"),
+            StepOutcome::Skipped(reason) => println!("{label:<8} skipped: {reason}"),
         }
         reports.push(StepReport {
             step: *step,
@@ -4820,7 +5001,7 @@ fn candidates_of<'a>(
 /// three self-describing variants: the error, plus where the card actually
 /// stands and what finishes the job.
 ///
-/// `force_reset` blocks the PIN and PUK on its way to RESET — the card only
+/// `factory_reset` blocks the PIN and PUK on its way to RESET — the card only
 /// accepts a RESET once both are blocked — so a fault in the middle can leave
 /// PIV locked but not wiped. That is not bricked, but it is also not something
 /// `keyroostctl piv reset` can finish: a fault in the PUK loop leaves the PIN
@@ -4836,14 +5017,156 @@ fn piv_factory_reset_failure(err: &str) -> String {
     )
 }
 
+/// How `--mgmt-key-env`/`--mgmt-key-stdin`/`--pin-env`/`--pin-stdin` resolved:
+/// the management key or a PIN for whichever RESET mechanism actually
+/// consumes it — `PivSession::factory_reset` (today, always HID Crescendo's
+/// ACA instance when it runs the device-wide step) for `factory-reset`'s PIV
+/// step, or a plain `PivSession::authenticate_management_current` +
+/// `PivSession::reset` for `piv reset`'s own credential prompt — see
+/// `resolve_reset_cli_auth`'s doc. Mirrors the GUI's `GlobalResetAuth` — same
+/// two-way shape, same eventual conversion into
+/// `keyroost_transport::CurrentMgmtAuth`.
+enum ResetCliAuth {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Pin(zeroize::Zeroizing<String>),
+}
+
+/// Resolve [`ResetCliAuth`] from a RESET command's four `--mgmt-key-*`/
+/// `--pin-*` flags, already mutually exclusive by construction (each
+/// `conflicts_with_all`s the other three) — shared by `factory-reset`'s PIV
+/// step and `piv reset`, the two commands that can hit `PivQuirk::
+/// ResetNeedsManagementAuth`'s precondition. No CLI equivalent of the GUI's
+/// "Use default XAUTH key" convenience: unlike the interactive dialog, a
+/// scripted `--yes` run should never silently reach for a well-known key —
+/// if the caller wants HID's documented all-zero factory default, they pass
+/// it explicitly via `--mgmt-key-env`/`-stdin`, the same as any other
+/// credential this CLI takes.
+///
+/// `pin_gate` is `PivSession::pin_management_auth_gate`'s live verdict for
+/// the device being reset, consulted only for the error below: the abort
+/// message names the PIN option — and whether it's confirmed or merely
+/// unverified on this device — precisely when that gate says a PIN is a
+/// candidate at all, rather than always offering it (`PivQuirk::
+/// ResetNeedsManagementAuth` says a credential is needed; it says nothing
+/// about which kinds this fingerprint actually accepts).
+fn resolve_reset_cli_auth(
+    mgmt_key_env: Option<&str>,
+    mgmt_key_stdin: bool,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
+    pin_gate: keyroost_piv::compat::FeatureGate,
+) -> Result<ResetCliAuth, Box<dyn std::error::Error>> {
+    if mgmt_key_env.is_some() || mgmt_key_stdin {
+        return Ok(ResetCliAuth::Key(read_mgmt_key(
+            "reset management key",
+            mgmt_key_env,
+            mgmt_key_stdin,
+        )?));
+    }
+    if pin_env.is_some() || pin_stdin {
+        return Ok(ResetCliAuth::Pin(read_secret(
+            "reset PIN",
+            pin_env,
+            pin_stdin,
+        )?));
+    }
+    use keyroost_piv::compat::FeatureGate;
+    let pin_hint = match pin_gate {
+        FeatureGate::Supported => {
+            " or --pin-env/--pin-stdin (a PIN works too, instead of the management key)"
+        }
+        FeatureGate::Unverified => {
+            " or --pin-env/--pin-stdin (a PIN may also work instead of the management key, \
+             but that's unverified on this device)"
+        }
+        FeatureGate::Unsupported => "",
+    };
+    Err(format!(
+        "this device needs a management-key credential to reset PIV \u{2014} pass \
+         --mgmt-key-env/--mgmt-key-stdin{pin_hint}"
+    )
+    .into())
+}
+
 /// Run one card-applet reset step, mapping its result to a StepOutcome so a
 /// single failure is recorded, not propagated (continue-on-error).
+/// `reset_auth` is only ever consulted for `ResetStep::Piv` — the credential
+/// `run_factory_reset` resolved when `PivSession::global_reset_available`
+/// said one was needed, handed straight through to
+/// `PivSession::factory_reset`, which decides on its own whether the
+/// device-wide mechanism or a plain PIV reset actually consumes it.
 fn reset_one_card_applet(
     step: keyroost_resolve::ResetStep,
     reader: Option<&str>,
     debug: bool,
+    reset_auth: Option<&ResetCliAuth>,
 ) -> keyroost_resolve::StepOutcome {
     use keyroost_resolve::{ResetStep, StepOutcome};
+
+    // PIV gets its own path, ahead of the shared closure below:
+    // `PivSession::factory_reset` decides on its own, from a live fingerprint,
+    // whether to run the device-wide mechanism, a PIV-only reset, or skip the
+    // applet outright (RESET known-unsupported on both axes, or a
+    // precondition — an authenticated management-key session — with no
+    // credential supplied) rather than fail it, a distinction `run()`'s
+    // uniform Ok/Err mapping below can't express.
+    if step == ResetStep::Piv {
+        let outcome = (|| -> Result<StepOutcome, Box<dyn std::error::Error>> {
+            let mut s = open_piv(reader, debug)?;
+            let current = reset_auth.map(|auth| match auth {
+                ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                ResetCliAuth::Pin(pin) => keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes()),
+            });
+            Ok(match s.factory_reset(current) {
+                Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
+                // The device-wide mechanism ran cleanly -- more than just PIV
+                // was wiped, so the report should say so rather than naming
+                // only the applet that happened to trigger it.
+                Ok(keyroost_transport::FactoryResetOutcome::WipedGlobal) => {
+                    StepOutcome::WipedGlobal
+                }
+                // The device IS wiped -- only the courtesy XAUTH-key restore
+                // (the device-wide mechanism's own follow-up) failed.
+                // `WipedWithWarning`, not `Failed`: the wipe itself is done,
+                // so this counts as wiped, but the restore failure is real
+                // and still needs its own line.
+                Ok(keyroost_transport::FactoryResetOutcome::WipedKeyRestoreFailed) => {
+                    StepOutcome::WipedWithWarning(
+                        "restoring XAUTH key 1 to the factory-delivery value afterward failed \
+                         \u{2014} it's left cleared instead. Set it manually \
+                         (`keyroostctl piv change-management-key`) if you need it back."
+                            .into(),
+                    )
+                }
+                // Never touched the PIN or PUK -- refused before the burn
+                // sequence even started. Not a failure, an exclusion.
+                Err(
+                    e @ (TransportError::PivResetUnsupported
+                    | TransportError::PivResetNeedsManagementAuth),
+                ) => StepOutcome::Skipped(sanitize_terminal(&e.to_string())),
+                // These already state the card's real state and the way
+                // forward. Pointing at `keyroostctl piv reset` on top of them
+                // would be wrong: it sends the very RESET the card just
+                // refused, or it contradicts their own "re-run the factory
+                // reset" (Incomplete, PukGuessAccepted); the unverified-attempt,
+                // device-wide-mechanism, and authenticated-management-key
+                // failures already explain themselves in full, with no
+                // PIN/PUK blocked to caveat about.
+                Err(
+                    e @ (TransportError::PivResetIncomplete(_)
+                    | TransportError::PivPukGuessAccepted
+                    | TransportError::PivResetUnverifiedFailed(_)
+                    | TransportError::PivResetGlobalFailed(_)
+                    | TransportError::PivResetManagementAuthFailed(_)),
+                ) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
+                Err(other) => StepOutcome::Failed(sanitize_terminal(&piv_factory_reset_failure(
+                    &other.to_string(),
+                ))),
+            })
+        })();
+        return outcome.unwrap_or_else(|e| StepOutcome::Failed(sanitize_terminal(&e.to_string())));
+    }
+
     let run = || -> Result<(), Box<dyn std::error::Error>> {
         match step {
             ResetStep::Oath => {
@@ -4857,23 +5180,7 @@ fn reset_one_card_applet(
                 let mut s = open_openpgp(reader, debug)?;
                 s.factory_reset()?;
             }
-            ResetStep::Piv => {
-                let mut s = open_piv(reader, debug)?;
-                s.force_reset().map_err(|e| -> Box<dyn std::error::Error> {
-                    match e {
-                        // These three already state the card's real state and
-                        // the way forward. Pointing at `keyroostctl piv reset`
-                        // on top of them would be wrong: it sends the very
-                        // RESET the card just refused (Unsupported), or it
-                        // contradicts their own "re-run the factory reset"
-                        // (Incomplete, PukGuessAccepted).
-                        TransportError::PivForceResetUnsupported
-                        | TransportError::PivForceResetIncomplete(_)
-                        | TransportError::PivPukGuessAccepted => e.into(),
-                        other => piv_factory_reset_failure(&other.to_string()).into(),
-                    }
-                })?;
-            }
+            ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
                 let mut s = open_otp(OtpTransportArg::Auto, debug)?;
                 s.erase_all()?;
@@ -6860,8 +7167,20 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
         }
 
-        PivCmd::Reset { reader, yes } => {
+        PivCmd::Reset {
+            reader,
+            yes,
+            force,
+            mgmt_key_env,
+            mgmt_key_stdin,
+            pin_env,
+            pin_stdin,
+        } => {
             let mut s = open_piv(reader.as_deref(), debug)?;
+            // Gate on the applet's fingerprint before reading status — the
+            // fingerprint probe re-SELECTs PIV, same ordering concern
+            // `delete-key`/`move-key` document at their own call sites.
+            guard_piv_feature(&mut s, keyroost_piv::compat::PivExtension::Reset, *force)?;
             let st = s.status()?;
             let serial = st
                 .serial
@@ -6874,6 +7193,33 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     serial
                 )
                 .into());
+            }
+            // Some fingerprints need an authenticated management-key session
+            // before RESET is even accepted (`PivQuirk::
+            // ResetNeedsManagementAuth`) — the same precondition
+            // `factory-reset`'s PIV step fingerprints for, scoped here to
+            // the plain PIV-only mechanism this command sends
+            // (`PivSession::plan_factory_reset`'s own shape, never the
+            // device-wide one `factory-reset` may additionally reach for).
+            // Resolve a credential for it up front, before the wipe, rather
+            // than let the bare RESET below fail with a raw status word.
+            if let keyroost_transport::FactoryResetPlan::NeedsManagementAuth =
+                s.plan_factory_reset()
+            {
+                let auth = resolve_reset_cli_auth(
+                    mgmt_key_env.as_deref(),
+                    *mgmt_key_stdin,
+                    pin_env.as_deref(),
+                    *pin_stdin,
+                    s.pin_management_auth_gate(),
+                )?;
+                let current = match &auth {
+                    ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                    ResetCliAuth::Pin(pin) => {
+                        keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+                    }
+                };
+                s.authenticate_management_current(current)?;
             }
             s.reset()?;
             println!("PIV application reset to factory defaults on {}.", serial);
@@ -7059,6 +7405,16 @@ fn authenticate_piv(
 ///   --force to run anyway.`; with `force`, downgrade that to the same kind of
 ///   warning and run.
 ///
+/// For [`PivExtension::Reset`] specifically, the known-unsupported refusal
+/// also checks [`PivExtension::ResetGlobal`] — the device-wide reset
+/// directive that takes PIV down with it alongside at least one other applet
+/// — and, if that resolves `Supported` or `Unverified`, appends a sentence
+/// pointing at `keyroostctl factory-reset` as the working alternative. This
+/// is the CLI counterpart of the PIV pane's "Factory reset supported →" link
+/// (`piv_reset_global_alternative_available` in the GUI), except the CLI also
+/// mentions the unverified case — a sentence can carry that nuance where a
+/// link either shows or doesn't.
+///
 /// Must be called on the session **before** management-key auth — it runs a
 /// fingerprint probe that re-SELECTs PIV.
 fn guard_piv_feature(
@@ -7066,7 +7422,7 @@ fn guard_piv_feature(
     extension: keyroost_piv::compat::PivExtension,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use keyroost_piv::compat::FeatureGate;
+    use keyroost_piv::compat::{FeatureGate, PivExtension};
     let needs = extension.requirement();
     match session.feature_gate(extension) {
         FeatureGate::Supported => {}
@@ -7080,14 +7436,48 @@ fn guard_piv_feature(
             );
         }
         FeatureGate::Unsupported => {
-            return Err(format!(
+            let mut msg = format!(
                 "{needs} {} Pass --force to run anyway.",
                 FeatureGate::INCOMPATIBLE_SUFFIX
-            )
-            .into());
+            );
+            if extension == PivExtension::Reset {
+                if let Some(hint) = reset_global_alternative_hint(session) {
+                    msg.push(' ');
+                    msg.push_str(&hint);
+                }
+            }
+            return Err(msg.into());
         }
     }
     Ok(())
+}
+
+/// When [`guard_piv_feature`] is about to refuse `PivExtension::Reset` as
+/// known-unsupported, checks whether `PivExtension::ResetGlobal` resolves
+/// `Supported` or `Unverified` on this same device and, if so, returns a
+/// sentence pointing at the whole-device `keyroostctl factory-reset` as a
+/// working alternative — `None` when `ResetGlobal` is itself known-unsupported,
+/// leaving nothing to redirect to.
+///
+/// Runs its own fingerprint probe (same cost as [`PivSession::feature_gate`]
+/// itself), so this is one more SELECT round trip — acceptable here since it
+/// only runs on the road to an error, never on a path that would otherwise
+/// succeed.
+fn reset_global_alternative_hint(session: &mut keyroost_transport::PivSession) -> Option<String> {
+    use keyroost_piv::compat::{FeatureGate, PivExtension};
+    match session.feature_gate(PivExtension::ResetGlobal) {
+        FeatureGate::Supported => Some(
+            "Its whole-device factory reset is supported, though — run \
+             `keyroostctl factory-reset` instead."
+                .to_string(),
+        ),
+        FeatureGate::Unverified => Some(
+            "Its whole-device factory reset is unverified but may work — run \
+             `keyroostctl factory-reset` instead."
+                .to_string(),
+        ),
+        FeatureGate::Unsupported => None,
+    }
 }
 
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
@@ -9930,6 +10320,112 @@ mod cli_tests {
     }
 
     #[test]
+    fn factory_reset_global_reset_credential_flags_parse_and_are_optional() {
+        // Absent by default -- most devices never need a management-key
+        // credential for PIV's reset at all.
+        match parse(&["keyroostctl", "factory-reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::FactoryReset {
+                mgmt_key_env,
+                mgmt_key_stdin,
+                pin_env,
+                pin_stdin,
+                ..
+            }) => {
+                assert_eq!(mgmt_key_env, None);
+                assert!(!mgmt_key_stdin);
+                assert_eq!(pin_env, None);
+                assert!(!pin_stdin);
+            }
+            _ => panic!("expected factory-reset"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::FactoryReset { mgmt_key_env, .. }) => {
+                assert_eq!(mgmt_key_env.as_deref(), Some("XAUTH"))
+            }
+            _ => panic!("expected factory-reset"),
+        }
+        match parse(&["keyroostctl", "factory-reset", "--yes", "--pin-env", "GPIN"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::FactoryReset { pin_env, .. }) => {
+                assert_eq!(pin_env.as_deref(), Some("GPIN"))
+            }
+            _ => panic!("expected factory-reset"),
+        }
+    }
+
+    #[test]
+    fn resolve_reset_cli_auth_errors_when_nothing_was_passed() {
+        // No `Debug` on `ResetCliAuth` (it carries secret material — same
+        // reason the GUI's analogous `PivMgmtAuth` skips it too), so match
+        // rather than `.expect_err()`.
+        use keyroost_piv::compat::FeatureGate;
+        match resolve_reset_cli_auth(None, false, None, false, FeatureGate::Unsupported) {
+            Ok(_) => panic!("no credential source was given"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(!msg.contains("--pin-env"), "{msg}");
+            }
+        }
+        match resolve_reset_cli_auth(None, false, None, false, FeatureGate::Supported) {
+            Ok(_) => panic!("no credential source was given"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(msg.contains("--pin-env"), "{msg}");
+                assert!(!msg.contains("unverified"), "{msg}");
+            }
+        }
+        match resolve_reset_cli_auth(None, false, None, false, FeatureGate::Unverified) {
+            Ok(_) => panic!("no credential source was given"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(msg.contains("--pin-env"), "{msg}");
+                assert!(msg.contains("unverified"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn factory_reset_global_reset_credential_flags_are_mutually_exclusive() {
+        // Any two of the four (mgmt-key-env/mgmt-key-stdin/pin-env/pin-stdin)
+        // at once must refuse -- only one credential source at a time.
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+            "--pin-env",
+            "GPIN",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-stdin",
+            "--pin-stdin",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn oath_add_positional_name_does_not_hijack_device_selector() {
         // Regression: a subcommand's `name` arg must not be consumed as the
         // global device selector. That happened when the global selector shared
@@ -10522,6 +11018,96 @@ mod cli_tests {
             }
             _ => panic!("expected piv delete-key"),
         }
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--force"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset { force, yes, .. },
+            }) => {
+                assert!(force);
+                assert!(yes);
+            }
+            _ => panic!("expected piv reset"),
+        }
+    }
+
+    #[test]
+    fn piv_reset_credential_flags_parse_and_are_optional() {
+        // Absent by default -- most devices' RESET never needs a
+        // management-key credential at all.
+        match parse(&["keyroostctl", "piv", "reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::Reset {
+                        mgmt_key_env,
+                        mgmt_key_stdin,
+                        pin_env,
+                        pin_stdin,
+                        ..
+                    },
+            }) => {
+                assert_eq!(mgmt_key_env, None);
+                assert!(!mgmt_key_stdin);
+                assert_eq!(pin_env, None);
+                assert!(!pin_stdin);
+            }
+            _ => panic!("expected piv reset"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset { mgmt_key_env, .. },
+            }) => assert_eq!(mgmt_key_env.as_deref(), Some("XAUTH")),
+            _ => panic!("expected piv reset"),
+        }
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--pin-env", "GPIN"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset { pin_env, .. },
+            }) => assert_eq!(pin_env.as_deref(), Some("GPIN")),
+            _ => panic!("expected piv reset"),
+        }
+    }
+
+    #[test]
+    fn piv_reset_credential_flags_are_mutually_exclusive() {
+        // Any two of the four (mgmt-key-env/mgmt-key-stdin/pin-env/pin-stdin)
+        // at once must refuse -- only one credential source at a time.
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+            "--pin-env",
+            "GPIN",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-stdin",
+            "--pin-stdin",
+        ])
+        .is_err());
     }
 
     #[test]

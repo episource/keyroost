@@ -50,7 +50,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::fingerprint::{AppletFingerprint, HidCrescendoVariant, OpenFips201Variant};
+use crate::fingerprint::{
+    AppletFingerprint, ArekinathVariant, HidCrescendoVariant, OpenFips201Variant, TrussedVariant,
+    HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY,
+};
 
 /// One of the non-standard, vendor-extension PIV commands keyroost exposes —
 /// nothing in SP 800-73-4 defines it, so support varies by applet and is
@@ -84,6 +87,44 @@ pub enum PivExtension {
     /// branches on whether the quirk is also set — see
     /// `keyroost_transport::PivSession::authenticate_management_via_pin`.
     PinManagementAuth,
+    /// Resetting the PIV applet to factory defaults — wiping every slot's
+    /// keys and certificates along with the PIN, PUK, and management key.
+    /// SP 800-73-4 doesn't define one true mechanism for this: the dominant
+    /// one in practice is Yubico's proprietary `INS 0xFB` "RESET" instruction
+    /// (`keyroost_piv::piv::reset`), widely mimicked by other vendors, so
+    /// keyroost defaults to sending it unless a fingerprint-specific rule
+    /// selects a different sequence instead — see [`Self::ResetGlobal`] for
+    /// HID Crescendo's own alternative
+    /// (`keyroost_transport::PivSession::factory_reset` implements both,
+    /// preferring `ResetGlobal`'s mechanism whenever it's available).
+    /// Whether `INS
+    /// 0xFB` is accepted can additionally depend on the quirk below, which
+    /// this extension itself says nothing about — a caller checks support
+    /// here first, then checks whether [`resolve_quirks`] reports
+    /// [`PivQuirk::ResetNeedsManagementAuth`] (the HID Crescendo
+    /// alternative); its absence carries a meaning of its own — see that
+    /// quirk's doc. This extension is PIV-scoped only — see
+    /// [`Self::ResetGlobal`] for the distinction from a reset that also takes
+    /// other applets with it.
+    Reset,
+    /// A device-level reset directive that covers the PIV applet *and* at
+    /// least one other applet in the same operation — HID Crescendo's own
+    /// RESET CARD, run against its ACA (Access Control Applet) instance
+    /// (`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`, `INS 0x38`;
+    /// <https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm>),
+    /// clears PIV's PKI keys and data containers alongside the XAUTH key,
+    /// OATH keys/configuration, and (per the C4000 page) FIDO credentials —
+    /// implemented by `keyroost_transport::PivSession::factory_reset`. This is
+    /// what distinguishes it from [`Self::Reset`]:
+    /// [`Self::Reset`] is defined as wiping *only* PIV, however it gets there;
+    /// [`Self::ResetGlobal`] is a *different* directive, wider by definition,
+    /// that happens to take PIV with it. It does not have to cover every
+    /// applet on the device to count — PIV plus at least one other applet is
+    /// enough — so a device offering this is not thereby claiming a full
+    /// factory reset in one command, only that PIV isn't the only casualty.
+    /// Resolved independently of [`Self::Reset`]: a device can support
+    /// either, both, or neither.
+    ResetGlobal,
 }
 
 impl PivExtension {
@@ -113,6 +154,8 @@ impl PivExtension {
             PivExtension::Attest => ATTEST_VERDICTS,
             PivExtension::GetMetadata => GET_METADATA_VERDICTS,
             PivExtension::PinManagementAuth => PIN_MANAGEMENT_AUTH_VERDICTS,
+            PivExtension::Reset => RESET_VERDICTS,
+            PivExtension::ResetGlobal => RESET_GLOBAL_VERDICTS,
         }
     }
 
@@ -129,7 +172,9 @@ impl PivExtension {
             | PivExtension::DeleteKey
             | PivExtension::GetMetadata
             | PivExtension::Attest
-            | PivExtension::PinManagementAuth => &[],
+            | PivExtension::PinManagementAuth
+            | PivExtension::Reset
+            | PivExtension::ResetGlobal => &[],
         }
     }
 
@@ -157,6 +202,13 @@ impl PivExtension {
             PivExtension::PinManagementAuth => {
                 "Unlocking management with a PIN instead of the management key needs \
                  YubiKey 3+ or a compatible third-party device."
+            }
+            PivExtension::Reset => {
+                "Resetting the PIV applet needs a YubiKey or a compatible third-party device."
+            }
+            PivExtension::ResetGlobal => {
+                "A device-wide reset that takes PIV with it needs a compatible third-party \
+                 device (e.g. HID Crescendo)."
             }
         }
     }
@@ -193,6 +245,104 @@ pub enum PivQuirk {
     /// the read comes back with no tag 88 / subtag 89, PIN management auth
     /// simply hasn't been set up on this card yet.
     PinManagementAuthProtected9BKey,
+    /// [`PivExtension::Reset`] requires an authenticated management-key
+    /// session before it is accepted — e.g. HID Crescendo's own reset
+    /// mechanism
+    /// (<https://docs.hidglobal.com/crescendo/api/low-level/reset-card.htm>),
+    /// implemented by `keyroost_transport::PivSession::factory_reset`'s
+    /// `FactoryResetPlan::NeedsManagementAuth` path; see
+    /// [`PivExtension::ResetGlobal`] for that same mechanism's other
+    /// distinguishing property (it takes other applets down with PIV, not
+    /// just PIV) — that device-wide mechanism always needs an authenticated
+    /// session by its own protocol, whether or not this quirk is set, so
+    /// `factory_reset` doesn't consult this quirk on that path at all; here it
+    /// gates the *plain* `Reset` path specifically.
+    ///
+    /// A fingerprint that does *not* carry this quirk follows the opposite,
+    /// more common YubiKey convention instead: `INS 0xFB` is accepted with no
+    /// management-key session at all, gated purely on the PIV PIN *and* PUK
+    /// both already being blocked (every retry exhausted). That's the
+    /// implicit default this quirk's absence signals, not a fact
+    /// [`PivExtension::Reset`]'s own [`FeatureGate::Supported`] verdict
+    /// records — nothing yet acts on it (no up-front retry-counter check, no
+    /// offer to deliberately burn through PIN/PUK first), but a caller
+    /// wondering "how does RESET unlock on this device" reads the absence of
+    /// this quirk as the answer.
+    ///
+    /// **Safety constraint for that future workaround:** deliberately burning
+    /// through PIN and PUK retries to unlock RESET must only ever run when
+    /// [`PivExtension::Reset`] resolves [`FeatureGate::Supported`] — never
+    /// [`FeatureGate::Unverified`]. Blocking both counters is the *precondition*
+    /// for RESET on this convention, not proof RESET itself is implemented;
+    /// doing it on a device where RESET support is merely unverified risks
+    /// bricking it outright if `INS 0xFB` then turns out unsupported there —
+    /// PIN and PUK both blocked with no working RESET is unrecoverable.
+    /// [`FeatureGate::Unverified`] must fall back to a manual, user-driven
+    /// PIN/PUK block (or simply refuse), same as any other unverified
+    /// extension.
+    ResetNeedsManagementAuth,
+    /// This fingerprint (at the version the entry covers) ships with a
+    /// well-known, publicly documented factory-default value for the
+    /// standard PIV management key (key reference `0x9B`) — the raw key
+    /// bytes are carried right on the variant, unlike every other
+    /// [`PivQuirk`], because there's nothing else to derive them from.
+    /// Deliberately a slice, not a fixed-size array: `0x9B`'s algorithm
+    /// varies by fingerprint (and, on YubiKey, by firmware — 3-DES/AES-192
+    /// are 24 bytes, but AES-128 is 16 and AES-256 is 32; see
+    /// [`crate::MgmtAlg::key_len`]), so a caller must not assume any one
+    /// length for this quirk's payload. A caller offering a "use the default
+    /// management key" convenience reads this off [`resolve_quirks`] (via
+    /// [`default_9b_management_key`]) and disables that convenience entirely
+    /// when it's absent — an absent entry means keyroost has no known
+    /// default for this fingerprint, not that the device has none; see each
+    /// fingerprint's row in [`QUIRKS_BY_APPLET_TABLE`] for what's actually
+    /// known.
+    ///
+    /// Four distinct values are seeded today, each shared by every
+    /// fingerprint observed to ship it:
+    /// * `01 02 03 04 05 06 07 08` repeated three times (24 bytes) — the
+    ///   standard PIV default YubiKey documents
+    ///   (<https://docs.yubico.com/software/yubikey/tools/authenticator/auth-guide/piv-certificates.html>)
+    ///   and a wide range of third-party PIV implementations mimic outright,
+    ///   not just genuine YubiKeys — including the Trussed `piv-authenticator`
+    ///   (fingerprinted as [`AppletFingerprint::Trussed`]), whose
+    ///   `constants.rs` hard-codes this exact value as
+    ///   `DEFAULT_MANAGEMENT_KEY`
+    ///   (<https://github.com/trussed-dev/piv-authenticator/blob/main/src/constants.rs>).
+    /// * Token2's own vendor-specific value (24 bytes)
+    ///   (<https://www.token2.com/pages/pin-firmware-feature-support-matrix-openpgp-fido2-otp-and-piv-across-releases>).
+    /// * Feitian's own vendor-specific value (24 bytes)
+    ///   (<https://fido.ftsafe.com/feitian-sk-manager-tool-user-manual/>).
+    /// * HID Crescendo's documented all-zero factory-delivery value for XAUTH
+    ///   key 1 (24 bytes, [`HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY`]) — HID
+    ///   Crescendo has no standard PIV management key at all (see
+    ///   [`PivExtension::PinManagementAuth`]'s doc), but the same "well-known
+    ///   default credential" convenience applies to its XAUTH key, so it's
+    ///   seeded here too rather than duplicated through a parallel
+    ///   mechanism; `keyroost_transport::PivSession`'s HID Crescendo reset
+    ///   path reads this entry back to restore XAUTH key 1 after RESET CARD,
+    ///   rather than hard-coding the constant a second time.
+    ///
+    /// Every seeded value today happens to be 24 bytes, but that's a fact
+    /// about what's been observed so far, not a constraint this variant
+    /// enforces — a future row for an AES-128 or AES-256 default must not
+    /// need this type to change.
+    Default9bManagementKey(&'static [u8]),
+}
+
+/// Extract the well-known factory-default management-key bytes from a
+/// resolved quirk set, if [`PivQuirk::Default9bManagementKey`] is present in
+/// it — [`resolve_quirks`]'s return value is the expected input. `None` means
+/// keyroost has no known default for this fingerprint/version, the signal a
+/// "use the default management key" UI convenience uses to disable itself.
+/// The returned slice's length is whatever that fingerprint's management-key
+/// algorithm actually takes (16/24/32 bytes) — never assume 24.
+#[must_use]
+pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static [u8]> {
+    quirks.iter().find_map(|q| match q {
+        PivQuirk::Default9bManagementKey(key) => Some(*key),
+        _ => None,
+    })
 }
 
 /// The known-support table shared by [`PivExtension::MoveKey`] and
@@ -428,6 +578,211 @@ const PIN_MANAGEMENT_AUTH_VERDICTS: &[FingerprintVerdicts] = &[
         verdicts: &[VersionVerdict {
             version: &[3],
             verdict: Verdict::KnownSupported,
+        }],
+    },
+];
+
+/// [`PivExtension::Reset`]'s applet-axis known-support table:
+///
+/// * YubiKey — RESET (`INS 0xFB`) has been supported by every YubiKey PIV
+///   implementation observed, so this row is a single
+///   [`Verdict::KnownSupported`] at the universal `[]` version, no
+///   known-unsupported floor to gate below it — unlike [`KEY_OPS_VERDICTS`]'s
+///   YubiKey row, RESET didn't arrive in a specific later firmware. YubiKey
+///   carries no row in [`QUIRKS_BY_APPLET_TABLE`] for
+///   [`PivQuirk::ResetNeedsManagementAuth`] either: "supported" here means
+///   the card accepts the instruction, not that it accepts it
+///   unconditionally — the precondition (PIN *and* PUK both already blocked)
+///   is exactly what that quirk's absence signals, per its own doc.
+/// * HID Crescendo C2300/C4000/Generic — [`Verdict::KnownUnsupportedSince`]
+///   at the universal `[]` version, on the same standing-pattern reasoning as
+///   [`GET_METADATA_VERDICTS`]'s HID Crescendo rows: this family has never
+///   attempted to mimic a Yubico extension APDU, building its own
+///   proprietary alternatives instead (ACA XAUTH, GET PIV PROPERTIES), and a
+///   card-wide reset alternative already exists for it
+///   (<https://docs.hidglobal.com/crescendo/api/low-level/reset-card.htm>,
+///   implemented by `keyroost_transport::PivSession::factory_reset` — see
+///   [`PivQuirk::ResetNeedsManagementAuth`], set on the same three
+///   fingerprints in [`QUIRKS_BY_APPLET_TABLE`], and
+///   [`PivExtension::ResetGlobal`]/[`RESET_GLOBAL_VERDICTS`] for that same
+///   mechanism's known-support data). Unlike
+///   [`ATTEST_VERDICTS`]/[`GET_METADATA_VERDICTS`], this row also includes
+///   [`HidCrescendoVariant::Generic`] — the reasoning ("never implements a
+///   Yubico extension APDU, always ships its own") is about the vendor's
+///   pattern across the whole product line, not about a specific tested
+///   model, the same broadening `keyroost_piv::fingerprint`'s ACA AID doc
+///   applies to the transport-level XAUTH fallback.
+const RESET_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+];
+
+/// [`PivExtension::ResetGlobal`]'s applet-axis known-support table:
+///
+/// * HID Crescendo C2300/C4000 — [`Verdict::KnownSupported`] at the universal
+///   `[]` version: RESET CARD against the ACA instance (`INS 0x38`,
+///   <https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm> /
+///   <https://docs.hidglobal.com/crescendo/api/low-level/reset-card.htm>) is
+///   documented for both families and needs no minimum applet version — the
+///   same shape [`RESET_VERDICTS`]'s YubiKey row uses for `INS 0xFB`, just
+///   the opposite verdict from that same table's HID Crescendo rows: this
+///   family is [`Verdict::KnownUnsupportedSince`] for [`PivExtension::Reset`]
+///   but [`Verdict::KnownSupported`] here — the two extensions are resolved
+///   independently, and a device can carry either verdict without the other.
+///   Deliberately **not** extended to [`HidCrescendoVariant::Generic`] the
+///   way [`RESET_VERDICTS`]'s HID Crescendo rows are: RESET CARD's own
+///   documentation names the C2300 and C4000 families specifically, so
+///   unlike [`PivExtension::Reset`] (where every HID Crescendo model shares
+///   one "never mimics a Yubico extension APDU" absence to reason from) there
+///   is no equivalently general basis here to extend a *presence* claim to a
+///   model this data doesn't name.
+/// * Every other fingerprint currently defined — [`Verdict::KnownUnsupportedSince`]
+///   at the universal `[]` version, one row apiece. Deliberately explicit
+///   rather than left absent (which would resolve [`FeatureGate::Unverified`],
+///   same as any fingerprint absent from a table): `PivSession::factory_reset`
+///   checks this gate *first*, ahead of [`PivExtension::Reset`]'s own shape —
+///   an `Unverified` default here would make a *non*-HID-Crescendo device
+///   with a genuinely working [`PivExtension::Reset`] path (e.g. the
+///   PIN/PUK-burn convention) attempt HID's ACA RESET CARD mechanism first
+///   instead, fail (there's no such applet on that card), and never fall
+///   through to the mechanism that would have worked. An explicit
+///   [`Verdict::KnownUnsupportedSince`] here closes that: every fingerprint
+///   that isn't HID Crescendo is a flat "no" on this axis, not "no data yet".
+///   [`HidCrescendoVariant::Generic`] is *not* included in this bulk
+///   coverage — it's still `HidCrescendo`, just the one sub-variant this
+///   table has no specific row for (see the bullet above), so it keeps
+///   resolving [`FeatureGate::Unverified`] like any other undocumented
+///   version/variant, not `Unsupported`.
+const RESET_GLOBAL_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Generic,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::AuthentrendATKey,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Feitian,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::IdPrime,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Thetis,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Token2,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::UTrust,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
         }],
     },
 ];
@@ -688,11 +1043,59 @@ struct VersionQuirks {
     quirks: &'static [PivQuirk],
 }
 
+/// The commonly-mimicked YubiKey PIV factory-default management key: 24
+/// bytes of `01 02 03 04 05 06 07 08` repeated three times (3-DES /
+/// AES-192) —
+/// <https://docs.yubico.com/software/yubikey/tools/authenticator/auth-guide/piv-certificates.html>.
+/// Seeded on [`PivQuirk::Default9bManagementKey`] for every fingerprint known
+/// to ship this exact value, genuine YubiKeys and third-party mimics alike —
+/// see that variant's doc.
+const YUBIKEY_DEFAULT_MGMT_KEY: &[u8] = &[
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+];
+
+/// Token2's own vendor-specific PIV factory-default management key —
+/// <https://www.token2.com/pages/pin-firmware-feature-support-matrix-openpgp-fido2-otp-and-piv-across-releases>.
+const TOKEN2_DEFAULT_MGMT_KEY: &[u8] = &[
+    0x86, 0x53, 0x62, 0x86, 0x53, 0x62, 0x86, 0x53, 0x62, 0x86, 0x53, 0x62, 0x86, 0x53, 0x62, 0x86,
+    0x53, 0x62, 0x86, 0x53, 0x62, 0x86, 0x53, 0x62,
+];
+
+/// Feitian's own vendor-specific PIV factory-default management key — ASCII
+/// `"12345678"` repeated three times —
+/// <https://fido.ftsafe.com/feitian-sk-manager-tool-user-manual/>.
+const FEITIAN_DEFAULT_MGMT_KEY: &[u8] = &[
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+];
+
 /// [`PivQuirk`] table keyed by the PIV applet's own version — same row shape
 /// as [`PivExtension::applet_verdicts`], but not scoped to any one
 /// extension: every fingerprint's known version-gated quirks live directly
 /// in this one table rather than being duplicated per extension.
+///
+/// [`PivQuirk::Default9bManagementKey`] rows deliberately repeat the quirk on
+/// every [`VersionQuirks`] entry of a row that has more than one: per
+/// [`latest_quirks`], entries don't accumulate with each other, only across
+/// the applet/firmware axes, so a version-gated row that only listed the
+/// default key on its earliest entry would lose it again once a later entry
+/// (e.g. one clearing an unrelated, actually version-gated quirk) takes
+/// over. The default management key itself is not known to be version-gated
+/// for any seeded fingerprint, so it's simply carried on every entry of a
+/// row instead of modeling a fourth axis for it.
 const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::Generic,
+        // No more specific fingerprint matched, but a device that speaks
+        // plain PIV with nothing else recognisable about it is, in
+        // practice, overwhelmingly likely to ship the same YubiKey-mimicked
+        // default every other unrecognised third-party implementation does.
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        }],
+    },
     FingerprintQuirks {
         fingerprint: AppletFingerprint::Token2,
         // The empty-slice version is the "from the very first version"
@@ -701,7 +1104,10 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
         // matches regardless of which applet version Token2 reports.
         quirks: &[VersionQuirks {
             version: &[],
-            quirks: &[PivQuirk::InsF8SerialIsBcd],
+            quirks: &[
+                PivQuirk::InsF8SerialIsBcd,
+                PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+            ],
         }],
     },
     FingerprintQuirks {
@@ -712,10 +1118,15 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
         // rather than confirmed to — no earlier-version hardware has been
         // available to test — so the empty-slice version below is a
         // deliberate "from the very first version" assumption, not a direct
-        // observation, using the same sentinel as the row above.
+        // observation, using the same sentinel as the row above. Mimics the
+        // YubiKey default management key like most other third-party
+        // implementations do.
         quirks: &[VersionQuirks {
             version: &[],
-            quirks: &[PivQuirk::InsF8SerialIsBcd],
+            quirks: &[
+                PivQuirk::InsF8SerialIsBcd,
+                PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            ],
         }],
     },
     FingerprintQuirks {
@@ -740,18 +1151,72 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
         // itself would not match a device reporting the shorter "1.4.1".
         // Per `latest_quirks`, entries don't accumulate across each other,
         // only across the two axes, so a version at or above `[1, 4, 1]`
-        // picks up this entry's empty quirk list instead and reports no
-        // quirk.
+        // picks up this entry's quirk list instead and drops
+        // `InsF7MetadataAlgorithmInvalid` — but the default-management-key
+        // quirk is repeated on both entries so it survives that clearing.
         quirks: &[
             VersionQuirks {
                 version: &[],
-                quirks: &[PivQuirk::InsF7MetadataAlgorithmInvalid],
+                quirks: &[
+                    PivQuirk::InsF7MetadataAlgorithmInvalid,
+                    PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+                ],
             },
             VersionQuirks {
                 version: &[1, 4, 1],
-                quirks: &[],
+                quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
             },
         ],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::AuthentrendATKey,
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::UTrust,
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        }],
+    },
+    // The Trussed `piv-authenticator`'s own default management key is the
+    // same YubiKey-standard value seeded above, hard-coded as
+    // `DEFAULT_MANAGEMENT_KEY` in its `constants.rs` —
+    // <https://github.com/trussed-dev/piv-authenticator/blob/main/src/constants.rs>.
+    // Only `NitroKey` is fingerprinted today (see that variant's doc), but
+    // the value is a property of the shared Trussed applet code, not a
+    // Nitrokey-specific customization, so any future `TrussedVariant` seeded
+    // here should get the same row.
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::Feitian,
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::Default9bManagementKey(FEITIAN_DEFAULT_MGMT_KEY)],
+        }],
     },
     FingerprintQuirks {
         fingerprint: AppletFingerprint::YubiKey,
@@ -759,10 +1224,71 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
         // version 3 is where `PivExtension::PinManagementAuth` becomes
         // known-supported, and on YubiKey it's always the indirect
         // PIN-protected-management-key scheme, never a direct PIN unlock —
-        // see this quirk's own doc.
+        // see this quirk's own doc. YubiKey carries no
+        // `PivQuirk::ResetNeedsManagementAuth` entry at all — its absence is
+        // exactly how a caller learns RESET follows the PIN/PUK-blocked
+        // convention instead; see that quirk's doc. The default-management-
+        // key quirk isn't gated on that same version split — it's repeated
+        // on both entries so it applies below applet version 3 too.
+        quirks: &[
+            VersionQuirks {
+                version: &[],
+                quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+            },
+            VersionQuirks {
+                version: &[3],
+                quirks: &[
+                    PivQuirk::PinManagementAuthProtected9BKey,
+                    PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+                ],
+            },
+        ],
+    },
+    // HID Crescendo doesn't support `PivExtension::Reset` at all
+    // (`RESET_VERDICTS`) — this quirk describes its *replacement* mechanism
+    // instead (RESET CARD against the ACA instance, `PivExtension::
+    // ResetGlobal` — see `RESET_GLOBAL_VERDICTS`), implemented by
+    // `keyroost_transport::PivSession::factory_reset` (see this quirk's own
+    // doc). All three sub-fingerprints, same as
+    // `RESET_VERDICTS`'s HID Crescendo rows — see that table's doc for why
+    // `Generic` is included alongside the two named models. (Unlike this
+    // quirk, `RESET_GLOBAL_VERDICTS`'s own known-support data deliberately
+    // does NOT extend to `Generic` — see that table's doc for why the two
+    // don't follow the same rule here.) HID Crescendo has no standard PIV
+    // management key at all — its "default key" is XAUTH key 1's documented
+    // all-zero factory-delivery value
+    // ([`HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY`]), seeded here too so
+    // `keyroost_transport::PivSession`'s post-RESET-CARD restore step reads
+    // it back from this one table rather than a separately hard-coded
+    // constant.
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
         quirks: &[VersionQuirks {
-            version: &[3],
-            quirks: &[PivQuirk::PinManagementAuthProtected9BKey],
+            version: &[],
+            quirks: &[
+                PivQuirk::ResetNeedsManagementAuth,
+                PivQuirk::Default9bManagementKey(&HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY),
+            ],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[
+                PivQuirk::ResetNeedsManagementAuth,
+                PivQuirk::Default9bManagementKey(&HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY),
+            ],
+        }],
+    },
+    FingerprintQuirks {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+        quirks: &[VersionQuirks {
+            version: &[],
+            quirks: &[
+                PivQuirk::ResetNeedsManagementAuth,
+                PivQuirk::Default9bManagementKey(&HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY),
+            ],
         }],
     },
 ];
@@ -856,6 +1382,9 @@ mod tests {
             PivExtension::DeleteKey.requirement(),
             PivExtension::GetMetadata.requirement(),
             PivExtension::Attest.requirement(),
+            PivExtension::PinManagementAuth.requirement(),
+            PivExtension::Reset.requirement(),
+            PivExtension::ResetGlobal.requirement(),
         ];
         for (i, a) in reqs.iter().enumerate() {
             for b in &reqs[i + 1..] {
@@ -1400,11 +1929,13 @@ mod tests {
 
     #[test]
     fn no_data_on_either_axis_resolves_to_no_quirks() {
-        // UTrust carries no quirk row at all (unlike YubiKey, which since
+        // IdPrime carries no quirk row at all — unlike YubiKey (which since
         // `PinManagementAuthProtected9BKey` has one from applet version 3 on
-        // — see `yubikey_pin_management_auth_3_and_newer_is_supported_with_the_protected_key_quirk`).
+        // — see `yubikey_pin_management_auth_3_and_newer_is_supported_with_the_protected_key_quirk`)
+        // or UTrust (which mimics the YubiKey default management key — see
+        // `default_9b_management_key_seeded_fingerprints`).
         assert_eq!(
-            resolve_quirks(AppletFingerprint::UTrust, Some(&[5, 7]), Some(&[5, 7])),
+            resolve_quirks(AppletFingerprint::IdPrime, Some(&[5, 7]), Some(&[5, 7])),
             BTreeSet::new()
         );
     }
@@ -1474,8 +2005,12 @@ mod tests {
 
     #[test]
     fn unknown_fingerprint_has_no_quirks() {
+        // IdPrime, again — see `no_data_on_either_axis_resolves_to_no_quirks`
+        // for why `Generic` no longer fits this test: it now carries its own
+        // `Default9bManagementKey` row (see
+        // `default_9b_management_key_seeded_fingerprints`).
         assert_eq!(
-            resolve_quirks(AppletFingerprint::Generic, Some(&[1, 0]), Some(&[1, 0])),
+            resolve_quirks(AppletFingerprint::IdPrime, Some(&[1, 0]), Some(&[1, 0])),
             BTreeSet::new()
         );
     }
@@ -1485,11 +2020,16 @@ mod tests {
     #[test]
     fn token2_bcd_serial_quirk_matches_any_reported_applet_version() {
         // The `[]` sentinel orders at or below every real version, so this
-        // fires regardless of how old or new the reported version is.
+        // fires regardless of how old or new the reported version is. Token2
+        // also carries its own vendor-specific default management key on the
+        // same row — see `default_9b_management_key_seeded_fingerprints`.
         for version in [&[0, 0][..], &[1, 0][..], &[9, 9, 9][..]] {
             assert_eq!(
                 resolve_quirks(AppletFingerprint::Token2, Some(version), None),
-                BTreeSet::from([PivQuirk::InsF8SerialIsBcd])
+                BTreeSet::from([
+                    PivQuirk::InsF8SerialIsBcd,
+                    PivQuirk::Default9bManagementKey(TOKEN2_DEFAULT_MGMT_KEY),
+                ])
             );
         }
     }
@@ -1514,11 +2054,15 @@ mod tests {
         // fires regardless of how old or new the reported version is —
         // including versions below 5.112.0, the only one actually tested;
         // see the row's comment on why that's an assumption, not an
-        // observation.
+        // observation. Thetis mimics the YubiKey default management key too
+        // — see `default_9b_management_key_seeded_fingerprints`.
         for version in [&[0, 0][..], &[1, 0][..], &[9, 9, 9][..]] {
             assert_eq!(
                 resolve_quirks(AppletFingerprint::Thetis, Some(version), None),
-                BTreeSet::from([PivQuirk::InsF8SerialIsBcd])
+                BTreeSet::from([
+                    PivQuirk::InsF8SerialIsBcd,
+                    PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+                ])
             );
         }
         assert_eq!(
@@ -1534,7 +2078,9 @@ mod tests {
     fn swissbit_ishield2_metadata_quirk_below_1_4_1() {
         // The sentinel version `[]` matches regardless of how old the
         // reported version is, so this is active from the very first
-        // version on record.
+        // version on record. The default-management-key quirk rides along
+        // on the same entry — see
+        // `default_9b_management_key_seeded_fingerprints`.
         for version in [&[0][..], &[1][..], &[1, 3, 9][..], &[1, 4, 0][..]] {
             assert_eq!(
                 resolve_quirks(
@@ -1542,7 +2088,10 @@ mod tests {
                     Some(version),
                     None,
                 ),
-                BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid])
+                BTreeSet::from([
+                    PivQuirk::InsF7MetadataAlgorithmInvalid,
+                    PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+                ])
             );
         }
     }
@@ -1551,7 +2100,10 @@ mod tests {
     fn swissbit_ishield2_metadata_quirk_cleared_at_1_4_1() {
         // `[1, 4, 1]` covers both a bare 3-component "1.4.1" report and the
         // actually-confirmed-clear 4-component "1.4.1.0" — `[1, 4, 1]`
-        // orders below both under slice-prefix comparison.
+        // orders below both under slice-prefix comparison. The metadata
+        // quirk clears here, but the default-management-key quirk is
+        // repeated on this entry too (see the row's comment) and so
+        // survives the clearing.
         for version in [
             &[1, 4, 1][..],
             &[1, 4, 1, 0][..],
@@ -1564,7 +2116,7 @@ mod tests {
                     Some(version),
                     None,
                 ),
-                BTreeSet::new()
+                BTreeSet::from([PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)])
             );
         }
     }
@@ -1580,6 +2132,109 @@ mod tests {
                 None,
             ),
             BTreeSet::new()
+        );
+    }
+
+    // --- PivQuirk::Default9bManagementKey: the seeded factory-default -----
+    // --- management-key quirk, by fingerprint -----------------------------
+
+    #[test]
+    fn default_9b_management_key_seeded_fingerprints() {
+        let yubikey_mimics = [
+            AppletFingerprint::Generic,
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+            AppletFingerprint::AuthentrendATKey,
+            AppletFingerprint::UTrust,
+            AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+        ];
+        for fp in yubikey_mimics {
+            assert_eq!(
+                default_9b_management_key(&resolve_quirks(fp, Some(&[0]), None)),
+                Some(YUBIKEY_DEFAULT_MGMT_KEY),
+                "{fp:?}"
+            );
+        }
+        // Thetis carries its own row (with `InsF8SerialIsBcd` alongside it —
+        // see `thetis_bcd_serial_quirk_matches_any_reported_applet_version`),
+        // so it's checked separately rather than folded into the loop above.
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(AppletFingerprint::Thetis, Some(&[0]), None)),
+            Some(YUBIKEY_DEFAULT_MGMT_KEY)
+        );
+
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(AppletFingerprint::Token2, Some(&[0]), None)),
+            Some(TOKEN2_DEFAULT_MGMT_KEY)
+        );
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(
+                AppletFingerprint::Feitian,
+                Some(&[0]),
+                None
+            )),
+            Some(FEITIAN_DEFAULT_MGMT_KEY)
+        );
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            assert_eq!(
+                default_9b_management_key(&resolve_quirks(
+                    AppletFingerprint::HidCrescendo(variant),
+                    Some(&[0]),
+                    None,
+                )),
+                Some(&HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY[..]),
+                "{variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_9b_management_key_applies_below_and_at_yubikey_applet_version_3() {
+        // Unlike `PinManagementAuthProtected9BKey` (which only starts at
+        // applet version 3), the default management key applies at any
+        // reported version, including below 3.
+        for version in [&[0][..], &[2, 9][..], &[3][..], &[5, 7][..]] {
+            assert_eq!(
+                default_9b_management_key(&resolve_quirks(
+                    AppletFingerprint::YubiKey,
+                    Some(version),
+                    None
+                )),
+                Some(YUBIKEY_DEFAULT_MGMT_KEY),
+                "{version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_9b_management_key_absent_without_a_seeded_row() {
+        for fp in [
+            AppletFingerprint::IdPrime,
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+        ] {
+            assert_eq!(
+                default_9b_management_key(&resolve_quirks(fp, Some(&[0]), None)),
+                None,
+                "{fp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_9b_management_key_absent_without_a_reported_version() {
+        // Same "None → skip" rule as every other quirk: with no
+        // applet/firmware version reported at all, there's nothing to
+        // version-match against, so even a seeded fingerprint resolves no
+        // quirks.
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(AppletFingerprint::YubiKey, None, None)),
+            None
         );
     }
 
@@ -1885,5 +2540,172 @@ mod tests {
             !resolve_quirks(AppletFingerprint::YubiKey, Some(&[2, 9, 9]), None)
                 .contains(&PivQuirk::PinManagementAuthProtected9BKey)
         );
+    }
+
+    // --- PIV RESET: YubiKey supported at any version, HID Crescendo never --
+
+    #[test]
+    fn yubikey_reset_supported_at_any_version_with_no_management_auth_quirk() {
+        // The universal `[]` sentinel: no known-unsupported floor to clear, unlike
+        // MOVE KEY/DELETE KEY's YubiKey row — RESET didn't arrive in a
+        // specific later firmware.
+        for version in [&[0][..], &[1, 0][..], &[9, 9, 9][..]] {
+            assert_eq!(
+                resolve(
+                    PivExtension::Reset,
+                    AppletFingerprint::YubiKey,
+                    Some(version),
+                    None
+                ),
+                FeatureGate::Supported
+            );
+            // `Supported` here means the card accepts `INS 0xFB` at all —
+            // *without* `ResetNeedsManagementAuth`, which per that quirk's
+            // doc is exactly how a caller reads off the PIN/PUK-blocked
+            // convention instead.
+            assert!(
+                !resolve_quirks(AppletFingerprint::YubiKey, Some(version), None)
+                    .contains(&PivQuirk::ResetNeedsManagementAuth)
+            );
+        }
+        assert_eq!(
+            resolve(PivExtension::Reset, AppletFingerprint::YubiKey, None, None),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn yubikey_reset_has_no_management_auth_quirk_alongside_the_pin_management_auth_quirk() {
+        // Applet version 3+ still carries `PinManagementAuthProtected9BKey`
+        // (an unrelated quirk, for a different extension) but no
+        // `ResetNeedsManagementAuth` — the two aren't linked.
+        let quirks = resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7]), None);
+        assert!(!quirks.contains(&PivQuirk::ResetNeedsManagementAuth));
+        assert!(quirks.contains(&PivQuirk::PinManagementAuthProtected9BKey));
+    }
+
+    #[test]
+    fn hid_crescendo_reset_unsupported_at_any_version_including_generic() {
+        // Same `KnownUnsupportedSince` shape as `GET_METADATA_VERDICTS`/
+        // `ATTEST_VERDICTS`'s HID Crescendo rows, but — unlike those two —
+        // also covers `Generic`; see `RESET_VERDICTS`'s doc for why.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[3, 0, 3, 6][..], &[9, 9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::Reset, fp, Some(version), None),
+                    FeatureGate::Unsupported
+                );
+            }
+            // The not-yet-implemented replacement mechanism's quirk is
+            // already in place, ready for the workaround to key off of.
+            assert!(
+                resolve_quirks(fp, Some(&[0]), None).contains(&PivQuirk::ResetNeedsManagementAuth)
+            );
+        }
+    }
+
+    #[test]
+    fn reset_data_does_not_leak_to_other_fingerprints() {
+        assert_eq!(
+            resolve(PivExtension::Reset, AppletFingerprint::Generic, None, None),
+            FeatureGate::Unverified
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::Reset,
+                AppletFingerprint::Token2,
+                Some(&[5, 112, 0]),
+                None,
+            ),
+            FeatureGate::Unverified
+        );
+        assert!(
+            !resolve_quirks(AppletFingerprint::Token2, Some(&[5, 112, 0]), None)
+                .contains(&PivQuirk::ResetNeedsManagementAuth)
+        );
+    }
+
+    // --- PIV RESET_GLOBAL: HID Crescendo C2300/C4000 only, not Generic ---
+
+    #[test]
+    fn hid_crescendo_c2300_c4000_reset_global_supported_at_any_version() {
+        for variant in [HidCrescendoVariant::C2300, HidCrescendoVariant::C4000] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[3, 0, 3, 6][..], &[9, 9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::ResetGlobal, fp, Some(version), None),
+                    FeatureGate::Supported
+                );
+            }
+            assert_eq!(
+                resolve(PivExtension::ResetGlobal, fp, None, None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_generic_has_no_reset_global_data() {
+        // Unlike `PivExtension::Reset`'s known-unsupported row, `ResetGlobal`'s
+        // known-supported claim deliberately isn't extended to `Generic` — see
+        // `RESET_GLOBAL_VERDICTS`'s doc for why.
+        assert_eq!(
+            resolve(
+                PivExtension::ResetGlobal,
+                AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+                Some(&[3, 0, 3, 6]),
+                None,
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    /// Every fingerprint that isn't `HidCrescendo` carries its own explicit
+    /// `Verdict::KnownUnsupportedSince` row (see `RESET_GLOBAL_VERDICTS`'s
+    /// doc for why an explicit "no" beats leaving these absent) -- a flat
+    /// `Unsupported` at any reported version, not the `Unverified` an absent
+    /// row would give. Covers every `AppletFingerprint` variant currently
+    /// defined outside `HidCrescendo`, one representative version each plus
+    /// a second to prove it's not just the exact-match version that resolves
+    /// this way.
+    #[test]
+    fn reset_global_is_known_unsupported_for_every_non_hid_crescendo_fingerprint() {
+        let non_hid_crescendo = [
+            AppletFingerprint::Generic,
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+            AppletFingerprint::AuthentrendATKey,
+            AppletFingerprint::Feitian,
+            AppletFingerprint::IdPrime,
+            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+            AppletFingerprint::Thetis,
+            AppletFingerprint::Token2,
+            AppletFingerprint::UTrust,
+            AppletFingerprint::YubiKey,
+        ];
+        for fp in non_hid_crescendo {
+            for version in [&[0][..], &[9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::ResetGlobal, fp, Some(version), None),
+                    FeatureGate::Unsupported,
+                    "{fp:?} at {version:?}"
+                );
+            }
+            // No reported version at all still can't match any row --
+            // `resolve_in` returns `Unverified` before ever consulting the
+            // table, same as any other extension.
+            assert_eq!(
+                resolve(PivExtension::ResetGlobal, fp, None, None),
+                FeatureGate::Unverified,
+                "{fp:?} with no reported version"
+            );
+        }
     }
 }
