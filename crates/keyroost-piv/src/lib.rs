@@ -61,6 +61,13 @@ pub const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
 /// Authentication method blocked (PIN/PUK exhausted, or RESET preconditions
 /// unmet).
 pub const SW_AUTH_BLOCKED: u16 = 0x6983;
+/// Conditions of use not satisfied. Yubico's own RESET documentation names
+/// this — not [`SW_AUTH_BLOCKED`] — as what a YubiKey returns when RESET's
+/// "PIN and PUK must already be blocked" precondition is unmet:
+/// <https://docs.yubico.com/yesdk/users-manual/application-piv/apdu/reset-piv.html>.
+/// Treat the two as interchangeable for that precondition rather than
+/// assuming one fingerprint's choice generalizes.
+pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 /// Reference data (key/PIN) not found.
 pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
 /// Wrong length (e.g. a PUT DATA whose object is longer than the card takes).

@@ -68,7 +68,7 @@ fn credential_guess_from(raw: &[u8; GUESS_LEN], previous: Option<&[u8]>) -> Zero
     guess
 }
 
-/// Re-map an error raised by the final RESET step of [`PivSession::force_reset`]
+/// Re-map an error raised by the final RESET step of [`PivSession::factory_reset`]
 /// onto what the card is actually left holding.
 ///
 /// By that point the PIN and the PUK are deliberately blocked, so a card that
@@ -83,10 +83,10 @@ fn map_reset_stage_error(e: TransportError) -> TransportError {
     match e {
         // Two refusals, and only two, are the card's final word.
         //
-        // 6983 (mapped to PivResetNotAllowed): the card checked the one
-        // precondition RESET has and says it is unmet — with the PIN and PUK
-        // already blocked, a second run reaches the same check and gets the
-        // same answer, so there is nothing left to retry.
+        // 6983 or 6985 (both mapped to PivResetNotAllowed): the card checked
+        // the one precondition RESET has and says it is unmet — with the PIN
+        // and PUK already blocked, a second run reaches the same check and
+        // gets the same answer, so there is nothing left to retry.
         //
         // 6D00 (INS not supported) / 6A81 (function not supported): the
         // vendor-extension RESET instruction is not implemented at all. No
@@ -110,7 +110,7 @@ fn map_reset_stage_error(e: TransportError) -> TransportError {
             label: "piv reset",
             sw1: 0x6A,
             sw2: 0x81,
-        } => TransportError::PivForceResetIncomplete(
+        } => TransportError::PivResetIncomplete(
             "the PIN and the PUK are now both blocked, but the card refused the \
              RESET instruction, so the PIV applet was NOT wiped. Its keys and \
              certificates are still on the card and there is no keyroost command \
@@ -331,6 +331,115 @@ pub enum CurrentMgmtAuth<'a> {
     Pin(&'a [u8]),
 }
 
+/// What [`PivSession::factory_reset`] does for the PIV-only path, resolved
+/// purely from this applet's [`keyroost_piv::compat::PivExtension::Reset`]
+/// gate and [`keyroost_piv::compat::PivQuirk`]s — see
+/// [`PivSession::plan_factory_reset`], which resolves this, and
+/// [`PivResetPreview`], which wraps it alongside the device-wide
+/// [`keyroost_piv::compat::PivExtension::ResetGlobal`] alternative
+/// [`PivSession::factory_reset`] prefers when it's available (this type says
+/// nothing about that axis on its own — see [`PivResetPreview::Global`]).
+/// Exposed as its own public type — not just an internal branch inside
+/// [`PivSession::factory_reset`] — so a whole-device factory reset can preview
+/// the PIV-only shape up front and decide how to report the step (e.g.
+/// "skipped: not supported" vs. a real failure) without duplicating the
+/// decision or having to parse it back out of a [`TransportError`] variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactoryResetPlan {
+    /// [`keyroost_piv::compat::FeatureGate::Unsupported`]: this fingerprint
+    /// is known not to implement RESET at all. Deliberately blocking the
+    /// PIN and PUK would have no way back, so [`PivSession::factory_reset`]
+    /// refuses before touching either counter — unless
+    /// [`keyroost_piv::compat::PivExtension::ResetGlobal`] offers something
+    /// instead, in which case [`PivResetPreview::Global`] wins before this
+    /// variant is even reached.
+    Unsupported,
+    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]: RESET
+    /// needs an authenticated management-key session on this fingerprint,
+    /// not the PIN/PUK-blocked precondition [`PivSession::factory_reset`]
+    /// otherwise automates. It authenticates with the
+    /// `current` credential its caller supplied, then sends RESET —
+    /// refusing instead, with [`TransportError::PivResetNeedsManagementAuth`],
+    /// only when no credential was supplied at all.
+    NeedsManagementAuth,
+    /// [`keyroost_piv::compat::FeatureGate::Unverified`]: support can't be
+    /// confirmed, so [`PivSession::factory_reset`] skips its usual PIN/PUK
+    /// pre-blocking (blocking both blindly on a device that might not
+    /// implement RESET risks a permanent lock) and sends a bare
+    /// [`PivSession::reset`] instead, succeeding or failing on the card's
+    /// own terms.
+    Unverified,
+    /// [`keyroost_piv::compat::FeatureGate::Supported`] with no
+    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`] — the
+    /// YubiKey convention, and the most-automated mechanism
+    /// [`PivSession::factory_reset`] runs: burn the PIN, then the PUK, then
+    /// RESET.
+    BurnPinPukThenReset,
+}
+
+/// What [`PivSession::factory_reset`] will attempt for this applet's current
+/// fingerprint, resolved read-only by [`PivSession::preview_factory_reset`] —
+/// [`keyroost_piv::compat::PivExtension::ResetGlobal`] checked first (a
+/// device-wide mechanism wins over a PIV-only one whenever it's available),
+/// [`FactoryResetPlan`] (`PivExtension::Reset`'s own shape) as the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PivResetPreview {
+    /// Neither `PivExtension::ResetGlobal` nor `PivExtension::Reset` is
+    /// anything but a confirmed dead end: [`PivSession::factory_reset`] would
+    /// refuse outright with [`TransportError::PivResetUnsupported`]. A
+    /// whole-device factory reset should not even plan a PIV step for this
+    /// device (`keyroost_resolve::exclude_unresettable_piv`).
+    Unsupported,
+    /// `PivExtension::ResetGlobal` resolves
+    /// [`keyroost_piv::compat::FeatureGate::Supported`] or
+    /// [`keyroost_piv::compat::FeatureGate::Unverified`]:
+    /// [`PivSession::factory_reset`] will attempt
+    /// the device-wide mechanism (HID Crescendo's ACA RESET CARD today),
+    /// which takes PIV down with it alongside at least one other applet.
+    /// Wins over [`Self::Piv`] even when `PivExtension::Reset` also offers
+    /// something — a device-wide mechanism, once available, is the more
+    /// complete reset.
+    Global,
+    /// `PivExtension::ResetGlobal` is a confirmed dead end but
+    /// `PivExtension::Reset` isn't: [`PivSession::factory_reset`] will attempt
+    /// a PIV-only reset, per this nested [`FactoryResetPlan`].
+    Piv(FactoryResetPlan),
+}
+
+/// Outcome of a successful [`PivSession::factory_reset`]. Both variants mean
+/// the applet (and, on the device-wide path, whatever else that mechanism
+/// covers) was actually wiped — [`Self::WipedKeyRestoreFailed`] only
+/// distinguishes a courtesy follow-up step that failed afterward, never
+/// reachable unless the wipe itself already succeeded. Named for the outcome
+/// generally, not just the device-wide path: every other path `factory_reset`
+/// can take (the PIN/PUK burn dance, a bare unverified RESET, an
+/// authenticated management-key RESET) only ever produces [`Self::Wiped`] on
+/// success, since none of them has an equivalent courtesy follow-up step to
+/// fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactoryResetOutcome {
+    /// The PIV applet was wiped by one of the mechanisms confined to PIV
+    /// itself ([`FactoryResetPlan`]'s shapes) — nothing outside PIV was
+    /// touched. See [`Self::WipedGlobal`] for the device-wide counterpart.
+    Wiped,
+    /// [`PivSession::hid_crescendo_aca_reset_card`]-specific: the device-wide
+    /// `PivExtension::ResetGlobal` mechanism ran cleanly — RESET CARD
+    /// succeeded and XAUTH key 1 was restored to HID's documented
+    /// factory-delivery value. This took at least one other applet down with
+    /// PIV, so a caller building a report line should name the whole device,
+    /// not just PIV (`keyroost_resolve`'s `PIV_GLOBAL_RESET_LABEL`) — unlike
+    /// [`Self::Wiped`], which is confined to PIV alone.
+    WipedGlobal,
+    /// [`PivSession::hid_crescendo_aca_reset_card`]-specific: RESET CARD
+    /// succeeded — the device IS wiped — but restoring XAUTH key 1 to HID's
+    /// documented factory-delivery value afterward failed. XAUTH key 1 is
+    /// left cleared (RESET CARD's own effect) rather than at the factory
+    /// default; a caller should tell the user this distinctly from a hard
+    /// failure, since the reset itself worked. Same device-wide scope as
+    /// [`Self::WipedGlobal`] — only the courtesy restore is what's soft here.
+    WipedKeyRestoreFailed,
+}
+
 /// What [`PivSession::hid_crescendo_aca_put_xauth_key_op`] should do to XAUTH
 /// key 1 once unlocked — install a new key ([`Self::Set`], from
 /// [`PivSession::set_management_key`]) or delete it outright ([`Self::Delete`],
@@ -450,7 +559,7 @@ impl PubkeyCache {
         }
     }
 
-    /// The applet was factory-reset (`reset`, which `force_reset` also
+    /// The applet was factory-reset (`reset`, which `factory_reset` also
     /// funnels into): every slot is empty, nothing cached survives.
     fn clear(&mut self) {
         self.0.clear();
@@ -1953,6 +2062,145 @@ impl PivSession {
         result
     }
 
+    /// HID Crescendo's device-wide reset — the mechanism behind
+    /// [`keyroost_piv::compat::PivExtension::ResetGlobal`]: SELECT the ACA
+    /// instance, authenticate with `current` (PIN or XAUTH key — the same
+    /// choice [`Self::hid_crescendo_aca_put_xauth_key_op`] takes, run fresh
+    /// here for the same reason that method's doc gives), send RESET CARD
+    /// ([`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_RESET_CARD`]), then
+    /// restore XAUTH key 1 to HID's documented factory-delivery value —
+    /// read via [`keyroost_piv::compat::default_9b_management_key`] off this
+    /// fingerprint's [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`]
+    /// row (seeded with
+    /// [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY`],
+    /// the single source of truth for the value) rather than the constant
+    /// hard-coded a second time — RESET CARD clears the key outright, but
+    /// the as-delivered state ships with it already set to this all-zero
+    /// key, and restoring it is also what keeps the device recoverable by
+    /// XAUTH alone if a later mistake ever blocks the ACA's own PIN. See
+    /// [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_RESET_CARD`]'s doc for
+    /// exactly what gets wiped (PIV's PKI keys and data containers always;
+    /// OATH and, on C4000 only as documented, FIDO — family-dependent).
+    ///
+    /// **Confirmed on hardware:** the ACA's authenticated security status
+    /// does *not* survive RESET CARD, so the PUT XAUTH KEY restore step
+    /// right after it re-authenticates first — against
+    /// [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_AFTER_RESET`], the
+    /// PIN RESET CARD itself just rewrote the card to, not against `current`
+    /// (which no longer verifies once the reset has run). If that
+    /// re-authentication or the restore itself fails, RESET CARD still
+    /// succeeded (the device is fully reset), which reports as
+    /// [`FactoryResetOutcome::WipedKeyRestoreFailed`] rather than a hard
+    /// error — a caller must not read that as "nothing happened."
+    ///
+    /// Only the restore step's failure is soft. Every earlier failure — the
+    /// SELECT, the authentication, or RESET CARD itself (`SW = 69 82`,
+    /// mapped by [`ok_or_write`] to [`TransportError::PivSecurityNotSatisfied`],
+    /// same status word and same mapping [`Self::hid_crescendo_aca_put_xauth_key_op`]
+    /// relies on) — means the device was never touched, and propagates as a
+    /// normal `Err`.
+    ///
+    /// Always re-SELECTs PIV afterward, whatever the outcome — same
+    /// discipline as [`Self::hid_crescendo_aca_put_xauth_key_op`] and every
+    /// other temporary-SELECT probe in this file.
+    ///
+    /// Private: [`Self::factory_reset`] is the one public entry point for
+    /// every `PivExtension::Reset`/`ResetGlobal` mechanism this crate
+    /// implements — it decides on its own, from the live fingerprint,
+    /// whether this method is even the right one to reach for, and wraps
+    /// whatever `Err` it returns in [`TransportError::PivResetGlobalFailed`]
+    /// so a caller can tell a device-wide-mechanism failure apart from a
+    /// burn-dance one. A caller that wants this specific mechanism without
+    /// that fingerprint check has no way to ask for it directly any more —
+    /// by design, since bypassing the check is exactly what let a caller
+    /// attempt HID's ACA RESET CARD against a device that was never
+    /// confirmed to have one.
+    fn hid_crescendo_aca_reset_card(
+        &mut self,
+        current: CurrentMgmtAuth<'_>,
+    ) -> Result<FactoryResetOutcome, TransportError> {
+        use keyroost_piv::fingerprint;
+
+        // Resolved up front, before the ACA gets SELECTed below: this reads
+        // `Self::quirks`, which (via `Self::identity`) may itself need to
+        // talk to the card the first time it's called in a session, and that
+        // has to happen against the currently selected PIV applet, not mid
+        // ACA sequence. `PivQuirk::Default9bManagementKey` on this
+        // fingerprint's row is always seeded with
+        // `fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY` — see that
+        // quirk's doc — so the fallback below is purely defensive, never
+        // actually reached for a fingerprint that got this far at all.
+        let restore_key = keyroost_piv::compat::default_9b_management_key(&self.quirks())
+            .unwrap_or(&fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY);
+
+        let result: Result<FactoryResetOutcome, TransportError> = (|| {
+            let (_, sw) =
+                self.transmit_full(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
+            ok_or_apdu("piv aca select", sw)?;
+
+            match current {
+                CurrentMgmtAuth::Pin(pin) => self.verify_pin_hid_crescendo_aca(pin)?,
+                CurrentMgmtAuth::Key(current_key) => self.aca_xauth_unlock(current_key)?,
+            }
+
+            let (_, sw) = self.transmit_full(&fingerprint::HID_CRESCENDO_ACA_RESET_CARD)?;
+            ok_or_write("piv aca reset card", sw)?;
+
+            // Wiped. Everything from here on is the factory-XAUTH-key
+            // courtesy restore, not the reset itself — its failure must not
+            // read as if RESET CARD had failed.
+            //
+            // RESET CARD drops the ACA's authenticated security status
+            // (confirmed on hardware — see this method's doc) and rewrites
+            // its PIN to HID's documented reset-default, so PUT XAUTH KEY
+            // below needs a fresh authenticated session against that
+            // default, not against `current`. A failure here is folded into
+            // the same soft `WipedKeyRestoreFailed` as the restore itself:
+            // the device is wiped either way.
+            if let Err(e) =
+                self.verify_pin_hid_crescendo_aca(fingerprint::HID_CRESCENDO_ACA_PIN_AFTER_RESET)
+            {
+                trace::line(self.debug, || {
+                    format!(
+                        "piv aca reauth after reset card (restore factory default): \
+                         failed ({e})"
+                    )
+                });
+                return Ok(FactoryResetOutcome::WipedKeyRestoreFailed);
+            }
+
+            // `hid_crescendo_aca_put_xauth_key` returning `None` can't
+            // actually happen (`restore_key` is 24 bytes, matching
+            // `MgmtAlg::TripleDes` exactly), but it's treated as a restore
+            // failure rather than unwrapped, so an internal slip here can
+            // never panic a destructive device operation.
+            let outcome = match fingerprint::hid_crescendo_aca_put_xauth_key(
+                keyroost_piv::MgmtAlg::TripleDes,
+                restore_key,
+            ) {
+                Some(apdu) => match self.transmit_full(&apdu) {
+                    Ok((_, sw)) if sw == piv::SW_OK => FactoryResetOutcome::WipedGlobal,
+                    Ok((_, sw)) => {
+                        trace::line(self.debug, || {
+                            format!(
+                                "piv aca put xauth key (restore factory default): \
+                                 rejected (SW {sw:04X})"
+                            )
+                        });
+                        FactoryResetOutcome::WipedKeyRestoreFailed
+                    }
+                    Err(_) => FactoryResetOutcome::WipedKeyRestoreFailed,
+                },
+                None => FactoryResetOutcome::WipedKeyRestoreFailed,
+            };
+            Ok(outcome)
+        })();
+
+        // Always switch back to PIV — see this method's doc.
+        let _ = self.select();
+        result
+    }
+
     /// Generate a fresh asymmetric key pair in `slot`, returning its public key.
     /// Requires prior management-key auth. Overwrites any existing key in the
     /// slot. May require a touch if the slot's touch policy demands it.
@@ -2579,50 +2827,373 @@ impl PivSession {
             .is_some_and(|md| metadata_key_material(&md).is_some()))
     }
 
-    /// Reset the PIV application to factory defaults. Only succeeds when **both**
-    /// the PIN and PUK are blocked (the card enforces this); otherwise the card
-    /// returns `6983` and this maps to [`TransportError::PivResetNotAllowed`].
+    /// Reset the PIV application to factory defaults. Always sends the bare
+    /// RESET APDU and reports whatever the card says — this method does
+    /// nothing to detect or satisfy either precondition below itself:
+    ///
+    /// * The widespread YubiKey-mimicking convention: succeeds only when
+    ///   **both** the PIN and PUK are already blocked (the card enforces
+    ///   this); otherwise it returns `6983` or `6985` (a genuine YubiKey's own
+    ///   choice, per Yubico's docs), either mapped to
+    ///   [`TransportError::PivResetNotAllowed`].
+    /// * Some fingerprints instead require an authenticated management-key
+    ///   session before RESET is accepted — flagged by
+    ///   [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`] — with
+    ///   no PIN/PUK blocking involved at all. This method itself still does
+    ///   nothing to satisfy that: it never authenticates, so called directly
+    ///   on a quirked device with no prior authenticated session in force,
+    ///   this call is expected to fail (however the card reports "management
+    ///   auth needed" — unverified, since no such session gets attempted
+    ///   here). [`Self::factory_reset`] is what actually authenticates first
+    ///   on such a device (`Self::authenticate_management_current`) before
+    ///   reaching this same method.
+    ///
+    /// A caller that wants to know which convention a device follows ahead
+    /// of time should check `self.quirks()` for the quirk above, or go
+    /// through [`Self::plan_factory_reset`]/[`Self::factory_reset`], which
+    /// already do and route around this method's PIN/PUK-blocking assumption
+    /// accordingly.
     pub fn reset(&mut self) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&piv::reset())?;
-        if sw == piv::SW_AUTH_BLOCKED {
+        // A YubiKey answers RESET's "PIN and PUK must already be blocked"
+        // precondition with 6985 (conditions of use not satisfied), not 6983
+        // per Yubico's own docs — see SW_CONDITIONS_NOT_SATISFIED. Other
+        // fingerprints have been observed using 6983 for the identical
+        // precondition, so both map to the same outcome here.
+        if sw == piv::SW_AUTH_BLOCKED || sw == piv::SW_CONDITIONS_NOT_SATISFIED {
             return Err(TransportError::PivResetNotAllowed);
         }
         ok_or_write("piv reset", sw)?;
-        // Wipes every slot; nothing cached survives it. `force_reset` reaches
+        // Wipes every slot; nothing cached survives it. `factory_reset` reaches
         // this same reset() at the end of its own path, so it's covered too.
         self.pubkey_cache.clear();
         Ok(())
     }
 
-    /// Factory-reset the PIV applet the manufacturer-intended way even when the
-    /// PIN/PUK are unknown: deliberately exhaust the PIN retry counter with wrong
-    /// values, then the PUK counter, then send RESET (which the card only accepts
-    /// once BOTH are blocked). This is the documented decommission path; it wipes
-    /// all PIV keys, certificates, and PINs and leaves the applet at defaults.
+    /// The raw [`keyroost_piv::compat::PivExtension::ResetGlobal`] gate for
+    /// this session's applet — exposed on its own because nothing else here
+    /// already surfaces it standalone: [`Self::plan_factory_reset`] resolves
+    /// only [`PivExtension::Reset`], and [`Self::global_reset_available`]
+    /// folds this gate together with `Reset`'s (via OR) and the
+    /// [`PivQuirk::ResetNeedsManagementAuth`] quirk (via AND) into one
+    /// `bool`, losing this gate's own value along the way. A caller that
+    /// needs to tell "`Reset` is `Unsupported` AND `ResetGlobal` is also
+    /// `Unsupported`" apart from "`Reset` is `Unsupported` but `ResetGlobal`
+    /// might still offer something" needs this method alongside
+    /// `plan_factory_reset`'s [`FactoryResetPlan::Unsupported`] (which alone
+    /// only proves the first half).
     ///
-    /// Used only by the whole-device factory reset — the single-applet PIV reset
-    /// keeps requiring an already-blocked card (that path is a user who knows the
-    /// card is blocked, not one asking us to block it).
-    pub fn force_reset(&mut self) -> Result<(), TransportError> {
+    /// Read-only, same cost as [`Self::plan_factory_reset`]: no APDU beyond
+    /// [`Self::identity`]'s fingerprint probe, cached after the first call
+    /// this session.
+    #[must_use]
+    pub fn reset_global_gate(&mut self) -> keyroost_piv::compat::FeatureGate {
+        self.extension_gate(keyroost_piv::compat::PivExtension::ResetGlobal)
+    }
+
+    /// The raw [`keyroost_piv::compat::PivExtension::PinManagementAuth`] gate
+    /// for this session's applet — exposed standalone for a caller that needs
+    /// to know whether a PIN is even a candidate credential *before* asking
+    /// for one, e.g. `keyroostctl factory-reset`'s (and `keyroostctl piv
+    /// reset`'s) abort-early message when [`Self::global_reset_available`]
+    /// (respectively [`Self::plan_factory_reset`] resolving
+    /// [`FactoryResetPlan::NeedsManagementAuth`]) is true: it names the PIN
+    /// option only when this gate says it applies, and flags it as
+    /// unverified when that's all this gate can confirm.
+    ///
+    /// Read-only, same cost as [`Self::reset_global_gate`]: no APDU beyond
+    /// [`Self::identity`]'s fingerprint probe, cached after the first call
+    /// this session.
+    #[must_use]
+    pub fn pin_management_auth_gate(&mut self) -> keyroost_piv::compat::FeatureGate {
+        self.extension_gate(keyroost_piv::compat::PivExtension::PinManagementAuth)
+    }
+
+    /// Resolve [`FactoryResetPlan`] for this session's applet — the PIV-only
+    /// shape, from [`keyroost_piv::compat::PivExtension::Reset`] alone.
+    /// Read-only: costs no PIN/PUK attempt, and no APDU at all beyond
+    /// [`Self::identity`]'s fingerprint probe (itself cached after the first
+    /// call this session).
+    ///
+    /// Most callers want [`Self::preview_factory_reset`] instead, which
+    /// additionally checks
+    /// [`keyroost_piv::compat::PivExtension::ResetGlobal`] first — the same
+    /// order [`Self::factory_reset`] itself checks in. This method alone says
+    /// nothing about that axis; call it directly only when the PIV-only
+    /// shape specifically is what's needed (e.g. a caller that already knows
+    /// `ResetGlobal` doesn't apply here).
+    #[must_use]
+    pub fn plan_factory_reset(&mut self) -> FactoryResetPlan {
+        use keyroost_piv::compat::{FeatureGate, PivExtension, PivQuirk};
+        match self.extension_gate(PivExtension::Reset) {
+            FeatureGate::Unsupported => FactoryResetPlan::Unsupported,
+            FeatureGate::Unverified => FactoryResetPlan::Unverified,
+            FeatureGate::Supported => {
+                if self.quirks().contains(&PivQuirk::ResetNeedsManagementAuth) {
+                    FactoryResetPlan::NeedsManagementAuth
+                } else {
+                    FactoryResetPlan::BurnPinPukThenReset
+                }
+            }
+        }
+    }
+
+    /// Resolve [`PivResetPreview`] for this session's applet: what
+    /// [`Self::factory_reset`] will attempt *first*, checking
+    /// [`keyroost_piv::compat::PivExtension::ResetGlobal`] first (a
+    /// device-wide mechanism wins when available) and falling back to
+    /// [`Self::plan_factory_reset`]'s PIV-only shape otherwise — the exact
+    /// order [`Self::factory_reset`] itself dispatches on. Read-only, same
+    /// cost as [`Self::plan_factory_reset`]: no APDU beyond
+    /// [`Self::identity`]'s fingerprint probe, cached after the first call
+    /// this session.
+    ///
+    /// "First" because it can't predict [`Self::factory_reset`]'s one
+    /// runtime fallback: when this resolves [`PivResetPreview::Global`] off
+    /// an *unverified* `ResetGlobal` gate and that attempt then fails,
+    /// `factory_reset` tries the PIV-only shape next rather than giving up
+    /// (see its doc) — something this method has no way to predict without
+    /// actually attempting the device-wide mechanism first. Still the right
+    /// preview to show ahead of time: `Global` is what actually runs in the
+    /// overwhelmingly common case (the attempt succeeds), and a caller
+    /// describing what's about to happen shouldn't hedge across a fallback
+    /// that only matters when that attempt fails.
+    #[must_use]
+    pub fn preview_factory_reset(&mut self) -> PivResetPreview {
+        use keyroost_piv::compat::FeatureGate;
+        if self.reset_global_gate() != FeatureGate::Unsupported {
+            return PivResetPreview::Global;
+        }
+        match self.plan_factory_reset() {
+            FactoryResetPlan::Unsupported => PivResetPreview::Unsupported,
+            other => PivResetPreview::Piv(other),
+        }
+    }
+
+    /// Whether either reset extension — [`PivExtension::Reset`] or
+    /// [`PivExtension::ResetGlobal`] — resolves anything other than
+    /// [`FeatureGate::Unsupported`] (i.e. `Supported` *or* `Unverified` on
+    /// at least one of the two) **and** this fingerprint carries
+    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]. `false`
+    /// otherwise.
+    ///
+    /// Deliberately not narrowed to `ResetGlobal == Supported`: that would
+    /// exclude [`HidCrescendoVariant::Generic`][generic], the one real
+    /// fingerprint this matters for today where it actually bites —
+    /// `RESET_GLOBAL_VERDICTS` carries no row for `Generic` (see that
+    /// table's doc for why: RESET CARD's own documentation names only
+    /// C2300/C4000, so there's no basis to *claim* Generic supports it), so
+    /// `ResetGlobal` resolves `Unverified` there, not `Supported` — yet the
+    /// underlying ACA mechanism is expected to work on Generic too, the same
+    /// way [`Self::set_management_key`]/
+    /// [`Self::delete_management_key_hid_crescendo`]'s HID Crescendo
+    /// fallback already matches on the fingerprint generically (`let
+    /// AppletFingerprint::HidCrescendo(variant) = self.fingerprint()`, any
+    /// variant) rather than singling out named models. `Reset` is checked
+    /// too, alongside `ResetGlobal`, for the same "don't require `Supported`
+    /// specifically" reasoning — either extension being anything but a
+    /// confirmed dead end is enough to justify collecting a credential the
+    /// quirk says is needed; [`Self::hid_crescendo_aca_reset_card`] itself
+    /// still decides whether the attempt actually succeeds.
+    ///
+    /// Read-only, same cost profile as [`Self::plan_factory_reset`]: no APDU
+    /// beyond [`Self::identity`]'s fingerprint probe, cached after the first
+    /// call this session — resolving both gates plus the quirk costs exactly
+    /// one fingerprint, not three.
+    ///
+    /// [generic]: keyroost_piv::fingerprint::HidCrescendoVariant::Generic
+    #[must_use]
+    pub fn global_reset_available(&mut self) -> bool {
+        use keyroost_piv::compat::{FeatureGate, PivExtension, PivQuirk};
+        let reset = self.extension_gate(PivExtension::Reset);
+        let reset_global = self.extension_gate(PivExtension::ResetGlobal);
+        (reset != FeatureGate::Unsupported || reset_global != FeatureGate::Unsupported)
+            && self.quirks().contains(&PivQuirk::ResetNeedsManagementAuth)
+    }
+
+    /// The well-known factory-default management-key bytes for this
+    /// session's applet, if keyroost has one on record —
+    /// [`keyroost_piv::compat::default_9b_management_key`] over
+    /// [`Self::quirks`]. `None` means keyroost has no known default for
+    /// this fingerprint/version, the same signal
+    /// [`Self::global_reset_available`]'s caller uses to disable its "use
+    /// the default" convenience. Whichever mechanism
+    /// [`Self::factory_reset`] ends up running when
+    /// [`Self::global_reset_available`] is true — the device-wide ACA XAUTH
+    /// round or the PIV-only management-key round — resolves its credential
+    /// from this same quirk (HID Crescendo has no standard PIV management
+    /// key at all; see [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`]'s
+    /// doc), so one accessor serves both. Read-only, same cost profile as
+    /// [`Self::global_reset_available`]: no APDU beyond the identity probe,
+    /// cached after the first call this session.
+    #[must_use]
+    pub fn default_management_key(&mut self) -> Option<&'static [u8]> {
+        keyroost_piv::compat::default_9b_management_key(&self.quirks())
+    }
+
+    /// Authenticate PIV management via whichever `current` credential a
+    /// caller supplied — [`CurrentMgmtAuth::Key`] runs the standard round
+    /// with the algorithm inferred from the key's own length (the same
+    /// inference [`Self::authenticate_management_via_pin`]'s
+    /// PIN-protected-key path already uses),
+    /// [`CurrentMgmtAuth::Pin`] runs [`Self::authenticate_management_via_pin`]
+    /// itself. Used by [`Self::factory_reset`]'s
+    /// [`FactoryResetPlan::NeedsManagementAuth`] path, where — unlike
+    /// [`Self::authenticate_management_via_pin`]'s own callers, which already
+    /// know PIN-based auth is what a given fingerprint offers — the caller
+    /// may be handed either kind of credential without knowing ahead of time
+    /// which one this fingerprint actually wants. Public so `keyroostctl
+    /// piv reset` can run the exact same round in front of a *plain*
+    /// [`Self::reset`] — unlike [`Self::factory_reset`], it must never reach
+    /// for the device-wide [`PivExtension::ResetGlobal`] mechanism, so it
+    /// authenticates here and sends [`Self::reset`] itself rather than
+    /// calling [`Self::factory_reset`].
+    pub fn authenticate_management_current(
+        &mut self,
+        current: CurrentMgmtAuth<'_>,
+    ) -> Result<(), TransportError> {
+        match current {
+            CurrentMgmtAuth::Key(key) => {
+                let alg = self.resolve_management_key_algorithm(key.len())?;
+                self.authenticate_management(alg, key)
+            }
+            CurrentMgmtAuth::Pin(pin) => self.authenticate_management_via_pin(pin),
+        }
+    }
+
+    /// Factory-reset PIV the manufacturer-intended way, whichever mechanism
+    /// this fingerprint actually offers — the one method every reset path
+    /// this crate implements funnels through, so a caller never has to
+    /// decide between them itself:
+    ///
+    /// 1. [`keyroost_piv::compat::PivExtension::ResetGlobal`] resolves
+    ///    anything but `Unsupported` → the device-wide mechanism (HID
+    ///    Crescendo's ACA RESET CARD today), which takes PIV down with it
+    ///    alongside at least one other applet. Always needs `current` — the
+    ///    ACA's own protocol requires an authenticated session regardless of
+    ///    any quirk; [`TransportError::PivResetNeedsManagementAuth`] if
+    ///    `current` is `None`.
+    ///
+    ///    If this fails and the gate was only
+    ///    [`keyroost_piv::compat::FeatureGate::Unverified`] (never a confirmed
+    ///    [`keyroost_piv::compat::FeatureGate::Supported`]) — falls through to
+    ///    step 2 instead of returning [`TransportError::PivResetGlobalFailed`]
+    ///    outright: an unverified gate's claim that the mechanism applies here
+    ///    was never confirmed, so the failure could just as easily be "wrong
+    ///    guess" as "real fault", and [`Self::hid_crescendo_aca_reset_card`]
+    ///    only ever fails before it has touched anything (see that method's
+    ///    doc), so nothing is lost by trying something else. A `Supported`
+    ///    gate skips this: a confirmed-good mechanism failing means something
+    ///    is actually wrong, not that the wrong mechanism was tried, so that
+    ///    case returns the failure as-is rather than guessing further.
+    /// 2. Otherwise (or as the above fallback), [`Self::plan_factory_reset`]
+    ///    resolves the PIV-only shape:
+    ///    [`FactoryResetPlan::Unsupported`] refuses outright (deliberately
+    ///    blocking the PIN and PUK would have no way back);
+    ///    [`FactoryResetPlan::NeedsManagementAuth`] authenticates with
+    ///    `current` (same `PivResetNeedsManagementAuth` refusal if `None`)
+    ///    then sends [`Self::reset`]; [`FactoryResetPlan::Unverified`] sends a
+    ///    bare [`Self::reset`] with no pre-blocking; and
+    ///    [`FactoryResetPlan::BurnPinPukThenReset`] deliberately exhausts the
+    ///    PIN retry counter with wrong values, then the PUK counter, then
+    ///    sends RESET (which the card only accepts once BOTH are blocked) —
+    ///    the documented decommission path for a card whose PIN/PUK are
+    ///    unknown.
+    ///
+    /// Every path wipes all PIV keys, certificates, and PINs (plus, on the
+    /// device-wide path, whatever else that mechanism covers) and leaves the
+    /// applet at defaults. [`Self::preview_factory_reset`] resolves which of
+    /// the above a caller is about to get *before* any fallback is known to
+    /// be needed, read-only, ahead of the call — see its doc for why that's
+    /// still the right preview to show even though this method might not
+    /// end up matching it exactly.
+    pub fn factory_reset(
+        &mut self,
+        current: Option<CurrentMgmtAuth<'_>>,
+    ) -> Result<FactoryResetOutcome, TransportError> {
+        use keyroost_piv::compat::FeatureGate;
+
+        let reset_global_gate = self.reset_global_gate();
+        if reset_global_gate != FeatureGate::Unsupported {
+            let global_current = current.ok_or(TransportError::PivResetNeedsManagementAuth)?;
+            match self.hid_crescendo_aca_reset_card(global_current) {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) if reset_global_gate != FeatureGate::Unverified => {
+                    // `Supported`: a confirmed-good mechanism failing is a
+                    // real failure, not "wrong mechanism" -- don't go
+                    // guessing at a completely different one.
+                    return Err(TransportError::PivResetGlobalFailed(Box::new(e)));
+                }
+                // `Unverified`: this gate's own claim that the device-wide
+                // mechanism applies here was never confirmed, so a failure
+                // could just as easily mean "wrong guess" as "real fault" --
+                // fall through to `PivExtension::Reset`'s own shape below
+                // instead of giving up on the one unverified guess.
+                // `hid_crescendo_aca_reset_card` only ever returns `Err`
+                // before RESET CARD itself has run (see its doc), so nothing
+                // was touched by this attempt -- safe to try a completely
+                // different mechanism next. Always re-SELECTs PIV before
+                // returning, success or failure, so the session is already
+                // in the right state for what follows.
+                Err(_) => {}
+            }
+        }
+
+        match self.plan_factory_reset() {
+            FactoryResetPlan::Unsupported => return Err(TransportError::PivResetUnsupported),
+            FactoryResetPlan::NeedsManagementAuth => {
+                let current = current.ok_or(TransportError::PivResetNeedsManagementAuth)?;
+                return (|| {
+                    self.authenticate_management_current(current)?;
+                    self.reset()
+                })()
+                .map(|()| FactoryResetOutcome::Wiped)
+                .map_err(|e| TransportError::PivResetManagementAuthFailed(Box::new(e)));
+            }
+            FactoryResetPlan::Unverified => {
+                return self
+                    .reset()
+                    .map(|()| FactoryResetOutcome::Wiped)
+                    .map_err(|e| TransportError::PivResetUnverifiedFailed(Box::new(e)));
+            }
+            FactoryResetPlan::BurnPinPukThenReset => self.force_reset(),
+        }
+    }
+
+    /// Burn the PIV PIN and PUK retry counters and RESET — the documented
+    /// decommission path for a card whose PIN/PUK are unknown.
+    ///
+    /// Tries a bare [`Self::reset`] first, before touching either counter:
+    /// if the card accepts it outright (e.g. a previous run already blocked
+    /// both and got interrupted before RESET), this succeeds immediately
+    /// with nothing further to burn. Only when that bare attempt comes back
+    /// [`TransportError::PivResetNotAllowed`] — RESET's `SW_AUTH_BLOCKED` or
+    /// `SW_CONDITIONS_NOT_SATISFIED`, meaning the card is enforcing its "PIN
+    /// and PUK must already be blocked" precondition — does this fall through
+    /// to actually burning
+    /// both: deliberately exhaust the PIN retry counter with wrong values,
+    /// then the PUK counter, then send RESET again. Any other error from the
+    /// bare attempt is returned as-is, with neither counter touched — this
+    /// method only starts burning on the strength of the one error it knows
+    /// how to fix.
+    ///
+    /// [`Self::factory_reset`] is what decides this mechanism is the right
+    /// one for this fingerprint ([`FactoryResetPlan::BurnPinPukThenReset`])
+    /// and calls here; this method itself doesn't consult that plan.
+    pub fn force_reset(&mut self) -> Result<FactoryResetOutcome, TransportError> {
+        match self.reset() {
+            Ok(()) => return Ok(FactoryResetOutcome::Wiped),
+            Err(TransportError::PivResetNotAllowed) => {}
+            Err(e) => return Err(e),
+        }
+
         // The PIN a successful PUK guess would leave behind: RESET RETRY COUNTER
         // rewrites the PIN when it succeeds, so this has to be a value we can
         // name back to the user (see PivPukGuessAccepted) rather than something
         // random nobody could recover. The PIV default is the friendliest choice.
         const RECOVERY_PIN: &[u8] = b"123456";
 
-        // RESET (INS FB) is a vendor extension — SP 800-73-4 defines no such
-        // instruction, so a standards-only card answers 6D00/6A81 and there is
-        // no way back from the blocked PIN and PUK this path deliberately
-        // creates. GET VERSION and GET SERIAL come from the same extension
-        // family, so a card that answers neither is exactly the card that must
-        // be refused. Any-length answers count: a card that replies to GET
-        // VERSION with four bytes (Swissbit iShield Key 2 Pro) is still speaking
-        // the extension family, which is what this gate is asking. Decide here,
-        // before the first wrong VERIFY: afterwards the damage is already done.
         let st = self.status()?;
-        if st.version.is_none() && st.serial.is_none() {
-            return Err(TransportError::PivForceResetUnsupported);
-        }
 
         // 1. Block the PIN.
         let mut blocked = false;
@@ -2645,7 +3216,7 @@ impl PivSession {
             previous = Some(guess);
         }
         if !blocked {
-            return Err(TransportError::PivForceResetIncomplete(
+            return Err(TransportError::PivResetIncomplete(
                 "the PIV PIN would not report itself blocked within the attempt cap, \
                  so the card was NOT wiped — its keys and certificates are still \
                  there and its PIN retry counter has been spent down. Re-run the \
@@ -2685,7 +3256,7 @@ impl PivSession {
             previous = Some(guess);
         }
         if !puk_blocked {
-            return Err(TransportError::PivForceResetIncomplete(
+            return Err(TransportError::PivResetIncomplete(
                 "the PIV PUK would not report itself blocked within the attempt cap. \
                  The PIN is now blocked but the card was NOT wiped — re-run the \
                  factory reset to finish, or unblock the PIN with the PUK if you \
@@ -2699,7 +3270,9 @@ impl PivSession {
         //    so honestly: that is the one exit that leaves a card nothing here
         //    can rescue. An unspecific status word is not that exit and keeps
         //    the caller's "re-run the factory reset" hint.
-        self.reset().map_err(map_reset_stage_error)
+        self.reset()
+            .map(|()| FactoryResetOutcome::Wiped)
+            .map_err(map_reset_stage_error)
     }
 
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
@@ -3652,7 +4225,7 @@ mod tests {
 
     #[test]
     fn clear_wipes_every_slot() {
-        // reset() factory-wipes the applet, and force_reset funnels into the
+        // reset() factory-wipes the applet, and factory_reset funnels into the
         // same reset() at the end of its path — both end here, with no
         // survivors for any slot.
         let mut cache = PubkeyCache::new();
@@ -4079,7 +4652,7 @@ mod tests {
             },
         ] {
             let mapped = map_reset_stage_error(e);
-            assert!(matches!(mapped, TransportError::PivForceResetIncomplete(_)));
+            assert!(matches!(mapped, TransportError::PivResetIncomplete(_)));
             let text = mapped.to_string();
             // The message has to say what is true and never point back at the
             // command that just failed.
@@ -4124,10 +4697,7 @@ mod tests {
         ] {
             let before = e.to_string();
             let mapped = map_reset_stage_error(e);
-            assert!(!matches!(
-                mapped,
-                TransportError::PivForceResetIncomplete(_)
-            ));
+            assert!(!matches!(mapped, TransportError::PivResetIncomplete(_)));
             assert_eq!(mapped.to_string(), before);
         }
     }

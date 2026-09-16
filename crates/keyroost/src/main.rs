@@ -819,18 +819,184 @@ fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
     info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
 }
 
+/// What `App::start_factory_reset_confirm` learned about the selected
+/// device's PIV step before arming the confirm dialog — resolved one step
+/// ahead of the dialog itself (fingerprinted the moment "Factory reset…" is
+/// pressed, not deferred to when the reset actually runs), so
+/// `factory_reset_confirm_summary` can describe exactly what that step will
+/// do instead of hedging across every possibility. Mirrors
+/// `keyroost_transport::PivResetPreview`, the same verdict the reset itself
+/// resolves when it runs (`PivSession::factory_reset`, inside
+/// `run_card_reset_step`) — fingerprinted again there rather than threaded
+/// through from here: the two calls are only ever seconds apart and
+/// `preview_factory_reset` costs no PIN/PUK attempt, so a fresh re-check is
+/// cheap and can't go stale the way carrying this value forward could (the
+/// confirm dialog can sit open for a while, or the key can be swapped and
+/// swapped back — see `render_factory_reset_confirm`'s KEY-008 guard).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FactoryResetPivPreview {
+    /// The device's plan has no PIV step — nothing to fingerprint.
+    NotOffered,
+    /// The fingerprint attempt itself failed (no PC/SC reader for PIV,
+    /// `PivSession::open` error, …) — the summary falls back to generic
+    /// wording rather than blocking the whole confirm dialog on a
+    /// diagnostic step's own failure.
+    CheckFailed,
+    /// The live verdict — `Unsupported` means neither reset mechanism is
+    /// available, so `App::start_factory_reset_confirm` doesn't even plan a
+    /// PIV step for this device (`keyroost_resolve::exclude_unresettable_piv`);
+    /// `factory_reset_confirm_summary` never actually renders this variant's
+    /// own text as a result (its `if plan.contains(&ResetStep::Piv)` guard
+    /// skips the whole block), but it's still tracked here rather than
+    /// folded into `NotOffered`/`CheckFailed` — those mean "nothing to say",
+    /// this means "there was something to fingerprint, and the answer was
+    /// no".
+    Resolved(keyroost_transport::PivResetPreview),
+}
+
+/// Whether `piv_preview` says PIV can't be reset at all —
+/// `App::render_factory_reset_confirm`/`App::run_factory_reset_gui` both
+/// exclude [`keyroost_resolve::ResetStep::Piv`]
+/// (`keyroost_resolve::exclude_unresettable_piv`) from the plan they rebuild
+/// when this is true, rather than offering (or attempting) a step
+/// `PivSession::factory_reset` would only refuse.
+#[must_use]
+fn factory_reset_piv_unresettable(preview: FactoryResetPivPreview) -> bool {
+    matches!(
+        preview,
+        FactoryResetPivPreview::Resolved(keyroost_transport::PivResetPreview::Unsupported)
+    )
+}
+
+/// State for the armed factory-reset confirm dialog: which device it's for
+/// (KEY-008 — the dialog dies the instant the selection changes; see
+/// `render_factory_reset_confirm`) and what's known about that device's PIV
+/// step (see `FactoryResetPivPreview`).
+#[derive(Clone)]
+struct FactoryResetConfirmState {
+    for_device: DeviceId,
+    piv_preview: FactoryResetPivPreview,
+    /// Whether `keyroost_transport::PivSession::global_reset_available`
+    /// resolved true for this device: either `PivExtension::Reset` or
+    /// `PivExtension::ResetGlobal` resolves something other than
+    /// `Unsupported` (`Supported` or `Unverified`), *and*
+    /// `PivQuirk::ResetNeedsManagementAuth` is set — today: every HID
+    /// Crescendo fingerprint, C2300/C4000/Generic alike (see that method's
+    /// doc for why `Generic` needs the OR, not just `ResetGlobal ==
+    /// Supported`). The credential need this reflects comes from the quirk
+    /// alone, not specifically from `ResetGlobal` — when true, the dialog
+    /// shows the credential prompt (`App::factory_reset_mgmt_auth_field`)
+    /// and `factory_reset_confirm_summary` says a credential is needed,
+    /// regardless of which extension is the reason. Does **not** by itself
+    /// decide whether `PivSession::factory_reset` ends up running the
+    /// device-wide mechanism or the PIV-only one — `piv_preview` already
+    /// carries that (see `FactoryResetPivPreview::Resolved`), so this crate
+    /// doesn't track `reset_global_gate` separately any more.
+    needs_reset_mgmt_auth: bool,
+    /// This device's well-known factory-default management-key bytes, from
+    /// the same fingerprint job that resolved `piv_preview`/
+    /// `needs_reset_mgmt_auth`
+    /// (`keyroost_transport::PivSession::default_management_key`). `None`
+    /// when keyroost has no known default for this fingerprint/version —
+    /// the same signal `App::piv_modal_mgmt_field` uses to disable its "Use
+    /// default management key" checkbox rather than offer one that might be
+    /// wrong. `App::factory_reset_mgmt_auth_field` mirrors that: disables
+    /// the checkbox and shows the hex value in a tooltip only when this is
+    /// `Some`.
+    default_mgmt_key: Option<&'static [u8]>,
+}
+
+/// How the factory-reset confirm dialog's reset management-auth credential
+/// prompt is currently resolved — the same three-way shape as
+/// [`PivMgmtAuthMode`] (a typed field, a "use the well-known default"
+/// convenience, or a PIN), kept as its own type because the credential
+/// itself is a different one: whatever
+/// [`keyroost_transport::PivSession::default_management_key`] resolves for
+/// *this reset*, not necessarily the same value
+/// [`PivMgmtAuthMode::Default`] resolves for a already-unlocked session's
+/// other management operations (e.g. Generate Key) — the two happen to
+/// coincide on HID Crescendo today (its only known default is its ACA
+/// XAUTH key either way — see
+/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`]'s doc), but
+/// nothing here assumes that holds for a future fingerprint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ResetMgmtAuthMode {
+    /// Neither toggle ticked: `App::reset_mgmt_auth_input` holds a typed
+    /// management-key hex string.
+    #[default]
+    Manual,
+    /// "Use default management key":
+    /// `FactoryResetConfirmState::default_mgmt_key`, resolved for the
+    /// specific device this dialog is armed for.
+    Default,
+    /// "Use PIN": the ACA instance's own VERIFY PIN — not the standard PIV
+    /// application PIN [`PivMgmtAuthMode::Pin`] means.
+    Pin,
+}
+
+/// [`piv_mgmt_mode_after_toggle`]'s twin for [`ResetMgmtAuthMode`] — same
+/// rule, different type: `mode_if_checked` if the click checked the box,
+/// [`ResetMgmtAuthMode::Manual`] if it unchecked it, regardless of what
+/// the mode held before.
+#[must_use]
+fn reset_mgmt_auth_mode_after_toggle(
+    checked: bool,
+    mode_if_checked: ResetMgmtAuthMode,
+) -> ResetMgmtAuthMode {
+    if checked {
+        mode_if_checked
+    } else {
+        ResetMgmtAuthMode::Manual
+    }
+}
+
+/// How the user authorized `PivSession::factory_reset`'s credential, when
+/// `PivQuirk::ResetNeedsManagementAuth` means one is needed — the
+/// factory-default management key, a typed management key, or a PIN for the
+/// ACA's own VERIFY PIN reference (today's only real consumer of any of the
+/// three is HID Crescendo's device-wide mechanism; a plain PIV reset needing
+/// this same quirk would take the same shape, just via the standard PIV
+/// management-key round instead — see `PivSession::factory_reset`'s doc).
+/// Produced by `App::reset_mgmt_current_auth`, consumed by
+/// `run_card_reset_step`'s `Piv` branch. Mirrors [`PivMgmtAuth`]'s shape for
+/// the same reason that type exists — a single resolved form both the
+/// dialog's validation and the worker job's actual call convert into
+/// `keyroost_transport::CurrentMgmtAuth` the same way.
+enum ResetMgmtAuth {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Pin(zeroize::Zeroizing<String>),
+}
+
 /// The confirmation body for the Factory reset modal: what key, and exactly
 /// which applets get wiped, with the two ceremonies that aren't a plain wipe
-/// spelled out (PIV blocks its PIN+PUK first; FIDO needs a replug + touch).
+/// spelled out (PIV's actual precondition, per `piv_preview`; FIDO needs a
+/// replug + touch).
 fn factory_reset_confirm_summary(
     serial: &str,
     model: &str,
     plan: &[keyroost_resolve::ResetStep],
+    piv_preview: FactoryResetPivPreview,
+    needs_management_auth: bool,
 ) -> String {
     use keyroost_resolve::ResetStep;
+    use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+    // `PivExtension::ResetGlobal` resolving `Supported` or `Unverified`
+    // (`PivResetPreview::Global`) means the PIV step, if it runs, will take
+    // at least one other applet down with it — the same device-wide
+    // mechanism `StepOutcome::WipedGlobal` names post-hoc with
+    // `PIV_GLOBAL_RESET_LABEL` once the reset has actually happened. Name it
+    // the same way here, ahead of time, rather than letting the confirm
+    // dialog undersell the PIV step as a bare "PIV".
+    let piv_is_global = matches!(
+        piv_preview,
+        FactoryResetPivPreview::Resolved(PivResetPreview::Global)
+    );
     let applets = plan
         .iter()
-        .map(|s| s.label())
+        .map(|s| match s {
+            ResetStep::Piv if piv_is_global => keyroost_resolve::PIV_GLOBAL_RESET_LABEL,
+            s => s.label(),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut msg = format!(
@@ -839,15 +1005,97 @@ fn factory_reset_confirm_summary(
          comes back in factory condition, ready to set up again."
     );
     if plan.contains(&ResetStep::Piv) {
-        // Don't promise the key "stays fully usable": the PIV path blocks the
-        // PIN and PUK on purpose, so a wipe that stops between the blocking and
-        // the RESET leaves that applet locked. The step report says which.
-        msg.push_str(
-            "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
-             is wiped (the standard reset path). If the wipe stops after the \
-             blocking, PIV stays locked until a reset finishes \u{2014} the report \
-             below the button says what state it's in.",
-        );
+        // Don't promise the key "stays fully usable" in the
+        // `BurnPinPukThenReset` case: PIN/PUK are blocked on purpose there, so
+        // a wipe that stops between the blocking and the RESET leaves PIV
+        // locked until a reset finishes.
+        let piv_note = match piv_preview {
+            // Shouldn't happen — `start_factory_reset_confirm` always
+            // fingerprints when the plan offers PIV — but fails into the same
+            // wording `CheckFailed` gets rather than claim something about a
+            // step that was never actually fingerprinted.
+            FactoryResetPivPreview::NotOffered | FactoryResetPivPreview::CheckFailed => {
+                "\n\nPIV: keyroost couldn't confirm this device's RESET support \
+                 ahead of time. It will still attempt the standard path (block the \
+                 PIN and PUK, then wipe) \u{2014} the report below the button says \
+                 what actually happened."
+            }
+            // Unreachable via normal flow: `start_factory_reset_confirm`
+            // drops `ResetStep::Piv` from the plan entirely whenever
+            // `preview_factory_reset` resolves this (`exclude_unresettable_piv`),
+            // so this whole block never runs for it. Kept for exhaustiveness
+            // — empty string is the safe fallback if it's ever reached anyway
+            // (e.g. a plan built before a fresh fingerprint changed the
+            // answer).
+            FactoryResetPivPreview::Resolved(PivResetPreview::Unsupported) => "",
+            // The device-wide mechanism will run — nothing special to caveat
+            // here: PIV just gets wiped along with the plan's other applets,
+            // same as `BurnPinPukThenReset` below promises for the PIV-only
+            // path, without that path's own PIN/PUK-blocking caveat (this
+            // mechanism never touches either counter). The credential
+            // sentence below covers the one thing worth calling out, when
+            // the quirk applies.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global) => "",
+            // Also unreachable via normal flow, same reasoning as the
+            // top-level `Unsupported` arm above — `preview_factory_reset` maps
+            // `FactoryResetPlan::Unsupported` to the outer `PivResetPreview::
+            // Unsupported`, never to `Piv(Unsupported)`.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::Unsupported,
+            )) => "",
+            // Unlike `BurnPinPukThenReset` below, this authenticates once,
+            // then sends RESET — a clean, atomic pass/fail with no
+            // partial-blocking state the step report could reveal, so this
+            // doesn't point at it the way the burn case does. The credential
+            // sentence below (always shown alongside this arm, since
+            // `NeedsManagementAuth` only resolves when the quirk applies)
+            // says where the credential it authenticates with comes from.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::NeedsManagementAuth,
+            )) => {
+                "\n\nPIV: this device resets via an authenticated management-key \
+                 session \u{2014} keyroost authenticates with the credential \
+                 entered below, then wipes."
+            }
+            // Also atomic, same reasoning as `NeedsManagementAuth` above: the
+            // bare RESET attempt this case sends never touches the PIN or PUK
+            // either, so it either wipes PIV outright or leaves it exactly as
+            // it was — nothing partial for the step report to disambiguate.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::Unverified,
+            )) => {
+                "\n\nPIV: RESET support on this device is unverified. keyroost will \
+                 attempt it without blocking the PIN and PUK first \u{2014} consult \
+                 this device's own documentation for any precondition (commonly: \
+                 the PIN and PUK both already blocked) and complete it manually if \
+                 the attempt fails."
+            }
+            // The one case that isn't atomic: burning the PIN, then the PUK,
+            // then sending RESET is three separate steps, and a failure
+            // between any of them leaves PIV in a partial state this text
+            // alone can't describe — hence pointing at the step report, unlike
+            // every other case above.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )) => {
+                "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
+                 is wiped (the standard reset path). If the wipe stops after the \
+                 blocking, PIV stays locked until a reset finishes \u{2014} the \
+                 report below the button says what state it's in."
+            }
+        };
+        msg.push_str(piv_note);
+        // `needs_management_auth` is `PivSession::global_reset_available`'s
+        // boolean — `PivQuirk::ResetNeedsManagementAuth` applying, ANDed
+        // with either `PivExtension::Reset` or `PivExtension::ResetGlobal`
+        // not being a confirmed dead end. Whichever mechanism `piv_preview`
+        // says will actually run (`Global` or `Piv(NeedsManagementAuth)`),
+        // this same credential is what it needs, entered in the same field
+        // (`App::factory_reset_mgmt_auth_field`) — so one sentence covers
+        // both, rather than duplicating it into each arm above.
+        if needs_management_auth {
+            msg.push_str("\n\nResetting this device requires management auth, entered below.");
+        }
     }
     if plan.contains(&ResetStep::Fido) {
         msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
@@ -881,6 +1129,9 @@ enum RowTone {
     Done,
     /// Nothing went wrong, but the step hasn't happened yet.
     Waiting,
+    /// The step wiped what it was supposed to, but something afterward
+    /// still needs attention.
+    Warn,
     /// The step did not wipe what it was supposed to.
     Bad,
     /// The step wasn't part of this run.
@@ -904,10 +1155,95 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
         ),
         FactoryResetRow::Step(r) => match &r.outcome {
             StepOutcome::Wiped => (format!("{}  wiped", r.step.label()), RowTone::Done),
+            // Device-wide mechanism, not confined to PIV alone — name the
+            // whole device instead of just the applet that triggered it.
+            StepOutcome::WipedGlobal => (
+                format!("{}  wiped", keyroost_resolve::PIV_GLOBAL_RESET_LABEL),
+                RowTone::Done,
+            ),
+            StepOutcome::WipedWithWarning(e) => (
+                format!("{}  wiped, but: {e}", r.step.label()),
+                RowTone::Warn,
+            ),
             StepOutcome::Failed(e) => (format!("{}  failed: {e}", r.step.label()), RowTone::Bad),
-            StepOutcome::Skipped => (format!("{}  skipped", r.step.label()), RowTone::Muted),
+            StepOutcome::Skipped(reason) => (
+                format!("{}  skipped: {reason}", r.step.label()),
+                RowTone::Muted,
+            ),
         },
     }
+}
+
+/// One-line factory-reset summary for the activity log: which steps wiped
+/// cleanly, which wiped but left a follow-up warning, which failed (each
+/// with its own reason), and which were skipped (each with its own reason)
+/// — the same buckets `factory_reset_row_line` paints per-row in the
+/// Overview pane, collapsed into one line so the activity log keeps a
+/// permanent record of the run even after the pane's own report is
+/// overwritten by the next one.
+///
+/// `StepOutcome::WipedWithWarning` counts toward *both* the "wiped" list
+/// (the applet really was wiped — a reader scanning just that list must see
+/// it there) and its own "warnings" list (the follow-up failure is real and
+/// still needs its own line) — the one outcome that isn't confined to a
+/// single bucket, matching what it actually is: a wipe that succeeded, with
+/// a caveat.
+fn factory_reset_report_summary(reports: &[keyroost_resolve::StepReport]) -> String {
+    use keyroost_resolve::StepOutcome;
+    let wiped: Vec<&str> = reports
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                StepOutcome::Wiped | StepOutcome::WipedGlobal | StepOutcome::WipedWithWarning(_)
+            )
+        })
+        .map(|r| match r.outcome {
+            // Device-wide mechanism, not confined to PIV alone — name the
+            // whole device instead of just the applet that triggered it.
+            StepOutcome::WipedGlobal => keyroost_resolve::PIV_GLOBAL_RESET_LABEL,
+            _ => r.step.label(),
+        })
+        .collect();
+    let warnings: Vec<String> = reports
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StepOutcome::WipedWithWarning(e) => Some(format!("{}: {e}", r.step.label())),
+            _ => None,
+        })
+        .collect();
+    let failed: Vec<String> = reports
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StepOutcome::Failed(e) => Some(format!("{}: {e}", r.step.label())),
+            _ => None,
+        })
+        .collect();
+    let skipped: Vec<String> = reports
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StepOutcome::Skipped(reason) => Some(format!("{}: {reason}", r.step.label())),
+            _ => None,
+        })
+        .collect();
+    let mut msg = format!(
+        "wiped: {}",
+        if wiped.is_empty() {
+            "none".to_string()
+        } else {
+            wiped.join(", ")
+        }
+    );
+    if !warnings.is_empty() {
+        msg.push_str(&format!("; warnings: {}", warnings.join("; ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("; failed: {}", failed.join("; ")));
+    }
+    if !skipped.is_empty() {
+        msg.push_str(&format!("; skipped: {}", skipped.join("; ")));
+    }
+    msg
 }
 
 /// Fold the FIDO finale's outcome into the factory-reset report, replacing the
@@ -923,7 +1259,17 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
 ///
 /// Only a caller that actually attempted the wipe may use this. Everything
 /// else takes [`resolve_pending_fido_reset_row`].
-fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolve::StepOutcome) {
+///
+/// Returns whether a row was actually found and replaced — `false` means this
+/// wasn't part of a factory-reset run at all (a standalone "Reset key"), which
+/// callers use to decide whether the finale is also worth a permanent
+/// activity-log line rather than just an Overview-pane update (see
+/// [`App::apply_factory_reset_sweep`]'s doc on why that permanent record
+/// matters).
+fn resolve_fido_reset_row(
+    rows: &mut [FactoryResetRow],
+    outcome: keyroost_resolve::StepOutcome,
+) -> bool {
     if let Some(row) = rows.iter_mut().find(|r| match r {
         FactoryResetRow::FidoPending => true,
         FactoryResetRow::Step(r) => r.step == keyroost_resolve::ResetStep::Fido,
@@ -932,6 +1278,9 @@ fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolv
             step: keyroost_resolve::ResetStep::Fido,
             outcome,
         });
+        true
+    } else {
+        false
     }
 }
 
@@ -947,10 +1296,17 @@ fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolv
 /// irreversible ceremony that already succeeded. A pending row is the only
 /// evidence that this dialog owns the finale, so it is the only row these
 /// callers may write.
+///
+/// Returns whether a pending row was actually found and resolved — `false`
+/// covers both "no factory reset in flight" and "this row already answered",
+/// neither of which is this dialog's finale to announce. `true` means this
+/// really was the factory reset's FIDO step being decided just now, which
+/// callers use to also give it a permanent activity-log line (see
+/// [`resolve_fido_reset_row`]'s doc for why).
 fn resolve_pending_fido_reset_row(
     rows: &mut [FactoryResetRow],
     outcome: keyroost_resolve::StepOutcome,
-) {
+) -> bool {
     if let Some(row) = rows
         .iter_mut()
         .find(|r| matches!(r, FactoryResetRow::FidoPending))
@@ -959,30 +1315,80 @@ fn resolve_pending_fido_reset_row(
             step: keyroost_resolve::ResetStep::Fido,
             outcome,
         });
+        true
+    } else {
+        false
     }
 }
 
-/// Render a forced PIV wipe's failure for the report pane.
+/// Severity + activity-log line for a factory reset's FIDO finale outcome.
 ///
-/// `force_reset` blocks the PIN and then the PUK on its way to RESET, so a
-/// failure between the blocking and the wipe leaves a card that is locked but
-/// not erased. The confirmation modal promises the report says which state the
-/// card is in, so every failure has to carry that.
+/// Callers reach here only after [`resolve_fido_reset_row`] or
+/// [`resolve_pending_fido_reset_row`] confirms this really was the finale
+/// being decided — otherwise the card sweep's own "factory reset finished"
+/// line (written before the FIDO ceremony even starts, see
+/// [`App::apply_factory_reset_sweep`]) is the only activity-log record of
+/// the run, and never gets updated once FIDO's outcome is known. Reuses
+/// [`factory_reset_row_line`]'s wording so the permanent log and the
+/// Overview pane read as the same event.
+fn factory_reset_fido_finale_log_line(
+    outcome: &keyroost_resolve::StepOutcome,
+) -> (Severity, String) {
+    use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+    let severity = match outcome {
+        // `WipedGlobal` never actually reaches here in practice (its sole
+        // producer is PIV, and this function is only ever called for
+        // `ResetStep::Fido`), but the match has to stay exhaustive.
+        StepOutcome::Wiped | StepOutcome::WipedGlobal => Severity::Ok,
+        StepOutcome::WipedWithWarning(_) | StepOutcome::Skipped(_) => Severity::Warn,
+        StepOutcome::Failed(_) => Severity::Err,
+    };
+    let (text, _tone) = factory_reset_row_line(&FactoryResetRow::Step(StepReport {
+        step: ResetStep::Fido,
+        outcome: outcome.clone(),
+    }));
+    (severity, format!("factory reset \u{2014} {text}"))
+}
+
+/// Render a `PivSession::factory_reset` failure for the report pane.
 ///
-/// Three variants already say it themselves — the card refused before anything
-/// was blocked, the run stopped part-way (carrying the state), or the throwaway
-/// PUK guess was accepted — and appending to those would contradict them.
-/// Everything else (a transport error mid-loop, an unexpected status word the
-/// PIN/PUK mapping renders as a bare APDU failure, a host RNG failure) arrives
-/// as text that says nothing about the blocking, so the disclosure is appended.
+/// Only one of its paths — the PIN/PUK burn dance — blocks the PIN and then
+/// the PUK on its way to RESET, so only there can a failure between the
+/// blocking and the wipe leave a card that is locked but not erased. The
+/// confirmation modal promises the report says which state the card is in,
+/// so every failure from that path has to carry that.
 ///
-/// The way out is to run the factory reset again, not the single-applet PIV
-/// reset: a fault in the PUK loop leaves the PIN blocked and the PUK *not*
-/// blocked, and the card refuses a plain RESET until both are blocked.
-fn piv_force_reset_message(e: TransportError) -> String {
+/// The variants each of `factory_reset`'s other paths (device-wide
+/// mechanism, authenticated management-key RESET, unverified bare RESET,
+/// or an outright refusal before anything ran) can return already say so
+/// themselves — none of them ever blocks a PIN or PUK, so appending the
+/// burn-dance disclosure to them would be wrong. Only an error that could
+/// have come from the burn dance (a transport error mid-loop, an unexpected
+/// status word the PIN/PUK mapping renders as a bare APDU failure, a host
+/// RNG failure) gets the disclosure appended.
+///
+/// The way out, when it applies, is to run the factory reset again, not the
+/// single-applet PIV reset: a fault in the PUK loop leaves the PIN blocked
+/// and the PUK *not* blocked, and the card refuses a plain RESET until both
+/// are blocked.
+fn piv_factory_reset_message(e: TransportError) -> String {
     match e {
-        TransportError::PivForceResetUnsupported
-        | TransportError::PivForceResetIncomplete(_)
+        // None of these touched the PIN or PUK: `Unsupported`/
+        // `NeedsManagementAuth` refuse before the burn sequence even starts
+        // (see `PivSession::plan_factory_reset`), `UnverifiedFailed` is the
+        // bare-RESET path that deliberately skips pre-blocking, and
+        // `GlobalFailed`/`ManagementAuthFailed` are the device-wide and
+        // authenticated-management-key mechanisms — neither has any
+        // PIN/PUK-blocking step to have left half-done. The "PIV may now be
+        // locked" caveat below would be actively wrong for any of these, so
+        // they pass through as-is — each variant's own `Display` already
+        // says what actually happened.
+        TransportError::PivResetUnsupported
+        | TransportError::PivResetNeedsManagementAuth
+        | TransportError::PivResetUnverifiedFailed(_)
+        | TransportError::PivResetGlobalFailed(_)
+        | TransportError::PivResetManagementAuthFailed(_)
+        | TransportError::PivResetIncomplete(_)
         | TransportError::PivPukGuessAccepted => e.to_string(),
         other => format!(
             "{other} (the wipe blocks the PIN and PUK before erasing, so PIV may \
@@ -990,6 +1396,24 @@ fn piv_force_reset_message(e: TransportError) -> String {
              factory reset again to finish it)"
         ),
     }
+}
+
+/// Whether the PIV pane's "Reset applet" card should show its "Factory reset
+/// supported →" link to the whole-device factory reset (Overview tab): true
+/// when `reset_global_gate` — a *different* extension,
+/// `PivExtension::ResetGlobal`, a device-wide reset directive that takes PIV
+/// down with it alongside at least one other applet — resolves
+/// [`FeatureGate::Supported`] (an *unverified* alternative isn't something to
+/// steer a user toward) AND `reset_gate` (`PivExtension::Reset`, the
+/// PIV-only path) is anything other than [`FeatureGate::Supported`] (a
+/// known-good PIV-only path has nothing to redirect away from — this is the
+/// "leave as-is" case).
+fn piv_reset_global_alternative_available(
+    reset_gate: keyroost_piv::compat::FeatureGate,
+    reset_global_gate: keyroost_piv::compat::FeatureGate,
+) -> bool {
+    use keyroost_piv::compat::FeatureGate;
+    reset_global_gate == FeatureGate::Supported && reset_gate != FeatureGate::Supported
 }
 
 /// Run one non-FIDO applet reset off the UI thread, mapping the result to a
@@ -1001,8 +1425,59 @@ fn run_card_reset_step(
     step: keyroost_resolve::ResetStep,
     reader: Option<&str>,
     hid_path: Option<&std::path::Path>,
+    reset_mgmt_auth: Option<&ResetMgmtAuth>,
 ) -> keyroost_resolve::StepOutcome {
     use keyroost_resolve::{ResetStep, StepOutcome};
+
+    // PIV gets its own path, ahead of the shared closure below:
+    // `PivSession::factory_reset` decides on its own, from a live fingerprint,
+    // whether to run the device-wide mechanism, a PIV-only reset, or skip the
+    // applet outright (RESET known-unsupported on both axes, or a
+    // precondition — an authenticated management-key session — with no
+    // credential supplied) rather than fail it, a distinction the shared
+    // Ok/Err mapping the other steps share can't express. See
+    // `piv_factory_reset_message` for why none of the "never touched PIN/PUK"
+    // errors get its usual caveat appended.
+    if step == ResetStep::Piv {
+        return (|| -> Result<StepOutcome, String> {
+            let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
+            let current = reset_mgmt_auth.map(|auth| match auth {
+                ResetMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                ResetMgmtAuth::Pin(pin) => keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes()),
+            });
+            let mut s = keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
+            Ok(match s.factory_reset(current) {
+                Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
+                // The device-wide mechanism ran cleanly -- more than just PIV
+                // was wiped, so the report should say so rather than naming
+                // only the applet that happened to trigger it.
+                Ok(keyroost_transport::FactoryResetOutcome::WipedGlobal) => {
+                    StepOutcome::WipedGlobal
+                }
+                // The device IS wiped -- only the courtesy XAUTH-key restore
+                // (the device-wide mechanism's own follow-up) failed.
+                // `WipedWithWarning`, not `Failed`: the wipe itself is done,
+                // so this must count as wiped everywhere that's what's being
+                // asked (the pane re-init below, the "N wiped" report), but
+                // the restore failure is real and still needs its own line.
+                Ok(keyroost_transport::FactoryResetOutcome::WipedKeyRestoreFailed) => {
+                    StepOutcome::WipedWithWarning(
+                        "restoring XAUTH key 1 to the factory-delivery value afterward failed \
+                         \u{2014} it's left cleared instead. Set it manually (PIV \u{2192} \
+                         Change management key) if you need it back."
+                            .into(),
+                    )
+                }
+                Err(
+                    e @ (TransportError::PivResetUnsupported
+                    | TransportError::PivResetNeedsManagementAuth),
+                ) => StepOutcome::Skipped(e.to_string()),
+                Err(e) => StepOutcome::Failed(piv_factory_reset_message(e)),
+            })
+        })()
+        .unwrap_or_else(StepOutcome::Failed);
+    }
+
     let run = || -> Result<(), String> {
         match step {
             ResetStep::Oath => {
@@ -1017,12 +1492,7 @@ fn run_card_reset_step(
                     keyroost_transport::OpenPgpSession::open(name).map_err(|e| e.to_string())?;
                 s.factory_reset().map_err(|e| e.to_string())?;
             }
-            ResetStep::Piv => {
-                let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
-                let mut s =
-                    keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
-                s.force_reset().map_err(piv_force_reset_message)?;
-            }
+            ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
                 // The OTP applet lives on the FIDO HID node when present, else on
                 // the PC/SC reader. Mirror the CLI's `HidThenReader` behavior:
@@ -2149,7 +2619,29 @@ struct App {
     reset_arm: Option<ResetArm>,
     /// Pending whole-device factory-reset confirmation, bound to the device it
     /// was opened for (KEY-008 posture). None unless the modal is open.
-    factory_reset_confirm: Option<DeviceId>,
+    factory_reset_confirm: Option<FactoryResetConfirmState>,
+    /// Validation error from the last "Yes, wipe this key" click on the
+    /// factory-reset confirm dialog (e.g. bad hex in the reset management-auth
+    /// credential field) — shown inline in that dialog, cleared on a fresh
+    /// arm, a successful submit, or Cancel. Kept separate from `piv.error`:
+    /// this error belongs to the confirm dialog, not the PIV pane, and must
+    /// not leak into (or be clobbered by) that pane's own error state.
+    factory_reset_confirm_error: Option<String>,
+    /// Mode for the factory-reset confirm dialog's reset management-auth
+    /// credential prompt (shown only when
+    /// `FactoryResetConfirmState::needs_reset_mgmt_auth` is true). Lives on `App`,
+    /// not inside `FactoryResetConfirmState`, for the same reason
+    /// `PivState::mgmt_auth_mode` lives on `PivState` rather than inside
+    /// whatever op is using it: it's user-typed UI state that must survive
+    /// the confirm-arming round trip (fingerprinting runs as a background
+    /// job in between) and be wiped explicitly on submit/cancel, not
+    /// implicitly dropped with whatever state happened to be armed when it
+    /// was typed.
+    reset_mgmt_auth_mode: ResetMgmtAuthMode,
+    /// Typed field backing `reset_mgmt_auth_mode`: a management-key hex
+    /// string in `Manual` mode, a PIN in `Pin` mode. Wiped on submit and on
+    /// dialog dismissal, same discipline as `PivState::mgmt_key_input`.
+    reset_mgmt_auth_input: String,
     /// Live per-step report while a factory reset runs (empty when idle).
     factory_reset_report: Vec<FactoryResetRow>,
     /// Remaining scans in the current burst. A single scan races slow-to-
@@ -4447,11 +4939,13 @@ impl App {
                 app.security_keys.info = None;
                 app.security_keys.error = None;
                 // When this reset was a factory reset's finale, record it —
-                // the Overview report is where the user is looking.
-                resolve_fido_reset_row(
-                    &mut app.factory_reset_report,
-                    keyroost_resolve::StepOutcome::Wiped,
-                );
+                // the Overview report is where the user is looking, and the
+                // activity log, where the permanent record lives.
+                let outcome = keyroost_resolve::StepOutcome::Wiped;
+                if resolve_fido_reset_row(&mut app.factory_reset_report, outcome.clone()) {
+                    let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                    app.log(severity, line);
+                }
                 // Re-read info so the PIN status reflects the wipe.
                 app.fetch_selected_info();
             }
@@ -4468,11 +4962,14 @@ impl App {
                 // `security_keys.error` is painted only in the FIDO2 and PIN
                 // panes; a factory reset leaves the user on Overview, so the
                 // failure has to land in the report too or the wipe looks
-                // complete when the passkeys and PIN survived.
-                resolve_fido_reset_row(
-                    &mut app.factory_reset_report,
-                    keyroost_resolve::StepOutcome::Failed(msg.clone()),
-                );
+                // complete when the passkeys and PIN survived — and in the
+                // activity log, so the permanent record doesn't stop at
+                // whatever the card sweep alone finished with.
+                let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+                if resolve_fido_reset_row(&mut app.factory_reset_report, outcome.clone()) {
+                    let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                    app.log(severity, line);
+                }
                 app.security_keys.error = Some(msg);
             }
         }
@@ -5072,25 +5569,123 @@ impl App {
         });
     }
 
+    /// The "Factory reset…" button's click handler: arms the confirm dialog
+    /// for the selected device, but if its plan includes a PIV step,
+    /// fingerprints PIV on the worker first — both `PivResetPreview`
+    /// (`PivSession::preview_factory_reset` — read-only, no PIN/PUK attempt;
+    /// tells the confirm dialog exactly which mechanism `factory_reset` will
+    /// run, or that neither is available) and whether that mechanism needs a
+    /// credential (`PivSession::global_reset_available`) — so the dialog's
+    /// text can say exactly what will happen (or be skipped) instead of
+    /// hedging across every possibility before the fact, and so it knows
+    /// whether to show the credential prompt at all. Same verdict
+    /// `PivSession::factory_reset` resolves again when the reset actually runs
+    /// — see `FactoryResetPivPreview`'s doc for why that's a deliberate,
+    /// cheap re-check rather than reused state (`needs_reset_mgmt_auth` itself,
+    /// unlike `piv_preview`, IS carried forward into `run_factory_reset_gui`
+    /// rather than re-fingerprinted — see that method's doc for why the two
+    /// differ).
+    ///
+    /// A device with no PIV step arms immediately. A device with one arms
+    /// only once the fingerprint job completes; a click while a job is
+    /// already in flight silently drops (the button can simply be pressed
+    /// again) — nothing user-typed is at stake here, unlike the callers
+    /// `spawn_job`'s own doc warns about.
+    fn start_factory_reset_confirm(&mut self) {
+        let Some(dev) = self.selected_device().cloned() else {
+            return;
+        };
+        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        if !plan.contains(&keyroost_resolve::ResetStep::Piv) {
+            self.factory_reset_confirm = Some(FactoryResetConfirmState {
+                for_device: dev.id,
+                piv_preview: FactoryResetPivPreview::NotOffered,
+                needs_reset_mgmt_auth: false,
+                default_mgmt_key: None,
+            });
+            return;
+        }
+        let Some(reader) = dev.reader.clone() else {
+            // `Caps::PIV` says PIV should be reachable, but there's no PC/SC
+            // reader to fingerprint it over (shouldn't happen in practice) —
+            // arm with the same fallback wording an outright fingerprint
+            // failure gets rather than get stuck offering nothing.
+            self.factory_reset_confirm = Some(FactoryResetConfirmState {
+                for_device: dev.id,
+                piv_preview: FactoryResetPivPreview::CheckFailed,
+                needs_reset_mgmt_auth: false,
+                default_mgmt_key: None,
+            });
+            return;
+        };
+        let for_device = dev.id;
+        self.spawn_job("Checking PIV reset support\u{2026}", move || {
+            let (preview, needs_reset_mgmt_auth, default_mgmt_key) =
+                match keyroost_transport::PivSession::open(&reader) {
+                    Ok(mut s) => {
+                        // One fingerprint serves all three checks — see
+                        // `PivSession::preview_factory_reset`/
+                        // `global_reset_available`/`default_management_key`'s
+                        // docs.
+                        let preview = FactoryResetPivPreview::Resolved(s.preview_factory_reset());
+                        (
+                            preview,
+                            s.global_reset_available(),
+                            s.default_management_key(),
+                        )
+                    }
+                    Err(_) => (FactoryResetPivPreview::CheckFailed, false, None),
+                };
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(Some(&for_device), app.selected_device.as_ref()) {
+                    return;
+                }
+                app.factory_reset_confirm = Some(FactoryResetConfirmState {
+                    for_device,
+                    piv_preview: preview,
+                    needs_reset_mgmt_auth,
+                    default_mgmt_key,
+                });
+            })
+        });
+    }
+
     /// Confirm modal for the whole-device factory reset. Device-bound like
     /// `render_oath_reset_confirm`: it dies the instant the selection changes,
     /// so a confirmed wipe can only ever land on the key it was opened for
     /// (KEY-008). "Yes, wipe this key" starts the sequential reset job.
     fn render_factory_reset_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
-        let Some(for_device) = self.factory_reset_confirm.clone() else {
+        let Some(FactoryResetConfirmState {
+            for_device,
+            piv_preview,
+            needs_reset_mgmt_auth,
+            default_mgmt_key,
+        }) = self.factory_reset_confirm.clone()
+        else {
             return;
         };
         if !completion_still_valid(Some(&for_device), self.selected_device.as_ref()) {
             self.factory_reset_confirm = None;
+            self.factory_reset_confirm_error = None;
             return;
         }
         let summary = match self.selected_device() {
             Some(dev) => {
-                let plan = keyroost_resolve::factory_reset_plan(dev.caps);
-                factory_reset_confirm_summary(&dev.serial, &dev.model, &plan)
+                let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                if factory_reset_piv_unresettable(piv_preview) {
+                    keyroost_resolve::exclude_unresettable_piv(&mut plan);
+                }
+                factory_reset_confirm_summary(
+                    &dev.serial,
+                    &dev.model,
+                    &plan,
+                    piv_preview,
+                    needs_reset_mgmt_auth,
+                )
             }
             None => {
                 self.factory_reset_confirm = None;
+                self.factory_reset_confirm_error = None;
                 return;
             }
         };
@@ -5101,6 +5696,14 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(summary);
+                if needs_reset_mgmt_auth {
+                    ui.add_space(8.0);
+                    self.factory_reset_mgmt_auth_field(ui, p, default_mgmt_key);
+                }
+                if let Some(err) = &self.factory_reset_confirm_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.err, err);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
@@ -5115,12 +5718,128 @@ impl App {
             Some(true) => {
                 if self.run_factory_reset_gui() {
                     self.factory_reset_confirm = None;
+                    self.factory_reset_confirm_error = None;
                 }
-                // else: a job is in flight; keep the modal open so the confirmed
-                // wipe isn't silently swallowed — the user can retry when it clears.
+                // else: either a job is already in flight, or the entered
+                // credential didn't validate (`factory_reset_confirm_error`
+                // is now set) — either way keep the modal open so the
+                // confirmed wipe isn't silently swallowed; the user can fix
+                // the input or retry once the worker clears.
             }
-            Some(false) => self.factory_reset_confirm = None,
+            Some(false) => {
+                self.factory_reset_confirm = None;
+                self.factory_reset_confirm_error = None;
+                wipe(&mut self.reset_mgmt_auth_input);
+            }
             None => {}
+        }
+    }
+
+    /// The factory-reset confirm dialog's management-auth credential prompt,
+    /// shown whenever `FactoryResetConfirmState::needs_reset_mgmt_auth` is true —
+    /// i.e. whenever `PivQuirk::ResetNeedsManagementAuth` applies.
+    /// `PivSession::factory_reset` decides on its own, from the live
+    /// fingerprint, which mechanism actually authenticates with what's typed
+    /// here: HID Crescendo's ACA instance (today's only real consumer) or,
+    /// on a fingerprint whose credential need is `PivExtension::Reset`
+    /// alone, the standard PIV management-key round
+    /// (`PivSession::authenticate_management_current`) — either way the same
+    /// field, resolved into the same `keyroost_transport::CurrentMgmtAuth`.
+    /// Same toggle-plus-field shape and wording as `App::piv_modal_mgmt_field`
+    /// — "Use default management key" / "Use PIN" checkboxes, each a pure
+    /// view onto (and setter of) `reset_mgmt_auth_mode`, plus the typed field
+    /// underneath when neither is ticked or "Use PIN" is. `default_key` is
+    /// `FactoryResetConfirmState::default_mgmt_key`, resolved for this
+    /// device by the same fingerprint job that armed the dialog; mirroring
+    /// `piv_modal_mgmt_field`, the checkbox is disabled — and reset back to
+    /// `Manual` if it was already ticked when the device stopped offering
+    /// one — whenever this is `None`, and shows the hex value in a tooltip
+    /// when it's `Some`, rather than assuming HID's factory value the way
+    /// this dialog used to. Unlike `piv_modal_mgmt_field`, there's no
+    /// `PinManagementAuth`-style support gate on "Use PIN": both choices are
+    /// always valid here, the only question is which credential the user has
+    /// on hand.
+    fn factory_reset_mgmt_auth_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        default_key: Option<&'static [u8]>,
+    ) {
+        if default_key.is_none() && self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Default {
+            // Same rationale as `piv_modal_mgmt_field`'s reset: don't leave
+            // the toggle checked for a default a device switch just took
+            // away.
+            self.reset_mgmt_auth_mode = ResetMgmtAuthMode::Manual;
+        }
+        ui.horizontal(|ui| {
+            let mut is_default = self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Default;
+            let mut resp = ui.add_enabled(
+                default_key.is_some(),
+                egui::Checkbox::new(&mut is_default, "Use default management key"),
+            );
+            if let Some(key) = default_key {
+                // Only on the enabled checkbox — a disabled one has no
+                // applicable default to show.
+                resp = resp.on_hover_text(format!("Default management key: {}", hex_lower(key)));
+            }
+            if resp.changed() {
+                self.reset_mgmt_auth_mode =
+                    reset_mgmt_auth_mode_after_toggle(is_default, ResetMgmtAuthMode::Default);
+            }
+            let mut is_pin = self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Pin;
+            if ui.checkbox(&mut is_pin, "Use PIN").changed() {
+                self.reset_mgmt_auth_mode =
+                    reset_mgmt_auth_mode_after_toggle(is_pin, ResetMgmtAuthMode::Pin);
+            }
+        });
+        if self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Default {
+            return;
+        }
+        let use_pin = self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Pin;
+        let (label, hint) = if use_pin {
+            ("PIN", "PIN")
+        } else {
+            // Deliberately not `piv_modal_mgmt_field`'s "hex (48/32/64
+            // chars)": HID's ACA XAUTH key — the credential this actually
+            // authenticates with on every fingerprint that needs this field
+            // today — only ever supports TDES/AES-128 (8/16/24-byte keys),
+            // never AES-256, unlike the standard PIV 0x9B round.
+            ("Management key", "hex (16/32/48 chars)")
+        };
+        secret_field(
+            ui,
+            p,
+            label,
+            &mut self.reset_mgmt_auth_input,
+            hint,
+            96.0,
+            300.0,
+        );
+    }
+
+    /// Resolve the credential the user entered for the factory reset's
+    /// management-auth step: `FactoryResetConfirmState::default_mgmt_key`
+    /// when "Use default management key" is ticked, a typed PIN with "Use
+    /// PIN" ticked, otherwise the typed management-key hex. Mirrors
+    /// `App::piv_current_mgmt_key`'s shape and error wording for the
+    /// `Default` case (down to reusing the exact same "no known default"
+    /// message) and `App::piv_current_mgmt_auth`'s role: the one call site
+    /// both the dialog's validation and `run_factory_reset_gui` go through,
+    /// so the resolution logic can't drift between the two.
+    fn reset_mgmt_current_auth(&self) -> Result<ResetMgmtAuth, String> {
+        match self.reset_mgmt_auth_mode {
+            ResetMgmtAuthMode::Default => self
+                .factory_reset_confirm
+                .as_ref()
+                .and_then(|c| c.default_mgmt_key)
+                .map(|key| ResetMgmtAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
+                .ok_or_else(|| "This device has no known default management key.".to_string()),
+            ResetMgmtAuthMode::Pin => Ok(ResetMgmtAuth::Pin(zeroize::Zeroizing::new(
+                self.reset_mgmt_auth_input.clone(),
+            ))),
+            ResetMgmtAuthMode::Manual => {
+                piv_mgmt_key_bytes(&self.reset_mgmt_auth_input).map(ResetMgmtAuth::Key)
+            }
         }
     }
 
@@ -5128,6 +5847,17 @@ impl App {
     /// against. Lifted out of `run_factory_reset_gui`'s apply closure for the
     /// same reason as [`App::apply_reset_path_outcome`]: the device-binding
     /// rule is the part worth testing, and it needs no key in hand.
+    ///
+    /// Every path through here logs a plain-language summary
+    /// (`factory_reset_report_summary`: which steps wiped, failed, or were
+    /// skipped, and why) — independent of `factory_reset_report` (the
+    /// Overview pane's own live list, overwritten by the next run) and
+    /// independent of any APDU trace. That `log`/`log_global` call is also
+    /// what flushes a trace captured for this job: `App::push_log` is the
+    /// sole consumer of `App::pending_trace` (see `Worker::spawn`'s doc), so
+    /// a path through here that never logs would silently drop it — this
+    /// function used to have exactly one such path (see the orphaned case
+    /// below, which already logged, and the normal case, which didn't).
     ///
     /// The orphaned case is louder here than anywhere else in the file. By the
     /// time this runs, every card step has already been executed against the
@@ -5149,28 +5879,6 @@ impl App {
             // and deliberately don't open the FIDO dialog either, because
             // arming a wipe under the key on screen now is exactly what the
             // guard exists to prevent.
-            let wiped: Vec<&str> = reports
-                .iter()
-                .filter(|r| matches!(r.outcome, StepOutcome::Wiped))
-                .map(|r| r.step.label())
-                .collect();
-            let failed: Vec<String> = reports
-                .iter()
-                .filter_map(|r| match &r.outcome {
-                    StepOutcome::Failed(e) => Some(format!("{}: {e}", r.step.label())),
-                    _ => None,
-                })
-                .collect();
-            let wiped_txt = if wiped.is_empty() {
-                "nothing".to_string()
-            } else {
-                wiped.join(", ")
-            };
-            let failed_txt = if failed.is_empty() {
-                "nothing".to_string()
-            } else {
-                failed.join("; ")
-            };
             let fido_txt = if ends_in_fido {
                 format!(
                     " {} was left un-wiped \u{2014} the replug-and-touch ceremony never started.",
@@ -5183,9 +5891,9 @@ impl App {
                 Severity::Warn,
                 LogKind::User,
                 format!(
-                    "a factory reset finished after the selection moved on \u{2014} wiped: \
-                     {wiped_txt}; not wiped: {failed_txt}.{fido_txt} Re-select that key to see \
-                     its current state and finish the reset."
+                    "a factory reset finished after the selection moved on \u{2014} {}.{fido_txt} \
+                     Re-select that key to see its current state and finish the reset.",
+                    factory_reset_report_summary(&reports)
                 ),
             );
             return;
@@ -5194,7 +5902,15 @@ impl App {
         // (mirrors the OATH reset apply), clearing its "tried" flag so the
         // pane re-lists on its own.
         for r in &reports {
-            if matches!(r.outcome, StepOutcome::Wiped) {
+            // `WipedGlobal` and `WipedWithWarning` count here too: the
+            // applet itself really was wiped, either cleanly via the
+            // device-wide mechanism or with a non-fatal follow-up (today:
+            // PIV's courtesy XAUTH-key restore) that didn't go cleanly --
+            // the pane's stale state still needs clearing either way.
+            if matches!(
+                r.outcome,
+                StepOutcome::Wiped | StepOutcome::WipedGlobal | StepOutcome::WipedWithWarning(_)
+            ) {
                 match r.step {
                     ResetStep::Oath => {
                         app.oath = OathState::default();
@@ -5203,6 +5919,10 @@ impl App {
                     ResetStep::OpenPgp => {
                         app.openpgp = OpenPgpState::default();
                     }
+                    // Fires regardless of which mechanism `PivSession::
+                    // factory_reset` actually ran (device-wide or PIV-only) --
+                    // `ResetStep::Piv` covers both; there's no separate step
+                    // for the device-wide path any more.
                     ResetStep::Piv => {
                         app.piv = PivState::default();
                         app.piv_tried = false;
@@ -5215,6 +5935,36 @@ impl App {
                 }
             }
         }
+        // Record the run in the activity log — independent of any APDU
+        // trace: whether a factory reset ran, which applets it wiped, and
+        // which steps failed or were skipped (and why). This is also the
+        // call that flushes a captured APDU trace: `App::push_log` is the
+        // sole consumer of `App::pending_trace` (see `Worker::spawn`'s doc),
+        // so without a `log` call here, a trace captured for this whole job
+        // had nowhere to attach and was silently discarded — this whole
+        // function used to report only through `factory_reset_report`
+        // (the Overview pane's own list), never through the activity log.
+        // `WipedGlobal` counts as clean here (it's a full success, just via
+        // a different mechanism), but deliberately not
+        // `| StepOutcome::WipedWithWarning(_)`, unlike the pane-reinit loop
+        // above: the applet is wiped either way, but a run with a warning
+        // attached isn't a clean run, and `Severity::Warn` is what actually
+        // gets that warning in front of the user.
+        let severity = if reports
+            .iter()
+            .all(|r| matches!(r.outcome, StepOutcome::Wiped | StepOutcome::WipedGlobal))
+        {
+            Severity::Ok
+        } else {
+            Severity::Warn
+        };
+        app.log(
+            severity,
+            format!(
+                "factory reset finished \u{2014} {}",
+                factory_reset_report_summary(&reports)
+            ),
+        );
         app.factory_reset_report = reports.into_iter().map(FactoryResetRow::Step).collect();
         // Hand the FIDO finale to the tested armed-reset flow. Seed its
         // report row first: the ceremony can fail (no touch in time) or
@@ -5235,15 +5985,69 @@ impl App {
     /// re-initialise the wiped panes, and — when the plan ends in FIDO — hand
     /// the finale to the existing armed `ResetDialog` (which owns the replug +
     /// touch ceremony), so no new FIDO logic is written here.
+    ///
+    /// If the armed `factory_reset_confirm` says a management-key credential
+    /// is needed (`FactoryResetConfirmState::needs_reset_mgmt_auth` — set
+    /// once, by `start_factory_reset_confirm`'s fingerprint, and carried
+    /// forward rather than re-checked here): resolves the credential the user
+    /// typed into the confirm dialog (`Self::reset_mgmt_current_auth`) and
+    /// hands it to `run_card_reset_step`'s `Piv` branch, which passes it straight
+    /// through to `PivSession::factory_reset` — that method decides on its own
+    /// which mechanism actually consumes it (or, if neither `PivExtension::
+    /// Reset` nor `ResetGlobal` is available, that it goes unused). Also
+    /// excludes `ResetStep::Piv` from the plan entirely when
+    /// `piv_preview` says neither mechanism is available at all
+    /// (`factory_reset_piv_unresettable` /
+    /// `keyroost_resolve::exclude_unresettable_piv`) — same decision
+    /// `render_factory_reset_confirm` already made for the dialog text, made
+    /// again here from the same stored `piv_preview` rather than a fresh
+    /// fingerprint, for the reason the next paragraph gives.
+    ///
+    /// Unlike the individual PIV step's own fingerprint (deliberately
+    /// re-run fresh every time it executes — see `FactoryResetPivPreview`'s
+    /// doc), *what's in the plan* is decided once, when the dialog was
+    /// armed, and not revisited here: re-deciding plan membership would need
+    /// its own PC/SC round trip before this method could even build
+    /// `card_steps`, which blocking-I/O-on-the-UI-thread this whole
+    /// worker-job structure exists to avoid.
+    ///
+    /// An invalid credential returns `false` (same "keep the dialog open"
+    /// signal a busy worker gives) with `factory_reset_confirm_error` set,
+    /// instead of queuing a job that could only fail once it reached the
+    /// card.
     fn run_factory_reset_gui(&mut self) -> bool {
         use keyroost_resolve::{ResetStep, StepReport};
         let Some(dev) = self.selected_device().cloned() else {
             return false;
         };
-        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let piv_preview = self
+            .factory_reset_confirm
+            .as_ref()
+            .map(|c| c.piv_preview)
+            .unwrap_or(FactoryResetPivPreview::NotOffered);
+        if factory_reset_piv_unresettable(piv_preview) {
+            keyroost_resolve::exclude_unresettable_piv(&mut plan);
+        }
         if plan.is_empty() {
             return false;
         }
+        let needs_reset_mgmt_auth = self
+            .factory_reset_confirm
+            .as_ref()
+            .is_some_and(|c| c.needs_reset_mgmt_auth);
+        let reset_mgmt_auth = if needs_reset_mgmt_auth {
+            match self.reset_mgmt_current_auth() {
+                Ok(auth) => Some(auth),
+                Err(e) => {
+                    self.factory_reset_confirm_error = Some(e);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        self.factory_reset_confirm_error = None;
         // Capture the transport descriptors before going off-thread.
         let reader = dev.reader.clone();
         let hid_path = dev.hid_path.clone();
@@ -5261,10 +6065,16 @@ impl App {
         self.spawn_job("Factory-resetting key\u{2026}", move || {
             let mut reports: Vec<StepReport> = Vec::new();
             for step in card_steps {
-                let outcome = run_card_reset_step(step, reader.as_deref(), hid_path.as_deref());
+                let outcome = run_card_reset_step(
+                    step,
+                    reader.as_deref(),
+                    hid_path.as_deref(),
+                    reset_mgmt_auth.as_ref(),
+                );
                 reports.push(StepReport { step, outcome });
             }
             Box::new(move |app: &mut App| {
+                wipe(&mut app.reset_mgmt_auth_input);
                 App::apply_factory_reset_sweep(app, for_device.as_ref(), reports, ends_in_fido)
             })
         })
@@ -5308,7 +6118,7 @@ impl App {
         let waiting = self.reset_arm.as_ref().is_some_and(|arm| {
             completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
         });
-        egui::Window::new("Reset security key?")
+        egui::Window::new("Reset FIDO security key?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -5398,10 +6208,14 @@ impl App {
                                progress. Retry from the FIDO2 pane once it finishes; \
                                the card was not touched."
                         .to_string();
-                    resolve_pending_fido_reset_row(
+                    let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+                    if resolve_pending_fido_reset_row(
                         &mut self.factory_reset_report,
-                        keyroost_resolve::StepOutcome::Failed(msg.clone()),
-                    );
+                        outcome.clone(),
+                    ) {
+                        let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                        self.log(severity, line);
+                    }
                     self.security_keys.error = Some(msg);
                 }
             } else {
@@ -5412,16 +6226,20 @@ impl App {
             self.security_keys.reset = ResetDialog::default();
             self.reset_arm = None;
             // If this dialog was a factory reset's FIDO finale, say so in the
-            // report rather than leaving a row that reads as still in progress.
+            // report rather than leaving a row that reads as still in progress
+            // — and in the activity log, whose "factory reset finished" line
+            // was written before this ceremony even started and never
+            // otherwise learns how it ended.
             // Pending-only: a row that already answered belongs to an earlier
             // ceremony this cancel didn't undo (the report outlives the dialog),
             // and rewriting a completed wipe as "failed" asks for it again.
-            resolve_pending_fido_reset_row(
-                &mut self.factory_reset_report,
-                keyroost_resolve::StepOutcome::Failed(
-                    "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
-                ),
+            let outcome = keyroost_resolve::StepOutcome::Failed(
+                "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
             );
+            if resolve_pending_fido_reset_row(&mut self.factory_reset_report, outcome.clone()) {
+                let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                self.log(severity, line);
+            }
         }
     }
 
@@ -5481,10 +6299,11 @@ impl App {
             // for a replug-and-touch ceremony that is never coming. Pending-only
             // for the same reason as the cancel branch: nothing was attempted
             // here, so an already-answered row is not this refusal's to rewrite.
-            resolve_pending_fido_reset_row(
-                &mut self.factory_reset_report,
-                keyroost_resolve::StepOutcome::Failed(msg.clone()),
-            );
+            let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+            if resolve_pending_fido_reset_row(&mut self.factory_reset_report, outcome.clone()) {
+                let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                self.log(severity, line);
+            }
             self.security_keys.error = Some(msg);
         } else {
             self.reset_arm = Some(ResetArm {
@@ -6088,17 +6907,28 @@ fn piv_mgmt_key_bytes(hex: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> 
         .map_err(|e| format!("management key is not valid hex: {}", e))
 }
 
-/// The well-known factory-default PIV management key, as a hex string. The
-/// standard PIV default is 24 bytes of `01 02 03 04 05 06 07 08` repeated three
-/// times (a 3-DES / AES-192 key); Token2 PIN+ ships a vendor-specific default
-/// instead. Used by the modal's "Use default management key" convenience toggle
-/// so the common case (key never rotated) is one click.
-fn piv_default_mgmt_key_hex(is_token2: bool) -> &'static str {
-    if is_token2 {
-        "865362865362865362865362865362865362865362865362"
-    } else {
-        "010203040506070801020304050607080102030405060708"
-    }
+/// The well-known factory-default PIV/XAUTH management-key bytes for a
+/// device fingerprinted as `fingerprint` at `version`/`firmware_version`, if
+/// keyroost has one on record —
+/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`], read off
+/// [`keyroost_piv::compat::resolve_quirks`]. `None` means keyroost has no
+/// known default for this device (an unrecognised fingerprint, or one the
+/// quirk table deliberately leaves unseeded) — the modal's "Use default
+/// management key" convenience toggle
+/// ([`App::piv_modal_mgmt_field`]) disables itself in that case rather than
+/// offering a default it can't actually supply. The slice's length is
+/// whatever that fingerprint's management-key algorithm actually takes — 16
+/// bytes for AES-128, 24 for 3-DES/AES-192, 32 for AES-256 — never assume 24.
+fn piv_default_mgmt_key(
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<&'static [u8]> {
+    keyroost_piv::compat::default_9b_management_key(&keyroost_piv::compat::resolve_quirks(
+        fingerprint,
+        version,
+        firmware_version,
+    ))
 }
 
 /// How the user authorized a PIV management operation — the standard
@@ -6811,17 +7641,34 @@ impl App {
         });
     }
 
+    /// [`piv_default_mgmt_key`] for the currently selected card's last-read
+    /// status — `None` before any status has been read, or when this
+    /// fingerprint/version carries no
+    /// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`]. The one
+    /// place both [`Self::piv_current_mgmt_key`] and
+    /// [`Self::piv_modal_mgmt_field`]'s checkbox-enablement check resolve
+    /// this, so the two can't disagree about whether a default is on offer.
+    fn piv_current_default_mgmt_key(&self) -> Option<&'static [u8]> {
+        let status = self.piv.status.as_ref()?;
+        piv_default_mgmt_key(
+            status.applet_fingerprint,
+            status.version.as_deref(),
+            status.version_firmware.as_deref(),
+        )
+    }
+
     /// Resolve the *current* management key the user authorized this op with:
-    /// the well-known factory default when "Use default management key" is
-    /// ticked, otherwise the hex they typed. Decoding errors are surfaced the
-    /// same way the inline field's were.
+    /// this device's well-known factory default when "Use default management
+    /// key" is ticked, otherwise the hex they typed. Decoding errors are
+    /// surfaced the same way the inline field's were; ticking the toggle on a
+    /// device with no known default (which the checkbox should already be
+    /// disabled for — see [`Self::piv_modal_mgmt_field`]) surfaces the same
+    /// way rather than silently falling back to a guess.
     fn piv_current_mgmt_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
         if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
-            let is_token2 = self
-                .selected_device()
-                .map(|d| d.vendor.eq_ignore_ascii_case("token2"))
-                .unwrap_or(false);
-            piv_mgmt_key_bytes(piv_default_mgmt_key_hex(is_token2))
+            self.piv_current_default_mgmt_key()
+                .map(|key| zeroize::Zeroizing::new(key.to_vec()))
+                .ok_or_else(|| "This device has no known default management key.".to_string())
         } else {
             piv_mgmt_key_bytes(&self.piv.mgmt_key_input)
         }
@@ -9941,6 +10788,7 @@ impl App {
                         )
                         .sense(egui::Sense::click()),
                     )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     go = true;
@@ -10400,7 +11248,7 @@ impl App {
                                     let (text, tone) = factory_reset_row_line(row);
                                     let color = match tone {
                                         RowTone::Done => p.ok,
-                                        RowTone::Waiting => p.warn,
+                                        RowTone::Waiting | RowTone::Warn => p.warn,
                                         RowTone::Bad => p.err,
                                         RowTone::Muted => p.txt3,
                                     };
@@ -10413,7 +11261,7 @@ impl App {
                             }
                         });
                     if arm {
-                        self.factory_reset_confirm = self.selected_device.clone();
+                        self.start_factory_reset_confirm();
                     }
                 }
             }
@@ -12746,7 +13594,14 @@ impl App {
     /// default management key" toggle (the common case — most users never rotate
     /// the well-known factory default) and, when it's off, the hex entry field.
     /// When the toggle is on the field is hidden and the op reads the default via
-    /// `piv_current_mgmt_auth`.
+    /// `piv_current_mgmt_auth`. The toggle itself is disabled — greyed out,
+    /// unclickable — whenever `Self::piv_current_default_mgmt_key` resolves
+    /// `None`: this fingerprint/version carries no
+    /// `keyroost_piv::compat::PivQuirk::Default9bManagementKey`, so keyroost has
+    /// no default to offer rather than one that might just be wrong. When it
+    /// does resolve `Some`, hovering the (enabled) checkbox shows the
+    /// applicable default key as hex in a tooltip, so the user can see what
+    /// they're about to authorize with before committing to it.
     ///
     /// When this device's fingerprint resolves
     /// `keyroost_piv::compat::PivExtension::PinManagementAuth` to `Supported`,
@@ -12791,12 +13646,24 @@ impl App {
             // from under an already-checked toggle.
             self.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
         }
+        let default_key = self.piv_current_default_mgmt_key();
+        if default_key.is_none() && self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
+            // Same rationale as the "Use PIN" reset above: don't leave the
+            // toggle checked for a default a device switch just took away.
+            self.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
+        }
         ui.horizontal(|ui| {
             let mut is_default = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default;
-            if ui
-                .checkbox(&mut is_default, "Use default management key")
-                .changed()
-            {
+            let mut resp = ui.add_enabled(
+                default_key.is_some(),
+                egui::Checkbox::new(&mut is_default, "Use default management key"),
+            );
+            if let Some(key) = default_key {
+                // Only on the enabled checkbox — a disabled one has no
+                // applicable default to show.
+                resp = resp.on_hover_text(format!("Default management key: {}", hex_lower(key)));
+            }
+            if resp.changed() {
                 self.piv.mgmt_auth_mode =
                     piv_mgmt_mode_after_toggle(is_default, PivMgmtAuthMode::Default);
             }
@@ -14237,6 +15104,7 @@ impl App {
         let mut open_new_chuid = false;
         let mut click_retired_tab = false;
         let mut arm_reset = false;
+        let mut go_to_overview = false;
         let mut copy_pem: Option<String> = None;
         // Slot the user clicked in the status card this frame (applied after the
         // card borrows end). `selected` is a copy of the active selection so the
@@ -14583,6 +15451,23 @@ impl App {
             keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
         let delete_key_gate =
             keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
+        // Reset (Yubico RESET, `INS 0xFB`) is gated the same way, from the
+        // same fingerprint/version triple — see the "Reset applet" card
+        // below.
+        let reset_gate =
+            keyroost_piv::compat::resolve(PivExtension::Reset, piv_fp, piv_ver, piv_fw_ver);
+        // A device-wide reset directive that takes PIV down with it alongside
+        // at least one other applet — a distinct extension from `Reset`
+        // above, resolved independently (see
+        // `keyroost_piv::compat::PivExtension::ResetGlobal`'s doc). Checked
+        // here only to decide whether the "Reset applet" card below should
+        // point at the whole-device factory reset (Overview tab) as a known
+        // alternative when the PIV-only path can't be trusted — never to
+        // change what that card's own button does.
+        let reset_global_gate =
+            keyroost_piv::compat::resolve(PivExtension::ResetGlobal, piv_fp, piv_ver, piv_fw_ver);
+        let show_reset_global_alternative =
+            piv_reset_global_alternative_available(reset_gate, reset_global_gate);
         // Explanations for the non-standard slot operations when the
         // fingerprint known-support table can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
@@ -14611,6 +15496,16 @@ impl App {
         let delete_key_blocked_hint = format!(
             "{} {}",
             PivExtension::DeleteKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        let reset_unverified_hint = format!(
+            "{} {}",
+            PivExtension::Reset.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let reset_blocked_hint = format!(
+            "{} {}",
+            PivExtension::Reset.requirement(),
             FeatureGate::INCOMPATIBLE_SUFFIX
         );
         // Both certificate actions below (self-sign into the slot, and sign a
@@ -15114,20 +16009,65 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "reset");
+                    // Same three-way gate as Move key / Delete key, from the
+                    // same `keyroost_piv::compat` known-support table — see
+                    // `reset_gate`'s definition above.
+                    if matches!(reset_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(reset_unverified_hint.as_str());
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
-                            arm_reset = true;
+                        match reset_gate {
+                            // Unverified still runs — the card refuses if it
+                            // truly can't — so the button stays live; only
+                            // the warning above marks the doubt.
+                            FeatureGate::Supported | FeatureGate::Unverified => {
+                                if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}")
+                                    .clicked()
+                                {
+                                    arm_reset = true;
+                                }
+                            }
+                            FeatureGate::Unsupported => {
+                                // Kept visible but dimmed so the capability
+                                // stays discoverable; the hover text says why
+                                // it can't run yet.
+                                theme::button_disabled(ui, p, "Reset applet\u{2026}")
+                                    .on_hover_text(reset_blocked_hint.as_str());
+                            }
                         }
                     });
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
-                         the PIN and PUK are already blocked.",
+                        "Wipes ALL PIV keys, certificates, and PINs. Typically requires both \
+                         the PIN and PUK to already be blocked.",
                     )
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
+                if show_reset_global_alternative {
+                    ui.add_space(6.0);
+                    // Same click-sense-label style as the Overview cards' own
+                    // "Manage →" jump (`App::card_head`) — an accent-colored
+                    // text link, not a button, since this isn't itself an
+                    // action, just a pointer to where the action lives; same
+                    // browser-style pointing-hand cursor on hover, too.
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new("Factory reset supported \u{2192}")
+                                    .font(theme::f_sb(12.5))
+                                    .color(p.accent),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        go_to_overview = true;
+                    }
+                }
             });
 
         // Apply collected intents now that the card borrows have ended.
@@ -15264,6 +16204,9 @@ impl App {
         }
         if arm_reset {
             self.piv.confirm_reset = Some(String::new());
+        }
+        if go_to_overview {
+            self.cap_tab = CapTab::Overview;
         }
         if let Some(pem) = copy_pem {
             ui.ctx().copy_text(pem);
@@ -16355,6 +17298,22 @@ fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
 mod tests {
     use super::*;
 
+    /// A minimal `PivStatus` reporting just `fingerprint`/`version` — enough
+    /// to drive `App::piv_current_default_mgmt_key`'s resolution in a test.
+    /// `PivStatus` is `#[non_exhaustive]`, so this crate can't use struct-
+    /// literal syntax on it directly; go through `Default` and field
+    /// assignment instead, same as the existing `PivStatus::default()` tests
+    /// already do.
+    fn piv_status_with(
+        fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+        version: Option<Vec<u8>>,
+    ) -> keyroost_transport::PivStatus {
+        let mut status = keyroost_transport::PivStatus::default();
+        status.applet_fingerprint = fingerprint;
+        status.version = version;
+        status
+    }
+
     #[test]
     fn openpgp_algorithm_choices_are_the_cards_list_or_everything() {
         use keyroost_transport::{KeyCrt, OpenPgpKeyAlg};
@@ -16407,11 +17366,20 @@ mod tests {
     #[test]
     fn factory_reset_summary_lists_applets_and_flags_piv_and_fido() {
         use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
         let mut caps = Caps::default();
         for c in [Caps::OATH, Caps::PIV, Caps::FIDO2] {
             caps.insert(c);
         }
-        let msg = factory_reset_confirm_summary("SN123", "Token2 PIN+", &factory_reset_plan(caps));
+        let msg = factory_reset_confirm_summary(
+            "SN123",
+            "Token2 PIN+",
+            &factory_reset_plan(caps),
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )),
+            false,
+        );
         assert!(msg.contains("SN123") && msg.contains("Token2 PIN+"));
         assert!(msg.contains("OATH") && msg.contains("PIV") && msg.contains("FIDO2"));
         // PIV disclosure and FIDO replug note are present.
@@ -16420,6 +17388,244 @@ mod tests {
         // The summary must not promise an outcome the PIV path can't guarantee:
         // that path blocks the PIN and PUK before the wipe.
         assert!(!msg.contains("stays fully usable"));
+    }
+
+    /// The confirm dialog's PIV paragraph is fingerprinted ahead of time (see
+    /// `App::start_factory_reset_confirm`), so it must actually say something
+    /// different per `FactoryResetPivPreview` case — a user deciding whether
+    /// to proceed needs to know which one they're looking at.
+    #[test]
+    fn factory_reset_summary_piv_note_matches_the_fingerprinted_plan() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        // `needs_management_auth` only matters to the credential sentence,
+        // covered by dedicated tests below -- the PIV-only note text under
+        // test here never depends on it, so `false` is a neutral stand-in
+        // throughout.
+
+        let needs_mgmt_auth = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::NeedsManagementAuth,
+            )),
+            false,
+        );
+        assert!(
+            needs_mgmt_auth.contains("management-key"),
+            "{needs_mgmt_auth}"
+        );
+        // Now genuinely attempted (authenticate, then RESET), not refused --
+        // unlike every other atomic case here, this one does NOT say "will
+        // NOT be wiped".
+        assert!(
+            !needs_mgmt_auth.contains("NOT be wiped"),
+            "{needs_mgmt_auth}"
+        );
+        // Atomic: authenticate-then-RESET is a clean pass/fail, no partial
+        // state for the step report to disambiguate, unlike the burn case.
+        assert!(
+            !needs_mgmt_auth.contains("the report below"),
+            "{needs_mgmt_auth}"
+        );
+
+        let unverified = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(FactoryResetPlan::Unverified)),
+            false,
+        );
+        assert!(unverified.contains("unverified"), "{unverified}");
+        assert!(unverified.contains("without blocking"), "{unverified}");
+        // Also atomic (a bare RESET attempt, no PIN/PUK burn) -- same
+        // reasoning as NeedsManagementAuth above.
+        assert!(!unverified.contains("the report below"), "{unverified}");
+
+        let burn_then_reset = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )),
+            false,
+        );
+        assert!(burn_then_reset.contains("PIN and PUK"), "{burn_then_reset}");
+        // The one multi-step case (block PIN, block PUK, then RESET): a
+        // failure partway through leaves PIV in a state this text alone
+        // can't describe, so -- unlike every atomic case above -- it must
+        // point at the step report.
+        assert!(
+            burn_then_reset.contains("the report below the button says what state it's in"),
+            "{burn_then_reset}"
+        );
+
+        // The device-wide mechanism has nothing PIV-specific to caveat --
+        // it's just another applet in the plan.
+        let global = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+        );
+        assert!(!global.contains("PIV:"), "{global}");
+
+        let check_failed = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::CheckFailed,
+            false,
+        );
+        assert!(check_failed.contains("couldn't confirm"), "{check_failed}");
+
+        // `NotOffered` inside a plan that DOES include PIV shouldn't happen in
+        // practice, but must not panic or claim something false about a step
+        // that was never fingerprinted -- it falls back to `CheckFailed`'s
+        // wording.
+        let not_offered = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::NotOffered,
+            false,
+        );
+        assert_eq!(not_offered, check_failed);
+
+        // A plan without PIV never gets a PIV paragraph, regardless of preview.
+        let no_piv = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &factory_reset_plan(Caps::OATH),
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+        );
+        assert!(!no_piv.contains("PIV:"), "{no_piv}");
+    }
+
+    /// `PivExtension::ResetGlobal` resolving `Global` means the PIV step, if
+    /// it runs, takes at least one other applet down with it — the "Wipes:"
+    /// list must say so up front (`PIV_GLOBAL_RESET_LABEL`), not report the
+    /// bare `ResetStep::Piv::label()` a caller would otherwise read as
+    /// "PIV, and only PIV, gets touched".
+    #[test]
+    fn factory_reset_summary_wipes_list_names_the_whole_device_when_global() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let mut caps = Caps::default();
+        for c in [Caps::OATH, Caps::PIV] {
+            caps.insert(c);
+        }
+        let plan = factory_reset_plan(caps);
+
+        let global = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+        );
+        assert!(
+            global.contains(&format!(
+                "Wipes: OATH, {}",
+                keyroost_resolve::PIV_GLOBAL_RESET_LABEL
+            )),
+            "{global}"
+        );
+        assert!(!global.contains("Wipes: OATH, PIV"), "{global}");
+        // `PivResetPreview::Global` itself already folds `ResetGlobal`
+        // resolving `Supported` *or* `Unverified` into one value (see that
+        // variant's own doc) -- there's no separate case to test here, both
+        // get this same label for the same reason: an unconfirmed
+        // device-wide mechanism might still take other applets with it.
+
+        // A PIV-only mechanism -- confirmed *not* device-wide -- keeps the
+        // bare applet label.
+        let piv_only = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )),
+            false,
+        );
+        assert!(piv_only.contains("Wipes: OATH, PIV"), "{piv_only}");
+    }
+
+    /// `PivResetPreview::Unsupported` never actually reaches the summary in
+    /// practice (`start_factory_reset_confirm` excludes `ResetStep::Piv`
+    /// from the plan whenever it's resolved -- see
+    /// `factory_reset_piv_unresettable`), but the match still has to handle
+    /// it, and defensively (a stale plan built before a fresh fingerprint
+    /// changed the answer) it must not claim anything: empty string, same as
+    /// its nested-`Unsupported` sibling that `preview_factory_reset` never
+    /// actually produces.
+    #[test]
+    fn factory_reset_summary_unsupported_preview_says_nothing_if_ever_reached() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        for preview in [
+            PivResetPreview::Unsupported,
+            PivResetPreview::Piv(FactoryResetPlan::Unsupported),
+        ] {
+            let msg = factory_reset_confirm_summary(
+                "SN",
+                "Model",
+                &plan,
+                FactoryResetPivPreview::Resolved(preview),
+                false,
+            );
+            assert!(!msg.contains("PIV:"), "{preview:?} {msg}");
+        }
+    }
+
+    /// The management-auth credential sentence is gated purely on
+    /// `needs_management_auth` (`PivQuirk::ResetNeedsManagementAuth`
+    /// applying), independent of which mechanism `piv_preview` says will
+    /// actually consume it -- appears exactly once whichever case is active,
+    /// never duplicated by the PIV-only note above it (which, for
+    /// `NeedsManagementAuth`, now separately says "authenticates ... then
+    /// wipes" but doesn't itself repeat "management auth").
+    #[test]
+    fn factory_reset_summary_credential_sentence_is_gated_on_needs_management_auth_alone() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        for preview in [
+            PivResetPreview::Global,
+            PivResetPreview::Piv(FactoryResetPlan::NeedsManagementAuth),
+        ] {
+            let with_credential = factory_reset_confirm_summary(
+                "SN",
+                "Model",
+                &plan,
+                FactoryResetPivPreview::Resolved(preview),
+                true,
+            );
+            assert_eq!(
+                with_credential.matches("requires management auth").count(),
+                1,
+                "{preview:?} {with_credential}"
+            );
+
+            let without_credential = factory_reset_confirm_summary(
+                "SN",
+                "Model",
+                &plan,
+                FactoryResetPivPreview::Resolved(preview),
+                false,
+            );
+            assert!(
+                !without_credential.contains("requires management auth"),
+                "{preview:?} {without_credential}"
+            );
+        }
     }
 
     /// Two "Save certificate…" dialogs can be open at once (the busy guard is
@@ -16643,31 +17849,65 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// A forced PIV wipe blocks the PIN and PUK before it erases, so a failure
-    /// in between leaves the applet locked but intact. The confirmation modal
-    /// promises the report says so — which means every failure that doesn't
-    /// already describe the card's state has to carry the disclosure, matching
-    /// what the CLI's factory reset prints for the same failures.
+    /// Only `PivSession::factory_reset`'s PIN/PUK burn-dance path blocks the
+    /// PIN and PUK before it erases, so only there can a failure in between
+    /// leave the applet locked but intact. The confirmation modal promises
+    /// the report says so — which means every failure that doesn't already
+    /// describe the card's state has to carry the disclosure, matching what
+    /// the CLI's factory reset prints for the same failures.
     #[test]
-    fn piv_force_reset_failures_disclose_the_blocked_credentials() {
+    fn piv_factory_reset_failures_disclose_the_blocked_credentials() {
         // Self-describing variants pass through untouched: appending "run the
-        // factory reset again" would contradict them (Unsupported never blocked
-        // anything; the other two already say what to do).
-        let unsupported = piv_force_reset_message(TransportError::PivForceResetUnsupported);
+        // factory reset again" would contradict them (Unsupported/
+        // NeedsManagementAuth never blocked anything; UnverifiedFailed/
+        // GlobalFailed/ManagementAuthFailed already explain themselves and
+        // never touched a PIN or PUK either; the other two already say what
+        // to do).
+        let unsupported = piv_factory_reset_message(TransportError::PivResetUnsupported);
+        assert_eq!(unsupported, TransportError::PivResetUnsupported.to_string());
+        let needs_mgmt_auth =
+            piv_factory_reset_message(TransportError::PivResetNeedsManagementAuth);
         assert_eq!(
-            unsupported,
-            TransportError::PivForceResetUnsupported.to_string()
+            needs_mgmt_auth,
+            TransportError::PivResetNeedsManagementAuth.to_string()
+        );
+        let unverified_failed = piv_factory_reset_message(
+            TransportError::PivResetUnverifiedFailed(Box::new(TransportError::PivResetNotAllowed)),
+        );
+        assert_eq!(
+            unverified_failed,
+            TransportError::PivResetUnverifiedFailed(Box::new(TransportError::PivResetNotAllowed))
+                .to_string()
+        );
+        let global_failed = piv_factory_reset_message(TransportError::PivResetGlobalFailed(
+            Box::new(TransportError::PivSecurityNotSatisfied),
+        ));
+        assert_eq!(
+            global_failed,
+            TransportError::PivResetGlobalFailed(Box::new(TransportError::PivSecurityNotSatisfied))
+                .to_string()
+        );
+        let mgmt_auth_failed =
+            piv_factory_reset_message(TransportError::PivResetManagementAuthFailed(Box::new(
+                TransportError::PivManagementAuthFailed,
+            )));
+        assert_eq!(
+            mgmt_auth_failed,
+            TransportError::PivResetManagementAuthFailed(Box::new(
+                TransportError::PivManagementAuthFailed
+            ))
+            .to_string()
         );
         let incomplete =
-            piv_force_reset_message(TransportError::PivForceResetIncomplete("card state here"));
+            piv_factory_reset_message(TransportError::PivResetIncomplete("card state here"));
         assert_eq!(incomplete, "card state here");
-        let guessed = piv_force_reset_message(TransportError::PivPukGuessAccepted);
+        let guessed = piv_factory_reset_message(TransportError::PivPukGuessAccepted);
         assert_eq!(guessed, TransportError::PivPukGuessAccepted.to_string());
 
         // Everything else says nothing about the blocking on its own — an
         // unexpected status word in the PIN/PUK loop renders as a bare APDU
         // failure — so the disclosure is appended.
-        let bare = piv_force_reset_message(TransportError::Apdu {
+        let bare = piv_factory_reset_message(TransportError::Apdu {
             label: "piv pin/puk",
             sw1: 0x6a,
             sw2: 0x80,
@@ -16684,6 +17924,51 @@ mod tests {
         // Not the single-applet reset: a fault in the PUK loop leaves the PUK
         // unblocked, and the card refuses a plain RESET until both are blocked.
         assert!(!bare.contains("piv reset"), "{bare}");
+    }
+
+    /// The "Reset applet" card only points at the whole-device factory reset
+    /// as a known alternative when a device-wide reset is itself confirmed
+    /// (`ResetGlobal` `Supported`, not merely `Unverified`) AND PIV's own
+    /// RESET isn't already the known-good path (`Reset` anything but
+    /// `Supported`) — matching the spec's three cases (Unsupported -> show
+    /// the link, Unverified -> show the link, Supported -> leave as-is) plus
+    /// the `ResetGlobal` axis those three cases were silent on.
+    #[test]
+    fn piv_reset_global_alternative_available_matches_spec() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // Reset::Supported -> leave as-is, regardless of ResetGlobal.
+        for global in [
+            FeatureGate::Supported,
+            FeatureGate::Unverified,
+            FeatureGate::Unsupported,
+        ] {
+            assert!(
+                !piv_reset_global_alternative_available(FeatureGate::Supported, global),
+                "Reset::Supported must never be redirected, ResetGlobal={global:?}"
+            );
+        }
+
+        // Reset::Unsupported / Unverified, but ResetGlobal isn't a known
+        // alternative either (Unverified or Unsupported) -> nothing to point at.
+        for reset in [FeatureGate::Unsupported, FeatureGate::Unverified] {
+            for global in [FeatureGate::Unverified, FeatureGate::Unsupported] {
+                assert!(
+                    !piv_reset_global_alternative_available(reset, global),
+                    "reset={reset:?} global={global:?}"
+                );
+            }
+        }
+
+        // The two cases the link actually shows for.
+        assert!(piv_reset_global_alternative_available(
+            FeatureGate::Unsupported,
+            FeatureGate::Supported
+        ));
+        assert!(piv_reset_global_alternative_available(
+            FeatureGate::Unverified,
+            FeatureGate::Supported
+        ));
     }
 
     /// Refusing to arm (KEY-005: no serial to re-identify the key by after a
@@ -16741,6 +18026,19 @@ mod tests {
             app.security_keys.error
         );
         assert!(app.log.iter().any(|l| l.text.contains("not armed")));
+        // The card sweep's own "factory reset finished" line was written
+        // before this ceremony even started (see `apply_factory_reset_sweep`)
+        // and never otherwise learns how FIDO ended — so the permanent record
+        // needs its own line naming the FIDO outcome, not just the earlier
+        // per-step summary.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("factory reset") && l.text.contains("FIDO2")),
+            "the activity log must record the FIDO finale, not just the card \
+             sweep's earlier summary: {:?}",
+            app.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     /// The FIDO finale is the one step that survives the job that started it:
@@ -16854,6 +18152,18 @@ mod tests {
             "{:?}",
             app.security_keys.error
         );
+        // The Overview row isn't the only permanent record of this attempt —
+        // the activity log needs its own line, or a session that ends here
+        // (the user walks away instead of retrying) leaves only the card
+        // sweep's earlier "factory reset finished — wiped: OATH" line, with no
+        // mention that FIDO was ever attempted, let alone that it failed.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("factory reset") && l.text.contains("refused the reset")),
+            "{:?}",
+            app.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
 
         // The retry lands: the row must be corrected, not appended to, or the
         // report claims passkeys survived on a key that is actually empty.
@@ -16871,6 +18181,15 @@ mod tests {
         assert!(
             app.security_keys.error.is_none(),
             "the retry clears the error"
+        );
+        // The successful retry gets its own log line too, distinct from the
+        // earlier failed attempt's.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("factory reset") && l.text.contains("FIDO2  wiped")),
+            "{:?}",
+            app.log.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
         // Nothing was dropped on the floor, so nothing to warn about.
         assert!(!app
@@ -17066,6 +18385,233 @@ mod tests {
             .log
             .iter()
             .any(|l| l.text.contains("selection moved on")));
+    }
+
+    /// The success path used to report only through `factory_reset_report`
+    /// (the Overview pane's list) and never through the activity log — which
+    /// silently dropped any captured APDU trace too, since `App::push_log`
+    /// (the sole consumer of `App::pending_trace`) was never called. Both
+    /// gaps are covered here: a plain-language summary lands in the log
+    /// (wiped/failed/skipped, independent of tracing), and a trace captured
+    /// for the job actually attaches to that entry instead of being discarded.
+    #[test]
+    fn a_same_device_card_sweep_logs_a_summary_and_flushes_any_captured_trace() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            pending_trace: Some(vec!["> SELECT".into(), "< 9000".into()]),
+            ..Default::default()
+        };
+
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![
+                StepReport {
+                    step: ResetStep::Oath,
+                    outcome: StepOutcome::Wiped,
+                },
+                StepReport {
+                    step: ResetStep::Piv,
+                    outcome: StepOutcome::Skipped("PIV does not support RESET".into()),
+                },
+                StepReport {
+                    step: ResetStep::Token2Otp,
+                    outcome: StepOutcome::Failed("card refused".into()),
+                },
+            ],
+            false,
+        );
+
+        let entry = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("factory reset finished"))
+            .expect("factory reset must log a summary line");
+        assert!(matches!(entry.severity, Severity::Warn)); // not everything wiped
+        assert!(entry.text.contains("OATH"), "{}", entry.text);
+        assert!(
+            entry.text.contains("PIV does not support RESET"),
+            "{}",
+            entry.text
+        );
+        assert!(entry.text.contains("card refused"), "{}", entry.text);
+        // The trace captured for this job attached to the summary line...
+        assert_eq!(
+            entry.trace.as_deref(),
+            Some(&["> SELECT".to_string(), "< 9000".to_string()][..])
+        );
+        // ...and was consumed, not left to attach to some later, unrelated line.
+        assert!(app.pending_trace.is_none());
+    }
+
+    /// All-`Wiped` reports log `Ok`, not `Warn` — the severity should read as
+    /// success when nothing failed or was skipped.
+    #[test]
+    fn a_fully_wiped_sweep_logs_ok_severity() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            ..Default::default()
+        };
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            }],
+            false,
+        );
+        let entry = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("factory reset finished"))
+            .expect("factory reset must log a summary line");
+        assert!(matches!(entry.severity, Severity::Ok));
+    }
+
+    /// `WipedWithWarning` still re-initialises the applet's pane (it really
+    /// was wiped) but logs `Warn`, not `Ok` (there's still something for the
+    /// user to act on) -- the end-to-end path behind the exact scenario
+    /// reported: a device-wide reset whose courtesy XAUTH-key restore failed
+    /// showed up as "wiped: none; failed: PIV: ..." instead of naming PIV as
+    /// wiped.
+    #[test]
+    fn a_wiped_with_warning_sweep_reinits_the_pane_but_logs_warn_severity() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            piv_tried: true,
+            ..Default::default()
+        };
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![StepReport {
+                step: ResetStep::Piv,
+                outcome: StepOutcome::WipedWithWarning("restoring XAUTH key 1 failed".into()),
+            }],
+            false,
+        );
+        assert!(
+            !app.piv_tried,
+            "the pane must re-list; PIV really was wiped"
+        );
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[0]),
+            (
+                "PIV  wiped, but: restoring XAUTH key 1 failed".to_string(),
+                RowTone::Warn
+            )
+        );
+        let entry = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("factory reset finished"))
+            .expect("factory reset must log a summary line");
+        assert!(matches!(entry.severity, Severity::Warn));
+        assert!(entry.text.contains("wiped: PIV"), "{}", entry.text);
+        assert!(
+            entry
+                .text
+                .contains("warnings: PIV: restoring XAUTH key 1 failed"),
+            "{}",
+            entry.text
+        );
+    }
+
+    #[test]
+    fn factory_reset_report_summary_names_every_bucket() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let summary = factory_reset_report_summary(&[
+            StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            },
+            StepReport {
+                step: ResetStep::OpenPgp,
+                outcome: StepOutcome::Failed("card refused".into()),
+            },
+            StepReport {
+                step: ResetStep::Piv,
+                outcome: StepOutcome::Skipped("not supported".into()),
+            },
+        ]);
+        assert!(summary.contains("wiped: OATH"), "{summary}");
+        assert!(
+            summary.contains("failed: OpenPGP: card refused"),
+            "{summary}"
+        );
+        assert!(summary.contains("skipped: PIV: not supported"), "{summary}");
+    }
+
+    /// A device-wide reset whose courtesy XAUTH-key restore fails is still a
+    /// wipe: the step must show up in the "wiped" list (a reader scanning
+    /// just that list must not conclude PIV was left untouched), and the
+    /// restore failure must still get its own line so it isn't lost. Exact
+    /// scenario reported: "wiped: none; failed: PIV: device wiped, but
+    /// restoring XAUTH key 1..." -- PIV belongs in "wiped", not only in
+    /// "failed".
+    #[test]
+    fn factory_reset_report_summary_counts_a_wiped_with_warning_step_as_wiped() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let summary = factory_reset_report_summary(&[StepReport {
+            step: ResetStep::Piv,
+            outcome: StepOutcome::WipedWithWarning("restoring XAUTH key 1 failed".into()),
+        }]);
+        assert!(summary.contains("wiped: PIV"), "{summary}");
+        assert!(!summary.contains("wiped: none"), "{summary}");
+        assert!(
+            summary.contains("warnings: PIV: restoring XAUTH key 1 failed"),
+            "{summary}"
+        );
+        assert!(!summary.contains("failed:"), "{summary}");
+    }
+
+    /// A PIV step wiped via the device-wide `ResetGlobal` mechanism took at
+    /// least one other applet down with it, so naming only "PIV" undersells
+    /// what happened — both the Overview row and the activity-log summary
+    /// must name the whole device instead.
+    #[test]
+    fn factory_reset_global_piv_wipe_names_the_whole_device() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let report = StepReport {
+            step: ResetStep::Piv,
+            outcome: StepOutcome::WipedGlobal,
+        };
+
+        let (text, tone) = factory_reset_row_line(&FactoryResetRow::Step(report.clone()));
+        assert_eq!(tone, RowTone::Done, "{text}");
+        assert_eq!(text, "Whole device (via PIV)  wiped");
+        assert!(!text.starts_with("PIV"), "{text}");
+
+        let summary = factory_reset_report_summary(&[
+            report,
+            StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            },
+        ]);
+        assert!(
+            summary.contains("wiped: Whole device (via PIV), OATH"),
+            "{summary}"
+        );
+        assert!(!summary.contains("wiped: PIV"), "{summary}");
+    }
+
+    #[test]
+    fn factory_reset_report_summary_names_none_wiped_when_nothing_wiped() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let summary = factory_reset_report_summary(&[StepReport {
+            step: ResetStep::Oath,
+            outcome: StepOutcome::Failed("card refused".into()),
+        }]);
+        assert!(summary.contains("wiped: none"), "{summary}");
+        assert!(!summary.contains("skipped"), "{summary}");
     }
 
     /// Refusing to arm (KEY-005) ends the ceremony, exactly as Cancel does. An
@@ -17787,21 +19333,43 @@ mod tests {
     }
 
     /// The standard PIV factory default is 24 bytes of `01..08` ×3; Token2 PIN+
-    /// ships its own vendor default. Both decode to 24-byte keys.
+    /// ships its own vendor default. Both resolve via
+    /// `PivQuirk::Default9bManagementKey`, at any reported version.
     #[test]
     fn piv_default_mgmt_key_is_well_known() {
-        let std = piv_default_mgmt_key_hex(false);
-        assert_eq!(std, "010203040506070801020304050607080102030405060708");
-        let bytes = piv_mgmt_key_bytes(std).unwrap();
-        assert_eq!(bytes.len(), 24);
-        assert_eq!(&bytes[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let std = piv_default_mgmt_key(
+            keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+            Some(&[0]),
+            None,
+        )
+        .expect("YubiKey has a seeded default");
+        assert_eq!(&std[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
         // Repeated three times.
-        assert_eq!(&bytes[8..16], &bytes[..8]);
-        assert_eq!(&bytes[16..24], &bytes[..8]);
+        assert_eq!(&std[8..16], &std[..8]);
+        assert_eq!(&std[16..24], &std[..8]);
 
-        let t2 = piv_default_mgmt_key_hex(true);
-        assert_eq!(piv_mgmt_key_bytes(t2).unwrap().len(), 24);
+        let t2 = piv_default_mgmt_key(
+            keyroost_piv::fingerprint::AppletFingerprint::Token2,
+            Some(&[0]),
+            None,
+        )
+        .expect("Token2 has a seeded default");
         assert_ne!(std, t2);
+    }
+
+    /// A fingerprint keyroost has no seeded default for (`IdPrime`) resolves
+    /// `None` — the signal `App::piv_modal_mgmt_field` disables the "Use
+    /// default management key" checkbox on.
+    #[test]
+    fn piv_default_mgmt_key_none_for_an_unseeded_fingerprint() {
+        assert_eq!(
+            piv_default_mgmt_key(
+                keyroost_piv::fingerprint::AppletFingerprint::IdPrime,
+                Some(&[0]),
+                None
+            ),
+            None
+        );
     }
 
     /// `OathAddDialog::validate` trims the name, requires it, base32-decodes the
@@ -17891,19 +19459,28 @@ mod tests {
     }
 
     /// With "Use default management key" ticked, `piv_current_mgmt_key` ignores
-    /// the (possibly empty) hex field and yields the well-known default; with it
-    /// off, it decodes the typed hex.
+    /// the (possibly empty) hex field and yields this device's well-known
+    /// default; with it off, it decodes the typed hex.
     #[test]
     fn piv_current_mgmt_key_honours_use_default() {
         let mut app = App::default();
-        // Default toggle on, hex field empty → resolves to the non-Token2 default
-        // (no device selected ⇒ not Token2).
+        app.piv.status = Some(piv_status_with(
+            keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+            Some(vec![5, 7]),
+        ));
+        // Default toggle on, hex field empty → resolves to this device's
+        // seeded default (YubiKey's, since that's the live fingerprint).
         app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
         app.piv.mgmt_key_input.clear();
         let key = app.piv_current_mgmt_key().expect("default fills");
         assert_eq!(
             &key[..],
-            &piv_mgmt_key_bytes(piv_default_mgmt_key_hex(false)).unwrap()[..]
+            piv_default_mgmt_key(
+                keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None
+            )
+            .unwrap()
         );
 
         // Toggle off → uses the typed hex.
@@ -17915,6 +19492,25 @@ mod tests {
 
         // Toggle off with bad hex → error surfaces.
         app.piv.mgmt_key_input = "nothex".into();
+        assert!(app.piv_current_mgmt_key().is_err());
+    }
+
+    /// With "Use default management key" ticked but no live status read yet
+    /// (or a fingerprint keyroost has no seeded default for), there's no
+    /// default to fall back on — `piv_current_mgmt_key` surfaces an error
+    /// rather than guessing.
+    #[test]
+    fn piv_current_mgmt_key_default_errors_without_a_known_default() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
+        // No status read yet at all.
+        assert!(app.piv_current_mgmt_key().is_err());
+
+        // A live status, but for a fingerprint with no seeded default.
+        app.piv.status = Some(piv_status_with(
+            keyroost_piv::fingerprint::AppletFingerprint::IdPrime,
+            None,
+        ));
         assert!(app.piv_current_mgmt_key().is_err());
     }
 
@@ -17961,11 +19557,20 @@ mod tests {
     #[test]
     fn piv_current_mgmt_auth_without_use_pin_falls_back_to_mgmt_key() {
         let mut app = App::default();
+        app.piv.status = Some(piv_status_with(
+            keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+            Some(vec![5, 7]),
+        ));
         app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
         match app.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
             Ok(PivMgmtAuth::Key(key)) => assert_eq!(
                 &key[..],
-                &piv_mgmt_key_bytes(piv_default_mgmt_key_hex(false)).unwrap()[..]
+                piv_default_mgmt_key(
+                    keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+                    Some(&[5, 7]),
+                    None
+                )
+                .unwrap()
             ),
             other => panic!("expected Key(default), got {}", other.is_ok()),
         }
@@ -18017,6 +19622,88 @@ mod tests {
             piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Pin),
             PivMgmtAuthMode::Manual
         );
+    }
+
+    #[test]
+    fn reset_mgmt_auth_mode_after_toggle_ignores_the_other_toggle_entirely() {
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(true, ResetMgmtAuthMode::Default),
+            ResetMgmtAuthMode::Default
+        );
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(true, ResetMgmtAuthMode::Pin),
+            ResetMgmtAuthMode::Pin
+        );
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(false, ResetMgmtAuthMode::Default),
+            ResetMgmtAuthMode::Manual
+        );
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(false, ResetMgmtAuthMode::Pin),
+            ResetMgmtAuthMode::Manual
+        );
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_default_reads_the_armed_dialogs_resolved_key() {
+        let app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Default,
+            factory_reset_confirm: Some(FactoryResetConfirmState {
+                for_device: "serial:AAA".into(),
+                piv_preview: FactoryResetPivPreview::NotOffered,
+                needs_reset_mgmt_auth: true,
+                default_mgmt_key: Some(&keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY),
+            }),
+            ..Default::default()
+        };
+        match app.reset_mgmt_current_auth() {
+            Ok(ResetMgmtAuth::Key(key)) => assert_eq!(
+                &*key,
+                &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY
+            ),
+            other => panic!("expected the factory-default key, got {}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_default_with_no_known_default_errors() {
+        // No `factory_reset_confirm` armed at all (e.g. a stale call) is the
+        // same "no known default" case as one armed with `default_mgmt_key:
+        // None` — both mean keyroost has nothing to offer for this device.
+        let app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Default,
+            ..Default::default()
+        };
+        assert!(app.reset_mgmt_current_auth().is_err());
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_pin_reads_the_typed_field() {
+        let app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Pin,
+            reset_mgmt_auth_input: "123456".into(),
+            ..Default::default()
+        };
+        match app.reset_mgmt_current_auth() {
+            Ok(ResetMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "123456"),
+            other => panic!("expected Pin(\"123456\"), got {}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_manual_decodes_typed_hex() {
+        let mut app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Manual,
+            reset_mgmt_auth_input: "00".repeat(24),
+            ..Default::default()
+        };
+        match app.reset_mgmt_current_auth() {
+            Ok(ResetMgmtAuth::Key(key)) => assert_eq!(&*key, &[0u8; 24]),
+            other => panic!("expected a 24-byte zero key, got {}", other.is_ok()),
+        }
+        // Bad hex surfaces a decode error, same as the PIV modal's field.
+        app.reset_mgmt_auth_input = "not hex".into();
+        assert!(app.reset_mgmt_current_auth().is_err());
     }
 
     /// `piv_cred_modal_close` resets `mgmt_auth_mode` to `Manual` — covering
