@@ -1601,14 +1601,22 @@ pub fn parse_serial(buf: &[u8]) -> Result<u128, ParseError> {
     Ok(u128::from_be_bytes(widened))
 }
 
+/// The largest serial this crate still formats in decimal — `2^80 - 1`.
+/// Chosen to comfortably cover HID Crescendo's GlobalPlatform-CPLC-derived
+/// serial ([`fingerprint::parse_cplc_serial`]: 20 decimal digits, under
+/// 2^67) with headroom to spare, while a genuinely large serial — currently
+/// only reachable via Nitrokey's own 128-bit admin serial command — still
+/// switches to hex past it. See [`format_serial_long`]/[`format_serial_short`].
+const MAX_DECIMAL_SERIAL: u128 = (1 << 80) - 1;
+
 /// Format a PIV serial for a text terminal: decimal with the hex form
-/// parenthesized, matching every serial observed so far (all of them fit
-/// 64 bits). Past 64 bits — currently only reachable via Nitrokey's own
-/// 128-bit admin serial command — the decimal expansion is unwieldy and no
-/// vendor prints a serial that large in decimal, so those display as hex
-/// alone, with no parenthetical.
+/// parenthesized, matching every serial observed so far, HID Crescendo's own
+/// on-card printed decimal serial included — see [`MAX_DECIMAL_SERIAL`].
+/// Past that, the decimal expansion is unwieldy and no vendor prints a
+/// serial that large in decimal, so those display as hex alone, with no
+/// parenthetical.
 pub fn format_serial_long(serial: u128) -> String {
-    if serial > u128::from(u64::MAX) {
+    if serial > MAX_DECIMAL_SERIAL {
         format!("0x{serial:X}")
     } else {
         format!("{serial} (0x{serial:08X})")
@@ -1616,10 +1624,10 @@ pub fn format_serial_long(serial: u128) -> String {
 }
 
 /// Format a PIV serial for a compact UI label: decimal for a serial that
-/// fits 64 bits, hex for one that doesn't — see [`format_serial_long`] for
-/// why.
+/// fits [`MAX_DECIMAL_SERIAL`], hex for one that doesn't — see
+/// [`format_serial_long`] for why.
 pub fn format_serial_short(serial: u128) -> String {
-    if serial > u128::from(u64::MAX) {
+    if serial > MAX_DECIMAL_SERIAL {
         format!("0x{serial:X}")
     } else {
         serial.to_string()
@@ -2040,22 +2048,36 @@ mod tests {
     }
 
     #[test]
-    fn format_serial_switches_to_hex_past_64_bits() {
+    fn format_serial_switches_to_hex_past_80_bits() {
         assert_eq!(format_serial_long(12345678), "12345678 (0x00BC614E)");
         assert_eq!(format_serial_short(12345678), "12345678");
-        // u64::MAX itself is still the decimal/hex-parenthesized form.
+        // A HID Crescendo CPLC-derived serial (20 decimal digits, well under
+        // 80 bits) still prints in decimal, matching the card's own printed
+        // serial rather than switching to hex.
+        let hid_crescendo_serial = 1234_5678_4321_0009_0009u128;
         assert_eq!(
-            format_serial_long(u128::from(u64::MAX)),
-            "18446744073709551615 (0xFFFFFFFFFFFFFFFF)"
+            format_serial_long(hid_crescendo_serial),
+            "12345678432100090009 (0xAB54A91FB0870099)"
         );
         assert_eq!(
-            format_serial_short(u128::from(u64::MAX)),
-            "18446744073709551615"
+            format_serial_short(hid_crescendo_serial),
+            "12345678432100090009"
         );
-        // One past u64::MAX switches both forms to hex-only, no parenthetical.
-        let past_64_bits = u128::from(u64::MAX) + 1;
-        assert_eq!(format_serial_long(past_64_bits), "0x10000000000000000");
-        assert_eq!(format_serial_short(past_64_bits), "0x10000000000000000");
+        // The 80-bit boundary itself is still the decimal/hex-parenthesized
+        // form.
+        let max_decimal = (1u128 << 80) - 1;
+        assert_eq!(
+            format_serial_long(max_decimal),
+            "1208925819614629174706175 (0xFFFFFFFFFFFFFFFFFFFF)"
+        );
+        assert_eq!(
+            format_serial_short(max_decimal),
+            "1208925819614629174706175"
+        );
+        // One bit past it switches both forms to hex-only, no parenthetical.
+        let past_80_bits = max_decimal + 1;
+        assert_eq!(format_serial_long(past_80_bits), "0x100000000000000000000");
+        assert_eq!(format_serial_short(past_80_bits), "0x100000000000000000000");
     }
 
     #[test]

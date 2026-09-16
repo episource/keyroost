@@ -122,6 +122,96 @@ pub const HID_CRESCENDO_C2300_PROPERTIES_TAG: [u8; 3] = [0xFF, 0xFF, 0x7F];
 /// that one shared detail might suggest.
 pub const HID_CRESCENDO_C4000_GET_PROPERTIES: [u8; 5] = [0x80, 0x56, 0x00, 0x00, 0x00];
 
+/// GlobalPlatform's Issuer Security Domain (the card's built-in "Card
+/// Manager") RID+PIX — `A0 00 00 01 51 00 00`. Unlike every other AID/RID in
+/// this module, this one is a GlobalPlatform Card Specification standard,
+/// not vendor-specific — present on essentially every GlobalPlatform-
+/// compliant card, HID Crescendo units included. Selecting it is the
+/// precondition for [`GLOBAL_PLATFORM_GET_CPLC`]: CPLC data is only readable
+/// while the Issuer Security Domain itself, not PIV or any other applet, is
+/// the currently-selected application.
+///
+/// `keyroost_transport::PivSession` selects this — and reads CPLC — before
+/// PIV is ever selected, not as one of the mid-session fingerprinting probes
+/// this module's other AIDs are (see [`FEITIAN_RID`] and friends, each
+/// followed by an unconditional re-SELECT of PIV): once PIV management-key
+/// authentication has happened, selecting a second applet drops it the same
+/// way switching to any other applet does, and there is no re-SELECT that
+/// restores it afterward — so this probe has to run first or not at all. See
+/// `PivSession::probe_hid_crescendo_cplc_serial`'s doc for the full story.
+pub const GLOBAL_PLATFORM_ISD_AID: [u8; 7] = [0xA0, 0x00, 0x00, 0x01, 0x51, 0x00, 0x00];
+
+/// GlobalPlatform `GET DATA` for Card Production Life Cycle (CPLC) data:
+/// `CLA 80h INS CAh P1 9Fh P2 7Fh Le 00h`, a case-2 APDU with no command
+/// data. Standard GlobalPlatform Card Specification command (data object tag
+/// `9F 7F`), not HID-specific — only meaningful once
+/// [`GLOBAL_PLATFORM_ISD_AID`] is selected. [`parse_cplc_serial`] decodes the
+/// one field keyroost reads out of the reply.
+pub const GLOBAL_PLATFORM_GET_CPLC: [u8; 5] = [0x80, 0xCA, 0x9F, 0x7F, 0x00];
+
+/// Decode a HID Crescendo unit's on-card printed serial number out of a
+/// GlobalPlatform CPLC ([`GLOBAL_PLATFORM_GET_CPLC`]) reply.
+///
+/// The Card Production Life Cycle structure GlobalPlatform standardizes is a
+/// fixed 42-byte layout — IC Fabricator (2 bytes), IC Type (2), Operating
+/// System ID (2), OS release date (2), OS release level (2), IC fabrication
+/// date (2), IC Serial Number (4), IC Batch Identifier (2), then ten further
+/// fields this crate has no use for — optionally wrapped in the tag itself
+/// (`9F 7F <len>`) the way a GET DATA reply for any other object is. Both
+/// forms are accepted here, the same tolerant-unwrap discipline
+/// [`parse_hid_crescendo_slot_key_algorithms`]/[`parse_hid_crescendo_version`]
+/// already use for their own GET PIV PROPERTIES replies: a reply starting
+/// with tag `9F 7F` is unwrapped first, anything else is assumed to already
+/// be the bare CPLC value.
+///
+/// HID's own on-card printed serial (confirmed against a live unit) is four
+/// of those eighteen fields, concatenated in a different order than they
+/// appear in the raw structure — IC Fabricator, then IC Type, then IC Batch
+/// Identifier, then IC Serial Number — with every nibble of the resulting 10
+/// bytes read as one decimal digit (IC Fabricator/Type/Batch each print as 4
+/// digits, IC Serial Number as 8, 20 digits total, confirmed against the
+/// same live unit): the same "nibble is a decimal digit" convention
+/// `keyroost_transport::decode_bcd_serial` implements for Token2's BCD GET
+/// SERIAL quirk, reimplemented here rather than shared since this crate
+/// doesn't depend on `keyroost-transport`.
+///
+/// `None` when the reply (after unwrapping) is shorter than 18 bytes — not
+/// enough to reach IC Batch Identifier, the last of the four fields this
+/// needs, which starts at offset 16 — or when any nibble of the ten
+/// concatenated bytes falls outside `0..=9`, the same "fail safe rather than
+/// report a wrong number" discipline `decode_bcd_serial` uses.
+#[must_use]
+pub fn parse_cplc_serial(data: &[u8]) -> Option<u128> {
+    let cplc = if data.first() == Some(&0x9F) && data.get(1) == Some(&0x7F) {
+        let (len, header) = crate::read_ber_len(data.get(2..)?).ok()?;
+        data.get(2 + header..(2 + header).checked_add(len)?)?
+    } else {
+        data
+    };
+    if cplc.len() < 18 {
+        return None;
+    }
+    let ic_fabricator = &cplc[0..2];
+    let ic_type = &cplc[2..4];
+    let ic_serial_number = &cplc[12..16];
+    let ic_batch_identifier = &cplc[16..18];
+    let mut decoded: u128 = 0;
+    for byte in ic_fabricator
+        .iter()
+        .chain(ic_type)
+        .chain(ic_batch_identifier)
+        .chain(ic_serial_number)
+    {
+        for nibble in [byte >> 4, byte & 0xF] {
+            if nibble > 9 {
+                return None;
+            }
+            decoded = decoded * 10 + u128::from(nibble);
+        }
+    }
+    Some(decoded)
+}
+
 /// The ACA (Access Control Applet) instance AID, `A0 00 00 00 79 10 00` —
 /// NIST GSC-IS 2.1's Access Control Applet, partially standardized there but
 /// carrying vendor-specific extensions on top. Most HID Crescendo units
@@ -2012,6 +2102,44 @@ mod tests {
     #[test]
     fn reports_slot_empty_data_object_is_false() {
         assert!(!hid_crescendo_reports_slot(&[0x53, 0x00], 0x9B));
+    }
+
+    // --- GlobalPlatform CPLC: on-card printed serial number -----------------
+
+    #[test]
+    fn cplc_serial_decodes_fabricator_type_batch_serial_in_that_order() {
+        // IC Fabricator=0x1234, IC Type=0x5678, OS ID/date/level/fab-date
+        // (unused, all zero), IC Serial Number=0x00090009 (8 digits with
+        // leading zeros), IC Batch Identifier=0x4321.
+        let mut cplc = vec![0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0];
+        cplc.extend_from_slice(&[0x00, 0x09, 0x00, 0x09]); // IC Serial Number
+        cplc.extend_from_slice(&[0x43, 0x21]); // IC Batch Identifier
+                                               // Fabricator "1234" + Type "5678" + Batch "4321" + Serial "00090009".
+        assert_eq!(parse_cplc_serial(&cplc), Some(1234_5678_4321_0009_0009));
+    }
+
+    #[test]
+    fn cplc_serial_unwraps_a_9f7f_tlv_reply() {
+        let mut cplc = vec![0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0];
+        cplc.extend_from_slice(&[0x00, 0x09, 0x00, 0x09]);
+        cplc.extend_from_slice(&[0x43, 0x21]);
+        cplc.extend_from_slice(&[0; 24]); // pad to the full 42-byte structure
+        let mut wrapped = vec![0x9F, 0x7F, cplc.len() as u8];
+        wrapped.extend_from_slice(&cplc);
+        assert_eq!(parse_cplc_serial(&wrapped), parse_cplc_serial(&cplc));
+    }
+
+    #[test]
+    fn cplc_serial_none_when_too_short() {
+        // 17 bytes — one short of reaching IC Batch Identifier (offset 16..18).
+        assert_eq!(parse_cplc_serial(&[0u8; 17]), None);
+    }
+
+    #[test]
+    fn cplc_serial_none_on_a_non_decimal_nibble() {
+        let mut cplc = vec![0u8; 18];
+        cplc[0] = 0xAB; // nibble 0xA is not a decimal digit
+        assert_eq!(parse_cplc_serial(&cplc), None);
     }
 
     // --- ACA (Access Control Applet) XAUTH byte layer -----------------------

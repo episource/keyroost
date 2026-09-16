@@ -156,11 +156,13 @@ pub struct PivStatus {
     pub version_firmware: Option<Vec<u8>>,
     /// Device serial number. Ordinarily the Yubico GET SERIAL extension
     /// (widened to `u128` — see [`keyroost_piv::parse_serial`]); when a
-    /// specific fingerprint's own probe supplies a serial instead (currently:
-    /// a Nitrokey's admin application), that one is used and GET SERIAL is
-    /// skipped entirely — a Nitrokey answers that Yubico extension too, but
-    /// with a number that isn't its real serial. `None` when neither source
-    /// answers.
+    /// specific fingerprint's own probe supplies a serial instead — a
+    /// Nitrokey's admin application, or a HID Crescendo unit's GlobalPlatform
+    /// CPLC read (see [`PivSession::probe_hid_crescendo_cplc_serial`]) —
+    /// that one is used and GET SERIAL is skipped entirely: a Nitrokey
+    /// answers that Yubico extension too, but with a number that isn't its
+    /// real serial, and HID Crescendo doesn't answer it at all. `None` when
+    /// neither source answers.
     pub serial: Option<u128>,
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when blocked,
     /// `None` when the card didn't report a count.
@@ -299,7 +301,10 @@ struct SessionIdentity {
 
 /// [`PivSession::applet_fingerprint`]'s resolved shape — see that method's
 /// doc for what each field means. Named fields for the same reason as
-/// [`SessionIdentity`]'s.
+/// [`SessionIdentity`]'s. `Clone` so [`PivSession::identity`] (the field) can
+/// cache one of these and hand out copies without re-resolving — see that
+/// field's doc.
+#[derive(Clone)]
 struct AppletFingerprintResult {
     fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
     name: String,
@@ -486,33 +491,44 @@ pub struct PivSession {
     /// with nothing), never `None`: fingerprint resolution treats empty and
     /// absent the same way.
     select_response: Vec<u8>,
-    /// [`Self::identity`]'s cache: `None` until first resolved, then this
-    /// applet's [`keyroost_piv::fingerprint::AppletFingerprint`] plus its
-    /// reported applet/firmware version bytes, for the rest of the session.
-    /// Safe to cache — unlike the read-through data this session
-    /// deliberately doesn't cache (certs, PIN retries, slot occupancy; see
-    /// [`Self::status_detailed`]'s doc) — because the applet's identity and
-    /// reported versions cannot change while the card stays connected, but
-    /// resolving them can cost a handful of extra APDUs (some fingerprints
-    /// need a live SELECT probe), so it's worth not repeating per slot.
-    /// [`Self::fingerprint`], [`Self::quirks`], and [`Self::extension_gate`]
-    /// are thin accessors over this; [`keyroost_piv::compat::resolve_quirks`]
-    /// and [`keyroost_piv::compat::resolve`] are themselves cheap pure table
-    /// lookups, so there's no need to additionally cache their outputs.
-    identity: Option<SessionIdentity>,
-    /// [`Self::hid_crescendo_properties_raw`]'s cache: `None` until first
-    /// resolved, then the raw response body of a HID Crescendo GET PIV
-    /// PROPERTIES read (C2300 or C4000 — both families expose this, over
-    /// differently-framed requests but with a compatible response
-    /// structure), for the rest of the session — one read serves both the
-    /// per-slot algorithm list ([`Self::hid_crescendo_slot_key_algorithms`]) and this
-    /// applet's own version ([`Self::hid_crescendo_version`],
-    /// [`Self::applet_fingerprint`]'s HID Crescendo branch), so this exists
-    /// purely to avoid re-issuing that same read for each of those —
-    /// including once per slot [`Self::status_detailed`] asks about. A read
-    /// that fails caches as an empty `Vec`, same "resolved, with or without
-    /// data" convention as [`Self::identity`].
-    hid_crescendo_properties_raw: Option<Vec<u8>>,
+    /// [`Self::applet_fingerprint`]'s cache: `None` until first resolved,
+    /// then that method's full result — fingerprint, name, version,
+    /// version/firmware bytes, serial — for the rest of the session.
+    /// [`Self::identity`] is a thinner view over the same cached value (just
+    /// the fingerprint/version/version_firmware fields [`Self::fingerprint`],
+    /// [`Self::quirks`], and [`Self::extension_gate`] need). Safe to cache —
+    /// unlike the read-through data this session deliberately doesn't cache
+    /// (certs, PIN retries, slot occupancy; see [`Self::status_detailed`]'s
+    /// doc) — because the applet's identity and reported versions cannot
+    /// change while the card stays connected, but resolving them can cost a
+    /// handful of extra APDUs (some fingerprints need a live SELECT probe or
+    /// a second applet's worth of round trips), so it's worth not repeating
+    /// on every call — [`Self::status`], [`Self::status_detailed`], and
+    /// [`Self::feature_gate`] each call [`Self::applet_fingerprint`] in their
+    /// own right (they need `name`/`serial`, which [`Self::identity`] doesn't
+    /// expose), and used to each pay the full resolution cost again on top
+    /// of the one [`Self::refresh`] already ran.
+    identity: Option<AppletFingerprintResult>,
+    /// Applet-specific data resolved once and reused for the rest of the
+    /// session — see [`AppletCache`]/[`AppletCacheKey`] for what's stored and
+    /// why this is a dict keyed by enum rather than a dedicated field per
+    /// value. Today's sole entry: [`Self::hid_crescendo_properties_raw`]'s
+    /// cache (the raw response body of a HID Crescendo GET PIV PROPERTIES
+    /// read — C2300 or C4000, both expose this over differently-framed
+    /// requests but a compatible response structure — one read serves both
+    /// the per-slot algorithm list, [`Self::hid_crescendo_slot_key_algorithms`],
+    /// and this applet's own version, [`Self::hid_crescendo_version`]/
+    /// [`Self::applet_fingerprint`]'s HID Crescendo branch, including once
+    /// per slot [`Self::status_detailed`] asks about — so this exists purely
+    /// to avoid re-issuing that read for each of those; a failed read caches
+    /// as an empty `Vec`, same "resolved, with or without data" convention as
+    /// [`Self::identity`]). The CPLC serial [`Self::probe_hid_crescendo_cplc_serial`]
+    /// reads doesn't need a second entry here: it's called directly from
+    /// [`Self::applet_fingerprint`]'s `HidCrescendo` arms, so its result
+    /// already rides along in the [`AppletFingerprintResult`] `identity`
+    /// caches — storing it a second time here would just be the same value
+    /// kept in two places.
+    applet_cache: AppletCache,
 }
 
 /// The in-session public-key cache behind `PivSession`, keyed by PIV key
@@ -567,6 +583,57 @@ impl PubkeyCache {
 
     fn get(&self, key_ref: u8) -> Option<&(KeyAlg, PublicKey)> {
         self.0.get(&key_ref)
+    }
+}
+
+/// Key into [`AppletCache`] — one per applet-specific value `PivSession`
+/// resolves once and reuses for the rest of a session. Add a variant here
+/// instead of a new dedicated `PivSession` field the next time some applet
+/// needs this same "resolve once, reuse for the rest of the session"
+/// treatment — see [`PivSession::applet_cache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AppletCacheKey {
+    /// [`PivSession::hid_crescendo_properties_raw`]'s cache.
+    HidCrescendoPropertiesRaw,
+}
+
+/// Session-lifetime cache for applet-specific byte blobs that don't fit
+/// `PivSession`'s other dedicated caches ([`PubkeyCache`], `identity`) — see
+/// [`AppletCacheKey`] for what's stored today. A dict keyed by enum rather
+/// than one `Option<Vec<u8>>` `PivSession` field per value: today's sole
+/// entry happens to be HID Crescendo-specific, but nothing here is — the
+/// next applet-specific quirk that needs a "resolve once, reuse for the rest
+/// of the session" slot gets a new [`AppletCacheKey`] variant, not a new
+/// struct field. A value that isn't a byte blob (see
+/// [`PivSession::probe_hid_crescendo_cplc_serial`]'s doc for why a serial
+/// doesn't belong here) has nowhere to fit until one actually needs this
+/// treatment — no speculative value-type abstraction ahead of that.
+#[derive(Default)]
+struct AppletCache(HashMap<AppletCacheKey, Vec<u8>>);
+
+impl AppletCache {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// `key`'s cached bytes, if resolved. `None` means only "never
+    /// resolved" — a caller that caches a failed read as an empty `Vec`
+    /// (see [`PivSession::hid_crescendo_properties_raw`]) gets `Some(&[])`
+    /// back, distinguishable from `None`.
+    fn bytes(&self, key: AppletCacheKey) -> Option<&[u8]> {
+        self.0.get(&key).map(Vec::as_slice)
+    }
+
+    fn set_bytes(&mut self, key: AppletCacheKey, value: Vec<u8>) {
+        self.0.insert(key, value);
+    }
+
+    /// Drop every entry at once — [`PivSession::refresh`]'s full-rebuild uses
+    /// this rather than reassigning `AppletCache::new()` in place, same
+    /// "clear via a method on the cache itself" convention
+    /// [`PubkeyCache::clear`] already follows.
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -705,10 +772,53 @@ impl PivSession {
             pubkey_cache: PubkeyCache::new(),
             select_response: Vec::new(),
             identity: None,
-            hid_crescendo_properties_raw: None,
+            applet_cache: AppletCache::new(),
         };
-        session.select()?;
+        session.refresh()?;
         Ok(session)
+    }
+
+    /// Rebuild every piece of in-session state this session caches or
+    /// resolves from the card, from nothing — the same "start over"
+    /// sequence [`Self::open_with_debug`] itself runs to build a session in
+    /// the first place, just replayed on the existing PC/SC connection
+    /// (`card`/`t0`/`debug` are per-connection, not per-selected-applet
+    /// state, so they're untouched here) rather than reconnecting. This is
+    /// exactly what every front end's "Refresh" action already does today by
+    /// discarding its whole [`PivSession`] and calling
+    /// [`Self::open`]/[`Self::open_with_debug`] again (see e.g. `keyroost`'s
+    /// `App::load_piv_status`) — this method is that same rebuild, available
+    /// to run in place on a session a caller is already holding.
+    ///
+    /// Drops `pubkey_cache`, `select_response`, `identity`, and
+    /// `applet_cache`, re-`SELECT`s PIV, then resolves the fingerprint fresh
+    /// (via [`Self::fingerprint`], caching it in `identity` the same as any
+    /// other first resolution) — genuinely starting over, the applet's
+    /// identity included, rather than carrying forward what an earlier
+    /// resolution in this same session found. Also drops any management-key
+    /// authentication in force, same as a bare re-`select()` always has —
+    /// this rebuilds, it doesn't preserve.
+    ///
+    /// That one resolution already covers a `HidCrescendo` fingerprint's own
+    /// serial: [`Self::applet_fingerprint`]'s `HidCrescendo` arms call
+    /// [`Self::probe_hid_crescendo_cplc_serial`] themselves, exactly the way
+    /// the Nitrokey arm calls [`Self::probe_nitrokey_admin`], so there's no
+    /// separate decision to make here — every other fingerprint's serial
+    /// comes from Yubico's own GET SERIAL extension instead (see
+    /// [`Self::status`]).
+    ///
+    /// [`Self::reset`] calls this directly so a caller that keeps reading
+    /// from the very session it just reset sees the same fully-rebuilt state
+    /// a reopen would have given it, without actually reopening.
+    pub fn refresh(&mut self) -> Result<(), TransportError> {
+        self.pubkey_cache.clear();
+        self.select_response = Vec::new();
+        self.identity = None;
+        self.applet_cache.clear();
+
+        self.select()?;
+        self.fingerprint();
+        Ok(())
     }
 
     /// Enable per-APDU stderr tracing. Only affects APDUs sent *after* this
@@ -716,6 +826,57 @@ impl PivSession {
     /// SELECT [`Self::open`]/this constructor issues before returning.
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;
+    }
+
+    /// Read a HID Crescendo unit's on-card printed serial number via
+    /// GlobalPlatform CPLC
+    /// ([`keyroost_piv::fingerprint::GLOBAL_PLATFORM_ISD_AID`]/
+    /// [`keyroost_piv::fingerprint::GLOBAL_PLATFORM_GET_CPLC`]) — called
+    /// directly from [`Self::applet_fingerprint`]'s `HidCrescendo` arms, once
+    /// classification already says this session's applet is one, so this
+    /// never runs blind against a device with no reason to answer it. Its
+    /// result becomes part of the [`AppletFingerprintResult`] that
+    /// `applet_fingerprint` caches in `identity`, the same "resolve once,
+    /// reuse for the session" treatment as every other field there — no
+    /// separate cache slot of its own.
+    ///
+    /// Same self-contained shape as every other mid-session identification
+    /// probe in this file (Feitian, Swissbit, IdPrime, Nitrokey's admin
+    /// app — see e.g. [`Self::probe_feitian_rid`]/[`Self::probe_nitrokey_admin`]):
+    /// SELECTs a second applet, reads what it needs, then unconditionally
+    /// re-SELECTs PIV before returning, so the caller gets the session back
+    /// exactly as any caller of [`Self::status`]/[`Self::status_detailed`]
+    /// expects. Safe to call this deep into `applet_fingerprint`'s own
+    /// resolution — after PIV is already selected, possibly after other
+    /// fingerprint probes ran — because nothing in that resolution
+    /// authenticates the management key first; there is no authenticated
+    /// state left here for switching applets to silently undo.
+    ///
+    /// `None` when the Issuer Security Domain doesn't SELECT (`SW != 9000` —
+    /// possible even on a confirmed HID Crescendo unit if its ISD AID
+    /// differs), when GET DATA CPLC is refused, or when
+    /// [`keyroost_piv::fingerprint::parse_cplc_serial`] can't make sense of
+    /// the reply.
+    fn probe_hid_crescendo_cplc_serial(&mut self) -> Option<u128> {
+        use keyroost_piv::fingerprint;
+
+        let selected = matches!(
+            self.transmit_full(&piv::select_by_aid(&fingerprint::GLOBAL_PLATFORM_ISD_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let serial = if selected {
+            self.transmit_full(&fingerprint::GLOBAL_PLATFORM_GET_CPLC)
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| fingerprint::parse_cplc_serial(&data))
+        } else {
+            None
+        };
+        // Restore PIV as the selected applet before returning — see this
+        // method's doc for why that's always required now, unlike when this
+        // ran before PIV was ever selected in the first place.
+        let _ = self.select();
+        serial
     }
 
     /// Names of connected readers whose PIV applet answers `SELECT` with `9000`.
@@ -738,7 +899,7 @@ impl PivSession {
                     pubkey_cache: PubkeyCache::new(),
                     select_response: Vec::new(),
                     identity: None,
-                    hid_crescendo_properties_raw: None,
+                    applet_cache: AppletCache::new(),
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -795,8 +956,15 @@ impl PivSession {
     /// probe supplies one — its serial number, so [`Self::status`] /
     /// [`Self::status_detailed`] can skip the Yubico GET SERIAL extension
     /// entirely when it would just get a fake answer (observed: a Nitrokey
-    /// answers that extension too, with a serial that isn't its real one).
-    /// The rest — from the ATR read just now plus the SELECT response
+    /// answers that extension too, with a serial that isn't its real one; HID
+    /// Crescendo simply doesn't answer it at all — every `HidCrescendo`
+    /// variant's arm below calls [`Self::probe_hid_crescendo_cplc_serial`]
+    /// directly, once classification already says the fingerprint is one,
+    /// same as the Nitrokey arm calling [`Self::probe_nitrokey_admin`]; the
+    /// result becomes part of this method's own cached result, so later
+    /// callers — `Self::status`, `Self::status_detailed` — get it for free
+    /// from that cache rather than re-probing. The rest — from the ATR read
+    /// just now plus the SELECT response
     /// captured by [`Self::select`]. When the select identity names
     /// OpenFIPS201, also probes for Swissbit's registered RID
     /// ([`keyroost_piv::fingerprint::wants_swissbit_probe`]); when neither
@@ -833,9 +1001,18 @@ impl PivSession {
     /// [`PivStatus::version_firmware`]'s doc for why the two axes aren't
     /// interchangeable.
     fn applet_fingerprint(&mut self) -> AppletFingerprintResult {
+        // Cached from an earlier call in this same session — most callers
+        // reach this via `Self::refresh`'s own resolution already having run
+        // once; re-resolving would mean re-issuing every probe below,
+        // including a GET VERSION a HidCrescendo never answers and a second
+        // applet-select round trip for the fingerprints that need one
+        // (Nitrokey's admin app, Swissbit/Feitian/IdPrime's RID/AID probes).
+        if let Some(cached) = &self.identity {
+            return cached.clone();
+        }
+
         use keyroost_piv::fingerprint;
 
-        let version = self.version();
         let atr = self.atr();
         let atr_identity =
             fingerprint::atr_historical_bytes(&atr).and_then(fingerprint::atr_identity);
@@ -879,21 +1056,43 @@ impl PivSession {
         } else {
             id
         };
+        // Yubico's GET VERSION extension, fetched only now that `id` is
+        // classified — a HID Crescendo (either family) is documented and
+        // observed to never answer it at all (see the `HidCrescendo` match
+        // arms below), so skip the round trip entirely rather than issuing it
+        // speculatively before the fingerprint is even known, the way every
+        // other identity here still needs to (nothing else about `id` is
+        // resolvable without at least one live probe, so there's no way to
+        // skip it generally — HidCrescendo is the sole identity that answers
+        // a plain SELECT/ATR alone and never needs this extension).
+        let version = if matches!(id, fingerprint::AppletFingerprint::HidCrescendo(_)) {
+            None
+        } else {
+            self.version()
+        };
         // No generic name fallback here — an undiscovered name stays empty,
         // per `PivStatus::applet_name`'s doc; `id`/its `Display`/
         // `applet_name()` are the generic fallback for a caller that wants
-        // one regardless.
-        let (name, version, version_firmware, serial) = match id {
+        // one regardless. Each arm builds the final `AppletFingerprintResult`
+        // directly rather than a same-shaped tuple that then gets wrapped
+        // afterward — named fields read a lot easier here than four
+        // positional ones would, especially once `Option<String>` `name` and
+        // `Option<Vec<u8>>` `version`/`version_firmware` sit next to each
+        // other.
+        let result = match id {
             fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::NitroKey) => {
-                let (name, firmware, serial) = self.probe_nitrokey_admin();
-                (name, version, firmware, serial)
+                self.probe_nitrokey_admin(id, version)
             }
-            fingerprint::AppletFingerprint::YubiKey => {
-                let name = version
+            fingerprint::AppletFingerprint::YubiKey => AppletFingerprintResult {
+                fingerprint: id,
+                name: version
                     .as_deref()
-                    .and_then(fingerprint::format_yubikey_name);
-                (name, version, None, None)
-            }
+                    .and_then(fingerprint::format_yubikey_name)
+                    .unwrap_or_default(),
+                version,
+                version_firmware: None,
+                serial: None,
+            },
             // HID Crescendo (either family — both are documented/observed to
             // answer a standard PIV SELECT, so there's no reason to expect
             // this to differ between them) names itself in its SELECT
@@ -934,17 +1133,38 @@ impl PivSession {
                     }
                     (name, _) => name,
                 };
-                (name, hid_version, None, None)
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: name.unwrap_or_default(),
+                    version: hid_version,
+                    version_firmware: None,
+                    serial: self.probe_hid_crescendo_cplc_serial(),
+                }
             }
-            _ => (None, version, None, None),
+            // The generic HidCrescendo identity (matched via select text
+            // alone, neither ATR narrowed it to C2300 nor C4000) gets the
+            // same CPLC probe as its two more specific siblings — the
+            // Issuer Security Domain answers it regardless of which HID
+            // Crescendo family is behind it.
+            fingerprint::AppletFingerprint::HidCrescendo(
+                fingerprint::HidCrescendoVariant::Generic,
+            ) => AppletFingerprintResult {
+                fingerprint: id,
+                name: String::new(),
+                version,
+                version_firmware: None,
+                serial: self.probe_hid_crescendo_cplc_serial(),
+            },
+            _ => AppletFingerprintResult {
+                fingerprint: id,
+                name: String::new(),
+                version,
+                version_firmware: None,
+                serial: None,
+            },
         };
-        AppletFingerprintResult {
-            fingerprint: id,
-            name: name.unwrap_or_default(),
-            version,
-            version_firmware,
-            serial,
-        }
+        self.identity = Some(result.clone());
+        result
     }
 
     /// SELECT [`keyroost_piv::fingerprint::FEITIAN_RID`] and report whether the
@@ -1008,29 +1228,41 @@ impl PivSession {
     /// with an unrelated, made-up number) — then unconditionally re-SELECT
     /// PIV on every path (mirrors [`Self::probe_feitian_rid`] against yet
     /// another applet, but reading three commands' worth of reply instead of
-    /// just the SELECT result). The three commands degrade independently:
-    /// `(None, _, _)` when SELECT itself is refused (no admin application on
-    /// this build) or the status command is refused/too short/names an
-    /// unrecognised variant byte, `(_, None, _)` when the version command is
-    /// refused, empty, or not a dotted-`u8` string, `(_, _, None)` when the
-    /// serial command is refused or too long to fit a `u128` — either way, a
-    /// Nitrokey that can't answer one of these simply reports nothing for
-    /// that field rather than an error.
-    fn probe_nitrokey_admin(&mut self) -> (Option<String>, Option<Vec<u8>>, Option<u128>) {
+    /// just the SELECT result). The three commands degrade independently: no
+    /// `name` when SELECT itself is refused (no admin application on this
+    /// build) or the status command is refused/too short/names an
+    /// unrecognised variant byte, no `version_firmware` when the version
+    /// command is refused, empty, or not a dotted-`u8` string, no `serial`
+    /// when the serial command is refused or too long to fit a `u128` —
+    /// either way, a Nitrokey that can't answer one of these simply reports
+    /// nothing for that field rather than an error.
+    ///
+    /// `id` and `version` are folded straight into the returned
+    /// [`AppletFingerprintResult`] unchanged — this probe doesn't produce
+    /// either of them itself (`id` is already known to be `Trussed(NitroKey)`
+    /// by the time [`Self::applet_fingerprint`] calls this; `version` is
+    /// Yubico's own GET VERSION reply, which a Nitrokey answers same as any
+    /// other applet) — so the caller doesn't have to unpack a probe-shaped
+    /// tuple and re-wrap it into the struct itself.
+    fn probe_nitrokey_admin(
+        &mut self,
+        id: keyroost_piv::fingerprint::AppletFingerprint,
+        version: Option<Vec<u8>>,
+    ) -> AppletFingerprintResult {
         use keyroost_piv::fingerprint;
 
         let selected = matches!(
             self.transmit_full(&piv::select_by_aid(&fingerprint::NITROKEY_ADMIN_AID)),
             Ok((_, sw)) if sw == piv::SW_OK
         );
-        let (name, firmware, serial) = if selected {
+        let (name, version_firmware, serial) = if selected {
             let name = self
                 .transmit_full(&fingerprint::NITROKEY_GET_ADMIN_STATUS)
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| fingerprint::parse_nitrokey_variant(&data))
                 .map(fingerprint::format_nitrokey_name);
-            let firmware = self
+            let version_firmware = self
                 .transmit_full(&fingerprint::NITROKEY_GET_VERSION_STRING)
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
@@ -1041,12 +1273,18 @@ impl PivSession {
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| keyroost_piv::parse_serial(&data).ok());
-            (name, firmware, serial)
+            (name, version_firmware, serial)
         } else {
             (None, None, None)
         };
         let _ = self.select();
-        (name, firmware, serial)
+        AppletFingerprintResult {
+            fingerprint: id,
+            name: name.unwrap_or_default(),
+            version,
+            version_firmware,
+            serial,
+        }
     }
 
     /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
@@ -1252,24 +1490,23 @@ impl PivSession {
     /// cached in [`Self::identity`] (the field) for the rest of the session;
     /// see that field's doc for why caching this particular resolution is
     /// safe. [`Self::fingerprint`], [`Self::quirks`], and
-    /// [`Self::extension_gate`] are thin accessors over this.
+    /// [`Self::extension_gate`] are thin accessors over this. The caching
+    /// itself lives in [`Self::applet_fingerprint`] now (shared with
+    /// [`Self::status`]/[`Self::status_detailed`]/[`Self::feature_gate`],
+    /// which need its `name`/`serial` fields too) — this is just the
+    /// narrower view over the same cached value.
     fn identity(&mut self) -> SessionIdentity {
-        if let Some(identity) = &self.identity {
-            return identity.clone();
-        }
         let AppletFingerprintResult {
             fingerprint,
             version,
             version_firmware,
             ..
         } = self.applet_fingerprint();
-        let identity = SessionIdentity {
+        SessionIdentity {
             fingerprint,
             version,
             version_firmware,
-        };
-        self.identity = Some(identity.clone());
-        identity
+        }
     }
 
     /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] — see
@@ -1392,8 +1629,11 @@ impl PivSession {
     ) -> Vec<u8> {
         use keyroost_piv::fingerprint::{self, HidCrescendoVariant};
 
-        if let Some(raw) = &self.hid_crescendo_properties_raw {
-            return raw.clone();
+        if let Some(raw) = self
+            .applet_cache
+            .bytes(AppletCacheKey::HidCrescendoPropertiesRaw)
+        {
+            return raw.to_vec();
         }
         let apdu = match variant {
             HidCrescendoVariant::C2300 => Some(piv::get_data(
@@ -1411,7 +1651,8 @@ impl PivSession {
             .filter(|(_, sw)| *sw == piv::SW_OK)
             .map(|(data, _)| data)
             .unwrap_or_default();
-        self.hid_crescendo_properties_raw = Some(raw.clone());
+        self.applet_cache
+            .set_bytes(AppletCacheKey::HidCrescendoPropertiesRaw, raw.clone());
         raw
     }
 
@@ -3059,9 +3300,19 @@ impl PivSession {
             return Err(TransportError::PivResetNotAllowed);
         }
         ok_or_write("piv reset", sw)?;
-        // Wipes every slot; nothing cached survives it. `factory_reset` reaches
-        // this same reset() at the end of its own path, so it's covered too.
-        self.pubkey_cache.clear();
+        // Wipes every slot; nothing cached survives it — rebuild in-session
+        // state from scratch exactly as `Self::refresh` documents, rather
+        // than hand-picking which caches this particular wipe invalidates.
+        // Its own re-`select()` failing is folded in as best-effort, not
+        // propagated as this method's own error: the RESET APDU itself
+        // already succeeded above, so a caller must still hear that as
+        // success — the same "the real operation is done, a courtesy
+        // follow-up failing is a separate concern" split
+        // [`Self::hid_crescendo_aca_reset_card`]'s `WipedKeyRestoreFailed`
+        // makes explicit for its own follow-up step. A refresh failure here
+        // leaves the session in a state any later call will fail loudly on
+        // its own, so nothing is silently swallowed forever.
+        let _ = self.refresh();
         Ok(())
     }
 
@@ -3335,22 +3586,20 @@ impl PivSession {
         }
 
         match self.plan_factory_reset() {
-            FactoryResetPlan::Unsupported => return Err(TransportError::PivResetUnsupported),
+            FactoryResetPlan::Unsupported => Err(TransportError::PivResetUnsupported),
             FactoryResetPlan::NeedsManagementAuth => {
                 let current = current.ok_or(TransportError::PivResetNeedsManagementAuth)?;
-                return (|| {
+                (|| {
                     self.authenticate_management_current(current)?;
                     self.reset()
                 })()
                 .map(|()| FactoryResetOutcome::Wiped)
-                .map_err(|e| TransportError::PivResetManagementAuthFailed(Box::new(e)));
+                .map_err(|e| TransportError::PivResetManagementAuthFailed(Box::new(e)))
             }
-            FactoryResetPlan::Unverified => {
-                return self
-                    .reset()
-                    .map(|()| FactoryResetOutcome::Wiped)
-                    .map_err(|e| TransportError::PivResetUnverifiedFailed(Box::new(e)));
-            }
+            FactoryResetPlan::Unverified => self
+                .reset()
+                .map(|()| FactoryResetOutcome::Wiped)
+                .map_err(|e| TransportError::PivResetUnverifiedFailed(Box::new(e))),
             FactoryResetPlan::BurnPinPukThenReset => self.force_reset(),
         }
     }
@@ -3600,11 +3849,12 @@ fn uses_extended_length(apdu: &[u8]) -> bool {
 }
 
 /// A short, human-readable name for one of the AIDs/RIDs this crate SELECTs
-/// — the standard PIV applet itself (either AID form [`Self::select`] tries)
-/// as well as this crate's own fingerprinting probes — for
-/// [`describe_apdu`]'s trace label. E.g. `"Feitian RID"` for
-/// [`keyroost_piv::fingerprint::FEITIAN_RID`]. `None` for anything else this
-/// crate doesn't recognize.
+/// — the standard PIV applet itself (either AID form [`Self::select`] tries),
+/// this crate's own fingerprinting probes, and the GlobalPlatform Issuer
+/// Security Domain [`PivSession::probe_hid_crescendo_cplc_serial`] SELECTs up
+/// front to read CPLC — for [`describe_apdu`]'s trace label. E.g. `"Feitian
+/// RID"` for [`keyroost_piv::fingerprint::FEITIAN_RID`]. `None` for anything
+/// else this crate doesn't recognize.
 fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
     use keyroost_piv::fingerprint;
     match aid {
@@ -3615,6 +3865,9 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         _ if aid == fingerprint::IDPRIME_SECONDARY_PIV_AID => Some("IdPrime secondary PIV AID"),
         _ if aid == fingerprint::NITROKEY_ADMIN_AID => Some("Nitrokey admin AID"),
         _ if aid == fingerprint::HID_CRESCENDO_ACA_AID => Some("HID ActivID ACA"),
+        _ if aid == fingerprint::GLOBAL_PLATFORM_ISD_AID => {
+            Some("GlobalPlatform Issuer Security Domain")
+        }
         _ => None,
     }
 }
@@ -3739,6 +3992,19 @@ fn describe_apdu(apdu: &[u8]) -> String {
             Some(0x04) => "PUT XAUTH KEY (HID ACA, delete)".to_string(),
             _ => "PUT XAUTH KEY (HID ACA)".to_string(),
         },
+        // GlobalPlatform `GET DATA` for CPLC (Card Production Life Cycle)
+        // data ([`keyroost_piv::fingerprint::GLOBAL_PLATFORM_GET_CPLC`]) —
+        // ISO 7816-4's plain GET DATA, with the tag folded straight into
+        // P1P2 (`9F 7F`) rather than PIV's `5C`-wrapped selector, and CLA
+        // 0x80 against GlobalPlatform's ISD rather than the PIV applet. Its
+        // INS 0xCA isn't one `piv::Instruction` models (PIV's own GET DATA
+        // is 0xCB), so `from_code` answers `None` and this would otherwise
+        // print as a bare "INS 0xCA". Only used today by
+        // `PivSession::probe_hid_crescendo_cplc_serial` to derive HID
+        // Crescendo's serial before PIV is ever selected.
+        None if apdu == piv::fingerprint::GLOBAL_PLATFORM_GET_CPLC => {
+            "GET DATA (GlobalPlatform CPLC)".to_string()
+        }
         None => format!("INS {ins:#04X}"),
     }
 }
@@ -4309,6 +4575,36 @@ mod tests {
         assert_eq!(
             describe_apdu(&keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()),
             "PUT XAUTH KEY (HID ACA, delete)"
+        );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_globalplatform_cplc_read() {
+        // `80 CA 9F 7F 00` — GlobalPlatform's plain GET DATA for CPLC, tag
+        // folded into P1P2 rather than PIV's `5C`-wrapped selector. INS
+        // 0xCA isn't modeled in `piv::Instruction` (PIV's own GET DATA is
+        // 0xCB), so without this arm it falls through to a bare "INS 0xCA".
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::GLOBAL_PLATFORM_GET_CPLC),
+            "GET DATA (GlobalPlatform CPLC)"
+        );
+        // A lookalike with a different P1P2 stays unnamed — only the exact
+        // CPLC read is recognized.
+        assert_eq!(
+            describe_apdu(&[0x80, 0xCA, 0x00, 0x00, 0x00]),
+            "INS 0xCA"
+        );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_globalplatform_isd_select() {
+        // The SELECT that has to precede `GLOBAL_PLATFORM_GET_CPLC` above —
+        // without a `known_aid_name` entry for it, this fell through to a
+        // bare "SELECT" in the trace, same as any AID this crate doesn't
+        // recognize.
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(&keyroost_piv::fingerprint::GLOBAL_PLATFORM_ISD_AID)),
+            "SELECT (GlobalPlatform Issuer Security Domain)"
         );
     }
 
