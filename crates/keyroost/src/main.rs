@@ -2104,9 +2104,12 @@ struct PivState {
     /// this pane still do that within one running app, on cards that don't
     /// answer GET METADATA. Populated by `piv_generate_key`; consumed (via
     /// `remember_pubkey`, seeded into a freshly-opened session before it needs
-    /// the key) by `load_piv_status`, `piv_self_sign`, and `piv_request_csr`;
-    /// invalidated by `piv_delete_key`, carried across by `piv_move_key`, and
-    /// cleared wholesale by `piv_reset`.
+    /// the key) by `load_piv_status`, `piv_self_sign`, `piv_request_csr`, and
+    /// `piv_import_cert` (whose freshly-opened session otherwise has nothing
+    /// for `PivSession::import_certificate`'s own key-match check to compare
+    /// against, even when this pane generated the slot's current key just a
+    /// moment ago); invalidated by `piv_delete_key`, carried across by
+    /// `piv_move_key`, and cleared wholesale by `piv_reset`.
     pubkey_cache: std::collections::HashMap<u8, (keyroost_piv::KeyAlg, keyroost_piv::PublicKey)>,
 }
 
@@ -7834,6 +7837,15 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         let path = self.piv.cert_path.trim().to_owned();
+        // See `load_piv_status`/`piv_self_sign`: this job opens its own fresh
+        // `PivSession`, so a key generated earlier this app run — including
+        // one that overwrote an older key already loaded into this slot —
+        // has to be handed back in for `import_certificate`'s own key-match
+        // check (`PivSession::reject_certificate_key_mismatch`) to have
+        // anything to compare against. Without this, that check silently
+        // treats the slot's key as unknowable and lets a stale certificate
+        // through even when this app run knows better.
+        let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
         self.spawn_job("Importing certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
@@ -7844,6 +7856,9 @@ impl App {
                     .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &mgmt)?;
+                if let Some((alg, key)) = known_key {
+                    s.remember_pubkey(slot, alg, key);
+                }
                 s.import_certificate(slot, &der)?;
                 s.status()
             })();
@@ -8847,6 +8862,38 @@ fn piv_slot_occupied(
                 .unwrap_or(false)
         }
     }
+}
+
+/// Whether a slot-emptiness-sensitive button should dim specifically because
+/// the active slot is confirmed empty — the narrower criterion
+/// `keyroost_piv::compat::PivExtension::GetSlotKeyStatus` unlocks. Shared by
+/// "Delete key" (distinct from "Delete certificate"'s `selected_has_cert`
+/// check — a different object, gated by a different extension) and "Import
+/// certificate" (which has no separate firmware gate of its own to check
+/// first, unlike "Delete key" — see that button's call site for why this is
+/// only meaningful there once `delete_key_gate` itself isn't
+/// `FeatureGate::Unsupported`).
+///
+/// `true` only when `get_slot_key_status_gate` resolves
+/// [`FeatureGate::Supported`](keyroost_piv::compat::FeatureGate::Supported)
+/// *and* `selected_has_key` is `false` — this device has a confirmed,
+/// device-reported way to know slot occupancy (GET METADATA, or HID
+/// Crescendo's own GET PIV PROPERTIES), and it says this slot has no key.
+/// Every other combination — the gate isn't `Supported`, or it is and the
+/// slot does hold a key — leaves the button enabled: without a reliable
+/// device signal, a `None` algorithm reading could just as easily mean
+/// "this device can't tell us" as "genuinely empty" (see
+/// [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s doc), and
+/// hiding a real capability on a guess is worse than occasionally offering a
+/// delete that fails deep with "slot has no key", or an import that a
+/// key loaded out-of-band this session can't see would in fact have matched.
+#[must_use]
+fn slot_confirmed_empty(
+    get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
+    selected_has_key: bool,
+) -> bool {
+    use keyroost_piv::compat::FeatureGate;
+    get_slot_key_status_gate == FeatureGate::Supported && !selected_has_key
 }
 
 fn move_key_eligible_destinations(
@@ -15451,6 +15498,23 @@ impl App {
             keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
         let delete_key_gate =
             keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
+        // Whether this device has a confirmed, device-reported way to know a
+        // slot's key occupancy (GET METADATA, or HID Crescendo's own GET PIV
+        // PROPERTIES — see `keyroost_piv::compat::PivExtension::GetSlotKeyStatus`'s
+        // doc). Consulted below (`slot_confirmed_empty`) to decide whether
+        // "Delete key" can safely dim on an empty slot the same way "Delete
+        // certificate" dims on a certless one, and whether "Import
+        // certificate" can safely dim on one too (nothing there for a freshly
+        // imported certificate's key to possibly match) — only when this
+        // resolves `Supported` is `selected_has_key` trustworthy enough to
+        // block on; everywhere else `None` could just as easily mean "this
+        // device can't tell us" as "genuinely empty".
+        let get_slot_key_status_gate = keyroost_piv::compat::resolve(
+            PivExtension::GetSlotKeyStatus,
+            piv_fp,
+            piv_ver,
+            piv_fw_ver,
+        );
         // Reset (Yubico RESET, `INS 0xFB`) is gated the same way, from the
         // same fingerprint/version triple — see the "Reset applet" card
         // below.
@@ -15521,6 +15585,16 @@ impl App {
         let no_move_key_hint =
             "This slot has no key to move \u{2014} generate one in this slot first.";
         let no_del_cert_hint = "This slot holds no certificate to delete.";
+        let no_del_key_hint = "This slot holds no key to delete.";
+        // "Import certificate" dims only when this device *confirms* the
+        // slot is empty (same `slot_confirmed_empty` gate as "Delete key" —
+        // see its doc): a certificate can't possibly match a key this slot
+        // doesn't hold. When occupancy can't be confirmed, the button stays
+        // enabled — a matching key may have been loaded out of band and this
+        // session just can't see it; `PivSession::import_certificate` itself
+        // still compares against whatever key it *can* find before writing.
+        let no_import_cert_hint = "This slot has no key for a certificate to match \u{2014} \
+             generate or move one into this slot first.";
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
         // (Passkeys / Settings / Storage): an opaque surface strip behind a row
@@ -15813,6 +15887,10 @@ impl App {
             // file picker then the management-key modal; Export opens a save
             // dialog and writes straight to the chosen path — no secret (see
             // `drain_file_dialogs`). Export dims when the slot holds no cert.
+            // Import dims only when the slot is *confirmed* empty
+            // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
+            // unconfirmed reading leaves it enabled, since a matching key may
+            // have been loaded out of band this session can't see.
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Import/Export cert")
@@ -15835,7 +15913,10 @@ impl App {
                             .on_hover_text(no_slot_cert_hint);
                     }
                     ui.add_space(8.0);
-                    if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
+                    if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
+                        theme::button_disabled(ui, p, "Import certificate\u{2026}")
+                            .on_hover_text(no_import_cert_hint);
+                    } else if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
                         .clicked()
                     {
                         open_import = true;
@@ -15918,15 +15999,9 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match delete_key_gate {
-                        // Unverified still runs — the card refuses if it truly
-                        // can't — so the button stays live; only the warning by
-                        // the help dot marks the doubt.
-                        FeatureGate::Supported | FeatureGate::Unverified => {
-                            if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked()
-                            {
-                                open_delete_key = true;
-                            }
-                        }
+                        // Unsupported blocks outright, regardless of slot
+                        // content — an operation the device can't run at all
+                        // is the reason to lead with, not slot occupancy.
                         FeatureGate::Unsupported => {
                             // Kept visible but dimmed on pre-5.7 firmware so the
                             // action is discoverable; the hover text says why it
@@ -15934,14 +16009,34 @@ impl App {
                             theme::button_disabled(ui, p, "Delete key\u{2026}")
                                 .on_hover_text(delete_key_blocked_hint.as_str());
                         }
+                        // Unverified still runs — the card refuses if it truly
+                        // can't — so the button stays live unless the slot's
+                        // emptiness is independently confirmed below; only the
+                        // warning by the help dot marks the firmware doubt.
+                        FeatureGate::Supported | FeatureGate::Unverified => {
+                            if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
+                                theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                    .on_hover_text(no_del_key_hint);
+                            } else if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}")
+                                .clicked()
+                            {
+                                open_delete_key = true;
+                            }
+                        }
                     }
                     ui.add_space(6.0);
                     // "Delete certificate" is standard PIV, so no firmware gate
                     // — but like Export it needs a certificate to act on. Same
                     // cert-presence signal, same optimistic fallback for retired
-                    // slots / pre-first-read. "Delete key" is deliberately not
-                    // gated: without GET METADATA key presence is unknown, and a
-                    // stale key is still worth an attempt to erase.
+                    // slots / pre-first-read. "Delete key" only gets the
+                    // equivalent empty-slot treatment when this device actually
+                    // confirms slot occupancy
+                    // (`PivExtension::GetSlotKeyStatus`, checked inside the
+                    // match above via `slot_confirmed_empty`) — everywhere
+                    // else it stays enabled whenever DELETE KEY itself is:
+                    // without a confirmed signal, key presence is simply
+                    // unknown, and a stale key is still worth an attempt to
+                    // erase.
                     if selected_has_cert {
                         if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
                             .clicked()
@@ -19315,6 +19410,22 @@ mod tests {
         assert!(!piv_slot_occupied(PivSlotSel::Retired(1), &slot_keys, None));
     }
 
+    #[test]
+    fn slot_confirmed_empty_only_fires_on_a_confirmed_empty_slot() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // Confirmed empty on a device that can actually tell us -> blocked.
+        assert!(slot_confirmed_empty(FeatureGate::Supported, false));
+        // Confirmed to hold a key -> never blocked, regardless of the gate.
+        assert!(!slot_confirmed_empty(FeatureGate::Supported, true));
+        // No reliable device signal (Unverified or Unsupported) -> never
+        // blocked on emptiness, even if the (untrustworthy) reading says
+        // empty -- this is the whole point of gating on
+        // `GetSlotKeyStatus` rather than trusting `selected_has_key` alone.
+        assert!(!slot_confirmed_empty(FeatureGate::Unverified, false));
+        assert!(!slot_confirmed_empty(FeatureGate::Unsupported, false));
+    }
+
     /// Given occupancy (slot -> has_key), the eligible move destinations are the
     /// empty slots that aren't the source — across standard *and* retired slots.
     #[test]
@@ -19652,7 +19763,9 @@ mod tests {
                 for_device: "serial:AAA".into(),
                 piv_preview: FactoryResetPivPreview::NotOffered,
                 needs_reset_mgmt_auth: true,
-                default_mgmt_key: Some(&keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY),
+                default_mgmt_key: Some(
+                    &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY,
+                ),
             }),
             ..Default::default()
         };

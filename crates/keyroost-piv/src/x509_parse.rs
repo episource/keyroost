@@ -561,7 +561,16 @@ fn strip_der_uint_sign_guard(content: &[u8]) -> &[u8] {
 /// signals corruption in whatever stored it, not a merely-unusual key.
 pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), X509ParseError> {
     let (spki, _) = expect_tag(der, 0x30)?;
-    let (alg_id, after_alg_id) = expect_tag(spki.content, 0x30)?;
+    parse_spki_content(spki.content)
+}
+
+/// Shared TLV decoding behind [`parse_subject_public_key_info`] and
+/// [`parse_certificate_public_key`]: `content` is a `SubjectPublicKeyInfo`
+/// `SEQUENCE`'s content (algorithm `AlgorithmIdentifier` + `subjectPublicKey`
+/// BIT STRING), already peeled of its own outer tag/length by each caller's
+/// own route to it (bare SPKI DER vs. a full certificate's `tbsCertificate`).
+fn parse_spki_content(content: &[u8]) -> Result<(KeyAlg, PublicKey), X509ParseError> {
+    let (alg_id, after_alg_id) = expect_tag(content, 0x30)?;
     let (spk, _) = expect_tag(after_alg_id, 0x03)?;
     let (oid_tlv, params) = expect_tag(alg_id.content, 0x06)?;
     let oid = decode_oid(oid_tlv.content).ok_or(X509ParseError::Malformed)?;
@@ -619,6 +628,12 @@ pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), 
 /// [`parse_subject_public_key_info`] recovers. Unlike `parse_key_algorithm`
 /// this errors (rather than `Ok(None)`) on an unrecognised key type: a caller
 /// that needs the key bytes has nothing to do with a key it can't read.
+///
+/// Also used for comparing an imported certificate's key against a slot's own
+/// reported public key (`PivSession::slot_key`) before writing it — an error
+/// here gives a caller nothing to compare against for a certificate whose key
+/// this reader doesn't understand, which callers should treat as "can't
+/// verify" rather than "mismatch confirmed".
 ///
 /// # Errors
 /// [`X509ParseError`] on a malformed certificate or a public-key OID/curve
@@ -971,6 +986,28 @@ mod tests {
             assert_eq!(
                 parse_key_algorithm(&cert),
                 Ok(Some(*alg)),
+                "round-trip mismatch for {:?}",
+                alg
+            );
+        }
+    }
+
+    /// Round-trip every `KeyAlg` through [`crate::spki::subject_public_key_info`]
+    /// and [`parse_certificate_public_key`] — the certificate-shaped
+    /// counterpart of `subject_public_key_info_round_trips_every_alg` below,
+    /// checking the full `(KeyAlg, PublicKey)` (not just the algorithm, unlike
+    /// `key_algorithm_round_trips_every_alg` above) comes back byte-identical
+    /// out of a whole `Certificate`, not just a bare SPKI. This is the
+    /// comparison `PivSession::import_certificate` relies on to catch a
+    /// certificate whose key doesn't match the slot it's about to land in.
+    #[test]
+    fn certificate_public_key_round_trips_every_alg() {
+        for (alg, key) in &round_trip_cases() {
+            let spki = crate::spki::subject_public_key_info(key, *alg).unwrap();
+            let cert = build_cert_with_spki(&spki);
+            assert_eq!(
+                parse_certificate_public_key(&cert),
+                Ok((*alg, key.clone())),
                 "round-trip mismatch for {:?}",
                 alg
             );

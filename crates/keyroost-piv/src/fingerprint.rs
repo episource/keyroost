@@ -639,6 +639,134 @@ pub fn hid_crescendo_algorithm_from_id(id: u8) -> Option<crate::KeyAlg> {
     }
 }
 
+/// The inverse of [`hid_crescendo_algorithm_from_id`]: a [`crate::KeyAlg`]
+/// to HID's C4000 algorithm-identifier byte, per the "P1 Reference Control
+/// Parameter" table on
+/// <https://docs.hidglobal.com/crescendo/api/c4000/inject-pki-key.htm>
+/// (`INJECT PKI KEY`'s own P1 encodes the algorithm directly, unlike
+/// C2300's coarser RSA/EC-only split — see
+/// [`hid_crescendo_c2300_delete_key`]/[`hid_crescendo_c4000_delete_key`]).
+/// Same five-entry table as [`hid_crescendo_algorithm_from_id`] — both
+/// pages describe the same `PIVCryptographicMechanismIdentifier`-typed
+/// field, RSA-4096's `0x04` (not Yubico's `0x16`) included — so this is
+/// that function's `id -> KeyAlg` direction run backward rather than a
+/// second, independently-sourced table. `None` for
+/// [`crate::KeyAlg::Rsa1024`], [`crate::KeyAlg::Ed25519`], and
+/// [`crate::KeyAlg::X25519`]: none of the three appear in that P1 table, so
+/// this crate has no known byte for them on this family. In practice this
+/// never fires for a value [`crate::KeyAlg`] round-trips through
+/// [`hid_crescendo_algorithm_from_id`] first (as
+/// `keyroost_transport::PivSession::hid_crescendo_slot_algorithm` always
+/// does before calling [`hid_crescendo_c4000_delete_key`]), since that
+/// function can't produce any of the three either — kept total (returning
+/// `Option`, not panicking) for a caller that hands this an algorithm from
+/// somewhere else.
+#[must_use]
+pub fn hid_crescendo_c4000_algorithm_id(alg: crate::KeyAlg) -> Option<u8> {
+    match alg {
+        crate::KeyAlg::Rsa4096 => Some(0x04),
+        crate::KeyAlg::Rsa3072 => Some(0x05),
+        crate::KeyAlg::Rsa2048 => Some(0x07),
+        crate::KeyAlg::EccP256 => Some(0x11),
+        crate::KeyAlg::EccP384 => Some(0x14),
+        crate::KeyAlg::Rsa1024 | crate::KeyAlg::Ed25519 | crate::KeyAlg::X25519 => None,
+    }
+}
+
+/// HID Crescendo C2300's INJECT PKI KEY (`INS D8h`), sent in its
+/// degenerate "remove the key" form, per
+/// <https://docs.hidglobal.com/crescendo/api/low-level/inject-pki-key.htm>:
+///
+/// | | CLA | INS | P1 | P2 | Lc | Data | Le |
+/// |---|---|---|---|---|---|---|---|
+/// | RSA | `80h` | `D8h` | `00h` | `key_ref` | `03h` | `00h 00 A3h 00h`¹ | (absent) |
+/// | EC | `80h` | `D8h` | `03h` | `key_ref` | `03h` | `00h B1h 00h`¹ | (absent) |
+///
+/// ¹ Data field, per the page's "Coding of the Data Field for INJECT PKI
+/// RSA/EC KEY" tables:
+///
+/// | offset | len | value | meaning |
+/// |---|---|---|---|
+/// | 0 | 1 | `0x00` | RFU |
+/// | 1 | 1 | `0xA3` (RSA) / `0xB1` (EC) | Algorithm Identifier |
+/// | 2 | 1 | `0x00` | Length of Key Data Value Field |
+///
+/// P1's bit 7 clear means "last (or only) command" — no chained calls
+/// follow, per the page's own P1 bit table — and its low bits are the
+/// coarse `00h`(RSA)/`03h`(EC) split that table gives for a non-chained
+/// call; C2300 draws no finer distinction between RSA key sizes at this
+/// layer, unlike C4000 (see [`hid_crescendo_c4000_delete_key`]), so any RSA
+/// [`crate::KeyAlg`] resolves the same `00h`/`0xA3` pair. The Data field's
+/// own length rule — both the RSA and EC tables state "0 bytes to remove
+/// the corresponding key, in this case the following bytes are absent" for
+/// the Length-of-Key-Data field — is what turns an ordinary key-install
+/// call into a delete: once that field is `0x00`, everything that would
+/// otherwise follow it (the real key-data length, the key value itself, the
+/// key check value) is omitted outright, leaving the 3-byte data field
+/// above.
+///
+/// **Not confirmed on live hardware.** The page documents removal only via
+/// that one general "zero-length field" rule shared with installation — it
+/// gives no literal example APDU for a delete specifically, on either key
+/// type. If a live C2300 rejects this, that rule (and this reconstruction
+/// of it) is the first thing to re-check against the page.
+///
+/// `None` for [`crate::KeyAlg::Ed25519`]/[`crate::KeyAlg::X25519`] — neither
+/// is a PIV RSA or EC algorithm HID's scheme recognises at all (same
+/// unreachable-in-practice caveat as
+/// [`hid_crescendo_c4000_algorithm_id`]'s `None` cases).
+#[must_use]
+pub fn hid_crescendo_c2300_delete_key(alg: crate::KeyAlg, key_ref: u8) -> Option<Vec<u8>> {
+    let (p1, alg_id) = match alg {
+        crate::KeyAlg::Rsa1024
+        | crate::KeyAlg::Rsa2048
+        | crate::KeyAlg::Rsa3072
+        | crate::KeyAlg::Rsa4096 => (0x00, 0xA3),
+        crate::KeyAlg::EccP256 | crate::KeyAlg::EccP384 => (0x03, 0xB1),
+        crate::KeyAlg::Ed25519 | crate::KeyAlg::X25519 => return None,
+    };
+    Some(vec![0x80, 0xD8, p1, key_ref, 0x03, 0x00, alg_id, 0x00])
+}
+
+/// HID Crescendo C4000's INJECT PKI KEY (`INS D8h`), sent in the same
+/// degenerate "remove the key" form as [`hid_crescendo_c2300_delete_key`] —
+/// see that function's doc for the shared "zero-length Length-of-Key-Data
+/// field removes the key" rule both families' API references state
+/// identically for RSA and EC — per
+/// <https://docs.hidglobal.com/crescendo/api/c4000/inject-pki-key.htm>:
+///
+/// `80h D8h <alg id> key_ref 03h 00h 00h 00h` (Lc `03h`, Data `00h 00h 00h`, no `Le`)
+///
+/// Unlike C2300, P1 here is [`hid_crescendo_c4000_algorithm_id`]'s
+/// algorithm-specific byte — C4000's P1 table names each RSA size and curve
+/// individually rather than C2300's coarse RSA/EC split — so `None`
+/// propagates straight through whenever that function has none. The data
+/// field's own offset-1 "Algorithm Identifier" byte is a fixed `0x00` here
+/// regardless of `alg` (confirmed for EC specifically; assumed to hold for
+/// RSA too — see the caveat below): once P1 already names the exact
+/// algorithm, `0x00`/`0x03` moves entirely onto P1 and the data-field byte
+/// that distinguished RSA from EC on C2300 has nothing left to do. This is
+/// distinct from the page's `0xA4`..`0xA8` per-CRT-component identifiers
+/// (`p`/`q`/`qInv`/`dP`/`dQ`), which belong to a separate, chained
+/// multi-part *installation* scheme (P1 bit 7 set, "more commands follow")
+/// this single-call, non-chained removal form has no reason to go through.
+///
+/// **Not confirmed on live hardware — more so than
+/// [`hid_crescendo_c2300_delete_key`].** No C4000 unit has been available
+/// to test any part of INJECT PKI KEY yet (same gap
+/// `keyroost_piv::compat`'s `GET_METADATA_VERDICTS` C4000 bullet documents
+/// for GET PIV PROPERTIES). The EC data field's fixed `0x00` Algorithm
+/// Identifier byte is what the page's EC-specific table states outright;
+/// the RSA data field is reconstructed by analogy to it, since the page's
+/// RSA table only spells out the per-CRT-component chained-install form,
+/// never a plain single-call one. If a live C4000 rejects an RSA delete
+/// specifically, that analogy is the first thing to re-check.
+#[must_use]
+pub fn hid_crescendo_c4000_delete_key(alg: crate::KeyAlg, key_ref: u8) -> Option<Vec<u8>> {
+    let p1 = hid_crescendo_c4000_algorithm_id(alg)?;
+    Some(vec![0x80, 0xD8, p1, key_ref, 0x03, 0x00, 0x00, 0x00])
+}
+
 /// Decode a plain-text command response as a `String`: no TLV or other
 /// framing at all, just the raw bytes themselves, decoded here as lossy
 /// UTF-8. `None` when empty.
@@ -2101,5 +2229,102 @@ mod tests {
             Some(crate::KeyAlg::EccP384)
         );
         assert_eq!(hid_crescendo_algorithm_from_id(0xFF), None);
+    }
+
+    #[test]
+    fn hid_crescendo_c4000_algorithm_id_is_the_exact_inverse_of_from_id() {
+        for id in [0x04, 0x05, 0x07, 0x11, 0x14] {
+            let alg = hid_crescendo_algorithm_from_id(id).unwrap();
+            assert_eq!(hid_crescendo_c4000_algorithm_id(alg), Some(id));
+        }
+        assert_eq!(
+            hid_crescendo_c4000_algorithm_id(crate::KeyAlg::Rsa1024),
+            None
+        );
+        assert_eq!(
+            hid_crescendo_c4000_algorithm_id(crate::KeyAlg::Ed25519),
+            None
+        );
+        assert_eq!(
+            hid_crescendo_c4000_algorithm_id(crate::KeyAlg::X25519),
+            None
+        );
+    }
+
+    #[test]
+    fn hid_crescendo_c2300_delete_key_rsa_frames_the_generic_rsa_alg_id() {
+        // Every RSA size shares the same `00h` P1 / `0xA3` Algorithm
+        // Identifier pair on C2300 — no per-size distinction at this layer.
+        for alg in [
+            crate::KeyAlg::Rsa1024,
+            crate::KeyAlg::Rsa2048,
+            crate::KeyAlg::Rsa3072,
+            crate::KeyAlg::Rsa4096,
+        ] {
+            assert_eq!(
+                hid_crescendo_c2300_delete_key(alg, 0x9A),
+                Some(vec![0x80, 0xD8, 0x00, 0x9A, 0x03, 0x00, 0xA3, 0x00]),
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_c2300_delete_key_ec_frames_the_generic_ec_alg_id() {
+        for (alg, key_ref) in [
+            (crate::KeyAlg::EccP256, 0x9C),
+            (crate::KeyAlg::EccP384, 0x9D),
+        ] {
+            assert_eq!(
+                hid_crescendo_c2300_delete_key(alg, key_ref),
+                Some(vec![0x80, 0xD8, 0x03, key_ref, 0x03, 0x00, 0xB1, 0x00]),
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_c2300_delete_key_rejects_algorithms_hid_does_not_recognise() {
+        assert_eq!(
+            hid_crescendo_c2300_delete_key(crate::KeyAlg::Ed25519, 0x9A),
+            None
+        );
+        assert_eq!(
+            hid_crescendo_c2300_delete_key(crate::KeyAlg::X25519, 0x9A),
+            None
+        );
+    }
+
+    #[test]
+    fn hid_crescendo_c4000_delete_key_frames_the_algorithm_specific_p1() {
+        for (alg, p1) in [
+            (crate::KeyAlg::Rsa4096, 0x04),
+            (crate::KeyAlg::Rsa3072, 0x05),
+            (crate::KeyAlg::Rsa2048, 0x07),
+            (crate::KeyAlg::EccP256, 0x11),
+            (crate::KeyAlg::EccP384, 0x14),
+        ] {
+            assert_eq!(
+                hid_crescendo_c4000_delete_key(alg, 0x9E),
+                Some(vec![0x80, 0xD8, p1, 0x9E, 0x03, 0x00, 0x00, 0x00]),
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_c4000_delete_key_rejects_algorithms_with_no_known_p1() {
+        assert_eq!(
+            hid_crescendo_c4000_delete_key(crate::KeyAlg::Rsa1024, 0x9A),
+            None
+        );
+        assert_eq!(
+            hid_crescendo_c4000_delete_key(crate::KeyAlg::Ed25519, 0x9A),
+            None
+        );
+        assert_eq!(
+            hid_crescendo_c4000_delete_key(crate::KeyAlg::X25519, 0x9A),
+            None
+        );
     }
 }
