@@ -973,6 +973,16 @@ enum PivCmd {
         save_pubkey: Option<std::path::PathBuf>,
     },
     /// Import a DER or PEM X.509 certificate into a slot. Needs the management key.
+    ///
+    /// No `--load-pubkey` here, unlike `request-cert`/`self-sign`: those
+    /// commands need the key material to build their actual output (a CSR, a
+    /// self-signed certificate), so it's load-bearing there. This command's
+    /// key-match check is only an extra, best-effort safety net — without an
+    /// independently confirmed key to compare against, there's no way to
+    /// judge whether the certificate is "correct" anyway, so it simply
+    /// trusts the certificate's own declared public key and imports it, same
+    /// as it did before that check existed. A `--load-pubkey` flag here would
+    /// only feed that same unverifiable trust back into the comparison.
     ImportCert {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,

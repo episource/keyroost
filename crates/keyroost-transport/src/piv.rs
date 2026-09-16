@@ -2259,6 +2259,37 @@ impl PivSession {
     /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
     /// management-key auth.
     ///
+    /// Refuses outright — before any APDU reaches the card — on either of two
+    /// independent checks, primary then secondary:
+    ///
+    /// 1. **Full key material.** When this session already knows `slot`'s
+    ///    current public key ([`Self::slot_key`]: GET METADATA, or this
+    ///    session's generate/`remember_pubkey` cache) and the certificate
+    ///    carries a different one, byte for byte — see
+    ///    [`TransportError::PivImportCertificateKeyMismatch`].
+    /// 2. **Algorithm only**, when step 1 couldn't run at all (`slot_key`
+    ///    failed — metadata-less firmware with nothing cached this session).
+    ///    [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`] resolving
+    ///    [`FeatureGate::Supported`](keyroost_piv::compat::FeatureGate::Supported)
+    ///    for this fingerprint means its own live, device-reported channel
+    ///    (GET METADATA's `algorithm` field, or HID Crescendo's GET PIV
+    ///    PROPERTIES) can still name the slot's algorithm even without full
+    ///    key material — see [`Self::slot_key_status_algorithm`]. An RSA slot
+    ///    receiving an ECC certificate (or any other algorithm mismatch)
+    ///    fails here even though the exact key bytes were never compared —
+    ///    see [`TransportError::PivImportCertificateAlgorithmMismatch`].
+    ///
+    /// Neither check is the same as "is the slot empty" — a caller wanting to
+    /// block import on a confirmed-empty slot needs `GetSlotKeyStatus`'s gate
+    /// directly, same as [`Self::delete_key`]'s UI-side dimming does; both
+    /// checks above only ever fire when there is something to actually
+    /// compare, and never on an empty slot (there is nothing to mismatch
+    /// against there). Every remaining "unknowable" case — `GetSlotKeyStatus`
+    /// not resolving `Supported` either, or a certificate whose
+    /// `SubjectPublicKeyInfo` this crate's minimal X.509 reader can't parse —
+    /// falls through to allowing the import: absence of information is not
+    /// evidence of a mismatch.
+    ///
     /// Tries a single extended-length PUT DATA first; a cert big enough to
     /// need one (any real X.509 cert typically is) that gets rejected falls
     /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why. The
@@ -2268,6 +2299,7 @@ impl PivSession {
     /// it yields [`TransportError::PivCertTooLarge`] /
     /// [`TransportError::PivCardFull`].
     pub fn import_certificate(&mut self, slot: Slot, der: &[u8]) -> Result<(), TransportError> {
+        self.reject_certificate_key_mismatch(slot, der)?;
         let value = piv::encode_certificate(der);
         let tag = slot.cert_object_tag();
         let apdu = piv::put_data(&tag, &value);
@@ -2319,6 +2351,68 @@ impl PivSession {
         cert_write_result(slot, der.len(), sw)
     }
 
+    /// [`Self::import_certificate`]'s pre-flight key check — see that
+    /// method's doc for what triggers each of its two refusals versus what
+    /// falls through to "allow". Split out so the early-returns (`slot_key`
+    /// failing, either side's algorithm/key parse failing) read as the
+    /// "can't verify" cases they are, not folded into `import_certificate`'s
+    /// own control flow.
+    fn reject_certificate_key_mismatch(
+        &mut self,
+        slot: Slot,
+        der: &[u8],
+    ) -> Result<(), TransportError> {
+        let Ok((slot_alg, slot_key)) = self.slot_key(slot) else {
+            // Full key material unknowable here — fall back to the weaker,
+            // algorithm-only check below rather than giving up entirely.
+            let gate = self.extension_gate(keyroost_piv::compat::PivExtension::GetSlotKeyStatus);
+            let status_alg = self.slot_key_status_algorithm(slot);
+            let cert_only_alg = keyroost_piv::x509_parse::parse_key_algorithm(der)
+                .ok()
+                .flatten();
+            return match algorithm_only_mismatch(gate, status_alg, cert_only_alg) {
+                Some((slot_algorithm, certificate_algorithm)) => {
+                    Err(TransportError::PivImportCertificateAlgorithmMismatch {
+                        slot,
+                        slot_algorithm,
+                        certificate_algorithm,
+                    })
+                }
+                None => Ok(()),
+            };
+        };
+        let Ok((cert_alg, cert_key)) = keyroost_piv::x509_parse::parse_certificate_public_key(der)
+        else {
+            return Ok(());
+        };
+        if certificate_key_mismatches(slot_alg, &slot_key, cert_alg, &cert_key) {
+            return Err(TransportError::PivImportCertificateKeyMismatch(slot));
+        }
+        Ok(())
+    }
+
+    /// `slot`'s algorithm via [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s
+    /// own live, device-reported channel — GET METADATA's `algorithm` field
+    /// alone (no public key required, unlike [`Self::slot_key`]/
+    /// `metadata_key_material`) for any Yubico-compatible fingerprint, or HID
+    /// Crescendo's own GET PIV PROPERTIES read
+    /// ([`Self::hid_crescendo_slot_algorithm`]) for that family. Deliberately
+    /// *not* [`Self::slot_key_algorithm`]: this never falls back to the
+    /// session-local pubkey cache (not device-reported — a caller of
+    /// [`Self::reject_certificate_key_mismatch`] already tried that, via
+    /// [`Self::slot_key`], before reaching here) nor to the slot's existing
+    /// certificate (not independent evidence — it's exactly the object about
+    /// to be overwritten, and may itself be stale). A caller can trust a
+    /// `Some` here as much as `GetSlotKeyStatus`'s own gate for this
+    /// fingerprint — check that gate too before treating a `None` as
+    /// "confirmed empty" rather than merely "this channel came up empty".
+    fn slot_key_status_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
+        self.metadata(slot.key_ref())
+            .and_then(|m| m.algorithm)
+            .and_then(KeyAlg::from_id)
+            .or_else(|| self.hid_crescendo_slot_algorithm(slot))
+    }
+
     /// Write a CHUID (Card Holder Unique Identifier) to the card: `guid` is
     /// the 16-byte GUID (tag `0x34`) — see [`random_chuid_guid`] for a
     /// host-side-only, no-card-I/O way to generate one a caller can pre-fill
@@ -2368,19 +2462,120 @@ impl PivSession {
         ok_or_write("piv clear certificate", sw)
     }
 
-    /// Delete `slot`'s private key (Yubico MOVE-to-`0xFF` extension). Permanently
-    /// erases the key material; the certificate object is untouched. This is a
-    /// Yubico vendor extension (YubiKey firmware 5.7+); it is **not**
-    /// version-gated here — a card that doesn't implement it refuses the APDU,
-    /// and [`Self::feature_gate`] is the way to check ahead of that. Requires
-    /// prior management-key auth ([`authenticate_management`]).
+    /// Delete `slot`'s private key. Permanently erases the key material; the
+    /// certificate object is untouched. Requires prior management-key auth
+    /// ([`authenticate_management`]) either way.
+    ///
+    /// On most fingerprints this is the Yubico MOVE-to-`0xFF` extension
+    /// (YubiKey firmware 5.7+); **not** version-gated here — a card that
+    /// doesn't implement it refuses the APDU, and [`Self::feature_gate`] is
+    /// the way to check ahead of that. HID Crescendo has no such extension
+    /// (see `keyroost_piv::compat`'s `MOVE_KEY_VERDICTS` doc — MOVE KEY
+    /// fares differently), but does have its own INJECT PKI KEY (`INS
+    /// 0xD8`) removal form, which this dispatches to instead:
+    ///
+    /// * [`C2300`](keyroost_piv::fingerprint::HidCrescendoVariant::C2300)/
+    ///   [`C4000`](keyroost_piv::fingerprint::HidCrescendoVariant::C4000) —
+    ///   the matching family-specific sequence
+    ///   ([`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`]/
+    ///   [`hid_crescendo_c4000_delete_key`](keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key)),
+    ///   which needs the slot's *current* algorithm
+    ///   ([`Self::hid_crescendo_slot_algorithm`], from the same GET PIV
+    ///   PROPERTIES read [`Self::hid_crescendo_slot_key_algorithms`] uses) —
+    ///   [`TransportError::PivDeleteKeyAlgorithmUnknown`] if that read never
+    ///   named this slot at all.
+    /// * [`Generic`](keyroost_piv::fingerprint::HidCrescendoVariant::Generic)
+    ///   — the exact family is unconfirmed, so this tries the C4000
+    ///   sequence first, and only if that's refused falls back to the
+    ///   C2300 one — [`TransportError::PivDeleteKeyHidCrescendoGenericFailed`]
+    ///   if both are. Safe to try in sequence: neither builder's command
+    ///   has a partial-apply failure mode (see each one's own doc for how
+    ///   confident this crate actually is in its bytes) — a refusal means
+    ///   the slot's key is untouched, not partially deleted.
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
     pub fn delete_key(&mut self, slot: Slot) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
-        ok_or_write("piv delete key", sw)?;
+        if let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(variant) =
+            self.fingerprint()
+        {
+            self.delete_key_hid_crescendo(variant, slot)?;
+        } else {
+            let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
+            ok_or_write("piv delete key", sw)?;
+        }
         self.pubkey_cache.evict(slot.key_ref());
         Ok(())
+    }
+
+    /// [`Self::delete_key`]'s HID Crescendo dispatch — see that method's doc
+    /// for the overall shape. Split out so the cache-evict + `Ok(())` tail
+    /// in `delete_key` isn't duplicated across the C2300/C4000/`Generic`
+    /// branches.
+    fn delete_key_hid_crescendo(
+        &mut self,
+        variant: keyroost_piv::fingerprint::HidCrescendoVariant,
+        slot: Slot,
+    ) -> Result<(), TransportError> {
+        use keyroost_piv::fingerprint::HidCrescendoVariant;
+
+        let alg = self
+            .hid_crescendo_slot_algorithm(slot)
+            .ok_or(TransportError::PivDeleteKeyAlgorithmUnknown(slot))?;
+        match variant {
+            HidCrescendoVariant::C2300 => self.delete_key_hid_crescendo_c2300(alg, slot),
+            HidCrescendoVariant::C4000 => self.delete_key_hid_crescendo_c4000(alg, slot),
+            // `HidCrescendoVariant::Generic`, and any future variant this
+            // crate doesn't have a named branch for yet — same "unconfirmed
+            // identity, try the more commonly encountered family first"
+            // fallback either way.
+            _ => {
+                match self.delete_key_hid_crescendo_c4000(alg, slot) {
+                    Ok(()) => Ok(()),
+                    // Wrong guess, not necessarily a real failure -- see
+                    // `Self::delete_key`'s doc for why trying the other
+                    // sequence next is safe.
+                    Err(_) => self.delete_key_hid_crescendo_c2300(alg, slot).map_err(|e| {
+                        TransportError::PivDeleteKeyHidCrescendoGenericFailed(Box::new(e))
+                    }),
+                }
+            }
+        }
+    }
+
+    /// One attempt at [`Self::delete_key`]'s C2300 sequence — see
+    /// [`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`]'s doc
+    /// for the APDU itself. `alg` not matching anything that function
+    /// recognizes surfaces as the same [`TransportError::PivDeleteKeyAlgorithmUnknown`]
+    /// the caller already checked for before either sequence runs — that
+    /// function's `None` cases ([`KeyAlg::Ed25519`]/[`KeyAlg::X25519`])
+    /// can't actually be reached from [`Self::hid_crescendo_slot_algorithm`]
+    /// in practice (see its doc), so this is unreachable defensiveness, not
+    /// a real path.
+    fn delete_key_hid_crescendo_c2300(
+        &mut self,
+        alg: KeyAlg,
+        slot: Slot,
+    ) -> Result<(), TransportError> {
+        let apdu = keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key(alg, slot.key_ref())
+            .ok_or(TransportError::PivDeleteKeyAlgorithmUnknown(slot))?;
+        let (_, sw) = self.transmit_full(&apdu)?;
+        ok_or_write("piv delete key (HID Crescendo C2300)", sw)
+    }
+
+    /// One attempt at [`Self::delete_key`]'s C4000 sequence — see
+    /// [`keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key`]'s doc
+    /// for the APDU itself. Same unreachable-in-practice `None` caveat as
+    /// [`Self::delete_key_hid_crescendo_c2300`], now also covering
+    /// [`KeyAlg::Rsa1024`].
+    fn delete_key_hid_crescendo_c4000(
+        &mut self,
+        alg: KeyAlg,
+        slot: Slot,
+    ) -> Result<(), TransportError> {
+        let apdu = keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key(alg, slot.key_ref())
+            .ok_or(TransportError::PivDeleteKeyAlgorithmUnknown(slot))?;
+        let (_, sw) = self.transmit_full(&apdu)?;
+        ok_or_write("piv delete key (HID Crescendo C4000)", sw)
     }
 
     /// Read the DER-encoded certificate stored in `slot`, or `None` when the
@@ -3446,9 +3641,18 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
 /// public nonce, not a secret.
 #[must_use]
 fn piv_cmd_sensitive(apdu: &[u8]) -> bool {
-    match apdu.get(1) {
-        Some(0xD8) => apdu.get(4) != Some(&0x04),
-        ins => matches!(
+    match (apdu.first(), apdu.get(1)) {
+        // HID Crescendo's PIV-applet-level INJECT PKI KEY (CLA 0x80) —
+        // distinct from the ACA's own PUT XAUTH KEY below, which shares the
+        // same INS byte but under CLA 0x00. This crate only ever builds
+        // INJECT PKI KEY's "delete" form
+        // (`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`/
+        // `hid_crescendo_c4000_delete_key`) — a fixed, publicly-known data
+        // field with no key material in it at all — so nothing to redact
+        // here, regardless of `Lc`.
+        (Some(0x80), Some(0xD8)) => false,
+        (_, Some(0xD8)) => apdu.get(4) != Some(&0x04),
+        (_, ins) => matches!(
             ins,
             Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x87) | Some(0xFF) | Some(0x82)
         ),
@@ -3460,10 +3664,12 @@ fn piv_cmd_sensitive(apdu: &[u8]) -> bool {
 /// data object GET DATA / PUT DATA is aimed at, names the AID/RID a SELECT
 /// targets whenever it's one this crate recognizes (the PIV applet itself,
 /// or one of its own fingerprinting probes), sharpens two more cases the INS
-/// byte alone leaves ambiguous, separately names HID Crescendo's ACA
-/// instructions (not modeled in [`piv::Instruction`] at all, since they
-/// aren't PIV), and falls back to the raw INS for anything else this crate
-/// never builds.
+/// byte alone leaves ambiguous, separately names HID Crescendo's own
+/// proprietary instructions — the ACA (Access Control Applet)'s GSC-IS/HID
+/// vendor extensions, and HID's PIV-applet-level INJECT PKI KEY, told apart
+/// from each other by CLA despite sharing INS `0xD8` — none of which are
+/// modeled in [`piv::Instruction`] at all, and falls back to the raw INS for
+/// anything else this crate never builds.
 fn describe_apdu(apdu: &[u8]) -> String {
     let Some(&ins) = apdu.get(1) else {
         return "(malformed APDU)".to_string();
@@ -3516,6 +3722,14 @@ fn describe_apdu(apdu: &[u8]) -> String {
         // applet, instead of falling through to a bare "INS 0x82"/"INS 0xD8".
         None if ins == 0x84 => "GET CHALLENGE (HID ACA XAUTH)".to_string(),
         None if ins == 0x82 => "EXTERNAL AUTHENTICATE (HID ACA XAUTH)".to_string(),
+        // HID Crescendo's PIV-applet-level INJECT PKI KEY (CLA 0x80) — this
+        // crate only ever builds its "delete" form (see `piv_cmd_sensitive`'s
+        // matching arm for why that's also why it's never redacted); told
+        // apart from the ACA's own PUT XAUTH KEY below by CLA, since both
+        // share INS 0xD8.
+        None if ins == 0xD8 && apdu.first() == Some(&0x80) => {
+            "INJECT PKI KEY (HID Crescendo, delete)".to_string()
+        }
         // `Lc` alone tells PUT XAUTH KEY's two forms apart: `0x04` is the
         // documented "remove" short form
         // ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]);
@@ -3682,6 +3896,44 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
                 cert_unreadable: None,
             }
         }
+    }
+}
+
+/// Behind [`PivSession::reject_certificate_key_mismatch`]: true when a slot's
+/// known key and a certificate's key are for different algorithms or
+/// different key material. Split out as a pure function (no card I/O) so the
+/// actual comparison stays unit-tested without a mock session.
+fn certificate_key_mismatches(
+    slot_alg: KeyAlg,
+    slot_key: &PublicKey,
+    cert_alg: KeyAlg,
+    cert_key: &PublicKey,
+) -> bool {
+    slot_alg != cert_alg || slot_key != cert_key
+}
+
+/// Behind [`PivSession::reject_certificate_key_mismatch`]'s secondary,
+/// algorithm-only path: `Some((slot_algorithm, certificate_algorithm))` when
+/// `get_slot_key_status_gate` resolves
+/// [`FeatureGate::Supported`](keyroost_piv::compat::FeatureGate::Supported)
+/// *and* both algorithms are actually known *and* they differ; `None`
+/// otherwise (gate not `Supported`, or either side unknowable, or they
+/// agree) — every one of those is "nothing to refuse on", same "absence of
+/// information is not evidence of a mismatch" standard the primary,
+/// full-key path applies. Split out as a pure function (no card I/O) so the
+/// decision table is unit-tested without a mock session, same as
+/// [`certificate_key_mismatches`] above.
+fn algorithm_only_mismatch(
+    get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
+    slot_algorithm: Option<KeyAlg>,
+    cert_algorithm: Option<KeyAlg>,
+) -> Option<(KeyAlg, KeyAlg)> {
+    if get_slot_key_status_gate != keyroost_piv::compat::FeatureGate::Supported {
+        return None;
+    }
+    match (slot_algorithm, cert_algorithm) {
+        (Some(s), Some(c)) if s != c => Some((s, c)),
+        _ => None,
     }
 }
 
@@ -4035,6 +4287,32 @@ mod tests {
     }
 
     #[test]
+    fn describe_apdu_names_hid_inject_pki_key_and_tells_it_apart_from_aca_put_xauth_key() {
+        // Both INJECT PKI KEY (CLA 0x80) and the ACA's PUT XAUTH KEY (CLA
+        // 0x00) share INS 0xD8 — CLA alone tells them apart.
+        assert_eq!(
+            describe_apdu(
+                &keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key(KeyAlg::Rsa2048, 0x9A)
+                    .unwrap()
+            ),
+            "INJECT PKI KEY (HID Crescendo, delete)"
+        );
+        assert_eq!(
+            describe_apdu(
+                &keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key(KeyAlg::EccP256, 0x9C)
+                    .unwrap()
+            ),
+            "INJECT PKI KEY (HID Crescendo, delete)"
+        );
+        // The ACA's own PUT XAUTH KEY (CLA 0x00) still names itself, not
+        // this — regression guard for the CLA disambiguation.
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()),
+            "PUT XAUTH KEY (HID ACA, delete)"
+        );
+    }
+
+    #[test]
     fn piv_cmd_sensitive_covers_every_secret_bearing_ins_including_hid_aca() {
         // Secret-bearing: PINs/PUKs, GENERAL AUTHENTICATE, SET MANAGEMENT
         // KEY, and the two HID ACA instructions that carry key-derived or
@@ -4063,6 +4341,18 @@ mod tests {
         // four fixed, publicly-known bytes — so it must not be redacted.
         assert!(!piv_cmd_sensitive(
             &keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()
+        ));
+        // HID Crescendo's own INJECT PKI KEY delete (CLA 0x80, same INS
+        // 0xD8) never carries key material either — always the fixed
+        // "delete" data field — so it must not be redacted regardless of
+        // algorithm/Lc.
+        assert!(!piv_cmd_sensitive(
+            &keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key(KeyAlg::Rsa2048, 0x9A)
+                .unwrap()
+        ));
+        assert!(!piv_cmd_sensitive(
+            &keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key(KeyAlg::EccP256, 0x9C)
+                .unwrap()
         ));
     }
 
@@ -4583,6 +4873,129 @@ mod tests {
         );
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, der.len());
+    }
+
+    // --- certificate_key_mismatches: the pure comparison behind
+    // `PivSession::reject_certificate_key_mismatch` — see that method's
+    // (and `PivSession::import_certificate`'s) doc for what feeds it.
+
+    #[test]
+    fn certificate_key_mismatches_same_alg_and_material_is_not_a_mismatch() {
+        let key = PublicKey::Rsa {
+            modulus: vec![0xAA; 256],
+            exponent: vec![0x01, 0x00, 0x01],
+        };
+        assert!(!certificate_key_mismatches(
+            KeyAlg::Rsa2048,
+            &key,
+            KeyAlg::Rsa2048,
+            &key
+        ));
+    }
+
+    #[test]
+    fn certificate_key_mismatches_differing_key_material_is_a_mismatch() {
+        let slot_key = PublicKey::Rsa {
+            modulus: vec![0xAA; 256],
+            exponent: vec![0x01, 0x00, 0x01],
+        };
+        let cert_key = PublicKey::Rsa {
+            modulus: vec![0xBB; 256],
+            exponent: vec![0x01, 0x00, 0x01],
+        };
+        assert!(certificate_key_mismatches(
+            KeyAlg::Rsa2048,
+            &slot_key,
+            KeyAlg::Rsa2048,
+            &cert_key
+        ));
+    }
+
+    #[test]
+    fn certificate_key_mismatches_differing_algorithm_is_a_mismatch_even_with_equal_bytes() {
+        // Same `PublicKey` bytes under two different `KeyAlg`s (an EC point at
+        // the wrong curve) must still count as a mismatch — the algorithm
+        // itself is part of what has to agree.
+        let point = PublicKey::Ecc {
+            point: vec![0xCC; 97],
+        };
+        assert!(certificate_key_mismatches(
+            KeyAlg::EccP256,
+            &point,
+            KeyAlg::EccP384,
+            &point
+        ));
+    }
+
+    // --- algorithm_only_mismatch: the pure comparison behind
+    // `PivSession::reject_certificate_key_mismatch`'s secondary,
+    // algorithm-only path — see that method's (and
+    // `PivSession::import_certificate`'s) doc for what feeds it.
+
+    #[test]
+    fn algorithm_only_mismatch_fires_only_when_the_gate_is_supported() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // The one case that actually refuses: gate `Supported`, both
+        // algorithms known, and they differ (an RSA slot, an ECC cert).
+        assert_eq!(
+            algorithm_only_mismatch(
+                FeatureGate::Supported,
+                Some(KeyAlg::Rsa2048),
+                Some(KeyAlg::EccP256)
+            ),
+            Some((KeyAlg::Rsa2048, KeyAlg::EccP256))
+        );
+        // Same disagreement, but the gate isn't `Supported` -> not trustworthy
+        // enough to refuse on, same standard `slot_confirmed_empty` (GUI) and
+        // the primary key check apply elsewhere.
+        assert_eq!(
+            algorithm_only_mismatch(
+                FeatureGate::Unverified,
+                Some(KeyAlg::Rsa2048),
+                Some(KeyAlg::EccP256)
+            ),
+            None
+        );
+        assert_eq!(
+            algorithm_only_mismatch(
+                FeatureGate::Unsupported,
+                Some(KeyAlg::Rsa2048),
+                Some(KeyAlg::EccP256)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn algorithm_only_mismatch_requires_both_sides_known() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // Slot's algorithm unknowable (e.g. GetSlotKeyStatus's own channel
+        // came up empty too) -> nothing to compare, not a mismatch.
+        assert_eq!(
+            algorithm_only_mismatch(FeatureGate::Supported, None, Some(KeyAlg::EccP256)),
+            None
+        );
+        // Certificate's algorithm unparsable -> same "can't verify" outcome.
+        assert_eq!(
+            algorithm_only_mismatch(FeatureGate::Supported, Some(KeyAlg::Rsa2048), None),
+            None
+        );
+    }
+
+    #[test]
+    fn algorithm_only_mismatch_agreeing_algorithms_is_not_a_mismatch() {
+        use keyroost_piv::compat::FeatureGate;
+
+        assert_eq!(
+            algorithm_only_mismatch(
+                FeatureGate::Supported,
+                Some(KeyAlg::EccP256),
+                Some(KeyAlg::EccP256)
+            ),
+            None
+        );
     }
 
     #[test]

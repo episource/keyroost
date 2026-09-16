@@ -66,11 +66,41 @@ use crate::fingerprint::{
 pub enum PivExtension {
     /// Yubico MOVE KEY — relocate a slot's private key into another slot.
     MoveKey,
-    /// Yubico DELETE KEY — erase a slot's private key in place.
+    /// Yubico DELETE KEY — erase a slot's private key in place. Whether
+    /// this is even worth *offering* on an already-empty slot is a
+    /// separate question from whether the operation is supported at all —
+    /// see [`Self::GetSlotKeyStatus`] for the gate a caller checks before
+    /// trusting a "no key here" reading enough to block the button on it;
+    /// this extension's own gate only answers "can DELETE KEY run here at
+    /// all".
     DeleteKey,
     /// Yubico GET METADATA (`INS 0xF7`) — key/PIN algorithm, policy, origin,
     /// retries.
     GetMetadata,
+    /// Whether a slot's private-key occupancy (does it hold a key at all,
+    /// independent of any certificate) can be read straight from the
+    /// device, rather than inferred. Unlike every other extension here,
+    /// this one is **not** primarily version-gated per fingerprint —
+    /// [`resolve`] special-cases it to fall through to
+    /// [`Self::GetMetadata`]'s own verdict whenever [`GET_SLOT_KEY_STATUS_VERDICTS`]
+    /// carries no row for the fingerprint at all (see that function's doc
+    /// for the mechanics), because GET METADATA's `algorithm` field *is*
+    /// how this capability is provided on every fingerprint that provides
+    /// it via a Yubico-compatible mechanism. A row only belongs in that
+    /// table when a fingerprint reports slot key status through some
+    /// *other*, independently-confirmed channel — today: HID Crescendo's
+    /// GET PIV PROPERTIES
+    /// (`keyroost_transport::PivSession::hid_crescendo_slot_algorithm`),
+    /// which answers this even though [`Self::GetMetadata`] itself resolves
+    /// [`FeatureGate::Unsupported`] there. Consumed internally, the same
+    /// way [`Self::GetMetadata`]/[`Self::Attest`] are (see this enum's own
+    /// doc) — `keyroost_transport::PivSession::slot_key_algorithm` already
+    /// tries both channels unconditionally and doesn't need this gate to
+    /// decide whether to bother; the one real consumer today is a UI
+    /// deciding whether a `None` algorithm reading is trustworthy enough to
+    /// *block* an operation on (see [`Self::DeleteKey`]'s doc for why that
+    /// distinction matters there specifically).
+    GetSlotKeyStatus,
     /// Yubico ATTEST (`INS 0xF9`) — a slot's self-signed attestation
     /// certificate, proving on-card key generation.
     Attest,
@@ -139,13 +169,20 @@ impl PivExtension {
             // MOVE KEY and DELETE KEY shipped together in YubiKey firmware
             // 5.7: unsupported at every earlier version, supported from 5.7
             // on. Token2 applet 5.112.0 has separately been observed to
-            // reject both, so it carries its own known-unsupported row in the same
-            // table — as does the Swissbit iShield 2 Pro (fingerprinted
+            // reject both, so it carries its own known-unsupported row in
+            // both tables — as does the Swissbit iShield 2 Pro (fingerprinted
             // `OpenFips201::SwissbitIShield2`) at applet version 1.4.1.0 and
             // below, and the Thetis PRO FIDO2 Security Key with PinPlex
             // (`AppletFingerprint::Thetis`) at applet version 5.112.0 and
-            // below.
-            PivExtension::MoveKey | PivExtension::DeleteKey => KEY_OPS_VERDICTS,
+            // below. `MOVE_KEY_VERDICTS`/`DELETE_KEY_VERDICTS` repeat those
+            // four rows identically (same "kept in sync manually" shape
+            // `ATTEST_VERDICTS`/`GET_METADATA_VERDICTS` already use for their
+            // own shared YubiKey row) rather than sharing one slice, because
+            // HID Crescendo diverges between the two: see
+            // `MOVE_KEY_VERDICTS`'s own doc for why only MOVE KEY gets a HID
+            // Crescendo row today.
+            PivExtension::MoveKey => MOVE_KEY_VERDICTS,
+            PivExtension::DeleteKey => DELETE_KEY_VERDICTS,
             // ATTEST and GET METADATA need separate tables, unlike MOVE
             // KEY/DELETE KEY above: YubiKey itself gained the two at
             // different firmware versions (4.3 vs. 5.3 — see each table's
@@ -153,6 +190,12 @@ impl PivExtension {
             // `ATTEST_VERDICTS`'s and `GET_METADATA_VERDICTS`'s docs.
             PivExtension::Attest => ATTEST_VERDICTS,
             PivExtension::GetMetadata => GET_METADATA_VERDICTS,
+            // Sparse on purpose — see `GET_SLOT_KEY_STATUS_VERDICTS`'s own
+            // doc. `resolve` consults this table directly only when it
+            // actually carries a row for the fingerprint; otherwise it
+            // never reaches this arm at all; it resolves `GetMetadata`'s
+            // verdict instead.
+            PivExtension::GetSlotKeyStatus => GET_SLOT_KEY_STATUS_VERDICTS,
             PivExtension::PinManagementAuth => PIN_MANAGEMENT_AUTH_VERDICTS,
             PivExtension::Reset => RESET_VERDICTS,
             PivExtension::ResetGlobal => RESET_GLOBAL_VERDICTS,
@@ -171,6 +214,7 @@ impl PivExtension {
             PivExtension::MoveKey
             | PivExtension::DeleteKey
             | PivExtension::GetMetadata
+            | PivExtension::GetSlotKeyStatus
             | PivExtension::Attest
             | PivExtension::PinManagementAuth
             | PivExtension::Reset
@@ -194,6 +238,10 @@ impl PivExtension {
             PivExtension::GetMetadata => {
                 "Reading key/PIN metadata needs YubiKey firmware 5.3+ or a compatible \
                  third-party device."
+            }
+            PivExtension::GetSlotKeyStatus => {
+                "Reading a slot's key occupancy directly needs YubiKey firmware 5.3+ or a \
+                 compatible third-party device."
             }
             PivExtension::Attest => {
                 "Reading a key's attestation certificate needs YubiKey firmware 4.3+ or a \
@@ -345,8 +393,8 @@ pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static
     })
 }
 
-/// The known-support table shared by [`PivExtension::MoveKey`] and
-/// [`PivExtension::DeleteKey`], one row per fingerprint keyroost has data for:
+/// [`PivExtension::MoveKey`]'s applet-axis known-support table, one row per
+/// fingerprint keyroost has data for:
 ///
 /// * YubiKey — the operation is unsupported before firmware 5.7 and supported
 ///   from 5.7 onward. The empty-slice version on the known-unsupported verdict is a
@@ -356,8 +404,8 @@ pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static
 ///   bearing and not implied by [`resolve_in`]'s backward-extension rule: the
 ///   verdict *above* it is a known-supported verdict ([5, 7]), not known-unsupported, and a
 ///   known-supported verdict says nothing about versions before it.
-/// * Token2 — applet version 5.112.0 has been observed to reject both
-///   extensions outright, and every version below it is assumed to as well
+/// * Token2 — applet version 5.112.0 has been observed to reject MOVE KEY
+///   outright, and every version below it is assumed to as well
 ///   per [`resolve_in`]'s backward-extension rule (no earlier hardware has
 ///   been available to test, but a feature known not to work at 5.112.0 is
 ///   presumed not to work in any older, untested version either). There is
@@ -370,19 +418,47 @@ pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static
 ///   backward on its own.
 /// * Swissbit iShield 2 Pro (`OpenFips201::SwissbitIShield2`) — applet
 ///   version 1.4.1.0 and every earlier version have been observed to reject
-///   both extensions. Same single-verdict shape as Token2's row above, just
+///   MOVE KEY. Same single-verdict shape as Token2's row above, just
 ///   with `[1, 4, 1, 0]` as the observed/backward-extending version instead
 ///   of `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row
 ///   and resolves [`FeatureGate::Unverified`] — the known-unsupported verdict deliberately
 ///   doesn't extend to a future, untested version.
 /// * Thetis PRO FIDO2 Security Key with PinPlex ([`AppletFingerprint::Thetis`])
 ///   — applet version 5.112.0 and every earlier version have been observed
-///   to reject both extensions. Same single-verdict shape as the rows above:
+///   to reject MOVE KEY. Same single-verdict shape as the rows above:
 ///   `[5, 112, 0]` is both the exact-match verdict and the one
 ///   [`resolve_in`] extends backward from. A version above 5.112.0 falls off
 ///   the end of the row and resolves [`FeatureGate::Unverified`] — the
 ///   known-unsupported verdict deliberately doesn't extend to a future, untested version.
-const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
+/// * HID Crescendo C2300/C4000/Generic — [`Verdict::KnownUnsupportedSince`]
+///   at the universal `[]` version, on the same standing-pattern reasoning as
+///   [`RESET_VERDICTS`]'s/[`GET_METADATA_VERDICTS`]'s HID Crescendo rows:
+///   this family has never attempted to mimic a Yubico extension APDU,
+///   building its own proprietary alternatives instead (ACA XAUTH, GET PIV
+///   PROPERTIES, RESET CARD), and — unlike those two — there is no HID
+///   equivalent of MOVE KEY at all, documented or otherwise: no ACA command
+///   relocates a key between PIV slots. That absence of even a proprietary
+///   alternative makes the standing-pattern bet the *only* evidence for this
+///   row (contrast [`GET_METADATA_VERDICTS`], where the alternative's actual
+///   documented shape is additional confirmation), but the same reasoning
+///   [`RESET_VERDICTS`]'s doc gives for including
+///   [`HidCrescendoVariant::Generic`] alongside the named C2300/C4000 models
+///   applies here too: the claim is about the vendor's pattern across the
+///   whole product line, not about a specific tested model. Should a real
+///   unit ever turn out to support MOVE KEY after all, this row needs a
+///   firmware sample to correct it, exactly like every other verdict here.
+///   Deliberately **not** mirrored onto [`DELETE_KEY_VERDICTS`] — DELETE KEY
+///   turned out to have the opposite answer on C2300/C4000: HID's own
+///   INJECT PKI KEY (`INS 0xD8`), sent with a zero-length key-data field, is
+///   a genuine, documented alternative (see [`DELETE_KEY_VERDICTS`]'s HID
+///   Crescendo bullet), so that table carries [`Verdict::KnownSupported`]
+///   rows for C2300/C4000 instead of leaving the family unlisted. The
+///   absence-vs-presence split between the two tables is deliberate, not an
+///   oversight: MOVE (relocate a key between slots) and DELETE (remove one
+///   in place) aren't the same operation just because Yubico's extension API
+///   happens to bundle them under one opcode — HID's proprietary API has no
+///   obligation to bundle them the same way, and evidently doesn't.
+const MOVE_KEY_VERDICTS: &[FingerprintVerdicts] = &[
     FingerprintVerdicts {
         fingerprint: AppletFingerprint::YubiKey,
         verdicts: &[
@@ -418,6 +494,152 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
             verdict: Verdict::KnownUnsupported,
         }],
     },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+];
+
+/// [`PivExtension::DeleteKey`]'s applet-axis known-support table. Was one
+/// table shared with [`PivExtension::MoveKey`] (`KEY_OPS_VERDICTS`) until HID
+/// Crescendo needed to diverge between the two — see [`MOVE_KEY_VERDICTS`]'s
+/// doc for why. The four rows below are otherwise identical to
+/// [`MOVE_KEY_VERDICTS`]'s own YubiKey/Token2/Swissbit/Thetis rows, kept in
+/// sync manually (same shape [`ATTEST_VERDICTS`]/[`GET_METADATA_VERDICTS`]
+/// already use for their own shared YubiKey row) because every one of those
+/// fingerprints was observed rejecting — or, for YubiKey, shipping — both
+/// operations together:
+///
+/// * YubiKey — the operation is unsupported before firmware 5.7 and supported
+///   from 5.7 onward. The empty-slice version on the known-unsupported verdict is a
+///   "from the very first version" sentinel — it orders below every real
+///   version (`[] < [5, 7]`), so that verdict is the one that applies to
+///   anything older than 5.7. Unlike the rows below, this sentinel is load-
+///   bearing and not implied by [`resolve_in`]'s backward-extension rule: the
+///   verdict *above* it is a known-supported verdict ([5, 7]), not known-unsupported, and a
+///   known-supported verdict says nothing about versions before it.
+/// * Token2 — applet version 5.112.0 has been observed to reject DELETE KEY
+///   outright, and every version below it is assumed to as well
+///   per [`resolve_in`]'s backward-extension rule (no earlier hardware has
+///   been available to test, but a feature known not to work at 5.112.0 is
+///   presumed not to work in any older, untested version either). There is
+///   no known-supported verdict on this row, so a version *above* 5.112.0 resolves
+///   [`FeatureGate::Unverified`], not [`FeatureGate::Unsupported`] — a
+///   known-unsupported verdict is deliberately never treated as covering a version
+///   it hasn't actually observed on the other side either. Unlike the
+///   YubiKey row above, this one needs no explicit `[]` sentinel: the single
+///   `[5, 112, 0]` known-unsupported verdict is enough for [`resolve_in`] to extend
+///   backward on its own.
+/// * Swissbit iShield 2 Pro (`OpenFips201::SwissbitIShield2`) — applet
+///   version 1.4.1.0 and every earlier version have been observed to reject
+///   DELETE KEY. Same single-verdict shape as Token2's row above, just
+///   with `[1, 4, 1, 0]` as the observed/backward-extending version instead
+///   of `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row
+///   and resolves [`FeatureGate::Unverified`] — the known-unsupported verdict deliberately
+///   doesn't extend to a future, untested version.
+/// * Thetis PRO FIDO2 Security Key with PinPlex ([`AppletFingerprint::Thetis`])
+///   — applet version 5.112.0 and every earlier version have been observed
+///   to reject DELETE KEY. Same single-verdict shape as the rows above:
+///   `[5, 112, 0]` is both the exact-match verdict and the one
+///   [`resolve_in`] extends backward from. A version above 5.112.0 falls off
+///   the end of the row and resolves [`FeatureGate::Unverified`] — the
+///   known-unsupported verdict deliberately doesn't extend to a future, untested version.
+/// * HID Crescendo C2300/C4000 — [`Verdict::KnownSupported`] at the
+///   universal `[]` version: `keyroost_transport::PivSession::delete_key`
+///   implements HID's own INJECT PKI KEY (`INS 0xD8`) removal form for both
+///   families (`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`/
+///   `hid_crescendo_c4000_delete_key`), so unlike [`MOVE_KEY_VERDICTS`]'s
+///   HID Crescendo rows this is a presence claim, not an absence one — see
+///   those functions' docs for what's confirmed from HID's own API
+///   references versus reconstructed from their generic "zero-length data
+///   field removes the key" rule (neither page gives a literal delete
+///   example). Same shape [`RESET_GLOBAL_VERDICTS`]'s C2300/C4000 rows use
+///   for RESET CARD: a positive claim needs no minimum applet version to
+///   gate below, so one `KnownSupported` verdict at `[]` is the whole row.
+///   Deliberately **not** extended to [`HidCrescendoVariant::Generic`], same
+///   reasoning as [`RESET_GLOBAL_VERDICTS`]'s equivalent bullet: this is a
+///   presence claim tied to two specific, named families' documented
+///   command references, not the vendor-wide absence pattern
+///   [`MOVE_KEY_VERDICTS`]'s HID Crescendo rows (and
+///   [`RESET_VERDICTS`]'s) lean on to justify covering `Generic` too — there
+///   is no equivalently general basis to extend a presence claim to a model
+///   neither reference names. `Generic` keeps resolving
+///   [`FeatureGate::Unverified`] here, same as any fingerprint absent from a
+///   table; `PivSession::delete_key` still attempts something sensible for
+///   it (see that method's doc) — this table only decides what the *UI*
+///   shows ahead of time, not what the transport layer is willing to try.
+const DELETE_KEY_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::KnownUnsupported,
+            },
+            VersionVerdict {
+                version: &[5, 7],
+                verdict: Verdict::KnownSupported,
+            },
+        ],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Token2,
+        verdicts: &[VersionVerdict {
+            version: &[5, 112, 0],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+        verdicts: &[VersionVerdict {
+            version: &[1, 4, 1, 0],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::Thetis,
+        // See this row's bullet in the doc comment on this table.
+        verdicts: &[VersionVerdict {
+            version: &[5, 112, 0],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
 ];
 
 /// [`PivExtension::Attest`]'s applet-axis known-support table:
@@ -425,7 +647,7 @@ const KEY_OPS_VERDICTS: &[FingerprintVerdicts] = &[
 /// * YubiKey — ATTEST shipped in firmware 4.3
 ///   (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>:
 ///   "Only available in YubiKey 4.3 & 5"), so this row is the same shape as
-///   [`KEY_OPS_VERDICTS`]'s YubiKey row: a [`Verdict::KnownUnsupported`] verdict at
+///   [`MOVE_KEY_VERDICTS`]'s YubiKey row: a [`Verdict::KnownUnsupported`] verdict at
 ///   the empty-slice "from the very first version" sentinel, unsupported at
 ///   every version below 4.3, and a [`Verdict::KnownSupported`] verdict at
 ///   `[4, 3]` covering 4.3 and every later version, assumed not to have
@@ -546,6 +768,65 @@ const GET_METADATA_VERDICTS: &[FingerprintVerdicts] = &[
     },
 ];
 
+/// [`PivExtension::GetSlotKeyStatus`]'s applet-axis known-support table —
+/// deliberately sparse, unlike every other table here. A fingerprint absent
+/// from this one does **not** mean "no data" the way it does everywhere
+/// else: [`resolve`] special-cases this one extension to fall through to
+/// [`PivExtension::GetMetadata`]'s own verdict instead of the ordinary
+/// [`FeatureGate::Unverified`] default whenever this table carries no row
+/// for the fingerprint at all — see [`resolve`]'s doc for the mechanics.
+/// That's correct precisely because GET METADATA's `algorithm` field *is*
+/// how this capability is provided on every fingerprint that doesn't have
+/// its own row here. A row only belongs in this table when a fingerprint
+/// reports slot key status through some *other* channel, independently
+/// confirmed and gated on its own terms — entirely unrelated to whether
+/// [`GET_METADATA_VERDICTS`] says anything at all for that same
+/// fingerprint:
+///
+/// * HID Crescendo C2300/C4000/Generic — [`Verdict::KnownSupported`] at the
+///   universal `[]` version: GET PIV PROPERTIES
+///   (`keyroost_transport::PivSession::hid_crescendo_slot_algorithm`, via
+///   [`crate::fingerprint::parse_hid_crescendo_slot_key_algorithms`]) names
+///   every slot that actually has a key loaded — independent of
+///   [`GET_METADATA_VERDICTS`]'s own HID Crescendo bullet, which resolves
+///   [`Verdict::KnownUnsupportedSince`] for all three of these same
+///   fingerprints: the two questions (does GET METADATA work; can this
+///   fingerprint report slot key status at all) have separate,
+///   independently confirmed answers here, unlike every fingerprint
+///   without a row of its own, where they're the same question. Extended
+///   to `Generic` for the same vendor-wide-pattern reasoning
+///   [`RESET_VERDICTS`]'s HID Crescendo rows use: this is a property of the
+///   GET PIV PROPERTIES mechanism itself (present, in some form, across the
+///   whole product line — see [`GET_METADATA_VERDICTS`]'s C2300 bullet for
+///   that same standing-pattern argument spelled out in full), not a claim
+///   tied to two specifically named, individually tested models.
+const GET_SLOT_KEY_STATUS_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+        // See the HID Crescendo bullet in this table's doc comment.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+];
+
 /// [`PivExtension::PinManagementAuth`]'s applet-axis known-support table:
 ///
 /// * HID Crescendo C2300/C4000 — [`Verdict::KnownSupported`] at the universal
@@ -587,7 +868,7 @@ const PIN_MANAGEMENT_AUTH_VERDICTS: &[FingerprintVerdicts] = &[
 /// * YubiKey — RESET (`INS 0xFB`) has been supported by every YubiKey PIV
 ///   implementation observed, so this row is a single
 ///   [`Verdict::KnownSupported`] at the universal `[]` version, no
-///   known-unsupported floor to gate below it — unlike [`KEY_OPS_VERDICTS`]'s
+///   known-unsupported floor to gate below it — unlike [`MOVE_KEY_VERDICTS`]'s
 ///   YubiKey row, RESET didn't arrive in a specific later firmware. YubiKey
 ///   carries no row in [`QUIRKS_BY_APPLET_TABLE`] for
 ///   [`PivQuirk::ResetNeedsManagementAuth`] either: "supported" here means
@@ -940,6 +1221,22 @@ impl FeatureGate {
 /// [`FeatureGate::Unverified`] and — per the rule above — simply doesn't
 /// change the outcome, so the combined result equals the one axis that has an
 /// opinion.
+///
+/// **One special case, ahead of all of the above:**
+/// [`PivExtension::GetSlotKeyStatus`] falls through entirely to
+/// `resolve(`[`PivExtension::GetMetadata`]`, fingerprint, applet_version,
+/// firmware_version)` whenever [`GET_SLOT_KEY_STATUS_VERDICTS`] carries no
+/// row for `fingerprint` at all — not the ordinary step-2
+/// [`FeatureGate::Unverified`] default every other extension gets in that
+/// situation. This is deliberate, not a workaround: GET METADATA's
+/// `algorithm` field *is* how slot-key-status is provided on every
+/// fingerprint that doesn't have its own [`GET_SLOT_KEY_STATUS_VERDICTS`]
+/// row, so "no row here" genuinely means "ask [`PivExtension::GetMetadata`]
+/// instead", not "no data, assume unverified". A fingerprint that *does*
+/// have a row (today: HID Crescendo, which provides this a different way —
+/// see that table's doc) is resolved through the ordinary per-axis
+/// machinery below, exactly like every other extension, and never
+/// consults [`PivExtension::GetMetadata`] at all.
 #[must_use]
 pub fn resolve(
     extension: PivExtension,
@@ -947,6 +1244,18 @@ pub fn resolve(
     applet_version: Option<&[u8]>,
     firmware_version: Option<&[u8]>,
 ) -> FeatureGate {
+    if extension == PivExtension::GetSlotKeyStatus
+        && !GET_SLOT_KEY_STATUS_VERDICTS
+            .iter()
+            .any(|row| row.fingerprint == fingerprint)
+    {
+        return resolve(
+            PivExtension::GetMetadata,
+            fingerprint,
+            applet_version,
+            firmware_version,
+        );
+    }
     let applet_gate = resolve_in(extension.applet_verdicts(), fingerprint, applet_version);
     let firmware_gate = resolve_in(extension.firmware_verdicts(), fingerprint, firmware_version);
     combine(applet_gate, firmware_gate)
@@ -1099,7 +1408,7 @@ const QUIRKS_BY_APPLET_TABLE: &[FingerprintQuirks] = &[
     FingerprintQuirks {
         fingerprint: AppletFingerprint::Token2,
         // The empty-slice version is the "from the very first version"
-        // sentinel also used by `KEY_OPS_VERDICTS`'s YubiKey row: it orders
+        // sentinel also used by `MOVE_KEY_VERDICTS`'s YubiKey row: it orders
         // at or below every real version (`[] <= anything`), so this entry
         // matches regardless of which applet version Token2 reports.
         quirks: &[VersionQuirks {
@@ -1381,6 +1690,7 @@ mod tests {
             PivExtension::MoveKey.requirement(),
             PivExtension::DeleteKey.requirement(),
             PivExtension::GetMetadata.requirement(),
+            PivExtension::GetSlotKeyStatus.requirement(),
             PivExtension::Attest.requirement(),
             PivExtension::PinManagementAuth.requirement(),
             PivExtension::Reset.requirement(),
@@ -1606,6 +1916,99 @@ mod tests {
         }
     }
 
+    // --- HID Crescendo: MOVE KEY only, `KnownUnsupportedSince` ------------
+
+    #[test]
+    fn hid_crescendo_move_key_is_known_unsupported_since_regardless_of_version() {
+        // `Verdict::KnownUnsupportedSince` at the universal `[]` version:
+        // unlike a plain `KnownUnsupported` verdict (see the Token2/Swissbit/
+        // Thetis tests above), this doesn't soften to `Unverified` for a
+        // version newer than anything on the row — every *reported* version
+        // matches it. (A missing version report is a separate case, covered
+        // below: `resolve_in` returns `Unverified` before it even looks at
+        // the table when there's no version to match against at all — same
+        // as `yubikey_without_a_reported_version_is_unverified`.)
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[3, 0, 3, 6][..], &[99][..]] {
+                assert_eq!(
+                    resolve(PivExtension::MoveKey, fp, Some(version), Some(version)),
+                    FeatureGate::Unsupported,
+                    "{variant:?} at {version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_move_key_without_a_reported_version_is_unverified() {
+        // Same "no version to compare against at all" rule every other
+        // extension follows — see `yubikey_without_a_reported_version_is_unverified`.
+        // `Verdict::KnownUnsupportedSince` changes how a *reported* version
+        // resolves, not whether a version is required in the first place.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            assert_eq!(
+                resolve(
+                    PivExtension::MoveKey,
+                    AppletFingerprint::HidCrescendo(variant),
+                    None,
+                    None,
+                ),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    // --- HID Crescendo: DELETE KEY only, `KnownSupported` on C2300/C4000 --
+
+    #[test]
+    fn hid_crescendo_c2300_c4000_delete_key_is_known_supported_regardless_of_version() {
+        // `Verdict::KnownSupported` at the universal `[]` version: a
+        // reported version, present or absent, doesn't change the verdict —
+        // unlike a version-gated row (contrast the YubiKey tests above),
+        // there's nothing to fall below or above. Still needs *some*
+        // reported version to reach the row at all — see
+        // `resolve_in`: `applet_version: None` returns `Unverified` before
+        // even looking at the table (matches
+        // `yubikey_without_a_reported_version_is_unverified`).
+        for variant in [HidCrescendoVariant::C2300, HidCrescendoVariant::C4000] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[3, 0, 3, 6][..], &[99][..]] {
+                assert_eq!(
+                    resolve(PivExtension::DeleteKey, fp, Some(version), Some(version)),
+                    FeatureGate::Supported,
+                    "{variant:?} at {version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_generic_delete_key_carries_no_row_and_stays_unverified() {
+        // Deliberately not extended to `Generic` — see `DELETE_KEY_VERDICTS`'s
+        // HID Crescendo bullet: this is a presence claim tied to C2300/C4000's
+        // own named API references, not the vendor-wide absence pattern that
+        // justifies covering `Generic` on `MOVE_KEY_VERDICTS`'s/
+        // `RESET_VERDICTS`'s HID Crescendo rows.
+        assert_eq!(
+            resolve(
+                PivExtension::DeleteKey,
+                AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+                Some(&[3, 0, 3, 6]),
+                None,
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
     // --- No row for the fingerprint -------------------------------------
 
     #[test]
@@ -1621,10 +2024,12 @@ mod tests {
                 FeatureGate::Unverified
             );
             // A second, real fingerprint that genuinely carries no row in
-            // `KEY_OPS_VERDICTS` at all — unlike `AppletFingerprint::Token2`,
+            // `MOVE_KEY_VERDICTS` at all — unlike `AppletFingerprint::Token2`,
             // whose row's single known-unsupported verdict extends backward to
             // resolve `Unsupported` for these same low versions; see
-            // `token2_older_versions_are_also_unsupported`.
+            // `token2_older_versions_are_also_unsupported`. Also unlike
+            // HID Crescendo, which now does carry a row on this table — see
+            // `hid_crescendo_move_key_is_known_unsupported_since_regardless_of_version`.
             assert_eq!(
                 resolve(
                     PivExtension::MoveKey,
@@ -2463,6 +2868,91 @@ mod tests {
             assert_eq!(
                 resolve(ext, AppletFingerprint::YubiKey, None, None),
                 FeatureGate::Unverified
+            );
+        }
+    }
+
+    // --- GetSlotKeyStatus: falls through to GetMetadata absent its own row ---
+
+    #[test]
+    fn get_slot_key_status_without_its_own_row_mirrors_get_metadata_exactly() {
+        // No `GET_SLOT_KEY_STATUS_VERDICTS` row for YubiKey (across its 5.3
+        // boundary — the version that matters for `GET_METADATA_VERDICTS`'s
+        // own YubiKey row), Token2 (no row in either table), or an
+        // unrecognized fingerprint — every one of these must resolve
+        // identically to `resolve(GetMetadata, ...)`.
+        let cases: &[(AppletFingerprint, Option<&[u8]>)] = &[
+            (AppletFingerprint::YubiKey, None),
+            (AppletFingerprint::YubiKey, Some(&[5, 2])),
+            (AppletFingerprint::YubiKey, Some(&[5, 3])),
+            (AppletFingerprint::YubiKey, Some(&[6, 0])),
+            (AppletFingerprint::Token2, Some(&[5, 112, 0])),
+            (AppletFingerprint::Generic, None),
+            (AppletFingerprint::Generic, Some(&[1, 0])),
+        ];
+        for &(fp, version) in cases {
+            assert_eq!(
+                resolve(PivExtension::GetSlotKeyStatus, fp, version, version),
+                resolve(PivExtension::GetMetadata, fp, version, version),
+                "{fp:?} at {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_get_slot_key_status_is_known_supported_regardless_of_version() {
+        // Unlike every fingerprint in the fallback test above, HID Crescendo
+        // has its own row here — `Verdict::KnownSupported` at the universal
+        // `[]` version — resolved directly, never falling through to
+        // `GetMetadata` (which is `KnownUnsupportedSince` for these same
+        // three fingerprints; see `GET_METADATA_VERDICTS`'s doc). The two
+        // extensions must therefore resolve *differently* here, the opposite
+        // of the fallback test above.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[3, 0, 3, 6][..], &[99][..]] {
+                assert_eq!(
+                    resolve(
+                        PivExtension::GetSlotKeyStatus,
+                        fp,
+                        Some(version),
+                        Some(version)
+                    ),
+                    FeatureGate::Supported,
+                    "{variant:?} at {version:?}"
+                );
+            }
+            assert_eq!(
+                resolve(PivExtension::GetSlotKeyStatus, fp, None, None),
+                FeatureGate::Unverified,
+                "{variant:?} with no reported version"
+            );
+        }
+        // And explicitly not delegating to `GetMetadata`: C2300/C4000 have
+        // their own `KnownUnsupportedSince` row there (see
+        // `GET_METADATA_VERDICTS`'s doc), while `Generic` has no row at all
+        // on that table (deliberately not extended the way `RESET_VERDICTS`'s
+        // rows are — see that table's own doc) and so resolves `Unverified`
+        // — neither matches `GetSlotKeyStatus`'s `Supported` for any of the
+        // three, but for two different reasons.
+        for (variant, get_metadata_verdict) in [
+            (HidCrescendoVariant::C2300, FeatureGate::Unsupported),
+            (HidCrescendoVariant::C4000, FeatureGate::Unsupported),
+            (HidCrescendoVariant::Generic, FeatureGate::Unverified),
+        ] {
+            assert_eq!(
+                resolve(
+                    PivExtension::GetMetadata,
+                    AppletFingerprint::HidCrescendo(variant),
+                    Some(&[3, 0, 3, 6]),
+                    Some(&[3, 0, 3, 6]),
+                ),
+                get_metadata_verdict,
+                "{variant:?}"
             );
         }
     }

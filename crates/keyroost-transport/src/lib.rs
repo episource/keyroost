@@ -212,6 +212,22 @@ pub enum TransportError {
     },
     /// A certificate import the card refused for lack of memory (`SW 6A84`).
     PivCardFull { slot: keyroost_piv::Slot },
+    /// `PivSession::delete_key` on a HID Crescendo fingerprint needs the
+    /// slot's current algorithm to build HID's own INJECT PKI KEY delete
+    /// sequence (see [`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`]/
+    /// [`hid_crescendo_c4000_delete_key`](keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key)),
+    /// but this session's GET PIV PROPERTIES read never named an algorithm
+    /// for `.0` — either the slot holds no key at all, or the read itself
+    /// failed.
+    PivDeleteKeyAlgorithmUnknown(keyroost_piv::Slot),
+    /// `PivSession::delete_key` on [`keyroost_piv::fingerprint::HidCrescendoVariant::Generic`]
+    /// tried both the C4000 and the C2300 INJECT PKI KEY delete sequence (in
+    /// that order — see [`PivSession::delete_key`]'s doc) and both were
+    /// refused. Carries the C2300 attempt's error, the last one tried — the
+    /// C4000 attempt's is dropped, same as `PivSession::factory_reset`'s
+    /// "wrong guess, not necessarily a real failure" unverified-gate
+    /// fallbacks elsewhere do.
+    PivDeleteKeyHidCrescendoGenericFailed(Box<TransportError>),
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
@@ -232,6 +248,27 @@ pub enum TransportError {
     /// The requested OpenPGP key algorithm cannot live in the requested slot
     /// (Ed25519 only signs; X25519 only agrees keys).
     OpenPgpSlotMismatch(keyroost_openpgp::SlotMismatch),
+    /// `PivSession::import_certificate` refused: this session already knows
+    /// `.0`'s current public key (GET METADATA, or this session's
+    /// generate/`remember_pubkey` cache — see `PivSession::slot_key`), and
+    /// the certificate about to be imported carries a different one. Only
+    /// raised when both sides are actually knowable — see
+    /// `PivSession::import_certificate`'s doc for why an unknowable slot key
+    /// or an unparsable certificate key each fall through to "allow" instead.
+    PivImportCertificateKeyMismatch(keyroost_piv::Slot),
+    /// `PivSession::import_certificate`'s weaker, secondary refusal: the full
+    /// key comparison above couldn't run at all (no GET METADATA/session
+    /// cache for the slot), but `PivExtension::GetSlotKeyStatus` resolves
+    /// `Supported` for this fingerprint, so its own live, device-reported
+    /// channel could still name `slot`'s algorithm (`slot_algorithm`) — and
+    /// it disagrees with the certificate's (`certificate_algorithm`), e.g. an
+    /// RSA slot receiving an ECC certificate. The exact key bytes were never
+    /// compared, only the algorithm.
+    PivImportCertificateAlgorithmMismatch {
+        slot: keyroost_piv::Slot,
+        slot_algorithm: keyroost_piv::KeyAlg,
+        certificate_algorithm: keyroost_piv::KeyAlg,
+    },
     /// An RSA-only operation (RSA key import) found the slot already holds an
     /// ECC key instead. `slot` is the CLI's `--slot` value (`sign` / `decrypt`
     /// / `auth`); `label` is the ECC algorithm's display label.
@@ -442,6 +479,18 @@ impl fmt::Display for TransportError {
                 "the card has no room left to store a certificate in {}",
                 slot.label()
             ),
+            TransportError::PivDeleteKeyAlgorithmUnknown(slot) => write!(
+                f,
+                "cannot delete slot {}'s key: this device's GET PIV PROPERTIES read \
+                 never named an algorithm for it (nothing loaded, or the read failed), \
+                 and that's needed to build the delete command",
+                slot.label()
+            ),
+            TransportError::PivDeleteKeyHidCrescendoGenericFailed(inner) => write!(
+                f,
+                "delete key failed: tried both HID Crescendo delete sequences \
+                 (C4000, then C2300) and neither worked ({inner})"
+            ),
             TransportError::HostRngFailed => {
                 write!(f, "the host OS random-number source failed")
             }
@@ -462,6 +511,28 @@ impl fmt::Display for TransportError {
                 "the {slot} slot holds an ECC key ({label}); RSA import needs an RSA \
                  slot — run `openpgp generate-key --slot {slot} --algorithm rsa2048` first"
             ),
+            TransportError::PivImportCertificateKeyMismatch(slot) => write!(
+                f,
+                "certificate not imported: its public key does not match the key \
+                 already in slot {} — either import the matching certificate, or \
+                 start over by generating a fresh CSR or self-signed certificate for \
+                 the slot's current key.",
+                slot.label()
+            ),
+            TransportError::PivImportCertificateAlgorithmMismatch {
+                slot,
+                slot_algorithm,
+                certificate_algorithm,
+            } => write!(
+                f,
+                "certificate not imported: slot {} currently holds a {} key, but the \
+                 certificate's key is {} — either import the matching certificate, or \
+                 start over by generating a fresh CSR or self-signed certificate for \
+                 the slot's current key.",
+                slot.label(),
+                slot_algorithm.label(),
+                certificate_algorithm.label()
+            ),
         }
     }
 }
@@ -477,7 +548,8 @@ impl std::error::Error for TransportError {
             TransportError::PivParse(e) => Some(e),
             TransportError::PivResetUnverifiedFailed(e)
             | TransportError::PivResetGlobalFailed(e)
-            | TransportError::PivResetManagementAuthFailed(e) => Some(e.as_ref()),
+            | TransportError::PivResetManagementAuthFailed(e)
+            | TransportError::PivDeleteKeyHidCrescendoGenericFailed(e) => Some(e.as_ref()),
             TransportError::X509(e) => Some(e),
             _ => None,
         }
