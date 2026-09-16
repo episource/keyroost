@@ -155,6 +155,30 @@ pub enum PivExtension {
     /// Resolved independently of [`Self::Reset`]: a device can support
     /// either, both, or neither.
     ResetGlobal,
+    /// Setting the PIV PIN's and PUK's retry counters. The only mechanism
+    /// keyroost implements today is Yubico SET PIN RETRIES (`INS 0xFA`,
+    /// `keyroost_piv::set_pin_retries`) — one APDU that sets both counters
+    /// together and resets both the PIN and the PUK to their factory
+    /// defaults in the process, with no way to change one counter without
+    /// the other, so unlike [`Self::MoveKey`]/[`Self::DeleteKey`] (two
+    /// genuinely independent operations that just happen to share a YubiKey
+    /// known-support row) this is modeled as a single extension covering
+    /// both counters, not two separate PIN/PUK gates. This extension names
+    /// the *capability*, though, not that one specific wire mechanism: a
+    /// vendor can reach the same result its own proprietary way — HID
+    /// Crescendo's SDK exposes an `UpdatePINProperties` method that in
+    /// principle covers this ground (see [`SET_PIN_PUK_RETRIES_VERDICTS`]'s
+    /// C4000 bullet) — the same shape [`Self::PinManagementAuth`] already
+    /// uses for a capability two vendors reach by genuinely different
+    /// mechanisms (direct PIN unlock on HID Crescendo, the indirect
+    /// PIN-protected-management-key scheme on YubiKey) under one gate. A
+    /// fingerprint with a confirmed alternative mechanism would resolve
+    /// [`FeatureGate::Supported`] here too, once keyroost has an APDU-level
+    /// implementation of it to run. Until then, every non-YubiKey verdict on
+    /// this extension reflects keyroost only having the Yubico extension
+    /// implemented and probed for — not a claim that no other device could
+    /// ever support the capability.
+    SetPinPukRetries,
 }
 
 impl PivExtension {
@@ -199,6 +223,7 @@ impl PivExtension {
             PivExtension::PinManagementAuth => PIN_MANAGEMENT_AUTH_VERDICTS,
             PivExtension::Reset => RESET_VERDICTS,
             PivExtension::ResetGlobal => RESET_GLOBAL_VERDICTS,
+            PivExtension::SetPinPukRetries => SET_PIN_PUK_RETRIES_VERDICTS,
         }
     }
 
@@ -218,7 +243,8 @@ impl PivExtension {
             | PivExtension::Attest
             | PivExtension::PinManagementAuth
             | PivExtension::Reset
-            | PivExtension::ResetGlobal => &[],
+            | PivExtension::ResetGlobal
+            | PivExtension::SetPinPukRetries => &[],
         }
     }
 
@@ -257,6 +283,10 @@ impl PivExtension {
             PivExtension::ResetGlobal => {
                 "A device-wide reset that takes PIV with it needs a compatible third-party \
                  device (e.g. HID Crescendo)."
+            }
+            PivExtension::SetPinPukRetries => {
+                "Setting the PIN/PUK retry counts needs a YubiKey or a compatible third-party \
+                 device."
             }
         }
     }
@@ -1068,6 +1098,68 @@ const RESET_GLOBAL_VERDICTS: &[FingerprintVerdicts] = &[
     },
 ];
 
+/// [`PivExtension::SetPinPukRetries`]'s applet-axis known-support table:
+///
+/// * YubiKey — SET PIN RETRIES has been supported by every YubiKey PIV
+///   implementation
+///   (<https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html#set-pin-retries>:
+///   "All YubiKeys with the PIV application."), so this row is a single
+///   [`Verdict::KnownSupported`] at the universal `[]` version — the same
+///   shape [`RESET_VERDICTS`]'s YubiKey row uses for `INS 0xFB` — with no
+///   known-unsupported floor to gate below it: unlike [`MOVE_KEY_VERDICTS`]'s
+///   YubiKey row, this didn't arrive in a specific later firmware.
+/// * HID Crescendo C2300/C4000/Generic — [`Verdict::KnownUnsupportedSince`]
+///   at the universal `[]` version, on the same standing-pattern reasoning as
+///   [`RESET_VERDICTS`]'s/[`GET_METADATA_VERDICTS`]'s HID Crescendo rows:
+///   this family has never attempted to mimic a Yubico extension APDU,
+///   building its own proprietary alternatives instead. C4000's SDK
+///   specifically does document a method that in principle covers this
+///   ground — `UpdatePINProperties`
+///   (<https://docs.hidglobal.com/hid-crescendo-sdk-v2.1/API%20references/html/classCrescendoDLL_1_1SDKCore.html#a0d787ce0adb6ddf90f14772485af9e3e>)
+///   — but its APDU-level wire format is undocumented, so there is no
+///   keyroost implementation to gate on: this row blocks C4000 for that
+///   reason (no implementation), not because HID has no mechanism for it at
+///   all. `Generic` is included alongside the two named models for the same
+///   vendor-wide-pattern reasoning [`RESET_VERDICTS`]'s HID Crescendo rows
+///   use.
+const SET_PIN_PUK_RETRIES_VERDICTS: &[FingerprintVerdicts] = &[
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::YubiKey,
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        // HID doesn't implement Yubico's SET PIN RETRIES APDU — like the
+        // rest of this family, it ships its own proprietary mechanisms
+        // instead of mimicking Yubico's. C4000's SDK docs a method that in
+        // principle covers the same ground (`UpdatePINProperties`), but its
+        // APDU-level wire format is undocumented, so there is no keyroost
+        // implementation to gate on yet — see this table's doc comment's
+        // C4000 bullet.
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    FingerprintVerdicts {
+        fingerprint: AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+];
+
 /// One fingerprint's row in an extension's known-support table.
 struct FingerprintVerdicts {
     fingerprint: AppletFingerprint,
@@ -1695,6 +1787,7 @@ mod tests {
             PivExtension::PinManagementAuth.requirement(),
             PivExtension::Reset.requirement(),
             PivExtension::ResetGlobal.requirement(),
+            PivExtension::SetPinPukRetries.requirement(),
         ];
         for (i, a) in reqs.iter().enumerate() {
             for b in &reqs[i + 1..] {
@@ -3197,5 +3290,84 @@ mod tests {
                 "{fp:?} with no reported version"
             );
         }
+    }
+
+    // --- PIV SET_PIN_PUK_RETRIES: YubiKey always, HID Crescendo never ----
+
+    #[test]
+    fn yubikey_set_pin_puk_retries_always_supported() {
+        // No known-unsupported floor, same shape as `RESET_VERDICTS`'s YubiKey
+        // row — SET PIN RETRIES didn't arrive in a specific later firmware,
+        // unlike MOVE KEY/DELETE KEY's YubiKey row.
+        for version in [&[0][..], &[1, 0][..], &[9, 9, 9][..]] {
+            assert_eq!(
+                resolve(
+                    PivExtension::SetPinPukRetries,
+                    AppletFingerprint::YubiKey,
+                    Some(version),
+                    None
+                ),
+                FeatureGate::Supported
+            );
+        }
+        assert_eq!(
+            resolve(
+                PivExtension::SetPinPukRetries,
+                AppletFingerprint::YubiKey,
+                None,
+                None
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn hid_crescendo_set_pin_puk_retries_unsupported_at_any_version_including_generic() {
+        // Same `KnownUnsupportedSince` shape as `RESET_VERDICTS`'s HID
+        // Crescendo rows, and likewise covers `Generic` alongside the two
+        // named models — see `SET_PIN_PUK_RETRIES_VERDICTS`'s doc. C4000 in
+        // particular is blocked for lack of a documented APDU, not lack of
+        // any HID mechanism — see that row's comment.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for version in [&[0][..], &[3, 0, 3, 6][..], &[9, 9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::SetPinPukRetries, fp, Some(version), None),
+                    FeatureGate::Unsupported,
+                    "{fp:?} at {version:?}"
+                );
+            }
+            assert_eq!(
+                resolve(PivExtension::SetPinPukRetries, fp, None, None),
+                FeatureGate::Unverified,
+                "{fp:?} with no reported version"
+            );
+        }
+    }
+
+    #[test]
+    fn set_pin_puk_retries_data_does_not_leak_to_other_fingerprints() {
+        assert_eq!(
+            resolve(
+                PivExtension::SetPinPukRetries,
+                AppletFingerprint::Generic,
+                None,
+                None
+            ),
+            FeatureGate::Unverified
+        );
+        assert_eq!(
+            resolve(
+                PivExtension::SetPinPukRetries,
+                AppletFingerprint::Token2,
+                Some(&[5, 112, 0]),
+                None,
+            ),
+            FeatureGate::Unverified
+        );
     }
 }

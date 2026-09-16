@@ -15161,6 +15161,58 @@ impl App {
 
         let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
+        // Yubico SET PIN RETRIES (`INS 0xFA`) sets the PIN's and PUK's retry
+        // counters together in one APDU — there is no way to change one
+        // without the other — so it's gated by a single extension rather
+        // than a pair the way Move/Delete key are. Computed up front,
+        // before the "Retry counts" row below (the per-slot gates further
+        // down compute this same fingerprint/version triple again, for
+        // their own slot-scoped purposes).
+        let (retries_piv_fp, retries_piv_ver, retries_piv_fw_ver) =
+            self.piv.status.as_ref().map_or(
+                (
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
+            );
+        let set_retries_gate = keyroost_piv::compat::resolve(
+            PivExtension::SetPinPukRetries,
+            retries_piv_fp,
+            retries_piv_ver,
+            retries_piv_fw_ver,
+        );
+        let set_retries_unverified_hint = format!(
+            "{} {}",
+            PivExtension::SetPinPukRetries.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let set_retries_blocked_hint = format!(
+            "{} {}",
+            PivExtension::SetPinPukRetries.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        // Unsupported doesn't just dim the DragValues below -- with no way
+        // to submit them, a count the user dragged in before this device
+        // turned out incompatible (or left over from a previous, compatible
+        // device, since this pane's state doesn't reset on every status
+        // refresh) would otherwise sit there stale and misleading. Reset
+        // both back to the same factory-default count `PivState::default()`
+        // seeds them with, every frame this gate resolves `Unsupported` --
+        // cheap and idempotent, and the fields are non-interactive anyway
+        // while it holds.
+        if matches!(set_retries_gate, FeatureGate::Unsupported) {
+            self.piv.retries_pin = 3;
+            self.piv.retries_puk = 3;
+        }
+
         // --- PIV smart card status card (full-width, FIDO2 "PIN & sign-in"
         // shape): title + help left, Refresh right, applet/serial/retries body.
         theme::card_frame(p).show(ui, |ui| {
@@ -15277,7 +15329,15 @@ impl App {
             });
 
             // Retry counts: label + help left, the tries DragValues and the
-            // apply button right-aligned.
+            // apply button right-aligned. SET PIN RETRIES (Yubico `INS
+            // 0xFA`) sets both counters in one APDU, so it's gated by the
+            // single `set_retries_gate` above rather than a pair, unlike
+            // Move/Delete key: `Unsupported` dims both DragValues and the
+            // button together (there's nothing partial to offer) and resets
+            // both counts to their factory default above, rather than
+            // leaving a stale drag-in value behind a disabled field; and
+            // `Unverified` only adds the same warning marker Move key uses,
+            // leaving everything else live.
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(
@@ -15287,20 +15347,58 @@ impl App {
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
+                if matches!(set_retries_gate, FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(set_retries_unverified_hint.as_str());
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}").clicked()
+                    if matches!(set_retries_gate, FeatureGate::Unsupported) {
+                        theme::button_disabled(ui, p, "Set retry counts\u{2026}")
+                            .on_hover_text(set_retries_blocked_hint.as_str());
+                    } else if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}")
+                        .clicked()
                     {
                         open_set_retries = true;
                     }
                     ui.add_space(8.0);
-                    ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
+                    let retries_unsupported = matches!(set_retries_gate, FeatureGate::Unsupported);
+                    // A disabled `DragValue` still renders whatever number
+                    // `self.piv.retries_{pin,puk}` currently holds — the
+                    // factory-default `3` these two reset to just above, on
+                    // a device that plain doesn't support setting retries at
+                    // all. Left alone, that reads as a real reported count
+                    // rather than the meaningless placeholder it is. Blank
+                    // it via a custom formatter rather than the field's
+                    // value: the value itself still has to stay a real `u8`
+                    // (`DragValue` requires `Numeric`, and the same field
+                    // backs the live, editable count on any device that
+                    // *does* support this), so emptiness lives at the
+                    // display layer, not the data.
+                    let blank_when_unsupported = move |n: f64, _: std::ops::RangeInclusive<usize>| {
+                        if retries_unsupported {
+                            String::new()
+                        } else {
+                            format!("{}", n as u8)
+                        }
+                    };
+                    ui.add_enabled(
+                        !retries_unsupported,
+                        egui::DragValue::new(&mut self.piv.retries_puk)
+                            .range(1..=15u8)
+                            .custom_formatter(blank_when_unsupported),
+                    );
                     ui.label(
                         egui::RichText::new("PUK tries")
                             .font(theme::f_reg(13.0))
                             .color(p.txt2),
                     );
                     ui.add_space(8.0);
-                    ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
+                    ui.add_enabled(
+                        !retries_unsupported,
+                        egui::DragValue::new(&mut self.piv.retries_pin)
+                            .range(1..=15u8)
+                            .custom_formatter(blank_when_unsupported),
+                    );
                     ui.label(
                         egui::RichText::new("PIN tries")
                             .font(theme::f_reg(13.0))
