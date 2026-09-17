@@ -486,6 +486,45 @@ pub fn build_verify_pin_data(
     Ok(out)
 }
 
+/// Build a `VERIFY_OTP_PIN` data field that also carries the optional
+/// `EncConfig` byte, used to enable (`0x01`) or disable (`0x00`) fingerprint
+/// protection for OTP while verifying the PIN (manual V1.3 §1.14 / §1.20):
+///
+/// ```text
+/// data      = IV || PinHashEnc2 || EncConfig
+/// EncConfig = AES-256-CBC(SessionEncKey, IV, PKCS#5pad16(FpEnable))   # same IV
+/// ```
+///
+/// The verify portion is identical to [`build_verify_pin_data`]; `EncConfig`
+/// reuses the same outer IV, as the reference firmware expects.
+pub fn build_verify_pin_data_with_config(
+    keys: &SessionKeys,
+    pin: &[u8],
+    rand: &[u8],
+    fp_enable: bool,
+) -> Result<Vec<u8>, EncryptError> {
+    let pin_hash = Zeroizing::new(sha256(pin));
+    let iv2_full = sha256(rand);
+    let mut iv2 = [0u8; 16];
+    iv2.copy_from_slice(&iv2_full[..16]);
+    let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand)?;
+
+    let iv = random_iv();
+    let outer = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &inner)?;
+
+    // EncConfig: PKCS#5-pad the single FpEnable byte to one block, encrypt under
+    // the session key with the SAME IV as the verify outer layer.
+    let cfg_byte = if fp_enable { 0x01u8 } else { 0x00u8 };
+    let cfg_padded = pkcs7_pad16(&[cfg_byte]);
+    let enc_config = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &cfg_padded)?;
+
+    let mut out = Vec::with_capacity(16 + outer.len() + enc_config.len());
+    out.extend_from_slice(&iv);
+    out.extend_from_slice(&outer);
+    out.extend_from_slice(&enc_config);
+    Ok(out)
+}
+
 /// Build the `CHANGE_OTP_PIN` data field, matching the Token2 reference client:
 ///
 /// ```text
@@ -871,5 +910,40 @@ mod pin_crypto_tests {
         );
         // The unpadded form used for Rand answers empty rather than panicking.
         assert!(session_decrypt_raw(&keys.enc, &[0u8; 16], &[0u8; 17]).is_empty());
+    }
+
+    #[test]
+    fn verify_pin_with_config_carries_the_fp_toggle() {
+        let keys = fixed_keys();
+        let rand = [0xA5u8; 16]; // the device challenge, one AES block
+        let mut verify_halves = Vec::new();
+
+        for (enable, want_byte) in [(true, 0x01u8), (false, 0x00u8)] {
+            let out = build_verify_pin_data_with_config(&keys, b"246813", &rand, enable).unwrap();
+            // IV(16) || verify outer(16) || EncConfig(16). The outer IV is
+            // random per call, so the ciphertext is not asserted directly —
+            // each block is decrypted under the IV the output carries.
+            assert_eq!(out.len(), 16 + 16 + 16, "IV || PinHashEnc2 || EncConfig");
+            let iv: [u8; 16] = out[..16].try_into().unwrap();
+
+            // EncConfig decrypts under the session key + the same IV as the
+            // verify block (which the reference firmware requires) to the
+            // FpEnable byte, PKCS#7-padded to a block.
+            let cfg = dec_nopad(&keys.enc, &iv, &out[32..48]);
+            let mut want = vec![want_byte];
+            want.extend_from_slice(&[0x0F; 15]); // PKCS#7 pad of 1 byte to 16
+            assert_eq!(
+                cfg, want,
+                "EncConfig must carry FpEnable = {want_byte:#04x}"
+            );
+
+            // Keep the decrypted verify half to prove it is independent of the
+            // toggle.
+            verify_halves.push(dec_nopad(&keys.enc, &iv, &out[16..32]));
+        }
+
+        // The PIN-verify half (PinHashEnc2) is identical whether fingerprint
+        // protection is being enabled or disabled — only EncConfig changes.
+        assert_eq!(verify_halves[0], verify_halves[1]);
     }
 }

@@ -336,6 +336,27 @@ pub fn lock_otp_pin() -> Vec<u8> {
     v
 }
 
+/// Build the fingerprint-verify request: `80 C5 05 06 01 01` (manual V1.3 §1.20).
+/// It shares the `VERIFY_OTP_PIN` header with a 1-byte `0x01` body (vs `0x00`
+/// for lock). The device replies `0x9100` ("capture in progress") and the host
+/// must then POLL with [`fingerprint_poll`] until it returns `0x9000` (the touch
+/// succeeded) or an error. `FpEnable` must be set first (see the callers of
+/// `build_verify_pin_data_with_config`).
+pub fn verify_fingerprint() -> Vec<u8> {
+    let mut v = cmd::VERIFY_OTP_PIN.to_vec();
+    v.push(0x01); // short Lc = 1
+    v.push(0x01); // body: fingerprint verify
+    v
+}
+
+/// Build the fingerprint capture-poll request: `80 11 00 00 00`. Sent
+/// repeatedly after [`verify_fingerprint`] while the device returns `0x9100`;
+/// a `0x9000` reply means the fingerprint was captured and the read window is
+/// open (manual V1.3 §1.20 sample script).
+pub fn fingerprint_poll() -> Vec<u8> {
+    vec![0x80, 0x11, 0x00, 0x00, 0x00]
+}
+
 /// Build the `READ_AGREEMENT_PUBKEY` request. `host_pub_xy` is the host's
 /// ephemeral P-256 public key as raw `X || Y` (64 bytes, no leading `0x04`).
 pub fn read_agreement_pubkey(host_pub_xy: &[u8]) -> Vec<u8> {
@@ -349,6 +370,10 @@ pub struct PinFlag {
     pub retries_left: u8,
     pub pin_len: u8,
     pub max_retries: u8,
+    /// `FpEnable` byte (offset 4): the device supports/permits fingerprint
+    /// protection for OTP. Fingerprint-gated OTP can only be enabled when this
+    /// is set. (Manual V1.3 §1.12.)
+    pub fp_enable: bool,
     /// Present only on the `Lc = 0x29` read: the verify challenge
     /// (`IV(16) || EncRand(16)`), still encrypted under the session key.
     pub challenge: Option<([u8; 16], [u8; 16])>,
@@ -381,6 +406,9 @@ impl PinFlag {
             retries_left: data[1],
             pin_len: data[2],
             max_retries: data[3],
+            // FpEnable is byte 4; only present on the 9-/41-byte reads, not the
+            // 4-byte base read.
+            fp_enable: data.get(4).map(|&b| b != 0).unwrap_or(false),
             challenge,
         })
     }
@@ -873,6 +901,38 @@ mod tests {
         // lower-case + stripped padding should still decode (spec §9 forgiving rule).
         let seed = decode_base32_seed("jbswy3dp").unwrap();
         assert_eq!(&seed[..], b"Hello");
+    }
+
+    #[test]
+    fn verify_fingerprint_apdu_form() {
+        // VERIFY_OTP_PIN header (80 C5 05 06) + short Lc=1 + body 0x01
+        // ("fingerprint verify"), the sibling of lock_otp_pin's 0x00 body
+        // (manual V1.3 §1.20).
+        assert_eq!(
+            verify_fingerprint(),
+            vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x01]
+        );
+        // One byte apart from the lock form, which carries 0x00.
+        assert_eq!(lock_otp_pin(), vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn fingerprint_poll_apdu_form() {
+        assert_eq!(fingerprint_poll(), vec![0x80, 0x11, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn pin_flag_reads_fp_enable_byte() {
+        // A 9-byte flag read: [is_set, retries, pin_len, max_retries, FpEnable, ...].
+        // FpEnable at offset 4 nonzero -> fingerprint protection on.
+        let on = PinFlag::parse(&[0x01, 0x03, 0x06, 0x03, 0x01, 0, 0, 0, 0]).unwrap();
+        assert!(on.fp_enable);
+        let off = PinFlag::parse(&[0x01, 0x03, 0x06, 0x03, 0x00, 0, 0, 0, 0]).unwrap();
+        assert!(!off.fp_enable);
+        // The 4-byte base read has no FpEnable byte: absent reads as false,
+        // never a panic on the missing offset.
+        let base = PinFlag::parse(&[0x01, 0x03, 0x06, 0x03]).unwrap();
+        assert!(!base.fp_enable);
     }
 }
 
