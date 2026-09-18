@@ -904,6 +904,16 @@ struct FactoryResetConfirmState {
     /// the checkbox and shows the hex value in a tooltip only when this is
     /// `Some`.
     default_mgmt_key: Option<&'static [u8]>,
+    /// [`keyroost_piv::compat::PivQuirk::ResetLongRunning`], from the same
+    /// fingerprint job that resolved `piv_preview`/`needs_reset_mgmt_auth`/
+    /// `default_mgmt_key` — `false` whenever that job never ran or never
+    /// completed (`NotOffered`/`CheckFailed`), same as the other two fields
+    /// default to their "nothing learned" value in those cases.
+    /// `factory_reset_confirm_summary` appends
+    /// [`keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT`] to the
+    /// PIV note when this is set, same wording the PIV pane's "Reset applet"
+    /// card and `keyroostctl piv reset` already show.
+    reset_long_running: bool,
 }
 
 /// How the factory-reset confirm dialog's reset management-auth credential
@@ -977,6 +987,7 @@ fn factory_reset_confirm_summary(
     plan: &[keyroost_resolve::ResetStep],
     piv_preview: FactoryResetPivPreview,
     needs_management_auth: bool,
+    reset_long_running: bool,
 ) -> String {
     use keyroost_resolve::ResetStep;
     use keyroost_transport::{FactoryResetPlan, PivResetPreview};
@@ -1095,6 +1106,13 @@ fn factory_reset_confirm_summary(
         // both, rather than duplicating it into each arm above.
         if needs_management_auth {
             msg.push_str("\n\nResetting this device requires management auth, entered below.");
+        }
+        // `PivQuirk::ResetLongRunning` — same wording the PIV pane's "Reset
+        // applet" card and `keyroostctl piv reset` already show, appended
+        // here too so it isn't missed before the whole-device wipe starts.
+        if reset_long_running {
+            msg.push_str("\n\n");
+            msg.push_str(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT);
         }
     }
     if plan.contains(&ResetStep::Fido) {
@@ -2630,6 +2648,13 @@ struct App {
     /// this error belongs to the confirm dialog, not the PIV pane, and must
     /// not leak into (or be clobbered by) that pane's own error state.
     factory_reset_confirm_error: Option<String>,
+    /// Typed-`reset` text for the factory-reset confirm dialog's guard —
+    /// mirrors `PivState::confirm_reset`/`typed_reset_modal`'s gate so both
+    /// destructive-reset dialogs demand the same "type reset to confirm"
+    /// ceremony before "Yes, wipe this key" arms. Cleared on arm, cancel, and
+    /// successful submit alongside `factory_reset_confirm`/
+    /// `factory_reset_confirm_error`.
+    factory_reset_confirm_typed: String,
     /// Mode for the factory-reset confirm dialog's reset management-auth
     /// credential prompt (shown only when
     /// `FactoryResetConfirmState::needs_reset_mgmt_auth` is true). Lives on `App`,
@@ -5598,6 +5623,7 @@ impl App {
         let Some(dev) = self.selected_device().cloned() else {
             return;
         };
+        self.factory_reset_confirm_typed.clear();
         let plan = keyroost_resolve::factory_reset_plan(dev.caps);
         if !plan.contains(&keyroost_resolve::ResetStep::Piv) {
             self.factory_reset_confirm = Some(FactoryResetConfirmState {
@@ -5605,6 +5631,7 @@ impl App {
                 piv_preview: FactoryResetPivPreview::NotOffered,
                 needs_reset_mgmt_auth: false,
                 default_mgmt_key: None,
+                reset_long_running: false,
             });
             return;
         }
@@ -5618,26 +5645,29 @@ impl App {
                 piv_preview: FactoryResetPivPreview::CheckFailed,
                 needs_reset_mgmt_auth: false,
                 default_mgmt_key: None,
+                reset_long_running: false,
             });
             return;
         };
         let for_device = dev.id;
         self.spawn_job("Checking PIV reset support\u{2026}", move || {
-            let (preview, needs_reset_mgmt_auth, default_mgmt_key) =
+            let (preview, needs_reset_mgmt_auth, default_mgmt_key, reset_long_running) =
                 match keyroost_transport::PivSession::open(&reader) {
                     Ok(mut s) => {
-                        // One fingerprint serves all three checks — see
+                        // One fingerprint serves all four checks — see
                         // `PivSession::preview_factory_reset`/
-                        // `global_reset_available`/`default_management_key`'s
-                        // docs.
+                        // `global_reset_available`/`default_management_key`/
+                        // `quirks`'s docs.
                         let preview = FactoryResetPivPreview::Resolved(s.preview_factory_reset());
                         (
                             preview,
                             s.global_reset_available(),
                             s.default_management_key(),
+                            s.quirks()
+                                .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning),
                         )
                     }
-                    Err(_) => (FactoryResetPivPreview::CheckFailed, false, None),
+                    Err(_) => (FactoryResetPivPreview::CheckFailed, false, None, false),
                 };
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(Some(&for_device), app.selected_device.as_ref()) {
@@ -5648,6 +5678,7 @@ impl App {
                     piv_preview: preview,
                     needs_reset_mgmt_auth,
                     default_mgmt_key,
+                    reset_long_running,
                 });
             })
         });
@@ -5663,6 +5694,7 @@ impl App {
             piv_preview,
             needs_reset_mgmt_auth,
             default_mgmt_key,
+            reset_long_running,
         }) = self.factory_reset_confirm.clone()
         else {
             return;
@@ -5670,6 +5702,7 @@ impl App {
         if !completion_still_valid(Some(&for_device), self.selected_device.as_ref()) {
             self.factory_reset_confirm = None;
             self.factory_reset_confirm_error = None;
+            self.factory_reset_confirm_typed.clear();
             return;
         }
         let summary = match self.selected_device() {
@@ -5684,11 +5717,13 @@ impl App {
                     &plan,
                     piv_preview,
                     needs_reset_mgmt_auth,
+                    reset_long_running,
                 )
             }
             None => {
                 self.factory_reset_confirm = None;
                 self.factory_reset_confirm_error = None;
+                self.factory_reset_confirm_typed.clear();
                 return;
             }
         };
@@ -5709,9 +5744,20 @@ impl App {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
-                        decision = Some(true);
-                    }
+                    ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.factory_reset_confirm_typed)
+                            .desired_width(120.0),
+                    );
+                });
+                ui.add_space(8.0);
+                let armed = self.factory_reset_confirm_typed.trim() == "reset";
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(armed, |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
+                            decision = Some(true);
+                        }
+                    });
                     if ui.button("Cancel").clicked() {
                         decision = Some(false);
                     }
@@ -5722,6 +5768,7 @@ impl App {
                 if self.run_factory_reset_gui() {
                     self.factory_reset_confirm = None;
                     self.factory_reset_confirm_error = None;
+                    self.factory_reset_confirm_typed.clear();
                 }
                 // else: either a job is already in flight, or the entered
                 // credential didn't validate (`factory_reset_confirm_error`
@@ -5732,6 +5779,7 @@ impl App {
             Some(false) => {
                 self.factory_reset_confirm = None;
                 self.factory_reset_confirm_error = None;
+                self.factory_reset_confirm_typed.clear();
                 wipe(&mut self.reset_mgmt_auth_input);
             }
             None => {}
@@ -8457,7 +8505,12 @@ impl App {
         self.spawn_job("Resetting PIV applet\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                s.reset()?;
+                // The PIV pane's "Reset applet" card collects no
+                // management-key/PIN credential of its own (unlike the
+                // Overview tab's whole-device factory reset) — nothing to
+                // pass here today; see `force_reset_if_known_supported`'s
+                // doc for why the parameter exists regardless.
+                s.force_reset_if_known_supported(None)?;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
@@ -15630,6 +15683,13 @@ impl App {
             keyroost_piv::compat::resolve(PivExtension::ResetGlobal, piv_fp, piv_ver, piv_fw_ver);
         let show_reset_global_alternative =
             piv_reset_global_alternative_available(reset_gate, reset_global_gate);
+        // Whether this device is known to take unusually long to finish
+        // RESET (`PivQuirk::ResetLongRunning`, e.g. observed over a minute
+        // on ArekinathPivApplet::SwissbitIShield1) — surfaced below as a
+        // standing note on the "Reset applet" card, not just a hover, so it
+        // isn't missed the moment the device looks like it's hung.
+        let reset_long_running = keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver)
+            .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning);
         // Explanations for the non-standard slot operations when the
         // fingerprint known-support table can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
@@ -16232,13 +16292,29 @@ impl App {
                     });
                 });
                 ui.label(
-                    egui::RichText::new(
+                    egui::RichText::new(if matches!(reset_gate, FeatureGate::Supported) {
+                        // Known-supported: `force_reset_if_known_supported`
+                        // burns the PIN/PUK retry counters itself when
+                        // needed, so the precondition below no longer
+                        // applies to what this button actually does.
+                        "Wipes ALL PIV keys, certificates, and PINs."
+                    } else {
                         "Wipes ALL PIV keys, certificates, and PINs. Typically requires both \
-                         the PIN and PUK to already be blocked.",
-                    )
+                         the PIN and PUK to already be blocked."
+                    })
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
+                if reset_long_running {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT,
+                        )
+                        .font(theme::f_reg(12.5))
+                        .color(p.warn),
+                    );
+                }
                 if show_reset_global_alternative {
                     ui.add_space(6.0);
                     // Same click-sense-label style as the Overview cards' own
@@ -17572,6 +17648,7 @@ mod tests {
                 FactoryResetPlan::BurnPinPukThenReset,
             )),
             false,
+            false,
         );
         assert!(msg.contains("SN123") && msg.contains("Token2 PIN+"));
         assert!(msg.contains("OATH") && msg.contains("PIV") && msg.contains("FIDO2"));
@@ -17605,6 +17682,7 @@ mod tests {
                 FactoryResetPlan::NeedsManagementAuth,
             )),
             false,
+            false,
         );
         assert!(
             needs_mgmt_auth.contains("management-key"),
@@ -17630,6 +17708,7 @@ mod tests {
             &plan,
             FactoryResetPivPreview::Resolved(PivResetPreview::Piv(FactoryResetPlan::Unverified)),
             false,
+            false,
         );
         assert!(unverified.contains("unverified"), "{unverified}");
         assert!(unverified.contains("without blocking"), "{unverified}");
@@ -17644,6 +17723,7 @@ mod tests {
             FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
                 FactoryResetPlan::BurnPinPukThenReset,
             )),
+            false,
             false,
         );
         assert!(burn_then_reset.contains("PIN and PUK"), "{burn_then_reset}");
@@ -17664,6 +17744,7 @@ mod tests {
             &plan,
             FactoryResetPivPreview::Resolved(PivResetPreview::Global),
             false,
+            false,
         );
         assert!(!global.contains("PIV:"), "{global}");
 
@@ -17672,6 +17753,7 @@ mod tests {
             "Model",
             &plan,
             FactoryResetPivPreview::CheckFailed,
+            false,
             false,
         );
         assert!(check_failed.contains("couldn't confirm"), "{check_failed}");
@@ -17686,6 +17768,7 @@ mod tests {
             &plan,
             FactoryResetPivPreview::NotOffered,
             false,
+            false,
         );
         assert_eq!(not_offered, check_failed);
 
@@ -17695,6 +17778,7 @@ mod tests {
             "Model",
             &factory_reset_plan(Caps::OATH),
             FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
             false,
         );
         assert!(!no_piv.contains("PIV:"), "{no_piv}");
@@ -17721,6 +17805,7 @@ mod tests {
             &plan,
             FactoryResetPivPreview::Resolved(PivResetPreview::Global),
             false,
+            false,
         );
         assert!(
             global.contains(&format!(
@@ -17745,6 +17830,7 @@ mod tests {
             FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
                 FactoryResetPlan::BurnPinPukThenReset,
             )),
+            false,
             false,
         );
         assert!(piv_only.contains("Wipes: OATH, PIV"), "{piv_only}");
@@ -17773,6 +17859,7 @@ mod tests {
                 &plan,
                 FactoryResetPivPreview::Resolved(preview),
                 false,
+                false,
             );
             assert!(!msg.contains("PIV:"), "{preview:?} {msg}");
         }
@@ -17800,6 +17887,7 @@ mod tests {
                 &plan,
                 FactoryResetPivPreview::Resolved(preview),
                 true,
+                false,
             );
             assert_eq!(
                 with_credential.matches("requires management auth").count(),
@@ -17813,12 +17901,57 @@ mod tests {
                 &plan,
                 FactoryResetPivPreview::Resolved(preview),
                 false,
+                false,
             );
             assert!(
                 !without_credential.contains("requires management auth"),
                 "{preview:?} {without_credential}"
             );
         }
+    }
+
+    /// `PivQuirk::ResetLongRunning` (e.g. ArekinathPivApplet::SwissbitIShield1)
+    /// appends the same hint text the PIV pane's "Reset applet" card and
+    /// `keyroostctl piv reset` already show, gated purely on the boolean --
+    /// independent of which `FactoryResetPivPreview` case is active -- and
+    /// only when the plan actually has a PIV step to warn about.
+    #[test]
+    fn factory_reset_summary_appends_the_long_running_hint_when_set() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        let preview = FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+            FactoryResetPlan::BurnPinPukThenReset,
+        ));
+
+        let warned = factory_reset_confirm_summary("SN", "Model", &plan, preview, false, true);
+        assert!(
+            warned.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
+            "{warned}"
+        );
+
+        let not_warned =
+            factory_reset_confirm_summary("SN", "Model", &plan, preview, false, false);
+        assert!(
+            !not_warned.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
+            "{not_warned}"
+        );
+
+        // A plan without PIV never gets the hint, even if the flag is set --
+        // there's no PIV step for it to attach to.
+        let no_piv_plan = factory_reset_plan(Caps::OATH);
+        let no_piv = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &no_piv_plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+            true,
+        );
+        assert!(
+            !no_piv.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
+            "{no_piv}"
+        );
     }
 
     /// Two "Save certificate…" dialogs can be open at once (the busy guard is
@@ -19864,6 +19997,7 @@ mod tests {
                 default_mgmt_key: Some(
                     &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY,
                 ),
+                reset_long_running: false,
             }),
             ..Default::default()
         };
