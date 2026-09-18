@@ -918,6 +918,11 @@ enum PivCmd {
         pin_stdin: bool,
     },
     /// Change the card-management (9B) key.
+    ///
+    /// Changing the management key needs a YubiKey or a compatible
+    /// third-party device: refused on a device known to be incompatible
+    /// unless `--force`, runs with a warning on an unverified one, silent on a
+    /// known-good one.
     ChangeManagementKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -935,6 +940,9 @@ enum PivCmd {
         /// Require a physical touch for every future management-key auth.
         #[arg(long)]
         touch: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
     /// Generate a new key pair in a slot and print its public key (PEM). Needs
     /// the management key. Overwrites any existing key in the slot.
@@ -6830,6 +6838,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             new_mgmt_key_stdin,
             new_algorithm,
             touch,
+            force,
         } => {
             let old = read_mgmt_key(
                 "old management key",
@@ -6851,11 +6860,19 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mut s = open_piv_authed(reader.as_deref(), debug, &old)?;
+            // Gate on the applet's fingerprint before authenticating — the
+            // fingerprint probe re-SELECTs PIV and would clear the auth.
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            guard_piv_feature(
+                &mut s,
+                keyroost_piv::compat::PivExtension::SetManagementKey,
+                *force,
+            )?;
+            authenticate_piv(&mut s, &old)?;
             // A HID Crescendo unit whose management key isn't a real PIV
             // object runs its own self-contained unlock right before PUT
             // XAUTH KEY (see `set_management_key`'s doc) rather than relying
-            // on `open_piv_authed`'s auth above still being in force —
+            // on `authenticate_piv`'s auth above still being in force —
             // `current` carries the same key again for that path; every
             // other device ignores it.
             s.set_management_key(

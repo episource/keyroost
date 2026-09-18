@@ -164,6 +164,15 @@ pub enum TransportError {
     /// burn-dance path automates. Burning the PIN and PUK anyway would only
     /// leave the card locked with no working RESET behind it.
     PivResetNeedsManagementAuth,
+    /// `PivSession::reset` was refused before it started: this fingerprint
+    /// carries [`keyroost_piv::compat::PivQuirk::ResetFailsIfManagementKeyIsAes`]
+    /// and the card's management key currently reports an AES algorithm
+    /// (`.0`) rather than 3DES. Every known version of this applet's own
+    /// RESET handler unconditionally casts the `0x9B` key object to `DESKey`
+    /// and throws when it's actually an AES key — sending RESET here would
+    /// only get that exception reported back as a non-success status word.
+    /// Change the management key back to 3DES first, then retry.
+    PivResetManagementKeyMustBe3Des(keyroost_piv::MgmtAlg),
     /// `PivSession::factory_reset`'s RESET attempt failed on a card whose
     /// [`keyroost_piv::compat::PivExtension::Reset`] support resolves
     /// [`keyroost_piv::compat::FeatureGate::Unverified`] — it deliberately
@@ -410,6 +419,12 @@ impl fmt::Display for TransportError {
                  Deliberately blocking the PIN and PUK anyway would only leave the \
                  card locked with no working RESET behind it, so keyroost refuses \
                  without a credential in hand."
+            ),
+            TransportError::PivResetManagementKeyMustBe3Des(alg) => write!(
+                f,
+                "this card's RESET is known to fail while the management key is {} — \
+                 change it back to 3DES first, then retry the reset",
+                alg.label()
             ),
             TransportError::PivResetUnverifiedFailed(inner) => {
                 write!(
