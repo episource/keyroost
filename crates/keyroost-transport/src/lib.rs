@@ -146,7 +146,10 @@ pub enum TransportError {
     /// Caught before transmit — the card would silently truncate or pad.
     PivBadPinLength,
     /// PIV reset refused by the card: the PIN and PUK must both be blocked
-    /// before the applet allows a factory reset (`SW 6983`).
+    /// before the applet allows a factory reset. Different fingerprints have
+    /// been observed answering this identical precondition with `SW 6982`,
+    /// `6983`, or `6985` — [`PivSession::reset`] maps all three onto this one
+    /// variant.
     PivResetNotAllowed,
     /// `PivSession::factory_reset` was refused before it started: this
     /// fingerprint's [`keyroost_piv::compat::PivExtension::Reset`] gate

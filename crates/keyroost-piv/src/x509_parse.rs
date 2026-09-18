@@ -428,20 +428,6 @@ const OID_P384: &str = "1.3.132.0.34";
 const OID_ED25519: &str = "1.3.101.112";
 const OID_X25519: &str = "1.3.101.110";
 
-/// Parse the key algorithm out of a certificate's `SubjectPublicKeyInfo`.
-///
-/// This is independent of GET METADATA (the Yubico extension `PivSession`
-/// otherwise reads the algorithm from, available on firmware 5.3+ only): a
-/// certificate is a mandatory PIV data object on any PIV card, so a caller
-/// that already has the cert bytes (e.g. for its Subject DN) can recover the
-/// algorithm from them too, with no extra card round-trip and no firmware- or
-/// vendor-dependent extension involved.
-///
-/// Returns `Ok(None)` — not an error — for a key type this reader doesn't
-/// recognize (an OID/parameter combination outside PIV's `KeyAlg` set, or an
-/// RSA modulus whose bit length doesn't land on one of PIV's four sizes): an
-/// unusual certificate shouldn't stop the caller from displaying whatever
-/// else (e.g. the Subject DN) it already parsed.
 /// The whole DER encoding of a `Certificate`'s `subjectPublicKeyInfo`
 /// `SEQUENCE` (tag, length, and content), by walking `Certificate ::= SEQUENCE
 /// { tbsCertificate, signatureAlgorithm, signature }` into `tbsCertificate`
@@ -471,6 +457,20 @@ fn certificate_spki(cert_der: &[u8]) -> Result<&[u8], X509ParseError> {
     Ok(&rest[..rest.len() - after_spki.len()])
 }
 
+/// Parse the key algorithm out of a certificate's `SubjectPublicKeyInfo`.
+///
+/// This is independent of GET METADATA (the Yubico extension `PivSession`
+/// otherwise reads the algorithm from, available on firmware 5.3+ only): a
+/// certificate is a mandatory PIV data object on any PIV card, so a caller
+/// that already has the cert bytes (e.g. for its Subject DN) can recover the
+/// algorithm from them too, with no extra card round-trip and no firmware- or
+/// vendor-dependent extension involved.
+///
+/// Returns `Ok(None)` — not an error — for a key type this reader doesn't
+/// recognize (an OID/parameter combination outside PIV's `KeyAlg` set, or an
+/// RSA modulus whose bit length doesn't land on one of PIV's four sizes): an
+/// unusual certificate shouldn't stop the caller from displaying whatever
+/// else (e.g. the Subject DN) it already parsed.
 pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
     let spki = certificate_spki(cert_der)?;
     // subjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }

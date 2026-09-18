@@ -1120,11 +1120,12 @@ enum PivCmd {
         #[arg(long, value_name = "HEX")]
         guid: Option<String>,
     },
-    /// Reset the PIV application to factory defaults (Yubico RESET, `INS
-    /// 0xFB`). On most devices this follows the common convention and only
-    /// works when BOTH the PIN and PUK are already blocked (every retry
-    /// exhausted) — this command does nothing to arrange that itself. Wipes
-    /// all keys, certs, and PINs.
+    /// Reset the PIV application to factory defaults: Wipes all keys, certs,
+    /// and PINs.This typically requires both the PIN and PUK to already be
+    /// blocked. This is arranged automatically if the device is known to
+    /// support RESET. On an unverified device, only a bare RESET is sent,
+    /// with nothing done to arrange any precondition itself — if it does turn
+    /// out to need PIN/PUK already blocked, the caller must prepare manually.
     ///
     /// Resetting the PIV applet needs a YubiKey or a compatible third-party
     /// device: refused on a device known to be incompatible unless
@@ -7213,25 +7214,46 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // device-wide one `factory-reset` may additionally reach for).
             // Resolve a credential for it up front, before the wipe, rather
             // than let the bare RESET below fail with a raw status word.
-            if let keyroost_transport::FactoryResetPlan::NeedsManagementAuth =
-                s.plan_factory_reset()
-            {
-                let auth = resolve_reset_cli_auth(
-                    mgmt_key_env.as_deref(),
-                    *mgmt_key_stdin,
-                    pin_env.as_deref(),
-                    *pin_stdin,
-                    s.pin_management_auth_gate(),
-                )?;
-                let current = match &auth {
-                    ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
-                    ResetCliAuth::Pin(pin) => {
-                        keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
-                    }
-                };
+            let auth = match s.plan_factory_reset() {
+                keyroost_transport::FactoryResetPlan::NeedsManagementAuth => {
+                    Some(resolve_reset_cli_auth(
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        pin_env.as_deref(),
+                        *pin_stdin,
+                        s.pin_management_auth_gate(),
+                    )?)
+                }
+                _ => None,
+            };
+            let current = auth.as_ref().map(|auth| match auth {
+                ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                ResetCliAuth::Pin(pin) => keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes()),
+            });
+            if let Some(current) = current {
                 s.authenticate_management_current(current)?;
             }
-            s.reset()?;
+            // Some fingerprints are known to take unusually long to finish
+            // RESET (`PivQuirk::ResetLongRunning`, e.g. observed over a
+            // minute on ArekinathPivApplet::SwissbitIShield1) — warn right
+            // before the wipe actually starts, using the same wording the
+            // GUI's PIV pane shows on its "Reset applet" card, so a slow but
+            // working reset isn't mistaken for a hang and interrupted.
+            if s.quirks()
+                .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning)
+            {
+                eprintln!(
+                    "warning: {}",
+                    keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT
+                );
+            }
+            // `current` is also handed to `force_reset_if_known_supported`
+            // below — dead today (`PivSession::reset`'s doc explains why),
+            // since the authenticated session above is what actually
+            // satisfies `NeedsManagementAuth` here; threaded through anyway
+            // so nothing here needs to change if the plain PIV-only RESET
+            // ever grows its own use for it.
+            s.force_reset_if_known_supported(current)?;
             println!("PIV application reset to factory defaults on {}.", serial);
         }
 
