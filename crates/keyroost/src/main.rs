@@ -14141,7 +14141,7 @@ impl App {
                                 ui,
                                 p,
                                 "The management key authorizes the deletion. Needs \
-                                 YubiKey 5.7 or newer.",
+                                 YubiKey 5.7+ or compatible third party device.",
                             );
                         }
                         PivCredKind::MoveKey => {
@@ -14184,7 +14184,8 @@ impl App {
                                 ui,
                                 p,
                                 "Moves only the key; the certificate stays in the \
-                                 source slot. Needs YubiKey 5.7 or newer.",
+                                 source slot. Needs YubiKey 5.7+ or compatible third \
+                                 party device.",
                             );
                         }
                         PivCredKind::NewChuid => {
@@ -15252,6 +15253,25 @@ impl App {
             PivExtension::SetPinPukRetries.requirement(),
             FeatureGate::INCOMPATIBLE_SUFFIX
         );
+        // Change management key (Yubico SET MANAGEMENT KEY) is gated the
+        // same way, from the same fingerprint/version triple as the retry
+        // counts above — see the "Management key" row below.
+        let change_mgmt_key_gate = keyroost_piv::compat::resolve(
+            PivExtension::SetManagementKey,
+            retries_piv_fp,
+            retries_piv_ver,
+            retries_piv_fw_ver,
+        );
+        let change_mgmt_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::SetManagementKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let change_mgmt_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::SetManagementKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
         // Unsupported doesn't just dim the DragValues below -- with no way
         // to submit them, a count the user dragged in before this device
         // turned out incompatible (or left over from a previous, compatible
@@ -15471,8 +15491,16 @@ impl App {
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
+                if matches!(change_mgmt_key_gate, FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p)
+                        .on_hover_text(change_mgmt_key_unverified_hint.as_str());
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                    if matches!(change_mgmt_key_gate, FeatureGate::Unsupported) {
+                        theme::button_disabled(ui, p, "Change management key\u{2026}")
+                            .on_hover_text(change_mgmt_key_blocked_hint.as_str());
+                    } else if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
                         .clicked()
                     {
                         open_change_mgmt = true;
@@ -15492,12 +15520,22 @@ impl App {
                     } else {
                         &PivMgmtAlgSel::ALL[..]
                     };
-                    piv_mgmtalg_combo(
-                        ui,
-                        "piv-new-mgmt-alg",
-                        &mut self.piv.new_mgmt_alg,
-                        mgmt_alg_options,
-                    );
+                    // There's nothing to pick an algorithm *for* once the
+                    // device is known unable to accept a new management key
+                    // at all — same `Unsupported`-only gate the "Change
+                    // management key…" button above already uses, so the two
+                    // controls dim together.
+                    let mgmt_key_unsupported = matches!(change_mgmt_key_gate, FeatureGate::Unsupported);
+                    ui.add_enabled_ui(!mgmt_key_unsupported, |ui| {
+                        piv_mgmtalg_combo(
+                            ui,
+                            "piv-new-mgmt-alg",
+                            &mut self.piv.new_mgmt_alg,
+                            mgmt_alg_options,
+                        );
+                    })
+                    .response
+                    .on_disabled_hover_text(change_mgmt_key_blocked_hint.as_str());
                 });
             });
 

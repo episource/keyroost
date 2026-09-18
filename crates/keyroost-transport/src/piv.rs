@@ -3306,6 +3306,20 @@ impl PivSession {
     /// already do and route around this method's PIN/PUK-blocking assumption
     /// accordingly.
     ///
+    /// Unlike the two preconditions above, this method *does* actively guard
+    /// against [`keyroost_piv::compat::PivQuirk::ResetFailsIfManagementKeyIsAes`]
+    /// (every known `ArekinathPivApplet` version): a bug in that applet's own
+    /// RESET handler throws when the `0x9B` key object is an AES key instead
+    /// of a 3DES one, and reports the exception back as a non-success status
+    /// word rather than completing. There's no way to recover from that
+    /// on-device — the fix is changing the management key back to 3DES
+    /// first — so a quirked fingerprint has its current management-key
+    /// algorithm checked (the same [`Self::reported_management_key_algorithm`]
+    /// a standard authentication round already relies on) and this call
+    /// refuses with [`TransportError::PivResetManagementKeyMustBe3Des`]
+    /// *before* sending anything, rather than let the card fail partway and
+    /// (on the [`Self::force_reset`] path) burn PIN/PUK retries for nothing.
+    ///
     /// `pre_reset_mgmt_auth` takes the same [`CurrentMgmtAuth`] shape
     /// [`Self::factory_reset`] does, for signature parity with it and
     /// [`Self::force_reset`]/[`Self::force_reset_if_known_supported`] — but
@@ -3324,6 +3338,20 @@ impl PivSession {
         // `_`-prefixed parameter, so the signature stays self-documenting
         // for whoever wires this up for real.
         let _ = pre_reset_mgmt_auth;
+        // Only bother reading the management-key algorithm back off the card
+        // (a GET METADATA round trip) when this fingerprint's own quirk says
+        // RESET can actually fail over it — every other fingerprint's RESET
+        // is unaffected by the algorithm, so skip the extra APDU for them.
+        if self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::ResetFailsIfManagementKeyIsAes)
+        {
+            if let Some(alg) = self.reported_management_key_algorithm() {
+                if alg != MgmtAlg::TripleDes {
+                    return Err(TransportError::PivResetManagementKeyMustBe3Des(alg));
+                }
+            }
+        }
         let (_, sw) = self.transmit_full(&piv::reset())?;
         // A YubiKey answers RESET's "PIN and PUK must already be blocked"
         // precondition with 6985 (conditions of use not satisfied), not 6983
@@ -4446,11 +4474,12 @@ mod tests {
             decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, Some(0x1234)),
             Some(1234)
         );
-        // No applet_version → nothing to version-match, so the quirk never
-        // resolves and the serial passes through unchanged.
+        // Neither applet_version nor firmware_version reported at all:
+        // `resolve_quirks` substitutes the universal `[]` sentinel on both
+        // (see its own "Both axes unset" doc), so the quirk still resolves.
         assert_eq!(
             decode_serial_if_bcd(AppletFingerprint::Token2, None, None, Some(0x1234)),
-            Some(0x1234)
+            Some(1234)
         );
         // A fingerprint with no quirk-table entry at all: unchanged.
         assert_eq!(

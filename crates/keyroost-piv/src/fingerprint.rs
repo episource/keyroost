@@ -1003,7 +1003,7 @@ pub enum AppletFingerprint {
     /// Token2 PIV products — <https://token2.com/c/piv-devices>.
     Token2,
     /// Identiv/Hirsch's uTrust series — <https://www.hirschsecure.com/germany/en/products>.
-    UTrust,
+    UTrust(UTrustVariant),
     /// Yubico's YubiKey series — <https://www.yubico.com/products/>.
     YubiKey,
 }
@@ -1055,6 +1055,27 @@ pub enum OpenFips201Variant {
     SwissbitIShield2,
 }
 
+/// Sub-fingerprint within [`AppletFingerprint::UTrust`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UTrustVariant {
+    /// Identiv/Hirsch's general-purpose uTrust FIDO2 Security Keys —
+    /// <https://www.hirschsecure.com/germany/en/products/security-keys/utrust-fido2-security-keys-nfc-plus>.
+    /// The only variant [`classify`] currently produces: every uTrust ATR
+    /// match becomes this one, since nothing yet distinguishes the Gov line
+    /// from it on the wire.
+    Generic,
+    /// Identiv/Hirsch's uTrust FIDO2 Gov Security Keys —
+    /// <https://www.hirschsecure.com/germany/en/products/security-keys/utrust-fido2-gov-security-keys>.
+    /// Per internal documentation
+    /// (<https://hirschsecure.atlassian.net/wiki/spaces/FIDO/pages/4395401218/PIV>)
+    /// this line has relevant PIV differences from [`Self::Generic`] — e.g.
+    /// a different default management key — but nothing in `classify`
+    /// distinguishes it yet, so this variant is reserved for future use and
+    /// currently unreachable.
+    Gov,
+}
+
 impl core::fmt::Display for AppletFingerprint {
     /// The identifier form: `Variant` for a unit variant, `Variant::Sub` for
     /// one carrying a sub-fingerprint — e.g. `OpenFips201::SwissbitIShield2`,
@@ -1074,7 +1095,7 @@ impl core::fmt::Display for AppletFingerprint {
             AppletFingerprint::OpenFips201(v) => write!(f, "OpenFips201::{v}"),
             AppletFingerprint::Thetis => write!(f, "Thetis"),
             AppletFingerprint::Token2 => write!(f, "Token2"),
-            AppletFingerprint::UTrust => write!(f, "UTrust"),
+            AppletFingerprint::UTrust(v) => write!(f, "UTrust::{v}"),
             AppletFingerprint::YubiKey => write!(f, "YubiKey"),
         }
     }
@@ -1116,6 +1137,15 @@ impl core::fmt::Display for OpenFips201Variant {
     }
 }
 
+impl core::fmt::Display for UTrustVariant {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            UTrustVariant::Generic => "Generic",
+            UTrustVariant::Gov => "Gov",
+        })
+    }
+}
+
 impl AppletFingerprint {
     /// A generic, human-readable display name for this fingerprint — the
     /// fallback a caller shows when the token didn't report a specific name
@@ -1149,7 +1179,8 @@ impl AppletFingerprint {
             }
             AppletFingerprint::Thetis => "Thetis Series",
             AppletFingerprint::Token2 => "Token2 Series",
-            AppletFingerprint::UTrust => "Identiv/Hirsch uTrust Series",
+            AppletFingerprint::UTrust(UTrustVariant::Generic) => "Identiv/Hirsch uTrust Series",
+            AppletFingerprint::UTrust(UTrustVariant::Gov) => "Identiv/Hirsch uTrust Gov Series",
             AppletFingerprint::YubiKey => "Yubico YubiKey Series",
         }
     }
@@ -1327,7 +1358,10 @@ pub fn classify(
     } else if atr.is_some_and(|a| a.contains("piv") && a.contains("8888888")) {
         AppletFingerprint::Thetis
     } else if atr == Some("utrust") {
-        AppletFingerprint::UTrust
+        // Nothing on the wire yet distinguishes the Gov line from the
+        // generic one — see `UTrustVariant::Gov`'s doc — so every uTrust ATR
+        // match becomes `Generic` for now.
+        AppletFingerprint::UTrust(UTrustVariant::Generic)
     } else if atr == Some("yubikey") {
         AppletFingerprint::YubiKey
     } else if sel.is_some_and(|s| s.starts_with("atpiv")) {
@@ -1671,7 +1705,7 @@ mod tests {
     fn classify_utrust_and_yubikey() {
         assert_eq!(
             classify(Some("uTrust"), None, false, false, false),
-            AppletFingerprint::UTrust
+            AppletFingerprint::UTrust(UTrustVariant::Generic)
         );
         assert_eq!(
             classify(Some("YubiKey"), None, false, false, false),
@@ -1726,7 +1760,14 @@ mod tests {
             ),
             (AppletFingerprint::Thetis, "Thetis Series"),
             (AppletFingerprint::Token2, "Token2 Series"),
-            (AppletFingerprint::UTrust, "Identiv/Hirsch uTrust Series"),
+            (
+                AppletFingerprint::UTrust(UTrustVariant::Generic),
+                "Identiv/Hirsch uTrust Series",
+            ),
+            (
+                AppletFingerprint::UTrust(UTrustVariant::Gov),
+                "Identiv/Hirsch uTrust Gov Series",
+            ),
             (AppletFingerprint::YubiKey, "Yubico YubiKey Series"),
         ];
         for (id, expected) in cases {
@@ -1754,6 +1795,10 @@ mod tests {
         assert_eq!(
             AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000).to_string(),
             "HidCrescendo::C4000"
+        );
+        assert_eq!(
+            AppletFingerprint::UTrust(UTrustVariant::Gov).to_string(),
+            "UTrust::Gov"
         );
         assert_eq!(AppletFingerprint::Feitian.to_string(), "Feitian");
         assert_eq!(AppletFingerprint::IdPrime.to_string(), "IdPrime");
