@@ -722,12 +722,16 @@ fn decode_serial_if_bcd(
 /// stuck and never reflecting the slot's actual key state, and the public key
 /// goes with it: a raw key blob is meaningless without a trustworthy
 /// algorithm to interpret it against (RSA vs. EC changes how those bytes are
-/// structured, e.g. in [`metadata_key_material`]). Every other field
-/// (`policy`, `origin`, `is_default`, `retries`) is untouched — the quirk is
-/// specific to tags `0x01`/`0x04`. [`PivSession::metadata`] is the sole
-/// caller; split out as a pure function, same seam style as
-/// [`decode_serial_if_bcd`], so the stripping rule is unit-testable without a
-/// card.
+/// structured, e.g. in [`metadata_key_material`]). Separately, strip `md`'s
+/// PIN/touch policy (tag `0x02`) when `quirks` contains
+/// [`keyroost_piv::compat::PivQuirk::InsF7MetadataPinTouchPolicyInvalid`] — same
+/// "always ignore, never trust a lucky-looking value" treatment, kept as its
+/// own `if` because the two quirks have been observed to apply independently
+/// (see that quirk's own doc). Every other field (`origin`, `is_default`,
+/// `retries`) is untouched by either quirk — each is specific to the tags
+/// named above. [`PivSession::metadata`] is the sole caller; split out as a
+/// pure function, same seam style as [`decode_serial_if_bcd`], so the
+/// stripping rules are unit-testable without a card.
 fn clear_metadata_if_quirky(
     quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
     mut md: Metadata,
@@ -735,6 +739,9 @@ fn clear_metadata_if_quirky(
     if quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid) {
         md.algorithm = None;
         md.public_key = None;
+    }
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataPinTouchPolicyInvalid) {
+        md.policy = None;
     }
     md
 }
@@ -1566,6 +1573,26 @@ impl PivSession {
         )
     }
 
+    /// The wire algorithm-identifier byte to send for `alg` in this session's
+    /// GENERATE ASYMMETRIC KEY PAIR / GENERAL AUTHENTICATE APDUs: this
+    /// fingerprint's own override if it has one, or [`KeyAlg::id`]'s
+    /// Yubico-default byte otherwise. See
+    /// [`keyroost_piv::compat::slot_key_algorithm_apdu_id`]. Cached via
+    /// [`Self::fingerprint`], so this costs no extra round trip once the
+    /// fingerprint has already been probed this session.
+    fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
+        keyroost_piv::compat::slot_key_algorithm_apdu_id(alg, self.fingerprint())
+    }
+
+    /// The inverse of [`Self::slot_key_algorithm_apdu_id`]: resolve a
+    /// device-reported algorithm-identifier byte (GET METADATA tag `0x01`)
+    /// back to a [`KeyAlg`], preferring this fingerprint's own override over
+    /// [`KeyAlg::from_id`]'s Yubico-default table. See
+    /// [`keyroost_piv::compat::key_alg_from_apdu_id`].
+    fn key_alg_from_apdu_id(&mut self, id: u8) -> Option<KeyAlg> {
+        keyroost_piv::compat::key_alg_from_apdu_id(id, self.fingerprint())
+    }
+
     /// GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a slot
     /// key ref). `None` when the firmware predates the extension (5.3-), or
     /// this fingerprint/version is known to never answer it at all
@@ -1723,6 +1750,11 @@ impl PivSession {
     /// vendor's own data object instead via [`Self::hid_crescendo_slot_key_algorithms`].
     /// `None` on any other fingerprint (nothing to try), or when the read
     /// doesn't name `slot`'s key at all.
+    ///
+    /// Decodes the reported byte via [`Self::key_alg_from_apdu_id`] rather
+    /// than [`keyroost_piv::fingerprint::hid_crescendo_algorithm_from_id`]
+    /// directly — the same per-fingerprint override table now backs both,
+    /// see [`keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`]'s doc.
     fn hid_crescendo_slot_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
         let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(variant) =
             self.fingerprint()
@@ -1735,7 +1767,7 @@ impl PivSession {
             .into_iter()
             .find(|&(kr, _)| kr == key_ref)?
             .1;
-        keyroost_piv::fingerprint::hid_crescendo_algorithm_from_id(id)
+        self.key_alg_from_apdu_id(id)
     }
 
     /// The card-management (9B) key's algorithm *as the card reports it* via
@@ -2477,8 +2509,9 @@ impl PivSession {
         pin_policy: PinPolicy,
         touch_policy: TouchPolicy,
     ) -> Result<PublicKey, TransportError> {
+        let alg_id = self.slot_key_algorithm_apdu_id(alg);
         let (data, sw) =
-            self.transmit_full(&piv::generate_key(slot, alg, pin_policy, touch_policy))?;
+            self.transmit_full(&piv::generate_key(slot, alg_id, pin_policy, touch_policy))?;
         ok_or_write("piv generate key", sw)?;
         let key = piv::parse_public_key(&data).map_err(TransportError::PivParse)?;
         // The new key just overwrote whatever was in `slot`; any existing
@@ -2664,9 +2697,9 @@ impl PivSession {
     /// fingerprint — check that gate too before treating a `None` as
     /// "confirmed empty" rather than merely "this channel came up empty".
     fn slot_key_status_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
-        self.metadata(slot.key_ref())
-            .and_then(|m| m.algorithm)
-            .and_then(KeyAlg::from_id)
+        let alg_id = self.metadata(slot.key_ref()).and_then(|m| m.algorithm);
+        alg_id
+            .and_then(|id| self.key_alg_from_apdu_id(id))
             .or_else(|| self.hid_crescendo_slot_algorithm(slot))
     }
 
@@ -2986,9 +3019,9 @@ impl PivSession {
     /// this session's generated-key cache — i.e. everything that needs no
     /// certificate read. [`Self::status_detailed`] appends the same step-3
     /// certificate fallback with a cert it already holds.
-    fn algorithm_without_cert(&self, slot: Slot, meta: Option<&Metadata>) -> Option<KeyAlg> {
+    fn algorithm_without_cert(&mut self, slot: Slot, meta: Option<&Metadata>) -> Option<KeyAlg> {
         meta.and_then(|m| m.algorithm)
-            .and_then(KeyAlg::from_id)
+            .and_then(|id| self.key_alg_from_apdu_id(id))
             .or_else(|| self.pubkey_cache.get(slot.key_ref()).map(|(alg, _)| *alg))
     }
 
@@ -3020,10 +3053,11 @@ impl PivSession {
         prepared: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         let key_ref = slot.key_ref();
+        let alg_id = self.slot_key_algorithm_apdu_id(alg);
         self.general_auth_dyn_auth(
             "piv sign",
-            &piv::general_auth_sign(alg, key_ref, prepared),
-            &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
+            &piv::general_auth_sign(alg_id, key_ref, prepared),
+            &piv::general_auth_sign_chained(alg_id, key_ref, prepared, CHAIN_CHUNK),
         )
     }
 
@@ -3040,10 +3074,11 @@ impl PivSession {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         let key_ref = slot.key_ref();
+        let alg_id = self.slot_key_algorithm_apdu_id(alg);
         self.general_auth_dyn_auth(
             "piv decrypt",
-            &piv::general_auth_sign(alg, key_ref, ciphertext),
-            &piv::general_auth_sign_chained(alg, key_ref, ciphertext, CHAIN_CHUNK),
+            &piv::general_auth_sign(alg_id, key_ref, ciphertext),
+            &piv::general_auth_sign_chained(alg_id, key_ref, ciphertext, CHAIN_CHUNK),
         )
     }
 
@@ -3060,10 +3095,11 @@ impl PivSession {
         peer_public_key: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         let key_ref = slot.key_ref();
+        let alg_id = self.slot_key_algorithm_apdu_id(alg);
         self.general_auth_dyn_auth(
             "piv key-agree",
-            &piv::general_auth_key_agree(alg, key_ref, peer_public_key),
-            &piv::general_auth_key_agree_chained(alg, key_ref, peer_public_key, CHAIN_CHUNK),
+            &piv::general_auth_key_agree(alg_id, key_ref, peer_public_key),
+            &piv::general_auth_key_agree_chained(alg_id, key_ref, peer_public_key, CHAIN_CHUNK),
         )
     }
 
@@ -3146,7 +3182,8 @@ impl PivSession {
     pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
         let key_ref = slot.key_ref();
         if let Some(md) = self.metadata(key_ref) {
-            if let Some((alg, raw)) = metadata_key_material(&md) {
+            if let Some((alg, raw)) = metadata_key_material(&md, |id| self.key_alg_from_apdu_id(id))
+            {
                 let key = public_key_from_metadata(raw).map_err(TransportError::PivParse)?;
                 return Ok((alg, key));
             }
@@ -3274,9 +3311,10 @@ impl PivSession {
     /// [`status`]: PivSession::status
     /// [`metadata`]: PivSession::metadata
     pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
-        Ok(self
-            .metadata(slot.key_ref())
-            .is_some_and(|md| metadata_key_material(&md).is_some()))
+        let Some(md) = self.metadata(slot.key_ref()) else {
+            return Ok(false);
+        };
+        Ok(metadata_key_material(&md, |id| self.key_alg_from_apdu_id(id)).is_some())
     }
 
     /// Reset the PIV application to factory defaults. Always sends the bare
@@ -4255,8 +4293,18 @@ fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
 /// `GetMetadata` handler is a stub for every slot but card-authentication) —
 /// functionally the same as "no GET METADATA support" for our purposes, not a
 /// malformed response worth erroring the caller over.
-fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
-    let alg = md.algorithm.and_then(KeyAlg::from_id)?;
+///
+/// `resolve_alg` decodes the metadata's raw algorithm-identifier byte: a real
+/// call site passes [`PivSession::key_alg_from_apdu_id`] (this fingerprint's
+/// own wire-byte override, falling back to [`KeyAlg::from_id`]'s
+/// Yubico-default table), while the unit tests below pass [`KeyAlg::from_id`]
+/// directly — keeping this pure and card-free/session-free rather than
+/// threading a `&mut PivSession` through it just to resolve one byte.
+fn metadata_key_material(
+    md: &Metadata,
+    resolve_alg: impl FnMut(u8) -> Option<KeyAlg>,
+) -> Option<(KeyAlg, &[u8])> {
+    let alg = md.algorithm.and_then(resolve_alg)?;
     let raw = md.public_key.as_deref()?;
     Some((alg, raw))
 }
@@ -4554,6 +4602,47 @@ mod tests {
     }
 
     #[test]
+    fn clear_metadata_if_quirky_strips_pin_touch_policy_independently_of_algorithm() {
+        use keyroost_piv::compat::PivQuirk;
+
+        let md = Metadata {
+            algorithm: Some(0x07),
+            policy: Some((0x01, 0x02)),
+            origin: Some(1),
+            public_key: Some(vec![0xAB, 0xCD]),
+            is_default: Some(false),
+            retries: None,
+        };
+
+        // Only the policy quirk active: policy is gone, algorithm/public key
+        // (guarded by the *other* quirk) survive untouched.
+        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataPinTouchPolicyInvalid]);
+        let cleared = clear_metadata_if_quirky(&quirky, md.clone());
+        assert_eq!(
+            cleared,
+            Metadata {
+                policy: None,
+                ..md.clone()
+            }
+        );
+
+        // Both quirks active together: both fields are gone, independently.
+        let both = BTreeSet::from([
+            PivQuirk::InsF7MetadataPinTouchPolicyInvalid,
+            PivQuirk::InsF7MetadataAlgorithmInvalid,
+        ]);
+        assert_eq!(
+            clear_metadata_if_quirky(&both, md.clone()),
+            Metadata {
+                algorithm: None,
+                public_key: None,
+                policy: None,
+                ..md
+            }
+        );
+    }
+
+    #[test]
     fn describe_apdu_names_the_command() {
         assert_eq!(
             describe_apdu(&piv::select_full()),
@@ -4736,10 +4825,7 @@ mod tests {
         );
         // A lookalike with a different P1P2 stays unnamed — only the exact
         // CPLC read is recognized.
-        assert_eq!(
-            describe_apdu(&[0x80, 0xCA, 0x00, 0x00, 0x00]),
-            "INS 0xCA"
-        );
+        assert_eq!(describe_apdu(&[0x80, 0xCA, 0x00, 0x00, 0x00]), "INS 0xCA");
     }
 
     #[test]
@@ -4749,7 +4835,9 @@ mod tests {
         // bare "SELECT" in the trace, same as any AID this crate doesn't
         // recognize.
         assert_eq!(
-            describe_apdu(&piv::select_by_aid(&keyroost_piv::fingerprint::GLOBAL_PLATFORM_ISD_AID)),
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::GLOBAL_PLATFORM_ISD_AID
+            )),
             "SELECT (GlobalPlatform Issuer Security Domain)"
         );
     }
@@ -4980,7 +5068,10 @@ mod tests {
     #[test]
     fn metadata_with_neither_field_is_not_usable() {
         // The stub-firmware case: SW_OK, empty body.
-        assert_eq!(metadata_key_material(&Metadata::default()), None);
+        assert_eq!(
+            metadata_key_material(&Metadata::default(), KeyAlg::from_id),
+            None
+        );
     }
 
     #[test]
@@ -4989,7 +5080,7 @@ mod tests {
             algorithm: Some(KeyAlg::EccP256.id()),
             ..Metadata::default()
         };
-        assert_eq!(metadata_key_material(&md), None);
+        assert_eq!(metadata_key_material(&md, KeyAlg::from_id), None);
     }
 
     #[test]
@@ -4998,7 +5089,7 @@ mod tests {
             public_key: Some(vec![0x86, 0x01, 0x04]),
             ..Metadata::default()
         };
-        assert_eq!(metadata_key_material(&md), None);
+        assert_eq!(metadata_key_material(&md, KeyAlg::from_id), None);
     }
 
     #[test]
@@ -5009,7 +5100,7 @@ mod tests {
             public_key: Some(vec![0x86, 0x01, 0x04]),
             ..Metadata::default()
         };
-        assert_eq!(metadata_key_material(&md), None);
+        assert_eq!(metadata_key_material(&md, KeyAlg::from_id), None);
     }
 
     #[test]
@@ -5020,7 +5111,7 @@ mod tests {
             ..Metadata::default()
         };
         assert_eq!(
-            metadata_key_material(&md),
+            metadata_key_material(&md, KeyAlg::from_id),
             Some((KeyAlg::EccP256, &[0x86, 0x01, 0x04][..]))
         );
     }

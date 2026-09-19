@@ -1434,6 +1434,21 @@ fn piv_reset_global_alternative_available(
     reset_global_gate == FeatureGate::Supported && reset_gate != FeatureGate::Supported
 }
 
+/// Whether the Generate Key modal's "Policy other than `default` requires
+/// YubiKey or compatible token." caveat still needs to be shown below the
+/// PIN/touch policy combos: true unless *both* gates are confirmed
+/// [`FeatureGate::Supported`] — at that point the caveat is stale noise on a
+/// device already known to handle non-default policies, and the per-row
+/// warning marker / disabled-combo hover above already cover the
+/// unverified/unsupported cases on their own.
+fn piv_policy_caveat_hint_needed(
+    pin_policy_gate: keyroost_piv::compat::FeatureGate,
+    touch_policy_gate: keyroost_piv::compat::FeatureGate,
+) -> bool {
+    use keyroost_piv::compat::FeatureGate;
+    pin_policy_gate != FeatureGate::Supported || touch_policy_gate != FeatureGate::Supported
+}
+
 /// Run one non-FIDO applet reset off the UI thread, mapping the result to a
 /// [`StepOutcome`](keyroost_resolve::StepOutcome) so a single failure is
 /// recorded rather than aborting the sweep (continue-on-error, matching the
@@ -1839,9 +1854,9 @@ enum PivCredKind {
     MoveKey,
     NewChuid,
     /// Run every key self-test the selected slot's algorithm supports
-    /// (decrypt / key-agree / sign, in that order). Needs the PIN (unless the
-    /// slot's PIN policy is `never`); no management key, and nothing on the
-    /// card changes.
+    /// (decrypt / key-agree / sign, in that order). The PIN field is always
+    /// optional — it's the user's choice whether to test with or without a
+    /// PIN; no management key, and nothing on the card changes.
     SelfTest,
 }
 
@@ -2064,7 +2079,7 @@ struct PivState {
     /// act on this single selection instead of each carrying its own dropdown.
     selected_slot: PivSlotSel,
     /// Key-generation algorithm selector.
-    gen_alg: PivKeyAlgSel,
+    gen_alg: keyroost_piv::KeyAlg,
     /// PIN/touch policy selectors in the Generate key modal. `Default`/
     /// `Default` (the initial selection) sends the plain PIV GENERATE
     /// ASYMMETRIC KEY PAIR APDU, with no policy tags, which is what every PIV
@@ -2085,11 +2100,21 @@ struct PivState {
     /// Certificate creation: subject (bare name or full DN), validity, the PIN
     /// that authorizes the on-card signature, and the CSR destination.
     cert_subject: String,
-    cert_days: u32,
+    /// Validity period, entered as three counts that sum — years applied
+    /// first, then months relative to that point, then a flat day count —
+    /// fed to [`keyroost_piv::add_calendar_period`]. Mirrors `keyroostctl
+    /// piv self-sign`'s combinable `--years`/`--months`/`--days` exactly.
+    cert_valid_years: u32,
+    cert_valid_months: u32,
+    cert_valid_days: u32,
     sign_pin: String,
     csr_path: String,
-    /// New CHUID: validity in days from now (same shape and default as
-    /// `cert_days`), fed to [`keyroost_piv::chuid_expiration_in_days`].
+    /// New CHUID: validity, same three-field shape and default as
+    /// `cert_valid_years`/`cert_valid_months`/`cert_valid_days`, fed to
+    /// [`keyroost_piv::add_calendar_period`] +
+    /// [`keyroost_piv::yyyymmdd_from_unix_secs`].
+    chuid_valid_years: u32,
+    chuid_valid_months: u32,
     chuid_valid_days: u32,
     /// New CHUID: the GUID input, hex (canonical `8-4-4-4-12` dashed form as
     /// pre-filled, but [`keyroost_piv::parse_guid_hex`] accepts plain hex
@@ -2188,7 +2213,7 @@ impl Default for PivState {
             retries_puk: 3,
             retries_pin_auth: String::new(),
             selected_slot: PivSlotSel::default(),
-            gen_alg: PivKeyAlgSel::default(),
+            gen_alg: keyroost_piv::KeyAlg::EccP256,
             gen_pin_policy: keyroost_piv::PinPolicy::Default,
             gen_touch_policy: keyroost_piv::TouchPolicy::Default,
             gen_pubkey_pem: None,
@@ -2197,10 +2222,14 @@ impl Default for PivState {
             new_mgmt_key_input: String::new(),
             new_mgmt_alg: PivMgmtAlgSel::default(),
             cert_subject: String::new(),
-            cert_days: 365,
+            cert_valid_years: 1,
+            cert_valid_months: 0,
+            cert_valid_days: 0,
             sign_pin: String::new(),
             csr_path: String::new(),
-            chuid_valid_days: 365,
+            chuid_valid_years: 1,
+            chuid_valid_months: 0,
+            chuid_valid_days: 0,
             chuid_guid: keyroost_transport::random_chuid_guid()
                 .map(|g| keyroost_piv::format_guid(&g))
                 .unwrap_or_default(),
@@ -2244,42 +2273,13 @@ impl PivSlotSel {
     }
 }
 
-/// PIV key-generation algorithm selector.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum PivKeyAlgSel {
-    #[default]
-    EccP256,
-    EccP384,
-    Rsa2048,
-    Rsa3072,
-    Rsa4096,
-    Ed25519,
-}
-
-impl PivKeyAlgSel {
-    fn to_alg(self) -> keyroost_piv::KeyAlg {
-        use keyroost_piv::KeyAlg::*;
-        match self {
-            PivKeyAlgSel::EccP256 => EccP256,
-            PivKeyAlgSel::EccP384 => EccP384,
-            PivKeyAlgSel::Rsa2048 => Rsa2048,
-            PivKeyAlgSel::Rsa3072 => Rsa3072,
-            PivKeyAlgSel::Rsa4096 => Rsa4096,
-            PivKeyAlgSel::Ed25519 => Ed25519,
-        }
-    }
-    fn label(self) -> &'static str {
-        self.to_alg().label()
-    }
-    const ALL: [PivKeyAlgSel; 6] = [
-        PivKeyAlgSel::EccP256,
-        PivKeyAlgSel::EccP384,
-        PivKeyAlgSel::Rsa2048,
-        PivKeyAlgSel::Rsa3072,
-        PivKeyAlgSel::Rsa4096,
-        PivKeyAlgSel::Ed25519,
-    ];
-}
+// PIV key-generation algorithm selection uses `keyroost_piv::KeyAlg` directly
+// (see `gen_alg` below) rather than a GUI-only wrapper enum — same pattern
+// `gen_pin_policy`/`gen_touch_policy` already use for their domain types.
+// `KeyAlg::ALL` lists every candidate for the combo
+// (`piv_keyalg_combo`); which ones are actually selectable on the live device
+// is a per-algorithm `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`
+// gate, resolved where the combo is drawn, not baked into the selector type.
 
 /// PIV management-key algorithm selector (for rotation). [`Self::Delete`] is
 /// not an algorithm at all — HID Crescendo's ACA-only "management key" (see
@@ -7839,7 +7839,7 @@ impl App {
             }
         };
         let slot = self.piv.selected_slot.to_slot();
-        let alg = self.piv.gen_alg.to_alg();
+        let alg = self.piv.gen_alg;
         let (pin_policy, touch_policy) = (self.piv.gen_pin_policy, self.piv.gen_touch_policy);
         self.piv.notice = None;
         self.piv.gen_pubkey_pem = None;
@@ -8035,10 +8035,12 @@ impl App {
                 return;
             }
         };
-        let expiration = keyroost_piv::chuid_expiration_in_days(
+        let expiration = keyroost_piv::yyyymmdd_from_unix_secs(keyroost_piv::add_calendar_period(
             u64::from(unix_now()),
+            self.piv.chuid_valid_years,
+            self.piv.chuid_valid_months,
             self.piv.chuid_valid_days,
-        );
+        ));
         self.piv.notice = None;
         self.spawn_piv_job("Writing a new CHUID\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
@@ -8238,19 +8240,19 @@ impl App {
     /// (decrypt, then key-agree, then sign): build a fixed challenge from the
     /// slot certificate's public key ([`keyroost_pivtest`]), run the
     /// private-key op on the card, and verify the reply against that public
-    /// key. Read-only on the card — no write, no management key. The PIN is
-    /// verified unless the slot's PIN policy is `never` and the field is
-    /// blank. Each operation's pass/fail is reported together.
+    /// key. Read-only on the card — no write, no management key. The PIN
+    /// field is always optional — it's the user's call whether to test with
+    /// or without one, independent of the slot's (possibly misreported) PIN
+    /// policy; the PIN is only sent to the card when the field is non-blank.
+    /// Each operation's pass/fail is reported together.
     fn piv_self_test(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
-        let policy = self.piv_selected_slot_policy();
-        let pin_required = policy.map(|(p, _)| p) != Some(keyroost_piv::PinPolicy::Never);
         let want_touch = matches!(
-            policy.map(|(_, t)| t),
+            self.piv_selected_slot_policy().map(|(_, t)| t),
             Some(keyroost_piv::TouchPolicy::Always | keyroost_piv::TouchPolicy::Cached)
         );
         self.piv.notice = None;
@@ -8260,7 +8262,7 @@ impl App {
             "Running self-test\u{2026}"
         };
         self.spawn_piv_job(label, move || {
-            let outcome = run_piv_self_test(&name, slot, pin_required, pin.as_bytes());
+            let outcome = run_piv_self_test(&name, slot, pin.as_bytes());
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.sign_pin);
                 let (all_ok, text) = match &outcome {
@@ -8327,7 +8329,16 @@ impl App {
         };
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
-        let days = i64::from(self.piv.cert_days.max(1));
+        let years = self.piv.cert_valid_years;
+        let months = self.piv.cert_valid_months;
+        // Same "at least a day" floor `cert_days.max(1)` used before the
+        // single field split into three: an all-zero combination would
+        // otherwise produce a validity period that ends before it starts.
+        let days = if years == 0 && months == 0 {
+            self.piv.cert_valid_days.max(1)
+        } else {
+            self.piv.cert_valid_days
+        };
         // See `load_piv_status`: this job opens its own fresh `PivSession`, so
         // a key generated earlier this app run has to be handed back in.
         let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
@@ -8341,12 +8352,12 @@ impl App {
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
                     }
-                    let now = i64::from(unix_now());
+                    let now = unix_now();
                     s.self_signed_certificate(
                         slot,
                         &subject,
-                        now,
-                        now + days * 86_400,
+                        i64::from(now),
+                        keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
                         pin.as_bytes(),
                     )?;
                     s.status()
@@ -8879,10 +8890,14 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
 ///
 /// `Err` is a *setup* failure (couldn't open the card, no certificate in the
 /// slot, unreadable key, PIN rejected) — nothing was tested.
+///
+/// The PIN is used only when `pin` is non-empty — never inferred from the
+/// slot's PIN policy. That policy is left entirely to the caller to decide
+/// whether to supply a PIN, so a test can deliberately be run without one to
+/// see whether the card enforces its policy.
 fn run_piv_self_test(
     reader: &str,
     slot: keyroost_piv::Slot,
-    pin_required: bool,
     pin: &[u8],
 ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, String> {
     let mut s = keyroost_transport::PivSession::open(reader).map_err(|e| e.to_string())?;
@@ -8907,7 +8922,8 @@ fn run_piv_self_test(
     // one per op). PIN-per-use slots (9C) drop the verified state after each
     // GENERAL AUTHENTICATE, so the per-op closure re-verifies before every
     // op after the first that actually runs.
-    if pin_required || !pin.is_empty() {
+    let has_pin = !pin.is_empty();
+    if has_pin {
         s.verify_pin(pin).map_err(|e| e.to_string())?;
     }
     let mut ran = 0usize;
@@ -8915,7 +8931,7 @@ fn run_piv_self_test(
         alg,
         &pubkey,
         |op, input| -> Result<Vec<u8>, String> {
-            if pin_required && ran > 0 {
+            if has_pin && ran > 0 {
                 s.verify_pin(pin).map_err(|e| e.to_string())?;
             }
             ran += 1;
@@ -9067,6 +9083,40 @@ fn card_note(ui: &mut egui::Ui, p: &Palette, t: &str) {
     );
 }
 
+/// The "Valid for" fields shared by the certificate and CHUID cards: three
+/// `DragValue`s — years, months, days, in that order — that sum, mirroring
+/// `keyroostctl piv self-sign`/`new-chuid`'s combinable `--years`/`--months`/
+/// `--days` exactly (see [`keyroost_piv::add_calendar_period`]). Renders
+/// only the three fields, not the "Valid for" label itself — the two call
+/// sites lay that out differently (a plain label vs. one column-aligned with
+/// the field above it), so each renders its own. Each field's own range
+/// tops out at what that unit alone could still represent from `now` —
+/// generous rather than exact once more than one field is nonzero, since the
+/// actual encoder clamps the summed result regardless.
+fn piv_valid_for_fields(
+    ui: &mut egui::Ui,
+    now: u32,
+    years: &mut u32,
+    months: &mut u32,
+    days: &mut u32,
+) {
+    ui.add(
+        egui::DragValue::new(years)
+            .range(0..=keyroost_piv::max_valid_years(u64::from(now)))
+            .suffix(" y"),
+    );
+    ui.add(
+        egui::DragValue::new(months)
+            .range(0..=keyroost_piv::max_valid_months(u64::from(now)))
+            .suffix(" mo"),
+    );
+    ui.add(
+        egui::DragValue::new(days)
+            .range(0..=keyroost_piv::max_valid_days(u64::from(now)))
+            .suffix(" d"),
+    );
+}
+
 /// A key/value detail row for the device-metadata card: a muted fixed-width
 /// label on the left, the value on the right. Wraps long values.
 fn mds_kv(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str) {
@@ -9183,13 +9233,29 @@ fn chuid_label_width(ctx: &egui::Context) -> f32 {
 }
 
 /// A PIV slot picker combo.
-/// A PIV key-algorithm picker combo.
-fn piv_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivKeyAlgSel) {
+/// A PIV key-algorithm picker combo, listing every `keyroost_piv::KeyAlg`
+/// variant. `gate_of` resolves each candidate's
+/// `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm` gate on the live
+/// device: an entry gating `Unsupported` renders disabled (dimmed, not
+/// removed — the combo's shape stays the same as gates change) the same way
+/// the Move/Delete-key rows dim on this device; `Unverified` entries stay
+/// enabled and are instead called out together in a note below the combo
+/// (see `cap_piv`), since a per-row marker doesn't fit a closed dropdown the
+/// way it does an always-visible row.
+fn piv_keyalg_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut keyroost_piv::KeyAlg,
+    gate_of: impl Fn(keyroost_piv::KeyAlg) -> keyroost_piv::compat::FeatureGate,
+) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
-            for opt in PivKeyAlgSel::ALL {
-                ui.selectable_value(sel, opt, opt.label());
+            for opt in keyroost_piv::KeyAlg::ALL {
+                let enabled = gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported;
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.selectable_value(sel, opt, opt.label());
+                });
             }
         });
 }
@@ -9245,14 +9311,35 @@ impl PivPolicyOption for keyroost_piv::TouchPolicy {
     }
 }
 
+/// Snap `*sel` to `options[0]` if it isn't already one of `options` — the
+/// generic counterpart of [`piv_mgmtalg_clamp`], used when a per-fingerprint
+/// [`keyroost_piv::compat::PivQuirk`] (e.g.
+/// [`SlotTouchPolicyCachedNotSupported`](keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported))
+/// has dropped a value from `options` that was previously selected — e.g. a
+/// device switch left `Cached` selected on a fingerprint that doesn't accept
+/// it. `T::ALL[0]` is always `Default`, so `options` never actually excludes
+/// it (only `Once`/`Cached` are ever quirk-gated) — this only ever snaps back
+/// to `Default`, never to some other survivor.
+fn piv_policy_clamp<T: PivPolicyOption>(sel: &mut T, options: &[T]) {
+    if let Some(&first) = options.first() {
+        if !options.contains(sel) {
+            *sel = first;
+        }
+    }
+}
+
 /// PIN/Touch Policy picker combo (Generate key modal). Generic over
-/// [`PivPolicyOption`] — the type of `sel` alone picks the right option list
-/// and labels.
-fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T) {
+/// [`PivPolicyOption`] — the type of `sel` alone picks the right label
+/// function. `options` is the offered set — [`PivPolicyOption::ALL`] on a
+/// device with no relevant quirk, or that list with one value removed (see
+/// [`piv_policy_clamp`]) — mirroring [`piv_mgmtalg_combo`]'s own
+/// caller-filtered-options shape.
+fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T, options: &[T]) {
+    piv_policy_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
-            for &opt in T::ALL {
+            for &opt in options {
                 ui.selectable_value(sel, opt, opt.label());
             }
         });
@@ -14005,18 +14092,131 @@ impl App {
                             self.piv_modal_mgmt_field(ui, p, kind);
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
                             ui.add_space(8.0);
+
+                            // PIN/touch policy (tags 0xAA/0xAB on GENERATE
+                            // ASYMMETRIC KEYPAIR) are Yubico extensions, not SP
+                            // 800-73-4 — gated the same three-way way
+                            // (`keyroost_piv::compat`) Move/Delete key are
+                            // elsewhere in this pane, just resolved locally
+                            // here since this modal doesn't share those rows'
+                            // gate locals. `default` needs neither extension
+                            // and is unaffected either way.
+                            use keyroost_piv::compat::{FeatureGate, PivExtension};
+                            let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+                                (
+                                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                                    None,
+                                    None,
+                                ),
+                                |s| {
+                                    (
+                                        s.applet_fingerprint,
+                                        s.version.as_deref(),
+                                        s.version_firmware.as_deref(),
+                                    )
+                                },
+                            );
+                            let pin_policy_gate = keyroost_piv::compat::resolve(
+                                PivExtension::SlotPinPolicy,
+                                piv_fp,
+                                piv_ver,
+                                piv_fw_ver,
+                            );
+                            let touch_policy_gate = keyroost_piv::compat::resolve(
+                                PivExtension::SlotTouchPolicy,
+                                piv_fp,
+                                piv_ver,
+                                piv_fw_ver,
+                            );
+                            // Narrower than the two gates above: a device can
+                            // support the extension in general yet reject one
+                            // specific value (e.g. YubiKey firmware 4.0-4.2
+                            // supports touch policy but not `cached`).
+                            let policy_quirks =
+                                keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver);
+                            let pin_once_blocked = policy_quirks.contains(
+                                &keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
+                            );
+                            let touch_cached_blocked = policy_quirks.contains(
+                                &keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
+                            );
+                            let pin_policy_unverified_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotPinPolicy.requirement(),
+                                FeatureGate::UNVERIFIED_SUFFIX
+                            );
+                            let pin_policy_blocked_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotPinPolicy.requirement(),
+                                FeatureGate::INCOMPATIBLE_SUFFIX
+                            );
+                            let touch_policy_unverified_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotTouchPolicy.requirement(),
+                                FeatureGate::UNVERIFIED_SUFFIX
+                            );
+                            let touch_policy_blocked_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotTouchPolicy.requirement(),
+                                FeatureGate::INCOMPATIBLE_SUFFIX
+                            );
+                            // `Unsupported` blocks the whole combo (matching
+                            // Move/Delete key's own treatment) rather than
+                            // just the one value the quirks above narrow —
+                            // there's nothing to offer once the extension
+                            // itself is known absent, so force the selection
+                            // back to `default` rather than leave a stale
+                            // non-default value the combo can no longer show
+                            // as selectable.
+                            if matches!(pin_policy_gate, FeatureGate::Unsupported) {
+                                self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
+                            }
+                            if matches!(touch_policy_gate, FeatureGate::Unsupported) {
+                                self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
+                            }
+                            let pin_policy_options: Vec<keyroost_piv::PinPolicy> =
+                                keyroost_piv::PinPolicy::ALL
+                                    .iter()
+                                    .copied()
+                                    .filter(|&opt| {
+                                        !(pin_once_blocked && opt == keyroost_piv::PinPolicy::Once)
+                                    })
+                                    .collect();
+                            let touch_policy_options: Vec<keyroost_piv::TouchPolicy> =
+                                keyroost_piv::TouchPolicy::ALL
+                                    .iter()
+                                    .copied()
+                                    .filter(|&opt| {
+                                        !(touch_cached_blocked
+                                            && opt == keyroost_piv::TouchPolicy::Cached)
+                                    })
+                                    .collect();
+
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new("Pin Policy")
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt2),
                                 );
+                                if matches!(pin_policy_gate, FeatureGate::Unverified) {
+                                    ui.add_space(4.0);
+                                    theme::warn_marker(ui, p)
+                                        .on_hover_text(pin_policy_unverified_hint.as_str());
+                                }
                                 ui.add_space(8.0);
-                                piv_policy_combo(
-                                    ui,
-                                    "piv-gen-pin-policy",
-                                    &mut self.piv.gen_pin_policy,
-                                );
+                                ui.add_enabled_ui(
+                                    !matches!(pin_policy_gate, FeatureGate::Unsupported),
+                                    |ui| {
+                                        piv_policy_combo(
+                                            ui,
+                                            "piv-gen-pin-policy",
+                                            &mut self.piv.gen_pin_policy,
+                                            &pin_policy_options,
+                                        );
+                                    },
+                                )
+                                .response
+                                .on_disabled_hover_text(pin_policy_blocked_hint.as_str());
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
@@ -14025,19 +14225,34 @@ impl App {
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt2),
                                 );
+                                if matches!(touch_policy_gate, FeatureGate::Unverified) {
+                                    ui.add_space(4.0);
+                                    theme::warn_marker(ui, p)
+                                        .on_hover_text(touch_policy_unverified_hint.as_str());
+                                }
                                 ui.add_space(8.0);
-                                piv_policy_combo(
-                                    ui,
-                                    "piv-gen-touch-policy",
-                                    &mut self.piv.gen_touch_policy,
-                                );
+                                ui.add_enabled_ui(
+                                    !matches!(touch_policy_gate, FeatureGate::Unsupported),
+                                    |ui| {
+                                        piv_policy_combo(
+                                            ui,
+                                            "piv-gen-touch-policy",
+                                            &mut self.piv.gen_touch_policy,
+                                            &touch_policy_options,
+                                        );
+                                    },
+                                )
+                                .response
+                                .on_disabled_hover_text(touch_policy_blocked_hint.as_str());
                             });
-                            card_note(
-                                ui,
-                                p,
-                                "Policy other than `default` requires YubiKey or compatible \
-                                 token.",
-                            );
+                            if piv_policy_caveat_hint_needed(pin_policy_gate, touch_policy_gate) {
+                                card_note(
+                                    ui,
+                                    p,
+                                    "Policy other than `default` requires YubiKey or compatible \
+                                     token.",
+                                );
+                            }
                         }
                         PivCredKind::ImportCert => {
                             card_note(ui, p, &format!("Reading {}", self.piv.cert_path));
@@ -14076,17 +14291,12 @@ impl App {
                             card_note(ui, p, "The PIN authorizes the on-card signature.");
                         }
                         PivCredKind::SelfTest => {
-                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
-                            if self.piv_selected_slot_policy().map(|(pin, _)| pin)
-                                == Some(keyroost_piv::PinPolicy::Never)
-                            {
-                                card_note(
-                                    ui,
-                                    p,
-                                    "This slot's PIN policy is \u{201c}never\u{201d} \u{2014} \
-                                     you can leave the PIN blank.",
-                                );
-                            }
+                            pin_field(ui, p, "PIN (optional)", &mut self.piv.sign_pin);
+                            card_note(
+                                ui,
+                                p,
+                                "PIN optional; device state and policy may still require it.",
+                            );
                             card_note(
                                 ui,
                                 p,
@@ -14266,17 +14476,23 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Valid for")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt2),
+                                // Same fixed label column the "GUID" row above
+                                // uses, so the years field's left edge lines up
+                                // with the GUID input's.
+                                ui.add_sized(
+                                    [chuid_label_width(ui.ctx()), 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("Valid for")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    ),
                                 );
-                                ui.add(
-                                    egui::DragValue::new(&mut self.piv.chuid_valid_days)
-                                        .range(
-                                            1..=keyroost_piv::max_valid_days(u64::from(unix_now())),
-                                        )
-                                        .suffix(" days"),
+                                piv_valid_for_fields(
+                                    ui,
+                                    unix_now(),
+                                    &mut self.piv.chuid_valid_years,
+                                    &mut self.piv.chuid_valid_months,
+                                    &mut self.piv.chuid_valid_days,
                                 );
                             });
                             card_note(
@@ -15803,6 +16019,31 @@ impl App {
         // isn't missed the moment the device looks like it's hung.
         let reset_long_running = keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver)
             .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning);
+        // Per-algorithm gates for the "Generate key" card's algorithm combo,
+        // below — resolved eagerly here (an owned array, not a closure over
+        // `piv_ver`/`piv_fw_ver`) because those two borrow `self.piv.status`
+        // and the combo is drawn from deep inside closures that also need
+        // `&mut self`; holding the borrow that long would conflict. Not every
+        // algorithm is universally implemented, standardized or not — see
+        // `PivExtension::SlotKeyAlgorithm`'s own doc.
+        let keyalg_gates: [(keyroost_piv::KeyAlg, FeatureGate); keyroost_piv::KeyAlg::ALL.len()] =
+            keyroost_piv::KeyAlg::ALL.map(|alg| {
+                (
+                    alg,
+                    keyroost_piv::compat::resolve(
+                        PivExtension::SlotKeyAlgorithm(alg),
+                        piv_fp,
+                        piv_ver,
+                        piv_fw_ver,
+                    ),
+                )
+            });
+        let keyalg_gate = move |alg: keyroost_piv::KeyAlg| {
+            keyalg_gates
+                .iter()
+                .find_map(|&(a, gate)| (a == alg).then_some(gate))
+                .unwrap_or(FeatureGate::Unverified)
+        };
         // Explanations for the non-standard slot operations when the
         // fingerprint known-support table can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
@@ -16059,6 +16300,31 @@ impl App {
 
                 // --- Generate key: bold label + help left, algorithm combo
                 // and primary button pinned right (FIDO2 setting-row shape).
+                // Each algorithm is gated independently
+                // (`PivExtension::SlotKeyAlgorithm`, resolved eagerly into
+                // `keyalg_gate` above) the same way Move/Delete key are gated
+                // elsewhere in this pane — not every device implements every
+                // algorithm, standardized or not (see that extension's own
+                // doc).
+                //
+                // Same "don't leave a selection the combo can no longer
+                // offer" treatment as the PIN/touch policy combos in the
+                // Generate Key modal: a prior selection that's since become
+                // known-unsupported (e.g. after switching readers) falls back
+                // to the widely-supported default rather than staying
+                // selected-but-disabled.
+                if keyalg_gate(self.piv.gen_alg) == FeatureGate::Unsupported {
+                    self.piv.gen_alg = keyroost_piv::KeyAlg::EccP256;
+                }
+                let unverified_algs: Vec<&str> = keyroost_piv::KeyAlg::ALL
+                    .into_iter()
+                    .filter(|&alg| keyalg_gate(alg) == FeatureGate::Unverified)
+                    .map(keyroost_piv::KeyAlg::label)
+                    .collect();
+                let gen_alg_unverified_hint = format!(
+                    "Unverified on this device: {}. May not be supported.",
+                    unverified_algs.join(", ")
+                );
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Generate key")
@@ -16067,12 +16333,20 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "piv-generate");
+                    // Same warn-triangle convention as Move/Delete/Reset key below:
+                    // sits right after the help dot rather than a printed line, so
+                    // "support unverified" reads the same way everywhere in this
+                    // pane instead of being the one section that just prints it.
+                    if !unverified_algs.is_empty() {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(gen_alg_unverified_hint.as_str());
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
                             open_generate = true;
                         }
                         ui.add_space(8.0);
-                        piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
+                        piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg, keyalg_gate);
                     });
                 });
                 if let Some(pem) = &self.piv.gen_pubkey_pem {
@@ -16092,12 +16366,15 @@ impl App {
                 }
 
                 ui.add_space(12.0);
-                // --- Certificate: subject/validity inputs, then both issue actions
-                // on one right-aligned row — "Sign & save CSR" then "Self-signed ->
-                // slot". Each is signed by the slot's key, so both dim with the same
-                // reason when the slot has none. "Sign & save CSR" opens a save
-                // dialog first (see `drain_file_dialogs`); "Self-signed -> slot"
-                // opens the PIN / management-key modal.
+                // --- Certificate: title row carries both issue actions
+                // right-aligned — "Sign & save CSR" then "Self-signed -> slot" —
+                // same layout "Import/Export cert" below uses, rather than
+                // sharing a row with the subject/validity inputs (three "Valid
+                // for" fields plus two buttons would collapse/wrap at narrow
+                // window widths). Each is signed by the slot's key, so both dim
+                // with the same reason when the slot has none. "Sign & save
+                // CSR" opens a save dialog first (see `drain_file_dialogs`);
+                // "Self-signed -> slot" opens the PIN / management-key modal.
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Certificate")
@@ -16106,35 +16383,8 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "piv-certificate");
-                });
-                ui.add_space(6.0);
-                text_field(
-                    ui,
-                    p,
-                    "Name",
-                    &mut self.piv.cert_subject,
-                    "e.g. Alice — or full CN=Alice,O=Example,C=US",
-                    300.0,
-                );
-                ui.horizontal(|ui| {
-                    // Same 96px label column `text_field` uses for the "Name" row
-                    // above, so this label lines up with it and the input below
-                    // starts at the same x.
-                    ui.add_sized(
-                        [96.0, 22.0],
-                        egui::Label::new(
-                            egui::RichText::new("Valid for")
-                                .font(theme::f_reg(13.0))
-                                .color(p.txt2),
-                        ),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut self.piv.cert_days)
-                            .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
-                            .suffix(" days"),
-                    );
-                    // right_to_left: add "Self-signed" first so it sits at the far
-                    // right, then "Sign & save CSR" to its left.
+                    // right_to_left: add "Self-signed" first so it sits at the
+                    // far right, then "Sign & save CSR" to its left.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if selected_has_key {
                             if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
@@ -16158,6 +16408,35 @@ impl App {
                                 .on_hover_text(no_slot_key_hint);
                         }
                     });
+                });
+                ui.add_space(6.0);
+                text_field(
+                    ui,
+                    p,
+                    "Name",
+                    &mut self.piv.cert_subject,
+                    "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                    300.0,
+                );
+                ui.horizontal(|ui| {
+                    // Same 96px label column `text_field` uses for the "Name" row
+                    // above, so this label lines up with it and the fields below
+                    // start at the same x.
+                    ui.add_sized(
+                        [96.0, 22.0],
+                        egui::Label::new(
+                            egui::RichText::new("Valid for")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        ),
+                    );
+                    piv_valid_for_fields(
+                        ui,
+                        unix_now(),
+                        &mut self.piv.cert_valid_years,
+                        &mut self.piv.cert_valid_months,
+                        &mut self.piv.cert_valid_days,
+                    );
                 });
 
                 ui.add_space(12.0);
@@ -18429,6 +18708,41 @@ mod tests {
         ));
     }
 
+    /// The Generate Key modal's "Policy other than `default` requires
+    /// YubiKey or compatible token." caveat hides only when *both* the PIN
+    /// and touch policy gates are confirmed `Supported` — any other
+    /// combination (either axis `Unverified` or `Unsupported`) still needs
+    /// it, since the per-row markers only warn about one axis at a time.
+    #[test]
+    fn piv_policy_caveat_hint_needed_only_hides_when_both_gates_are_supported() {
+        use keyroost_piv::compat::FeatureGate;
+
+        assert!(!piv_policy_caveat_hint_needed(
+            FeatureGate::Supported,
+            FeatureGate::Supported
+        ));
+
+        for pin in [
+            FeatureGate::Supported,
+            FeatureGate::Unverified,
+            FeatureGate::Unsupported,
+        ] {
+            for touch in [
+                FeatureGate::Supported,
+                FeatureGate::Unverified,
+                FeatureGate::Unsupported,
+            ] {
+                if pin == FeatureGate::Supported && touch == FeatureGate::Supported {
+                    continue;
+                }
+                assert!(
+                    piv_policy_caveat_hint_needed(pin, touch),
+                    "pin={pin:?} touch={touch:?}"
+                );
+            }
+        }
+    }
+
     /// Refusing to arm (KEY-005: no serial to re-identify the key by after a
     /// replug) ends the run — the dialog closes and no reset is ever sent. The
     /// seeded FIDO row has to resolve too, or the report sits forever on
@@ -19620,6 +19934,34 @@ mod tests {
         let mut sel = PivMgmtAlgSel::Delete;
         piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::ALL);
         assert_eq!(sel, PivMgmtAlgSel::Aes192);
+    }
+
+    /// `piv_policy_clamp` — the PIN/touch policy counterpart of
+    /// `piv_mgmtalg_clamp` — snaps a selection a `PivQuirk` has dropped from
+    /// the offered list (e.g. `Once`/`Cached`) back to `Default`, and leaves
+    /// an already-offered selection alone.
+    #[test]
+    fn piv_policy_clamp_snaps_an_unoffered_selection_to_default() {
+        let cached_excluded: Vec<keyroost_piv::TouchPolicy> = keyroost_piv::TouchPolicy::ALL
+            .iter()
+            .copied()
+            .filter(|&opt| opt != keyroost_piv::TouchPolicy::Cached)
+            .collect();
+
+        let mut sel = keyroost_piv::TouchPolicy::Cached;
+        piv_policy_clamp(&mut sel, &cached_excluded);
+        assert_eq!(sel, keyroost_piv::TouchPolicy::Default);
+
+        // Already offered: left alone.
+        let mut sel = keyroost_piv::TouchPolicy::Always;
+        piv_policy_clamp(&mut sel, &cached_excluded);
+        assert_eq!(sel, keyroost_piv::TouchPolicy::Always);
+
+        // The full list never excludes `Default` itself, so a full-list
+        // clamp never moves a valid selection.
+        let mut sel = keyroost_piv::TouchPolicy::Cached;
+        piv_policy_clamp(&mut sel, keyroost_piv::TouchPolicy::ALL);
+        assert_eq!(sel, keyroost_piv::TouchPolicy::Cached);
     }
 
     /// Each flow maps to its own title, busy caption, and success text.

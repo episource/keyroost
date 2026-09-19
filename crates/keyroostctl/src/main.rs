@@ -979,6 +979,10 @@ enum PivCmd {
         /// generation into the signing command.
         #[arg(long, value_name = "PATH")]
         save_pubkey: Option<std::path::PathBuf>,
+        /// Run even with a PIN/touch policy known to be incompatible with
+        /// this device (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
     /// Import a DER or PEM X.509 certificate into a slot. Needs the management key.
     ///
@@ -1066,9 +1070,23 @@ enum PivCmd {
         /// (supported attributes: CN, O, OU, C, L, ST).
         #[arg(long, value_name = "DN")]
         subject: String,
-        /// Validity period in days, starting now.
-        #[arg(long, value_name = "N", default_value_t = 365)]
-        days: u32,
+        /// Validity period in whole calendar years from now, applied before
+        /// `--months`/`--days` — the same month and day as today, that many
+        /// years later (a Feb 29 clamps to Feb 28 in a target year that
+        /// isn't a leap year).
+        #[arg(long, value_name = "N")]
+        years: Option<u32>,
+        /// Validity period in whole calendar months, added on top of
+        /// `--years` (if given) before `--days` — the same day of month as
+        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
+        /// to Feb 28/29, the month's last day).
+        #[arg(long, value_name = "N")]
+        months: Option<u32>,
+        /// Validity period in days, starting now. Combines with `--years`/
+        /// `--months` (e.g. `--years 1 --days 5` is 1 year and 5 additional
+        /// days from now); defaults to 1 year if none of the three is given.
+        #[arg(long, value_name = "N")]
+        days: Option<u32>,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
@@ -1095,8 +1113,9 @@ enum PivCmd {
     /// for RSA / ECDSA / Ed25519), run a fixed challenge on the card and
     /// verify the result against the slot certificate's public key. Reports
     /// each operation's pass / fail / skipped. Read-only — nothing on the card
-    /// changes. Needs the PIN unless the slot's PIN policy is `never`
-    /// (then omit `--pin-env` / `--pin-stdin`).
+    /// changes. `--pin-env` / `--pin-stdin` are always optional: it's your
+    /// call whether to test with or without a PIN. Depending on device state
+    /// and PIN policy, omitting it may fail.
     Test {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1119,11 +1138,24 @@ enum PivCmd {
         mgmt_key_env: Option<String>,
         #[arg(long)]
         mgmt_key_stdin: bool,
+        /// CHUID expiration, in whole calendar years from now, applied
+        /// before `--months`/`--days` — the same month and day as today,
+        /// that many years later (a Feb 29 clamps to Feb 28 in a target
+        /// year that isn't a leap year). Informational only.
+        #[arg(long, value_name = "N")]
+        years: Option<u32>,
+        /// CHUID expiration, in whole calendar months, added on top of
+        /// `--years` (if given) before `--days` — the same day of month as
+        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
+        /// to Feb 28/29, the month's last day). Informational only.
+        #[arg(long, value_name = "N")]
+        months: Option<u32>,
         /// CHUID expiration, in days from now. Informational only — it has no
-        /// technical implications. Same default as self-sign's certificate
-        /// validity.
-        #[arg(long, value_name = "N", default_value_t = 365)]
-        days: u32,
+        /// technical implications. Combines with `--years`/`--months` (e.g.
+        /// `--years 1 --days 5` is 1 year and 5 additional days from now);
+        /// same default as self-sign's certificate validity.
+        #[arg(long, value_name = "N")]
+        days: Option<u32>,
         /// GUID, hex (dashes optional). Omit to use random GUID.
         #[arg(long, value_name = "HEX")]
         guid: Option<String>,
@@ -2819,6 +2851,130 @@ fn check_valid_days(days: u32) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     Ok(())
+}
+
+/// The years counterpart of [`check_valid_days`] — same rationale, same
+/// 9999-12-31 ceiling, just checked against [`keyroost_piv::max_valid_years`]
+/// instead.
+fn check_valid_years(years: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
+    if years > max {
+        return Err(format!(
+            "--years {years} exceeds the largest representable value ({max} years \
+             from now) — a CHUID/certificate date is a 4-digit year, capped at \
+             9999-12-31"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The months counterpart of [`check_valid_days`]/[`check_valid_years`] —
+/// same rationale, same 9999-12-31 ceiling, checked against
+/// [`keyroost_piv::max_valid_months`].
+fn check_valid_months(months: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
+    if months > max {
+        return Err(format!(
+            "--months {months} exceeds the largest representable value ({max} months \
+             from now) — a CHUID/certificate date is a 4-digit year, capped at \
+             9999-12-31"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `piv self-sign` and `piv new-chuid` both take a `--days`/`--months`/
+/// `--years` triple that freely combines and sums (e.g. `--years 1 --days 5`
+/// is 1 year and 5 additional days from now, applied in that order — see
+/// [`keyroost_piv::add_calendar_period`]); `None`/`None`/`None` — no flag
+/// given — resolves to a 1-year default rather than each call site
+/// re-deriving it.
+#[derive(Debug, PartialEq, Eq)]
+struct ValidFor {
+    years: u32,
+    months: u32,
+    days: u32,
+}
+
+impl ValidFor {
+    fn resolve(days: Option<u32>, months: Option<u32>, years: Option<u32>) -> ValidFor {
+        if days.is_none() && months.is_none() && years.is_none() {
+            return ValidFor {
+                years: 1,
+                months: 0,
+                days: 0,
+            };
+        }
+        ValidFor {
+            years: years.unwrap_or(0),
+            months: months.unwrap_or(0),
+            days: days.unwrap_or(0),
+        }
+    }
+
+    /// Reject an all-zero period, then check each given unit against its own
+    /// ceiling ([`keyroost_piv::max_valid_days`]/`_months`/`_years`, each
+    /// independently computed from "now") — a conservative check when units
+    /// combine (adding years first only ever shrinks the days/months budget
+    /// left before 9999-12-31, so a component that already fits its own
+    /// from-now ceiling always fits the summed one too); the actual encoder
+    /// clamps the summed result as a backstop regardless (see
+    /// `check_valid_days`'s doc comment for why a clear error is still
+    /// preferred over that silent saturation for the common single-unit
+    /// case).
+    fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.years == 0 && self.months == 0 && self.days == 0 {
+            return Err("validity must be at least 1 day".into());
+        }
+        if self.years > 0 {
+            check_valid_years(self.years)?;
+        }
+        if self.months > 0 {
+            check_valid_months(self.months)?;
+        }
+        if self.days > 0 {
+            check_valid_days(self.days)?;
+        }
+        Ok(())
+    }
+
+    /// Unix seconds this period ends at, starting from `now_unix_secs`.
+    fn end_unix_secs(&self, now_unix_secs: u64) -> i64 {
+        keyroost_piv::add_calendar_period(now_unix_secs, self.years, self.months, self.days)
+    }
+
+    /// CHUID expiration (`YYYYMMDD`) this period produces from `now_unix_secs`.
+    fn chuid_expiration(&self, now_unix_secs: u64) -> [u8; 8] {
+        keyroost_piv::yyyymmdd_from_unix_secs(self.end_unix_secs(now_unix_secs))
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.years > 0 {
+            parts.push(format!(
+                "{} year{}",
+                self.years,
+                if self.years == 1 { "" } else { "s" }
+            ));
+        }
+        if self.months > 0 {
+            parts.push(format!(
+                "{} month{}",
+                self.months,
+                if self.months == 1 { "" } else { "s" }
+            ));
+        }
+        if self.days > 0 {
+            parts.push(format!(
+                "{} day{}",
+                self.days,
+                if self.days == 1 { "" } else { "s" }
+            ));
+        }
+        parts.join(", ")
+    }
 }
 
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
@@ -6897,10 +7053,60 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_env,
             mgmt_key_stdin,
             save_pubkey,
+            force,
         } => {
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let alg = algorithm.to_alg();
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            // Gate the PIN/touch policy — Yubico extensions to GENERATE
+            // ASYMMETRIC KEYPAIR, not SP 800-73-4 — on the applet's
+            // fingerprint before authenticating, same reasoning as
+            // `guard_piv_feature`'s own doc: its fingerprint probe re-SELECTs
+            // PIV and would clear the auth. `default` is standard PIV and
+            // needs neither extension, so both checks are skipped outright
+            // when the caller didn't ask for anything non-default.
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            // Unlike PIN/touch policy, every algorithm choice is gated —
+            // there's no "default" that's exempt: even the SP 800-73-4
+            // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
+            // universally implemented, and RSA-3072/4096/Ed25519/X25519 are
+            // vendor extensions with no standard obligation at all. See
+            // `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`.
+            guard_piv_feature(
+                &mut s,
+                keyroost_piv::compat::PivExtension::SlotKeyAlgorithm(alg),
+                *force,
+            )?;
+            if !matches!(pin_policy, CliPinPolicy::Default) {
+                guard_piv_feature(
+                    &mut s,
+                    keyroost_piv::compat::PivExtension::SlotPinPolicy,
+                    *force,
+                )?;
+            }
+            if !matches!(touch_policy, CliTouchPolicy::Default) {
+                guard_piv_feature(
+                    &mut s,
+                    keyroost_piv::compat::PivExtension::SlotTouchPolicy,
+                    *force,
+                )?;
+            }
+            // Narrower than the two gates above: a device can support the
+            // extension in general yet reject one specific value.
+            guard_piv_policy_value(
+                &mut s,
+                keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
+                matches!(pin_policy, CliPinPolicy::Once),
+                "PIN policy \"once\"",
+                *force,
+            )?;
+            guard_piv_policy_value(
+                &mut s,
+                keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
+                matches!(touch_policy, CliTouchPolicy::Cached),
+                "Touch policy \"cached\"",
+                *force,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             eprintln!(
                 "Generating {} in {} (touch the key if it blinks)\u{2026}",
                 alg.label(),
@@ -7034,6 +7240,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             slot,
             subject,
             days,
+            months,
+            years,
             pin_env,
             pin_stdin,
             mgmt_key_env,
@@ -7042,10 +7250,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             load_pubkey,
             keygen,
         } => {
-            if *days == 0 {
-                return Err("validity must be at least 1 day".into());
-            }
-            check_valid_days(*days)?;
+            let valid_for = ValidFor::resolve(*days, *months, *years);
+            valid_for.check()?;
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             // Management-key auth covers the certificate import; the PIN
@@ -7058,18 +7264,18 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 s.remember_pubkey(slot.to_slot(), alg, key);
             }
             eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
-            let now = unix_now() as i64;
+            let now = unix_now();
             let der = s.self_signed_certificate(
                 slot.to_slot(),
                 subject,
-                now,
-                now + i64::from(*days) * 86_400,
+                i64::from(now),
+                valid_for.end_unix_secs(u64::from(now)),
                 pin.as_bytes(),
             )?;
             println!(
-                "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
+                "Self-signed certificate ({} bytes, {}) created and stored in {}.",
                 der.len(),
-                days,
+                valid_for.describe(),
                 slot.to_slot().label()
             );
             if let Some(path) = file {
@@ -7086,8 +7292,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_stdin,
         } => {
             let piv_slot = slot.to_slot();
-            // The PIN is optional: a slot whose PIN policy is `never` (usually
-            // 9e) needs none. When given, verify it once up front so a wrong
+            // The PIN is always optional, independent of the slot's PIN
+            // policy — it's the caller's call whether to test with or
+            // without one. When given, verify it once up front so a wrong
             // PIN fails before any op and costs just one retry.
             let pin = if pin_env.is_some() || *pin_stdin {
                 Some(read_secret("PIN", pin_env.as_deref(), *pin_stdin)?)
@@ -7178,9 +7385,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_env,
             mgmt_key_stdin,
             days,
+            months,
+            years,
             guid,
         } => {
-            check_valid_days(*days)?;
+            let valid_for = ValidFor::resolve(*days, *months, *years);
+            valid_for.check()?;
             let guid = match guid {
                 Some(hex) => keyroost_piv::parse_guid_hex(hex).ok_or(
                     "--guid must be 16 bytes of hex, dashes optional \
@@ -7188,7 +7398,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )?,
                 None => keyroost_transport::random_chuid_guid()?,
             };
-            let expiration = keyroost_piv::chuid_expiration_in_days(u64::from(unix_now()), *days);
+            let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
             s.new_chuid(&guid, &expiration)?;
@@ -7527,6 +7737,54 @@ fn reset_global_alternative_hint(session: &mut keyroost_transport::PivSession) -
         ),
         FeatureGate::Unsupported => None,
     }
+}
+
+/// Refuse one specific PIN/touch policy *value* the fingerprint/version
+/// quirk table ([`keyroost_piv::compat::PivQuirk`]) has flagged as
+/// unsupported even though the surrounding extension
+/// ([`keyroost_piv::compat::PivExtension::SlotPinPolicy`]/
+/// [`SlotTouchPolicy`](keyroost_piv::compat::PivExtension::SlotTouchPolicy))
+/// otherwise resolves fine — e.g. YubiKey firmware 4.0\u{2013}4.2 supports slot
+/// touch policy in general but rejects the specific `cached` value
+/// ([`keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported`]).
+/// Mirrors [`guard_piv_feature`]'s tone and `--force` override, but keys off a
+/// quirk rather than a [`FeatureGate`], since this is about one option within
+/// an otherwise-supported extension, not the extension as a whole:
+///
+/// * `value_selected` is `false` (some other value was picked) → no-op,
+///   regardless of the quirk;
+/// * the quirk isn't present → no-op;
+/// * quirk present and selected → refuse with `--force` guidance, unless
+///   `force` is set, in which case warn and continue.
+///
+/// Must run before management-key auth for the same reason
+/// [`guard_piv_feature`] must: [`PivSession::quirks`] shares the cached
+/// fingerprint probe [`PivSession::feature_gate`] performs, and that probe
+/// re-SELECTs PIV.
+///
+/// [`PivSession::quirks`]: keyroost_transport::PivSession::quirks
+/// [`PivSession::feature_gate`]: keyroost_transport::PivSession::feature_gate
+fn guard_piv_policy_value(
+    session: &mut keyroost_transport::PivSession,
+    quirk: keyroost_piv::compat::PivQuirk,
+    value_selected: bool,
+    value_label: &str,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !value_selected || !session.quirks().contains(&quirk) {
+        return Ok(());
+    }
+    if force {
+        eprintln!(
+            "warning: {value_label} is known to be unsupported on this device. Running anyway \
+             because --force was given."
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "{value_label} is known to be unsupported on this device. Pass --force to run anyway."
+    )
+    .into())
 }
 
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
@@ -11175,11 +11433,13 @@ mod cli_tests {
                     PivCmd::GenerateKey {
                         pin_policy,
                         touch_policy,
+                        force,
                         ..
                     },
             }) => {
                 assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Default);
                 assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Default);
+                assert!(!force);
             }
             _ => panic!("expected piv generate-key"),
         }
@@ -11195,6 +11455,7 @@ mod cli_tests {
             "once",
             "--touch-policy",
             "cached",
+            "--force",
         ])
         .unwrap()
         .command
@@ -11204,11 +11465,13 @@ mod cli_tests {
                     PivCmd::GenerateKey {
                         pin_policy,
                         touch_policy,
+                        force,
                         ..
                     },
             }) => {
                 assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Once);
                 assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Cached);
+                assert!(force);
             }
             _ => panic!("expected piv generate-key"),
         }
@@ -11332,16 +11595,25 @@ mod cli_tests {
 
     #[test]
     fn piv_new_chuid_default_days_matches_self_sign() {
-        // `new-chuid --days` and `self-sign --days` are two separate clap
-        // literal defaults (365 each) — pin them equal so a future change to
-        // one doesn't silently drift from the other.
-        let chuid_days = match parse(&["keyroostctl", "piv", "new-chuid"]).unwrap().command {
+        // Neither command's `--days`/`--months`/`--years` defaults via clap
+        // anymore (all three are `Option<u32>`, left `None` when omitted so
+        // `ValidFor::resolve` can tell "explicitly given" from "defaulted");
+        // pin the parsed triples equal across both commands so a future
+        // change to one doesn't silently drift from the other, and pin
+        // `ValidFor::resolve`'s shared default to 1 year.
+        let chuid = match parse(&["keyroostctl", "piv", "new-chuid"]).unwrap().command {
             Some(Cmd::Piv {
-                cmd: PivCmd::NewChuid { days, .. },
-            }) => days,
+                cmd:
+                    PivCmd::NewChuid {
+                        days,
+                        months,
+                        years,
+                        ..
+                    },
+            }) => (days, months, years),
             _ => panic!("expected piv new-chuid"),
         };
-        let cert_days = match parse(&[
+        let cert = match parse(&[
             "keyroostctl",
             "piv",
             "self-sign",
@@ -11354,11 +11626,67 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::SelfSign { days, .. },
-            }) => days,
+                cmd:
+                    PivCmd::SelfSign {
+                        days,
+                        months,
+                        years,
+                        ..
+                    },
+            }) => (days, months, years),
             _ => panic!("expected piv self-sign"),
         };
-        assert_eq!(chuid_days, cert_days);
+        assert_eq!(chuid, cert);
+        assert_eq!(chuid, (None, None, None));
+        assert_eq!(
+            ValidFor::resolve(chuid.0, chuid.1, chuid.2),
+            ValidFor {
+                years: 1,
+                months: 0,
+                days: 0
+            }
+        );
+    }
+
+    #[test]
+    fn piv_self_sign_days_months_years_combine_and_sum() {
+        // `--years 1 --days 5` is not rejected as a conflict; it resolves to
+        // both counts at once.
+        let (days, months, years) = match parse(&[
+            "keyroostctl",
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--years",
+            "1",
+            "--days",
+            "5",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::SelfSign {
+                        days,
+                        months,
+                        years,
+                        ..
+                    },
+            }) => (days, months, years),
+            _ => panic!("expected piv self-sign"),
+        };
+        assert_eq!(
+            ValidFor::resolve(days, months, years),
+            ValidFor {
+                years: 1,
+                months: 0,
+                days: 5
+            }
+        );
     }
 
     #[test]
@@ -11372,6 +11700,46 @@ mod cli_tests {
         let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
         let err = check_valid_days(max + 1).unwrap_err();
         assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn check_valid_months_accepts_the_default_and_the_actual_ceiling() {
+        assert!(check_valid_months(12).is_ok());
+        assert!(check_valid_months(keyroost_piv::max_valid_months(u64::from(unix_now()))).is_ok());
+    }
+
+    #[test]
+    fn check_valid_months_rejects_one_past_the_ceiling() {
+        let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
+        let err = check_valid_months(max + 1).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn check_valid_years_accepts_the_default_and_the_actual_ceiling() {
+        assert!(check_valid_years(1).is_ok());
+        assert!(check_valid_years(keyroost_piv::max_valid_years(u64::from(unix_now()))).is_ok());
+    }
+
+    #[test]
+    fn check_valid_years_rejects_one_past_the_ceiling() {
+        let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
+        let err = check_valid_years(max + 1).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn valid_for_check_rejects_an_all_zero_period() {
+        assert!(ValidFor {
+            years: 0,
+            months: 0,
+            days: 0
+        }
+        .check()
+        .is_err());
+        // Explicitly passing `--days 0` (nothing else) also resolves to an
+        // all-zero period, and must be rejected the same way.
+        assert!(ValidFor::resolve(Some(0), None, None).check().is_err());
     }
 
     #[test]
