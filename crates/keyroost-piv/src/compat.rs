@@ -54,6 +54,7 @@ use crate::fingerprint::{
     AppletFingerprint, ArekinathVariant, HidCrescendoVariant, OpenFips201Variant, TrussedVariant,
     UTrustVariant, HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY,
 };
+use crate::KeyAlg;
 
 /// One of the non-standard, vendor-extension PIV commands keyroost exposes —
 /// nothing in SP 800-73-4 defines it, so support varies by applet and is
@@ -196,51 +197,129 @@ pub enum PivExtension {
     /// probed for — not a claim that no other device could ever support the
     /// capability.
     SetManagementKey,
+    /// Setting a slot's PIN policy (tag `0xAA`: does using the freshly
+    /// generated private key require the PIN once per session, every time, or
+    /// never) as part of GENERATE ASYMMETRIC KEYPAIR — Yubico's own extension
+    /// to the standard command
+    /// (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>).
+    /// Distinct from *reading* a slot's PIN policy back, which travels over
+    /// [`Self::GetMetadata`] instead and is never guarded by this extension.
+    /// `default` (send no `0xAA` tag at all) is standard PIV and always works
+    /// regardless of this extension's verdict; only a non-default value needs
+    /// it. See [`PivQuirk::SlotPinPolicyOnceNotSupported`] for the narrower
+    /// case of a device that supports this extension in general but rejects
+    /// one specific value.
+    SlotPinPolicy,
+    /// Setting a slot's touch policy (tag `0xAB`: does using the freshly
+    /// generated private key require a physical touch never, always, or
+    /// cached for a short window after the last one) as part of GENERATE
+    /// ASYMMETRIC KEYPAIR — the sibling of [`Self::SlotPinPolicy`], same
+    /// Yubico extension reference. Same "default needs nothing, this
+    /// extension only gates the button once a non-default value is
+    /// requested" shape, and the same GetMetadata/GENERATE split: reading a
+    /// slot's touch policy back is unaffected by this extension's verdict.
+    /// See [`PivQuirk::SlotTouchPolicyCachedNotSupported`] for the narrower
+    /// case of a device that supports this extension in general but rejects
+    /// the specific `cached` value.
+    SlotTouchPolicy,
+    /// Whether a given [`crate::KeyAlg`] can be used in a slot on this
+    /// device — RSA-1024/2048 and ECC P-256/P-384 are standardized by SP
+    /// 800-73-4 itself, but not every applet implements every standardized
+    /// algorithm either (some drop RSA-1024 outright), and RSA-3072/4096 and
+    /// the Ed25519/X25519 curves are vendor extensions with no standard
+    /// obligation at all. A plain, payload-free capability marker exactly
+    /// like every other variant here — [`resolve`] gates it through the same
+    /// per-fingerprint known-support tables and version-matching rule as
+    /// [`Self::MoveKey`]/[`Self::DeleteKey`], and it's consumed internally
+    /// (APDU construction and response parsing in `keyroost-transport`) the
+    /// same way [`Self::GetMetadata`]/[`Self::Attest`] are, as well as
+    /// surfaced to a UI's algorithm picker.
+    ///
+    /// Says nothing about which byte names `KeyAlg` on the wire — that's a
+    /// separate question, resolved by [`slot_key_algorithm_apdu_id`]/
+    /// [`key_alg_from_apdu_id`] rather than carried on this variant. Those
+    /// default to [`crate::KeyAlg::id`]'s Yubico encoding and consult a
+    /// small, non-versioned, per-fingerprint override table for any
+    /// fingerprint confirmed to use a different byte — HID Crescendo C4000
+    /// is one such case, reporting RSA-4096 as `0x04` rather than `0x16` on
+    /// GENERATE ASYMMETRIC KEYPAIR itself, not just its own proprietary GET
+    /// PIV PROPERTIES / INJECT PKI KEY commands — see
+    /// [`slot_key_algorithm_apdu_id_override`]'s own doc.
+    SlotKeyAlgorithm(KeyAlg),
 }
 
 impl PivExtension {
     /// A one-sentence statement of what running this extension needs, phrased
     /// for the user. A UI or the CLI follows it with a state-specific suffix —
     /// [`FeatureGate::UNVERIFIED_SUFFIX`] or [`FeatureGate::INCOMPATIBLE_SUFFIX`]
-    /// — so both surfaces say the same thing.
+    /// — so both surfaces say the same thing. Not `const` — unlike every other
+    /// variant, [`Self::SlotKeyAlgorithm`]'s sentence names the specific
+    /// algorithm, so this has to build a `String` rather than return a
+    /// `&'static str`; every other arm still returns the exact same fixed
+    /// wording it always did, just heap-allocated now.
     #[must_use]
-    pub const fn requirement(self) -> &'static str {
+    pub fn requirement(self) -> String {
         match self {
             PivExtension::MoveKey => {
                 "Moving keys between slots needs YubiKey 5.7+ or a compatible third-party device."
+                    .to_string()
             }
             PivExtension::DeleteKey => {
-                "Key deletion needs YubiKey 5.7+ or a compatible third-party device."
+                "Key deletion needs YubiKey 5.7+ or a compatible third-party device.".to_string()
             }
             PivExtension::GetMetadata => {
                 "Reading key/PIN metadata needs YubiKey firmware 5.3+ or a compatible \
                  third-party device."
+                    .to_string()
             }
             PivExtension::GetSlotKeyStatus => {
                 "Reading a slot's key occupancy directly needs YubiKey firmware 5.3+ or a \
                  compatible third-party device."
+                    .to_string()
             }
             PivExtension::Attest => {
                 "Reading a key's attestation certificate needs YubiKey firmware 4.3+ or a \
                  compatible third-party device."
+                    .to_string()
             }
             PivExtension::PinManagementAuth => {
                 "Unlocking management with a PIN instead of the management key needs \
                  YubiKey 3+ or a compatible third-party device."
+                    .to_string()
             }
             PivExtension::Reset => {
                 "Resetting the PIV applet needs a YubiKey or a compatible third-party device."
+                    .to_string()
             }
             PivExtension::ResetGlobal => {
                 "A device-wide reset that takes PIV with it needs a compatible third-party \
                  device (e.g. HID Crescendo)."
+                    .to_string()
             }
             PivExtension::SetPinPukRetries => {
                 "Setting the PIN/PUK retry counts needs a YubiKey or a compatible third-party \
                  device."
+                    .to_string()
             }
             PivExtension::SetManagementKey => {
                 "Changing the management key needs a YubiKey or a compatible third-party device."
+                    .to_string()
+            }
+            PivExtension::SlotPinPolicy => {
+                "Setting a slot's PIN policy needs YubiKey firmware 4+ or a compatible \
+                 third-party device."
+                    .to_string()
+            }
+            PivExtension::SlotTouchPolicy => {
+                "Setting a slot's touch policy needs YubiKey firmware 4+ or a compatible \
+                 third-party device."
+                    .to_string()
+            }
+            PivExtension::SlotKeyAlgorithm(alg) => {
+                format!(
+                    "Generating a {} key needs a compatible device.",
+                    alg.label()
+                )
             }
         }
     }
@@ -264,6 +343,24 @@ pub enum PivQuirk {
     /// not reflect the slot's actual key state — and must always be ignored
     /// when this quirk is set, regardless of what value is read.
     InsF7MetadataAlgorithmInvalid,
+    /// GET METADATA (`INS 0xF7`) might report a PIN/touch policy (tag `0x02`,
+    /// packing `(pin_policy, touch_policy)` — see [`crate::Metadata::policy`])
+    /// on this device, but the returned values are either invalid/stuck/stale
+    /// or malformed by other means — not a live reflection of what GENERATE
+    /// ASYMMETRIC KEYPAIR actually set for the slot. A caller with this quirk
+    /// set must ignore tag `0x02` entirely, the same "always ignore, never
+    /// trust a lucky-looking value" rule [`Self::InsF7MetadataAlgorithmInvalid`]
+    /// applies to the algorithm tag — kept as a separate variant because the
+    /// two tags have been observed to fail independently: a device can report
+    /// a stale algorithm while its policy tag is fine, or vice versa. Says
+    /// nothing about whether GENERATE ASYMMETRIC KEYPAIR's own PIN/touch
+    /// policy tags (`0xAA`/`0xAB`) are accepted — that's
+    /// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`]'s own
+    /// [`resolve`] verdict, queried separately; a device can reject *setting*
+    /// a non-default policy and still echo a (meaningless) tag `0x02` back on
+    /// every GET METADATA call, which is exactly the case this quirk exists
+    /// to name.
+    InsF7MetadataPinTouchPolicyInvalid,
     /// [`PivExtension::PinManagementAuth`] is available on this device, but
     /// PIN VERIFY doesn't unlock management functionality by itself — it only
     /// unlocks *reading* the real management key, which the card stores PIN-
@@ -412,6 +509,21 @@ pub enum PivQuirk {
     /// while leaving the AES key in place, so the recovery is to change the
     /// management key back to 3DES first and retry.
     ResetFailsIfManagementKeyIsAes,
+    /// [`PivExtension::SlotPinPolicy`] is supported on this device in
+    /// principle — GENERATE ASYMMETRIC KEYPAIR accepts the `0xAA` tag — but
+    /// the specific `Once` value is rejected. A caller offering the PIN
+    /// policy picker (GUI combo box, `keyroostctl piv generate-key
+    /// --pin-policy`) disables/refuses just that one choice rather than
+    /// dimming the whole control the way an [`PivExtension::SlotPinPolicy`]
+    /// [`FeatureGate::Unsupported`] verdict would — every other value
+    /// (`default`/`never`/`always`) is unaffected.
+    SlotPinPolicyOnceNotSupported,
+    /// [`PivExtension::SlotTouchPolicy`] is supported on this device in
+    /// principle, but the specific `Cached` value is rejected — the touch
+    /// counterpart of [`Self::SlotPinPolicyOnceNotSupported`], same narrow
+    /// single-value scope and the same caller obligation (disable/refuse just
+    /// `Cached`, leave `default`/`never`/`always` alone).
+    SlotTouchPolicyCachedNotSupported,
 }
 
 impl PivQuirk {
@@ -438,12 +550,22 @@ pub fn default_9b_management_key(quirks: &BTreeSet<PivQuirk>) -> Option<&'static
     })
 }
 
-/// One extension's known-support verdicts within one fingerprint's
-/// applet-axis or firmware-axis table — e.g. [`YUBIKEY_APPLET_VERDICTS`].
+/// One or more extensions' shared known-support verdicts within one
+/// fingerprint's applet-axis or firmware-axis table — e.g.
+/// [`YUBIKEY_APPLET_VERDICTS`]. Carrying several extensions on one row is
+/// semantically identical to one row per extension, each with the same
+/// `verdicts` — it's purely a way to collapse rows that would otherwise
+/// repeat the same verdicts verbatim for two or more extensions this
+/// fingerprint happens to treat identically.
 struct ExtensionVerdicts {
-    extension: PivExtension,
-    /// This (fingerprint, extension) pair's per-version verdicts, **ascending
-    /// by [`VersionVerdict::version`]** and non-empty.
+    /// The extension(s) these verdicts apply to — non-empty. More than one
+    /// entry means this fingerprint's evidence doesn't distinguish between
+    /// them: they were tested (or reasoned about) together and landed on the
+    /// same verdict at every version, so there's nothing extension-specific
+    /// left to say.
+    extensions: &'static [PivExtension],
+    /// This (fingerprint, extension-set) pair's per-version verdicts,
+    /// **ascending by [`VersionVerdict::version`]** and non-empty.
     verdicts: &'static [VersionVerdict],
 }
 
@@ -657,7 +779,9 @@ fn firmware_verdicts(
 }
 
 /// Shared lookup backing [`applet_verdicts`]/[`firmware_verdicts`]: find
-/// `extension`'s entry within one fingerprint's already-selected table.
+/// `extension`'s entry within one fingerprint's already-selected table —
+/// `extension` may be listed alongside others on the same row, per
+/// [`ExtensionVerdicts::extensions`].
 #[must_use]
 fn find_verdicts(
     table: &'static [ExtensionVerdicts],
@@ -665,7 +789,7 @@ fn find_verdicts(
 ) -> Option<&'static [VersionVerdict]> {
     table
         .iter()
-        .find(|e| e.extension == extension)
+        .find(|e| e.extensions.contains(&extension))
         .map(|e| e.verdicts)
 }
 
@@ -813,37 +937,38 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
 ///   [`YUBIKEY_APPLET_QUIRKS`], so a caller still has to read the
 ///   PIN-protected management key back and run the standard `0x9B` round
 ///   with it — see [`PivExtension::PinManagementAuth`]'s own doc.
-/// * [`PivExtension::Reset`] — RESET (`INS 0xFB`) has been supported by
-///   every YubiKey PIV implementation observed, so this is a single
-///   [`Verdict::KnownSupported`] at the universal `[]` version, no
-///   known-unsupported floor to gate below it — unlike MOVE KEY/DELETE KEY
-///   above, RESET didn't arrive in a specific later firmware. YubiKey
-///   carries no [`PivQuirk::ResetNeedsManagementAuth`] entry on
-///   [`YUBIKEY_APPLET_QUIRKS`] either: "supported" here means
-///   the card accepts the instruction, not that it accepts it
-///   unconditionally — the precondition (PIN *and* PUK both already
-///   blocked) is exactly what that quirk's absence signals, per its own doc.
-/// * [`PivExtension::SetPinPukRetries`] — supported by every YubiKey PIV
-///   implementation
-///   (<https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html#set-pin-retries>:
-///   "All YubiKeys with the PIV application."), same shape as
-///   [`PivExtension::Reset`] above: a single [`Verdict::KnownSupported`] at
-///   the universal `[]` version, no known-unsupported floor — unlike MOVE
-///   KEY/DELETE KEY's row, this didn't arrive in a specific later firmware.
-/// * [`PivExtension::SetManagementKey`] — supported by every YubiKey PIV
-///   implementation, same shape as [`PivExtension::SetPinPukRetries`]
-///   immediately above: a single [`Verdict::KnownSupported`] at the universal
-///   `[]` version, no known-unsupported floor — unlike MOVE KEY/DELETE KEY's
-///   row, this is core key management, not a firmware-5.7 addition.
+/// * [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`]/
+///   [`PivExtension::SetManagementKey`] — share one row: all three have been
+///   supported by every YubiKey PIV implementation observed
+///   (RESET, `INS 0xFB`, unconditionally; SET PIN RETRIES per
+///   <https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html#set-pin-retries>,
+///   "All YubiKeys with the PIV application."; SET MANAGEMENT KEY as core key
+///   management), so this is a single [`Verdict::KnownSupported`] at the
+///   universal `[]` version, no known-unsupported floor to gate below it —
+///   unlike MOVE KEY/DELETE KEY above, none of the three arrived in a
+///   specific later firmware. YubiKey carries no
+///   [`PivQuirk::ResetNeedsManagementAuth`] entry on [`YUBIKEY_APPLET_QUIRKS`]
+///   either: "supported" for RESET here means the card accepts the
+///   instruction, not that it accepts it unconditionally — the precondition
+///   (PIN *and* PUK both already blocked) is exactly what that quirk's
+///   absence signals, per its own doc.
 /// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownUnsupportedSince`] at
 ///   the universal `[]` version, same as every other non-HID-Crescendo
 ///   fingerprint's table — see e.g. [`GENERIC_APPLET_VERDICTS`]'s doc for why.
+/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] —
+///   [`Verdict::KnownSupported`] at applet major version `[4]`
+///   (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>),
+///   no known-unsupported floor to gate below — like
+///   [`PivExtension::SetManagementKey`] above, these predate the 5.x lineage
+///   the MOVE KEY/DELETE KEY/ATTEST/GET METADATA rows are anchored to. See
+///   [`YUBIKEY_APPLET_QUIRKS`] for the touch-policy `Cached` value's own
+///   narrower gate at this same version.
 /// * No entry for [`PivExtension::GetSlotKeyStatus`] — falls through to
 ///   [`PivExtension::GetMetadata`]'s own verdict above, per [`resolve`]'s
 ///   special case.
 const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[PivExtension::MoveKey, PivExtension::DeleteKey],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -856,20 +981,7 @@ const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[
-            VersionVerdict {
-                version: &[],
-                verdict: Verdict::KnownUnsupported,
-            },
-            VersionVerdict {
-                version: &[5, 7],
-                verdict: Verdict::KnownSupported,
-            },
-        ],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Attest,
+        extensions: &[PivExtension::Attest],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -882,7 +994,7 @@ const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
+        extensions: &[PivExtension::GetMetadata],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -895,37 +1007,34 @@ const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::PinManagementAuth,
+        extensions: &[PivExtension::PinManagementAuth],
         verdicts: &[VersionVerdict {
             version: &[3],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Reset,
+        extensions: &[
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::SetManagementKey,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
+        extensions: &[PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy],
         verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
-        verdicts: &[VersionVerdict {
-            version: &[],
+            version: &[4],
             verdict: Verdict::KnownSupported,
         }],
     },
@@ -949,7 +1058,25 @@ const YUBIKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 /// at all — its absence is exactly how a caller learns RESET follows the
 /// PIN/PUK-blocked convention instead; see that quirk's doc. The
 /// default-management-key quirk isn't gated on that same version split —
-/// it's repeated on both entries so it applies below applet version 3 too.
+/// it's repeated on every entry so it applies at every applet version.
+///
+/// The `[3]` entry also carries [`PivQuirk::SlotTouchPolicyCachedNotSupported`],
+/// even though touch policy itself
+/// ([`YUBIKEY_APPLET_VERDICTS`]'s [`PivExtension::SlotTouchPolicy`] row) only
+/// goes known-supported at applet version 4, one entry up — that extension
+/// verdict is the real guard a caller checks first, so a quirk that merely
+/// narrows one *value* within it is inert wherever the extension itself
+/// isn't `Supported` yet. Placing it here instead of on its own `[4]` entry
+/// just avoids a second entry that would otherwise be identical to this one;
+/// it takes effect the moment [`PivExtension::SlotTouchPolicy`] does, at `[4]`,
+/// same as if it had its own entry there. The `[4, 3]` entry drops it again —
+/// the `Cached` value specifically isn't accepted until firmware 4.3
+/// (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>) —
+/// repeating [`PivQuirk::PinManagementAuthProtected9BKey`]/
+/// [`PivQuirk::Default9bManagementKey`] from the `[3]` entry rather than
+/// leaving them off, since [`latest_quirks`] takes one entry's quirk list as-is
+/// rather than accumulating across entries on the same axis (see
+/// [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`]'s doc for the same repetition rule).
 const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
     VersionQuirks {
         version: &[],
@@ -957,6 +1084,14 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
     },
     VersionQuirks {
         version: &[3],
+        quirks: &[
+            PivQuirk::PinManagementAuthProtected9BKey,
+            PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+            PivQuirk::SlotTouchPolicyCachedNotSupported,
+        ],
+    },
+    VersionQuirks {
+        version: &[4, 3],
         quirks: &[
             PivQuirk::PinManagementAuthProtected9BKey,
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
@@ -971,108 +1106,82 @@ const YUBIKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
 /// Token2's applet-axis known-support table:
 ///
-/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] — applet version
-///   5.112.0 has been observed to reject both outright, and every version
-///   below it is assumed to as well per [`resolve_in`]'s backward-extension
-///   rule (no earlier hardware has been available to test, but a feature
-///   known not to work at 5.112.0 is presumed not to work in any older,
-///   untested version either). There is no known-supported verdict on either
-///   row, so a version *above* 5.112.0 resolves [`FeatureGate::Unverified`],
-///   not [`FeatureGate::Unsupported`] — a known-unsupported verdict is
+/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
+///   [`PivExtension::SlotTouchPolicy`] — share one row: applet version
+///   5.112.0 has been observed to reject all three outright (MOVE KEY/DELETE
+///   KEY outright; SlotTouchPolicy via a rejected `0xAB` tag on GENERATE
+///   ASYMMETRIC KEYPAIR — contrast [`PivExtension::SlotPinPolicy`] below,
+///   whose `0xAA` tag the same live unit *accepts*, so this isn't a blanket
+///   "policy tags unsupported" verdict), and every version below it is
+///   assumed to as well per [`resolve_in`]'s backward-extension rule (no
+///   earlier hardware has been available to test, but a feature known not to
+///   work at 5.112.0 is presumed not to work in any older, untested version
+///   either). There is no known-supported verdict on this row, so a version
+///   *above* 5.112.0 resolves [`FeatureGate::Unverified`], not
+///   [`FeatureGate::Unsupported`] — a known-unsupported verdict is
 ///   deliberately never treated as covering a version it hasn't actually
-///   observed on the other side either. Neither row needs an explicit `[]`
+///   observed on the other side either. The row needs no explicit `[]`
 ///   sentinel: the single `[5, 112, 0]` known-unsupported verdict is enough
 ///   for [`resolve_in`] to extend backward on its own.
-/// * [`PivExtension::Reset`] — [`Verdict::KnownSupported`] pinned to applet
-///   version 5.112.0, the only version keyroost has hardware evidence for: a
-///   live unit at this version accepts `INS 0xFB`. Token2 carries no
-///   [`PivQuirk::ResetNeedsManagementAuth`] entry on [`TOKEN2_APPLET_QUIRKS`]
-///   either, so — same as YubiKey — this device doesn't need an
-///   authenticated management-key session for RESET. Unlike YubiKey, though,
-///   that same live unit accepted `INS 0xFB` with *neither* the PIN nor the
-///   PUK blocked — it does not also fall back to the YubiKey convention's
-///   blocked-precondition gate; see
-///   [`PivQuirk::ResetNeedsManagementAuth`]'s own doc for why this quirk's
-///   absence doesn't imply that convention. No known-unsupported floor is
-///   recorded below 5.112.0, so an older reported version resolves
-///   [`FeatureGate::Unverified`] rather than inheriting this verdict
-///   backward — unlike YubiKey's universal `[]` version, this one only
-///   speaks for 5.112.0 and later.
-/// * [`PivExtension::SetPinPukRetries`] — [`Verdict::KnownSupported`] pinned
-///   to applet version 5.112.0, the only version keyroost has hardware
-///   evidence for: a live unit at this version accepts Yubico's SET PIN
-///   RETRIES APDU. Unlike the MOVE KEY/DELETE KEY rows above — both
+/// * [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`]/
+///   [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`]/
+///   [`PivExtension::SlotPinPolicy`] — share one row: [`Verdict::KnownSupported`]
+///   pinned to applet version 5.112.0, the only version keyroost has hardware
+///   evidence for — a live unit at this version accepts `INS 0xFB`, Yubico's
+///   SET PIN RETRIES APDU, GET METADATA, Yubico's SET MANAGEMENT KEY APDU, and
+///   the `0xAA` tag on GENERATE ASYMMETRIC KEYPAIR alike. Unlike the MOVE
+///   KEY/DELETE KEY/SlotTouchPolicy row above — all three
 ///   [`Verdict::KnownUnsupported`] at this same version — Token2 mimics some
 ///   Yubico extension APDUs and not others, so each extension's verdict for
 ///   this fingerprint is independent and this row's positive result doesn't
-///   imply anything about those two. No known-unsupported floor is recorded
-///   below 5.112.0 here either.
+///   imply anything about those. No known-unsupported floor is recorded below
+///   5.112.0 here either, so an older reported version resolves
+///   [`FeatureGate::Unverified`] rather than inheriting this verdict backward
+///   — unlike YubiKey's universal `[]` version on its own RESET row, this one
+///   only speaks for 5.112.0 and later. For RESET specifically: Token2
+///   carries no [`PivQuirk::ResetNeedsManagementAuth`] entry on
+///   [`TOKEN2_APPLET_QUIRKS`] either, so — same as YubiKey — this device
+///   doesn't need an authenticated management-key session for RESET. Unlike
+///   YubiKey, though, that same live unit accepted `INS 0xFB` with *neither*
+///   the PIN nor the PUK blocked — it does not also fall back to the YubiKey
+///   convention's blocked-precondition gate; see
+///   [`PivQuirk::ResetNeedsManagementAuth`]'s own doc for why this quirk's
+///   absence doesn't imply that convention.
 /// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownUnsupportedSince`] at
 ///   the universal `[]` version — see [`GENERIC_APPLET_VERDICTS`]'s doc for
 ///   why.
-/// * [`PivExtension::GetMetadata`] — [`Verdict::KnownSupported`] pinned to
-///   applet version 5.112.0, same single-verdict shape as
-///   [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`] above: a live
-///   unit at this version answers GET METADATA. No known-unsupported floor is
-///   recorded below 5.112.0 here either, so an older reported version
-///   resolves [`FeatureGate::Unverified`] rather than inheriting this verdict
-///   backward.
-/// * [`PivExtension::SetManagementKey`] — [`Verdict::KnownSupported`] pinned
-///   to applet version 5.112.0, same single-verdict shape as
-///   [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`]/
-///   [`PivExtension::GetMetadata`] above: a live unit at this version accepts
-///   Yubico's SET MANAGEMENT KEY APDU. No known-unsupported floor is recorded
-///   below 5.112.0 here either.
 /// * No entries for [`PivExtension::Attest`] or
 ///   [`PivExtension::PinManagementAuth`].
 const TOKEN2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
+        extensions: &[
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::GetMetadata,
+            PivExtension::SetManagementKey,
+            PivExtension::SlotPinPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownSupported,
         }],
     },
 ];
@@ -1101,13 +1210,25 @@ const TOKEN2_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// The Swissbit iShield 2 Pro's (`OpenFips201::SwissbitIShield2`) applet-axis
 /// known-support table:
 ///
-/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] — applet version
-///   1.4.1.0 and every earlier version have been observed to reject both.
-///   Same single-verdict shape as [`TOKEN2_APPLET_VERDICTS`]'s rows, just
-///   with `[1, 4, 1, 0]` as the observed/backward-extending version instead
-///   of `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row
-///   and resolves [`FeatureGate::Unverified`] — the known-unsupported
-///   verdict deliberately doesn't extend to a future, untested version.
+/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
+///   [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] —
+///   share one row: applet version 1.4.1.0 and every earlier version have
+///   been observed to reject all four — MOVE KEY/DELETE KEY outright,
+///   *setting* either slot policy on GENERATE ASYMMETRIC KEYPAIR too. Same
+///   single-verdict shape as [`TOKEN2_APPLET_VERDICTS`]'s rows, just with
+///   `[1, 4, 1, 0]` as the observed/backward-extending version instead of
+///   `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row and
+///   resolves [`FeatureGate::Unverified`] — the known-unsupported verdict
+///   deliberately doesn't extend to a future, untested version. Some slots
+///   do echo a PIN/touch policy value back in their GET METADATA response,
+///   but that value has been observed unrelated to what was actually
+///   requested — stale or synthesized, not a live reflection of on-card
+///   state — so it's no evidence either policy extension actually works; see
+///   [`PivQuirk::InsF7MetadataPinTouchPolicyInvalid`] (carried on
+///   [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`] below), which names exactly that and
+///   is why a caller must ignore GET METADATA's tag `0x02` on this
+///   fingerprint entirely. *Setting* either policy is treated as unsupported
+///   regardless of what GET METADATA claims to report back.
 /// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownUnsupportedSince`] at
 ///   the universal `[]` version — see [`GENERIC_APPLET_VERDICTS`]'s doc for
 ///   why.
@@ -1123,14 +1244,13 @@ const TOKEN2_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   [`FeatureGate::Unverified`] — the known-unsupported floor is bracketed
 ///   by the known-supported verdict above it, so it's treated as
 ///   authoritative up to that point.
-/// * [`PivExtension::Reset`] — [`Verdict::KnownSupported`] at the universal
-///   `[]` version: both tested applet versions (1.0.0.0 and 1.4.1.0) accept
-///   RESET, so there's no known-unsupported floor to gate below, same shape
-///   as YubiKey's own [`PivExtension::Reset`] row.
-/// * [`PivExtension::GetMetadata`] — [`Verdict::KnownSupported`] at the
-///   universal `[]` version, same reasoning as [`PivExtension::Reset`]
-///   immediately above: both tested applet versions answer GET METADATA.
-///   This is orthogonal to [`PivQuirk::InsF7MetadataAlgorithmInvalid`] (see
+/// * [`PivExtension::Reset`]/[`PivExtension::GetMetadata`] — share one row:
+///   [`Verdict::KnownSupported`] at the universal `[]` version. Both tested
+///   applet versions (1.0.0.0 and 1.4.1.0) accept RESET and answer GET
+///   METADATA alike, so there's no known-unsupported floor to gate below,
+///   same shape as YubiKey's own [`PivExtension::Reset`] row. GET METADATA's
+///   half of this is orthogonal to
+///   [`PivQuirk::InsF7MetadataAlgorithmInvalid`] (see
 ///   [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`] below) — that quirk is about the
 ///   older versions' *algorithm field* value being stale, not about whether
 ///   GET METADATA itself is implemented.
@@ -1144,28 +1264,26 @@ const TOKEN2_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   pre-1.0 release this fingerprint has never shipped.
 const SWISSBIT_ISHIELD2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[1, 4, 1, 0],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[1, 4, 1, 0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
+        extensions: &[PivExtension::SetPinPukRetries],
         verdicts: &[
             VersionVerdict {
                 version: &[1, 0, 0, 0],
@@ -1178,21 +1296,14 @@ const SWISSBIT_ISHIELD2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Reset,
+        extensions: &[PivExtension::Reset, PivExtension::GetMetadata],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
+        extensions: &[PivExtension::SetManagementKey],
         verdicts: &[VersionVerdict {
             version: &[1],
             verdict: Verdict::KnownSupported,
@@ -1227,17 +1338,29 @@ const SWISSBIT_ISHIELD2_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 /// key quirk is repeated on both entries so it survives that clearing.
 /// Mimics the YubiKey default management key like most other third-party
 /// implementations do.
+///
+/// [`PivQuirk::InsF7MetadataPinTouchPolicyInvalid`] is repeated on both entries
+/// instead: unlike the algorithm-tag quirk above, GET METADATA's PIN/touch
+/// policy tag (`0x02`) has been observed unreliable on every tested applet
+/// version, 1.0.0.0 through 1.4.1.0 alike, with no version yet confirmed
+/// clear of it — see [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`]'s
+/// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] doc for
+/// the same observation from the "does *setting* it work" side.
 const SWISSBIT_ISHIELD2_APPLET_QUIRKS: &[VersionQuirks] = &[
     VersionQuirks {
         version: &[],
         quirks: &[
             PivQuirk::InsF7MetadataAlgorithmInvalid,
+            PivQuirk::InsF7MetadataPinTouchPolicyInvalid,
             PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
         ],
     },
     VersionQuirks {
         version: &[1, 4, 1],
-        quirks: &[PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)],
+        quirks: &[
+            PivQuirk::InsF7MetadataPinTouchPolicyInvalid,
+            PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+        ],
     },
 ];
 
@@ -1247,92 +1370,68 @@ const SWISSBIT_ISHIELD2_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// The Thetis PRO FIDO2 Security Key with PinPlex's
 /// (`AppletFingerprint::Thetis`) applet-axis known-support table:
 ///
-/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] — applet version
-///   5.112.0 and every earlier version have been observed to reject both.
-///   Same single-verdict shape as the tables above: `[5, 112, 0]` is both
-///   the exact-match verdict and the one [`resolve_in`] extends backward
-///   from. A version above 5.112.0 falls off the end of the row and
-///   resolves [`FeatureGate::Unverified`] — the known-unsupported verdict
-///   deliberately doesn't extend to a future, untested version.
+/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
+///   [`PivExtension::SlotTouchPolicy`] — share one row: applet version
+///   5.112.0 and every earlier version have been observed to reject all
+///   three — MOVE KEY/DELETE KEY outright, the `0xAB` tag on GENERATE
+///   ASYMMETRIC KEYPAIR too (contrast [`PivExtension::SlotPinPolicy`] below,
+///   whose `0xAA` tag the same live unit *accepts*). Same single-verdict
+///   shape as the tables above: `[5, 112, 0]` is both the exact-match verdict
+///   and the one [`resolve_in`] extends backward from. A version above
+///   5.112.0 falls off the end of the row and resolves
+///   [`FeatureGate::Unverified`] — the known-unsupported verdict deliberately
+///   doesn't extend to a future, untested version.
 /// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownUnsupportedSince`] at
 ///   the universal `[]` version — see [`GENERIC_APPLET_VERDICTS`]'s doc for
 ///   why.
-/// * [`PivExtension::GetMetadata`] — [`Verdict::KnownSupported`] pinned to
-///   applet version 5.112.0, the only version keyroost has hardware evidence
-///   for: a live unit at this version answers GET METADATA. Unlike the
-///   MoveKey/DeleteKey rows above — both [`Verdict::KnownUnsupported`] at this
-///   same version — this fingerprint mimics some Yubico extension APDUs and
-///   not others, so each extension's verdict for this fingerprint is
-///   independent and this row's positive result doesn't imply anything about
-///   those two. No known-unsupported floor is recorded below 5.112.0, so an
-///   older reported version resolves [`FeatureGate::Unverified`] rather than
-///   inheriting this verdict backward.
-/// * [`PivExtension::Reset`] — [`Verdict::KnownSupported`] pinned to applet
-///   version 5.112.0, same single-verdict shape and same hardware evidence as
-///   [`PivExtension::GetMetadata`] above: a live unit at this version accepts
-///   `INS 0xFB`. Thetis carries no [`PivQuirk::ResetNeedsManagementAuth`]
-///   entry on [`THETIS_APPLET_QUIRKS`] either, so — same as YubiKey and
-///   Token2 — RESET doesn't need an authenticated management-key session on
-///   this fingerprint. No known-unsupported floor is recorded below 5.112.0
-///   here either.
-/// * [`PivExtension::SetPinPukRetries`] — [`Verdict::KnownSupported`] pinned
-///   to applet version 5.112.0, same single-verdict shape and same hardware
-///   evidence as [`PivExtension::Reset`]/[`PivExtension::GetMetadata`] above:
-///   a live unit at this version accepts Yubico's SET PIN RETRIES APDU. No
-///   known-unsupported floor is recorded below 5.112.0 here either.
-/// * [`PivExtension::SetManagementKey`] — [`Verdict::KnownSupported`] pinned
-///   to applet version 5.112.0, same single-verdict shape and same hardware
-///   evidence as the other 5.112.0 rows above: a live unit at this version
-///   accepts Yubico's SET MANAGEMENT KEY APDU. No known-unsupported floor is
-///   recorded below 5.112.0 here either.
+/// * [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`]/
+///   [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`]/
+///   [`PivExtension::SlotPinPolicy`] — share one row: [`Verdict::KnownSupported`]
+///   pinned to applet version 5.112.0, the only version keyroost has hardware
+///   evidence for — a live unit at this version accepts `INS 0xFB`, answers
+///   GET METADATA, and accepts Yubico's SET PIN RETRIES APDU, Yubico's SET
+///   MANAGEMENT KEY APDU, and the `0xAA` tag on GENERATE ASYMMETRIC KEYPAIR
+///   alike. Unlike the MOVE KEY/DELETE KEY/SlotTouchPolicy row above — all
+///   three [`Verdict::KnownUnsupported`] at this same version — this
+///   fingerprint mimics some Yubico extension APDUs and not others, so each
+///   extension's verdict for this fingerprint is independent and this row's
+///   positive result doesn't imply anything about those. No known-unsupported
+///   floor is recorded below 5.112.0 here either, so an older reported
+///   version resolves [`FeatureGate::Unverified`] rather than inheriting this
+///   verdict backward. For RESET specifically: Thetis carries no
+///   [`PivQuirk::ResetNeedsManagementAuth`] entry on [`THETIS_APPLET_QUIRKS`]
+///   either, so — same as YubiKey and Token2 — RESET doesn't need an
+///   authenticated management-key session on this fingerprint.
 const THETIS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
+        extensions: &[
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::GetMetadata,
+            PivExtension::SetManagementKey,
+            PivExtension::SlotPinPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[5, 112, 0],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
-        verdicts: &[VersionVerdict {
-            version: &[5, 112, 0],
-            verdict: Verdict::KnownSupported,
         }],
     },
 ];
@@ -1366,13 +1465,15 @@ const THETIS_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// separate tables even though the two fingerprints share one upstream
 /// codebase:
 ///
-/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] — this applet's
-///   own source doesn't implement either in applet version 5.4.0 or any
-///   release before it: a [`Verdict::KnownUnsupported`] verdict pinned to
-///   `[5, 4, 0]`, extended backward by [`resolve_in`]'s rule to cover every
-///   earlier version too. A version above 5.4.0 falls off the end of the row
-///   and resolves [`FeatureGate::Unverified`] — the known-unsupported
-///   verdict doesn't extend forward to an untested future release.
+/// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
+///   [`PivExtension::SlotTouchPolicy`] — share one row: this applet's own
+///   source implements none of the three in applet version 5.4.0 or any
+///   release before it — MOVE KEY/DELETE KEY, and no touch-policy equivalent
+///   either — a [`Verdict::KnownUnsupported`] verdict pinned to `[5, 4, 0]`,
+///   extended backward by [`resolve_in`]'s rule to cover every earlier
+///   version too. A version above 5.4.0 falls off the end of the row and
+///   resolves [`FeatureGate::Unverified`] — the known-unsupported verdict
+///   doesn't extend forward to an untested future release.
 /// * [`PivExtension::GetMetadata`] — lands in this applet's own source at
 ///   version 5.3.0: a [`Verdict::KnownUnsupported`] verdict at the
 ///   empty-slice `[]` sentinel (every version before 5.3.0) and a
@@ -1389,32 +1490,31 @@ const THETIS_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   [`AREKINATH_GENERIC_APPLET_QUIRKS`],
 ///   so — same as YubiKey and Token2 — RESET doesn't need an authenticated
 ///   management-key session on this applet either.
-/// * [`PivExtension::SetManagementKey`] — [`Verdict::KnownSupported`] pinned
-///   to major version `[4]`, predating the 5.x lineage every other row above
-///   is anchored to: SET MANAGEMENT KEY is core key management this applet's
-///   own source has supported since its major version 4 releases, with no
-///   known-unsupported floor to gate below the way MOVE KEY/DELETE KEY's row
-///   above has one.
 /// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownUnsupportedSince`] at
 ///   the universal `[]` version — see [`GENERIC_APPLET_VERDICTS`]'s doc for
 ///   why.
+/// * [`PivExtension::SetManagementKey`]/[`PivExtension::SlotPinPolicy`] —
+///   share one row: [`Verdict::KnownSupported`] pinned to major version
+///   `[4]`, predating the 5.x lineage every other row above is anchored to.
+///   SET MANAGEMENT KEY is core key management this applet's own source has
+///   supported since its major version 4 releases; PIN policy on GENERATE
+///   ASYMMETRIC KEYPAIR (<https://github.com/arekinath/PivApplet>) the same —
+///   neither has a known-unsupported floor to gate below the way MOVE
+///   KEY/DELETE KEY/SlotTouchPolicy's row above has one.
 const AREKINATH_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[5, 4, 0],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[5, 4, 0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
+        extensions: &[PivExtension::GetMetadata],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -1427,7 +1527,7 @@ const AREKINATH_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Reset,
+        extensions: &[PivExtension::Reset, PivExtension::SetPinPukRetries],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -1440,27 +1540,14 @@ const AREKINATH_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[
-            VersionVerdict {
-                version: &[],
-                verdict: Verdict::KnownUnsupported,
-            },
-            VersionVerdict {
-                version: &[5, 0, 0],
-                verdict: Verdict::KnownSupported,
-            },
-        ],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
+        extensions: &[PivExtension::SetManagementKey, PivExtension::SlotPinPolicy],
         verdicts: &[VersionVerdict {
             version: &[4],
             verdict: Verdict::KnownSupported,
@@ -1495,24 +1582,27 @@ const AREKINATH_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// row here is *additionally* confirmed on a real firmware v3.35.0 device
 /// reporting applet version 5.4.0 — past both the 5.0.0 and 5.3.0 thresholds
 /// below, so it only confirms the known-supported side of those rows, not
-/// the floor.
+/// the floor. The same live unit confirms [`PivExtension::SlotPinPolicy`]
+/// works and [`PivExtension::SlotTouchPolicy`] doesn't, exactly matching
+/// [`AREKINATH_GENERIC_APPLET_VERDICTS`]'s own two rows for those extensions
+/// — its `[5, 4, 0]` [`PivExtension::SlotTouchPolicy`] pin *is* this device's
+/// confirmed version, unlike MoveKey/DeleteKey/GetMetadata/Reset/
+/// SetPinPukRetries above where 5.4.0 is merely the *floor* their table
+/// entries are pinned to.
 const AREKINATH_SWISSBIT_ISHIELD1_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[5, 4, 0],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[5, 4, 0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
+        extensions: &[PivExtension::GetMetadata],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -1525,7 +1615,7 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Reset,
+        extensions: &[PivExtension::Reset, PivExtension::SetPinPukRetries],
         verdicts: &[
             VersionVerdict {
                 version: &[],
@@ -1538,27 +1628,14 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         ],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[
-            VersionVerdict {
-                version: &[],
-                verdict: Verdict::KnownUnsupported,
-            },
-            VersionVerdict {
-                version: &[5, 0, 0],
-                verdict: Verdict::KnownSupported,
-            },
-        ],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
+        extensions: &[PivExtension::SetManagementKey, PivExtension::SlotPinPolicy],
         verdicts: &[VersionVerdict {
             version: &[4],
             verdict: Verdict::KnownSupported,
@@ -1596,7 +1673,13 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQui
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const AREKINATH_SWISSBIT_ISHIELD1_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
-/// HID Crescendo C2300's applet-axis known-support table:
+/// HID Crescendo C2300's applet-axis known-support table. Each bullet below
+/// still walks its extension's own reasoning individually, even though every
+/// extension that lands on [`Verdict::KnownUnsupportedSince`] shares one row
+/// in the table below, and separately every extension that lands on
+/// [`Verdict::KnownSupported`] shares the other — the two verdicts happen to
+/// coincide across several otherwise-independent claims, not because they're
+/// the same claim:
 ///
 /// * [`PivExtension::DeleteKey`] — [`Verdict::KnownSupported`] at the
 ///   universal `[]` version: `keyroost_transport::PivSession::delete_key`
@@ -1646,25 +1729,18 @@ const AREKINATH_SWISSBIT_ISHIELD1_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   them the same way, and evidently doesn't.
 /// * [`PivExtension::Attest`]/[`PivExtension::GetMetadata`] —
 ///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version for
-///   both: a live unit reporting applet version `3.0.3.6` (read from its GET
-///   PIV PROPERTIES response's tag `0x01` "Applet Version Block" —
+///   both, same standing-pattern reasoning as [`PivExtension::MoveKey`]
+///   above (this GET PIV PROPERTIES read is itself the proprietary
+///   alternative standing in for GET METADATA): a live unit reporting
+///   applet version `3.0.3.6` (read from its GET PIV PROPERTIES response's
+///   tag `0x01` "Applet Version Block" —
 ///   [`crate::fingerprint::parse_hid_crescendo_version`] — and reported on
 ///   the *applet* axis despite not coming from Yubico's own GET VERSION
 ///   extension) has been observed to refuse both extensions outright
-///   (`SW = 6D 00`, "instruction not supported"). That alone would only
-///   justify an ordinary [`Verdict::KnownUnsupported`] pinned to `3.0.3.6`
-///   (or, generalized, the whole `3.0.3.<any>` lineage) — but HID Crescendo
-///   has never attempted to implement *any* Yubico extension APDU, building
-///   its own proprietary alternatives instead across the whole product
-///   line: ACA XAUTH (see
-///   `keyroost_transport::PivSession::authenticate_management`) standing in
-///   for `GENERAL AUTHENTICATE` on `0x9B`, and this very GET PIV PROPERTIES
-///   read standing in for GET METADATA. That standing pattern, not just an
-///   absence observed on one firmware, is the reason to expect HID never
-///   bothers implementing Yubico's competing extension APDUs on *any*
-///   version, observed or not, past or future — exactly what
-///   [`Verdict::KnownUnsupportedSince`] is for, hence the universal `[]`
-///   version rather than a version-specific one. See
+///   (`SW = 6D 00`, "instruction not supported"), but the standing pattern
+///   is what justifies the universal `[]` version rather than pinning just
+///   `3.0.3.6` (or, generalized, `3.0.3.<any>`) the way an ordinary
+///   [`Verdict::KnownUnsupported`] would. See
 ///   [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc for C4000's own version
 ///   of this same pair of rows.
 /// * [`PivExtension::GetSlotKeyStatus`] — [`Verdict::KnownSupported`] at the
@@ -1730,75 +1806,79 @@ const AREKINATH_SWISSBIT_ISHIELD1_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   the same way [`PivExtension::GetSlotKeyStatus`]'s row is: the capability
 ///   belongs to the GET PIV PROPERTIES / XAUTH mechanism itself, present
 ///   across the whole product line, not to two specifically named models.
+/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] —
+///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version, on the
+///   same standing-pattern reasoning as [`PivExtension::MoveKey`] above: this
+///   family has never attempted to mimic a Yubico extension APDU, and GET PIV
+///   PROPERTIES / INJECT PKI KEY carry no PIN/touch-policy fields of their
+///   own to stand in for these two.
+/// * [`PivExtension::SlotKeyAlgorithm`] — C2300's own GENERATE KEY PAIR
+///   reference
+///   (<https://docs.hidglobal.com/crescendo/api/low-level/generate-key-pair.htm>)
+///   states outright that "the GENERATE KEY PAIR command is used to generate
+///   2048-bit RSA keys, 256-bit EC or 384-bit EC keys" and lists exactly
+///   those three in its cryptographic-mechanism-identifier table — a closed
+///   enumeration, not a handful of examples — so RSA-2048/ECC P-256/ECC
+///   P-384 are [`Verdict::KnownSupported`] and every other [`crate::KeyAlg`]
+///   (RSA-1024/3072/4096, Ed25519, X25519) is
+///   [`Verdict::KnownUnsupportedSince`], both at the universal `[]` version.
+///   See [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc for C4000's own,
+///   wider closed list from its own reference. Not shared with
+///   [`HID_CRESCENDO_GENERIC_APPLET_VERDICTS`]: the two named families'
+///   closed lists differ from each other (C4000's includes RSA-3072/4096,
+///   C2300's doesn't), so there's no single list to extend to an
+///   unclassified unit.
 const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::Attest,
+            PivExtension::GetMetadata,
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
+        extensions: &[
+            PivExtension::DeleteKey,
+            PivExtension::GetSlotKeyStatus,
+            PivExtension::PinManagementAuth,
+            PivExtension::ResetGlobal,
+            PivExtension::SetManagementKey,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Attest,
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetSlotKeyStatus,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::PinManagementAuth,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
         }],
     },
 ];
@@ -1862,79 +1942,79 @@ const HID_CRESCENDO_C2300_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// * [`PivExtension::ResetGlobal`]'s RESET CARD reference
 ///   (<https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm>) is
 ///   C4000's own page, distinct from (but equivalent to) C2300's.
+/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] — same
+///   [`Verdict::KnownUnsupportedSince`] row as
+///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s — see its doc.
+/// * [`PivExtension::SlotKeyAlgorithm`] — unlike every row above, this one
+///   *is* confirmed from C4000's own dedicated reference rather than assumed
+///   from C2300's:
+///   <https://docs.hidglobal.com/crescendo/api/c4000/generate-key-pair.htm>
+///   states "the GENERATE KEY PAIR command is used to generate RSA keys
+///   (2048, 3072, or 4096 bits) or elliptic curve (EC) keys (256 or 384
+///   bits)" and lists exactly those five in its
+///   cryptographic-mechanism-identifier table — a closed enumeration, so
+///   RSA-2048/3072/4096 and ECC P-256/P-384 are [`Verdict::KnownSupported`]
+///   and RSA-1024/Ed25519/X25519 are [`Verdict::KnownUnsupportedSince`], both
+///   at the universal `[]` version. Wider than
+///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s own row (which excludes
+///   RSA-3072/4096 too) — the two families' closed lists genuinely differ,
+///   which is also why this row isn't shared with
+///   [`HID_CRESCENDO_GENERIC_APPLET_VERDICTS`]. See
+///   [`slot_key_algorithm_apdu_id_override`]'s doc for the *wire-byte*
+///   question this same reference also answers — RSA-4096 is `0x04` here,
+///   not [`crate::KeyAlg::id`]'s `0x16` — a separate axis from this
+///   known-support gate.
 const HID_CRESCENDO_C4000_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::Attest,
+            PivExtension::GetMetadata,
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
+        extensions: &[
+            PivExtension::DeleteKey,
+            PivExtension::GetSlotKeyStatus,
+            PivExtension::PinManagementAuth,
+            PivExtension::ResetGlobal,
+            PivExtension::SetManagementKey,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Attest,
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetSlotKeyStatus,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::PinManagementAuth,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        // C4000's SDK docs a method that in principle covers the same
-        // ground (`UpdatePINProperties`), but its APDU-level wire format is
-        // undocumented, so there is no keyroost implementation to gate on
-        // yet — see this table's doc comment.
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
         }],
     },
 ];
@@ -1959,22 +2039,23 @@ const HID_CRESCENDO_C4000_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// nor C4000 applies) applet-axis known-support table:
 ///
 /// * [`PivExtension::MoveKey`], [`PivExtension::Reset`],
-///   [`PivExtension::SetPinPukRetries`] — [`Verdict::KnownUnsupportedSince`]
-///   at the universal `[]` version, shared with
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]/[`HID_CRESCENDO_C4000_APPLET_VERDICTS`]:
+///   [`PivExtension::SetPinPukRetries`], [`PivExtension::SlotPinPolicy`],
+///   [`PivExtension::SlotTouchPolicy`] — share one row:
+///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version, shared
+///   with [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]/[`HID_CRESCENDO_C4000_APPLET_VERDICTS`]:
 ///   the reasoning ("never implements a Yubico extension APDU, always ships
 ///   its own") is about the vendor's pattern across the whole product line,
 ///   not about a specific tested model, the same broadening
 ///   `keyroost_piv::fingerprint`'s ACA AID doc applies to the
 ///   transport-level XAUTH fallback.
 /// * [`PivExtension::GetSlotKeyStatus`]/[`PivExtension::SetManagementKey`] —
-///   both [`Verdict::KnownSupported`] at the universal `[]` version, shared
-///   with the two named models for the same vendor-wide-pattern reasoning:
-///   each is a property of a mechanism present, in some form, across the
-///   whole product line (GET PIV PROPERTIES for the former, GET PIV
-///   PROPERTIES plus PUT XAUTH KEY for the latter — see
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc), not a claim tied to two
-///   specifically named, individually tested models the way
+///   share one row: both [`Verdict::KnownSupported`] at the universal `[]`
+///   version, shared with the two named models for the same
+///   vendor-wide-pattern reasoning: each is a property of a mechanism
+///   present, in some form, across the whole product line (GET PIV
+///   PROPERTIES for the former, GET PIV PROPERTIES plus PUT XAUTH KEY for the
+///   latter — see [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc), not a claim
+///   tied to two specifically named, individually tested models the way
 ///   [`PivExtension::DeleteKey`] below is.
 /// * No entries for [`PivExtension::DeleteKey`] (the C2300/C4000 presence
 ///   claim isn't general enough to extend here — see
@@ -1982,38 +2063,32 @@ const HID_CRESCENDO_C4000_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 ///   [`PivExtension::GetMetadata`], [`PivExtension::PinManagementAuth`], or
 ///   [`PivExtension::ResetGlobal`] (see that extension's bullet on
 ///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc for why a presence claim
-///   doesn't reach `Generic`).
+///   doesn't reach `Generic`), or [`PivExtension::SlotKeyAlgorithm`] (C2300's
+///   and C4000's own GENERATE KEY PAIR references document two genuinely
+///   different closed algorithm lists — see
+///   [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc — so there's no single
+///   list to extend to an unclassified unit; [`slot_key_algorithm_apdu_id_override`]'s
+///   *wire-byte* answer still applies to `Generic`, though — see its doc for
+///   why that's a different axis this reasoning doesn't touch).
 const HID_CRESCENDO_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
+        extensions: &[
+            PivExtension::MoveKey,
+            PivExtension::Reset,
+            PivExtension::SetPinPukRetries,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::GetSlotKeyStatus,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
+        extensions: &[
+            PivExtension::GetSlotKeyStatus,
+            PivExtension::SetManagementKey,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownSupported,
@@ -2063,7 +2138,7 @@ const HID_CRESCENDO_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// [`FEITIAN_APPLET_VERDICTS`] carries this same row too, alongside further
 /// rows of its own now — see its doc.
 const GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extension: PivExtension::ResetGlobal,
+    extensions: &[PivExtension::ResetGlobal],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2090,7 +2165,7 @@ const GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry.
 const AUTHENTREND_ATKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extension: PivExtension::ResetGlobal,
+    extensions: &[PivExtension::ResetGlobal],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2132,44 +2207,29 @@ const AUTHENTREND_ATKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// not Yubico's SET MANAGEMENT KEY APDU — keyroost hasn't implemented that
 /// proprietary mechanism yet, so this extension is unsupported by keyroost
 /// today independent of the device's own capability.
+///
+/// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] join the
+/// same hardware-observed [`Verdict::KnownUnsupported`] group at applet
+/// version `[0]`: the live unit's GENERATE ASYMMETRIC KEYPAIR rejects both
+/// the `0xAA` and `0xAB` tags.
 const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
-        verdicts: &[VersionVerdict {
-            version: &[0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
-        verdicts: &[VersionVerdict {
-            version: &[0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[0],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
+        extensions: &[
+            PivExtension::SetManagementKey,
+            PivExtension::SetPinPukRetries,
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::GetMetadata,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[0],
             verdict: Verdict::KnownUnsupported,
@@ -2195,7 +2255,7 @@ const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry.
 const IDPRIME_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extension: PivExtension::ResetGlobal,
+    extensions: &[PivExtension::ResetGlobal],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2246,7 +2306,7 @@ const IDPRIME_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// fingerprint is the one exception noted on that const's own doc rather
 /// than following [`YUBIKEY_FIRMWARE_VERDICTS`]'s "always empty" norm.
 const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extension: PivExtension::ResetGlobal,
+    extensions: &[PivExtension::ResetGlobal],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2279,71 +2339,51 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   (<https://github.com/trussed-dev/piv-authenticator>), corroborated by a
 ///   live unit at firmware 1.8.3 accepting all three.
 /// * [`PivExtension::SetPinPukRetries`], [`PivExtension::MoveKey`],
-///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`] —
+///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`],
+///   [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
 ///   [`Verdict::KnownUnsupported`] pinned to exactly the version keyroost has
 ///   evidence for, firmware 1.8.3 (`[1, 8, 3]`): a live unit there rejects
-///   all four. Per [`Verdict::KnownUnsupported`]'s backward-extension rule
-///   this is assumed to also hold at every earlier, untested version —
-///   including 1.8 itself — without a separate `[1, 8]` entry on these rows;
-///   the single `[1, 8, 3]` verdict already covers both. A firmware newer
-///   than 1.8.3 with no verdict of its own softens to
-///   [`FeatureGate::Unverified`] rather than staying `Unsupported`, since a
-///   later firmware may have added any of these four — unlike
-///   [`PivExtension::ResetGlobal`]'s [`Verdict::KnownUnsupportedSince`] row
-///   above, which has a standing reason (this vendor's own architecture) to
-///   expect it never comes back.
+///   all six, corroborated for the two policy rows by the Trussed
+///   `piv-authenticator` source itself
+///   (<https://github.com/trussed-dev/piv-authenticator>), which implements
+///   no `0xAA`/`0xAB` handling on GENERATE ASYMMETRIC KEYPAIR. Per
+///   [`Verdict::KnownUnsupported`]'s backward-extension rule this is assumed
+///   to also hold at every earlier, untested version — including 1.8 itself —
+///   without a separate `[1, 8]` entry on these rows; the single `[1, 8, 3]`
+///   verdict already covers both. A firmware newer than 1.8.3 with no verdict
+///   of its own softens to [`FeatureGate::Unverified`] rather than staying
+///   `Unsupported`, since a later firmware may have added any of these six —
+///   unlike [`PivExtension::ResetGlobal`]'s [`Verdict::KnownUnsupportedSince`]
+///   row above, which has a standing reason (this vendor's own architecture)
+///   to expect it never comes back.
 const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::SetManagementKey,
+        extensions: &[
+            PivExtension::SetManagementKey,
+            PivExtension::Reset,
+            PivExtension::GetMetadata,
+        ],
         verdicts: &[VersionVerdict {
             version: &[1, 8],
             verdict: Verdict::KnownSupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::Reset,
-        verdicts: &[VersionVerdict {
-            version: &[1, 8],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[1, 8],
-            verdict: Verdict::KnownSupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[1, 8, 3],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
-        verdicts: &[VersionVerdict {
-            version: &[1, 8, 3],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
-        verdicts: &[VersionVerdict {
-            version: &[1, 8, 3],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Attest,
+        extensions: &[
+            PivExtension::SetPinPukRetries,
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+            PivExtension::Attest,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ],
         verdicts: &[VersionVerdict {
             version: &[1, 8, 3],
             verdict: Verdict::KnownUnsupported,
@@ -2373,8 +2413,18 @@ const TRUSSED_NITROKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// explicit [`PivExtension::ResetGlobal`] entry. Distinct from
 /// [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`] above, which additionally carries
 /// MOVE KEY/DELETE KEY data this generic OpenFIPS201 fingerprint has none of.
+///
+/// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] also get
+/// an explicit [`Verdict::KnownUnsupportedSince`] row at the universal `[]`
+/// version: upstream OpenFIPS201 has not been observed to mimic any Yubico
+/// extension, the same standing-vendor-pattern reasoning
+/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc uses.
 const OPENFIPS201_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extension: PivExtension::ResetGlobal,
+    extensions: &[
+        PivExtension::ResetGlobal,
+        PivExtension::SlotPinPolicy,
+        PivExtension::SlotTouchPolicy,
+    ],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2410,45 +2460,23 @@ const OPENFIPS201_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// universal `version: &[]` sentinel rather than a real version number.
 const UTRUST_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
+        extensions: &[
+            PivExtension::DeleteKey,
+            PivExtension::MoveKey,
+            PivExtension::SetPinPukRetries,
+            PivExtension::Reset,
+            PivExtension::GetMetadata,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
         }],
     },
 ];
@@ -2492,45 +2520,23 @@ const UTRUST_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 /// `classify` at all, same as [`UTRUST_GOV_APPLET_QUIRKS`] already is.
 const UTRUST_GOV_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extension: PivExtension::DeleteKey,
+        extensions: &[
+            PivExtension::DeleteKey,
+            PivExtension::MoveKey,
+            PivExtension::SetPinPukRetries,
+            PivExtension::Reset,
+            PivExtension::GetMetadata,
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupported,
         }],
     },
     ExtensionVerdicts {
-        extension: PivExtension::MoveKey,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::SetPinPukRetries,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::Reset,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::ResetGlobal,
+        extensions: &[PivExtension::ResetGlobal],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
-        }],
-    },
-    ExtensionVerdicts {
-        extension: PivExtension::GetMetadata,
-        verdicts: &[VersionVerdict {
-            version: &[],
-            verdict: Verdict::KnownUnsupported,
         }],
     },
 ];
@@ -2547,7 +2553,9 @@ const UTRUST_GOV_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 /// the data is ready once it can be.
 const UTRUST_GOV_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     version: &[],
-    quirks: &[PivQuirk::Default9bManagementKey(UTRUST_GOV_DEFAULT_MGMT_KEY)],
+    quirks: &[PivQuirk::Default9bManagementKey(
+        UTRUST_GOV_DEFAULT_MGMT_KEY,
+    )],
 }];
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
@@ -2777,6 +2785,83 @@ fn resolve_in(verdicts: Option<&[VersionVerdict]>, version: Option<&[u8]>) -> Fe
     }
 }
 
+/// This fingerprint's wire algorithm-identifier override for `key_alg`, if
+/// it's confirmed to use a byte other than [`KeyAlg::id`]'s Yubico-default
+/// one on the mechanism [`slot_key_algorithm_apdu_id`]/
+/// [`key_alg_from_apdu_id`] serve — GENERATE ASYMMETRIC KEYPAIR / GENERAL
+/// AUTHENTICATE / GET METADATA, and (via
+/// `keyroost_transport::PivSession::hid_crescendo_slot_algorithm`) HID
+/// Crescendo's own GET PIV PROPERTIES read too, which shares this same
+/// override rather than decoding through a second, parallel table. Not
+/// version-gated, unlike [`resolve`]'s known-support tables: no fingerprint
+/// has been observed to change its own wire byte for an algorithm across
+/// firmware generations, so there's nothing to key by version yet.
+///
+/// Every HID Crescendo variant (`C2300`, `C4000`, and the unclassified
+/// `Generic`) shares one answer here:
+/// [`crate::fingerprint::hid_crescendo_c4000_algorithm_id`] — already the
+/// source of truth for GET PIV PROPERTIES and INJECT PKI KEY — doubles as
+/// this override too, on the same "one `PIVCryptographicMechanismIdentifier`
+/// field, shared across the whole product line" basis that function's own
+/// doc already reasons from for extending C4000's confirmed table to C2300.
+/// HID Crescendo C4000's standard GENERATE ASYMMETRIC KEYPAIR (`INS 0x47`)
+/// independently confirms this same table for its own command —
+/// <https://docs.hidglobal.com/crescendo/api/c4000/generate-key-pair.htm> —
+/// and the only byte it actually diverges from [`KeyAlg::id`] on is RSA-4096
+/// (`0x04` here, `0x16` there); every other algorithm it names already
+/// agrees with the default. Applying the same table to every variant here is
+/// a wider claim than [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]/
+/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s own [`PivExtension::SlotKeyAlgorithm`]
+/// rows make (those stay narrower, per-family, and don't extend to
+/// `Generic`) — a different axis from this override: an algorithm's support
+/// gate says nothing about which byte names it once encountered, and vice
+/// versa, so a byte GET PIV PROPERTIES reports for an algorithm C2300's own
+/// GENERATE KEY PAIR can't create (RSA-4096, say) is still decoded
+/// correctly here.
+#[must_use]
+fn slot_key_algorithm_apdu_id_override(
+    fingerprint: AppletFingerprint,
+    key_alg: KeyAlg,
+) -> Option<u8> {
+    match fingerprint {
+        AppletFingerprint::HidCrescendo(_) => {
+            crate::fingerprint::hid_crescendo_c4000_algorithm_id(key_alg)
+        }
+        _ => None,
+    }
+}
+
+/// The wire algorithm-identifier byte to send for `key_alg` on `fingerprint`
+/// in a GENERATE ASYMMETRIC KEYPAIR / GENERAL AUTHENTICATE APDU:
+/// [`slot_key_algorithm_apdu_id_override`]'s entry for this pair if it has
+/// one, or [`KeyAlg::id`]'s Yubico-default byte otherwise. A caller building
+/// such an APDU should always go through this rather than [`KeyAlg::id`]
+/// directly — see that method's doc.
+#[must_use]
+pub fn slot_key_algorithm_apdu_id(key_alg: KeyAlg, fingerprint: AppletFingerprint) -> u8 {
+    slot_key_algorithm_apdu_id_override(fingerprint, key_alg).unwrap_or_else(|| key_alg.id())
+}
+
+/// The inverse of [`slot_key_algorithm_apdu_id`]: resolve a device-reported
+/// wire algorithm-identifier byte (GET METADATA tag `0x01`, or a GENERATE
+/// ASYMMETRIC KEYPAIR / GENERAL AUTHENTICATE reply that echoes one) back to a
+/// [`KeyAlg`], preferring whichever algorithm this fingerprint's own
+/// [`slot_key_algorithm_apdu_id_override`] says `id` actually means over
+/// [`KeyAlg::from_id`]'s Yubico-default table. Tries every [`KeyAlg::ALL`]
+/// variant through [`slot_key_algorithm_apdu_id`] and returns the one whose
+/// resolved byte matches `id`; falls back to [`KeyAlg::from_id`] when none
+/// does, which also covers every fingerprint with no override data at all
+/// (every candidate then resolves to its own [`KeyAlg::id`] default, so this
+/// is equivalent to calling [`KeyAlg::from_id`] directly in that case, just
+/// by a longer path).
+#[must_use]
+pub fn key_alg_from_apdu_id(id: u8, fingerprint: AppletFingerprint) -> Option<KeyAlg> {
+    KeyAlg::ALL
+        .into_iter()
+        .find(|&alg| slot_key_algorithm_apdu_id(alg, fingerprint) == id)
+        .or_else(|| KeyAlg::from_id(id))
+}
+
 /// The entry in `quirks` with the greatest [`VersionQuirks::version`] `<=`
 /// `version`, if any — the "current" quirks entry for that version, ignoring
 /// anything with a higher version on record. Same lookup rule as step 3 of
@@ -2875,6 +2960,10 @@ mod tests {
             PivExtension::ResetGlobal.requirement(),
             PivExtension::SetPinPukRetries.requirement(),
             PivExtension::SetManagementKey.requirement(),
+            PivExtension::SlotPinPolicy.requirement(),
+            PivExtension::SlotTouchPolicy.requirement(),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048).requirement(),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096).requirement(),
         ];
         for (i, a) in reqs.iter().enumerate() {
             for b in &reqs[i + 1..] {
@@ -3758,6 +3847,7 @@ mod tests {
                 ),
                 BTreeSet::from([
                     PivQuirk::InsF7MetadataAlgorithmInvalid,
+                    PivQuirk::InsF7MetadataPinTouchPolicyInvalid,
                     PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
                 ])
             );
@@ -3768,10 +3858,10 @@ mod tests {
     fn swissbit_ishield2_metadata_quirk_cleared_at_1_4_1() {
         // `[1, 4, 1]` covers both a bare 3-component "1.4.1" report and the
         // actually-confirmed-clear 4-component "1.4.1.0" — `[1, 4, 1]`
-        // orders below both under slice-prefix comparison. The metadata
-        // quirk clears here, but the default-management-key quirk is
-        // repeated on this entry too (see the row's comment) and so
-        // survives the clearing.
+        // orders below both under slice-prefix comparison. The algorithm
+        // quirk clears here, but the default-management-key and PIN/touch
+        // policy quirks are both repeated on this entry too (see the row's
+        // comment) and so survive the clearing.
         for version in [
             &[1, 4, 1][..],
             &[1, 4, 1, 0][..],
@@ -3784,7 +3874,10 @@ mod tests {
                     Some(version),
                     None,
                 ),
-                BTreeSet::from([PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY)])
+                BTreeSet::from([
+                    PivQuirk::InsF7MetadataPinTouchPolicyInvalid,
+                    PivQuirk::Default9bManagementKey(YUBIKEY_DEFAULT_MGMT_KEY),
+                ])
             );
         }
     }
@@ -4492,6 +4585,167 @@ mod tests {
         assert!(quirks.contains(&PivQuirk::PinManagementAuthProtected9BKey));
     }
 
+    // --- Slot PIN/touch policy: SlotPinPolicy/SlotTouchPolicy ------------
+
+    #[test]
+    fn yubikey_slot_pin_and_touch_policy_supported_from_v4_touch_cached_quirk_until_4_3() {
+        for version in [&[4][..], &[4, 1][..], &[5, 7][..]] {
+            for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+                assert_eq!(
+                    resolve(ext, AppletFingerprint::YubiKey, Some(version), None),
+                    FeatureGate::Supported
+                );
+            }
+        }
+        // Below v4, neither row has anything to extend backward from (both
+        // are `KnownSupported`, which says nothing about earlier versions).
+        for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::YubiKey, Some(&[3, 4]), None),
+                FeatureGate::Unverified
+            );
+        }
+        // The touch policy `Cached` value specifically isn't accepted until
+        // 4.3 — the quirk marks that even though the extension as a whole is
+        // already `Supported` at v4. It's carried on the `[3]` entry (merged
+        // with `PinManagementAuthProtected9BKey` rather than living on its
+        // own `[4]` entry — see `YUBIKEY_APPLET_QUIRKS`'s doc), but is inert
+        // below v4 since `SlotTouchPolicy` itself isn't `Supported` there yet
+        // — a caller checks the extension gate first.
+        assert!(resolve_quirks(AppletFingerprint::YubiKey, Some(&[3]), None)
+            .contains(&PivQuirk::SlotTouchPolicyCachedNotSupported));
+        assert!(resolve_quirks(AppletFingerprint::YubiKey, Some(&[4]), None)
+            .contains(&PivQuirk::SlotTouchPolicyCachedNotSupported));
+        assert!(
+            resolve_quirks(AppletFingerprint::YubiKey, Some(&[4, 1]), None)
+                .contains(&PivQuirk::SlotTouchPolicyCachedNotSupported)
+        );
+        assert!(
+            !resolve_quirks(AppletFingerprint::YubiKey, Some(&[4, 3]), None)
+                .contains(&PivQuirk::SlotTouchPolicyCachedNotSupported)
+        );
+        assert!(
+            !resolve_quirks(AppletFingerprint::YubiKey, Some(&[5, 7]), None)
+                .contains(&PivQuirk::SlotTouchPolicyCachedNotSupported)
+        );
+        assert!(
+            !resolve_quirks(AppletFingerprint::YubiKey, Some(&[2, 9, 9]), None)
+                .contains(&PivQuirk::SlotTouchPolicyCachedNotSupported)
+        );
+        // The PIN policy `Once` value has no such quirk on YubiKey at any
+        // observed version.
+        assert!(
+            !resolve_quirks(AppletFingerprint::YubiKey, Some(&[4]), None)
+                .contains(&PivQuirk::SlotPinPolicyOnceNotSupported)
+        );
+    }
+
+    #[test]
+    fn arekinath_slot_pin_policy_supported_from_v4_touch_policy_unsupported_through_5_4_0() {
+        for fp in [
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+        ] {
+            for version in [&[4][..], &[4, 5][..], &[5, 4, 0][..]] {
+                assert_eq!(
+                    resolve(PivExtension::SlotPinPolicy, fp, Some(version), None),
+                    FeatureGate::Supported
+                );
+            }
+            for version in [&[4][..], &[4, 5][..], &[5, 4, 0][..]] {
+                assert_eq!(
+                    resolve(PivExtension::SlotTouchPolicy, fp, Some(version), None),
+                    FeatureGate::Unsupported
+                );
+            }
+            // Past the confirmed 5.4.0 ceiling, touch policy softens to
+            // unverified rather than staying blocked — a later applet
+            // release may have added it.
+            assert_eq!(
+                resolve(PivExtension::SlotTouchPolicy, fp, Some(&[5, 5, 0]), None),
+                FeatureGate::Unverified
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_slot_pin_and_touch_policy_unsupported_at_any_version_including_generic() {
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+                for version in [&[0][..], &[3, 0, 3, 6][..], &[9, 9, 9, 9][..]] {
+                    assert_eq!(
+                        resolve(ext, fp, Some(version), None),
+                        FeatureGate::Unsupported
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trussed_nitrokey_slot_pin_and_touch_policy_unsupported_at_1_8_3_firmware() {
+        for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            assert_eq!(
+                resolve(
+                    ext,
+                    AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+                    None,
+                    Some(&[1, 8, 3]),
+                ),
+                FeatureGate::Unsupported
+            );
+            // Backward-extends to earlier, untested firmware too.
+            assert_eq!(
+                resolve(
+                    ext,
+                    AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+                    None,
+                    Some(&[1, 8]),
+                ),
+                FeatureGate::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn feitian_slot_pin_and_touch_policy_unsupported_at_v0() {
+        for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::Feitian, Some(&[0]), None),
+                FeatureGate::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn swissbit_ishield2_slot_pin_and_touch_policy_unsupported_at_1_4_1_0() {
+        let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2);
+        for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            assert_eq!(
+                resolve(ext, fp, Some(&[1, 4, 1, 0]), None),
+                FeatureGate::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn openfips201_generic_slot_pin_and_touch_policy_unsupported_since() {
+        let fp = AppletFingerprint::OpenFips201(OpenFips201Variant::Generic);
+        for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            for version in [&[0][..], &[9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(ext, fp, Some(version), None),
+                    FeatureGate::Unsupported
+                );
+            }
+        }
+    }
+
     #[test]
     fn hid_crescendo_reset_unsupported_at_any_version_including_generic() {
         // Same `KnownUnsupportedSince` shape as `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
@@ -5057,6 +5311,36 @@ mod tests {
     }
 
     #[test]
+    fn token2_and_thetis_5_112_0_slot_pin_policy_supported_touch_policy_unsupported() {
+        // Same hardware-observed, single-verdict-pinned-to-5.112.0 shape as
+        // `SetManagementKey`'s row above, except the two policies disagree
+        // with each other on this fingerprint.
+        for fp in [AppletFingerprint::Token2, AppletFingerprint::Thetis] {
+            for version in [&[5, 112, 0][..], &[5, 113, 0][..], &[9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::SlotPinPolicy, fp, Some(version), None),
+                    FeatureGate::Supported,
+                    "{fp:?} at {version:?}"
+                );
+            }
+            // Exact match only — a version above 5.112.0 with no verdict of
+            // its own softens to `Unverified` rather than staying blocked.
+            assert_eq!(
+                resolve(PivExtension::SlotTouchPolicy, fp, Some(&[5, 112, 0]), None),
+                FeatureGate::Unsupported,
+                "{fp:?}"
+            );
+            for version in [&[5, 113, 0][..], &[9, 9, 9][..]] {
+                assert_eq!(
+                    resolve(PivExtension::SlotTouchPolicy, fp, Some(version), None),
+                    FeatureGate::Unverified,
+                    "{fp:?} at {version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn arekinath_generic_and_swissbit_ishield1_set_management_key_supported_from_v4() {
         for fp in [
             AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
@@ -5244,6 +5528,158 @@ mod tests {
                 FeatureGate::Unverified,
                 "{ext:?} above 1.8.3"
             );
+        }
+    }
+
+    // --- SlotKeyAlgorithm -------------------------------------------------
+
+    #[test]
+    fn slot_key_algorithm_with_no_table_data_is_unverified() {
+        // YubiKey seeds no `SlotKeyAlgorithm` row, so every algorithm
+        // resolves unverified — the same "no data" default every other
+        // extension gets.
+        for alg in KeyAlg::ALL {
+            assert_eq!(
+                resolve(
+                    PivExtension::SlotKeyAlgorithm(alg),
+                    AppletFingerprint::YubiKey,
+                    None,
+                    None
+                ),
+                FeatureGate::Unverified,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_key_algorithm_apdu_id_falls_back_to_key_alg_id_with_no_override() {
+        // YubiKey has no confirmed override, so every algorithm resolves to
+        // `KeyAlg::id()`'s own default.
+        for alg in KeyAlg::ALL {
+            assert_eq!(
+                slot_key_algorithm_apdu_id(alg, AppletFingerprint::YubiKey),
+                alg.id()
+            );
+        }
+    }
+
+    #[test]
+    fn key_alg_from_apdu_id_falls_back_to_the_default_table_with_no_override() {
+        for alg in KeyAlg::ALL {
+            assert_eq!(
+                key_alg_from_apdu_id(alg.id(), AppletFingerprint::YubiKey),
+                Some(alg)
+            );
+        }
+        // A byte no `KeyAlg` claims by default, and no override claims
+        // either, resolves to nothing either way.
+        assert_eq!(key_alg_from_apdu_id(0xFF, AppletFingerprint::YubiKey), None);
+    }
+
+    #[test]
+    fn hid_crescendo_c4000_algorithm_support_matches_its_generate_key_pair_reference() {
+        let fp = AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000);
+        for alg in [
+            KeyAlg::Rsa2048,
+            KeyAlg::Rsa3072,
+            KeyAlg::Rsa4096,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        for alg in [KeyAlg::Rsa1024, KeyAlg::Ed25519, KeyAlg::X25519] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Unsupported,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_c2300_algorithm_support_is_narrower_than_c4000() {
+        // C2300's own GENERATE KEY PAIR reference documents a strictly
+        // smaller closed list than C4000's — RSA-3072/4096 are confirmed
+        // unsupported here even though C4000 supports them.
+        let fp = AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300);
+        for alg in [KeyAlg::Rsa2048, KeyAlg::EccP256, KeyAlg::EccP384] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        for alg in [
+            KeyAlg::Rsa1024,
+            KeyAlg::Rsa3072,
+            KeyAlg::Rsa4096,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Unsupported,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_generic_has_no_algorithm_support_data() {
+        // The two named families' closed lists genuinely differ, so an
+        // unclassified unit gets no known-support claim either way.
+        let fp = AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic);
+        for alg in KeyAlg::ALL {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Unverified,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_apdu_id_override_matches_its_confirmed_byte_table() {
+        // Every HID Crescendo variant shares one wire-byte table — the same
+        // one `hid_crescendo_c4000_algorithm_id` already carries for GET PIV
+        // PROPERTIES / INJECT PKI KEY — regardless of whether that variant's
+        // own GENERATE KEY PAIR reference confirms support for the algorithm
+        // (RSA-4096 on C2300, say): the byte and the support gate are
+        // separate axes.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            assert_eq!(slot_key_algorithm_apdu_id(KeyAlg::Rsa4096, fp), 0x04);
+            assert_eq!(slot_key_algorithm_apdu_id(KeyAlg::Rsa3072, fp), 0x05);
+            assert_eq!(slot_key_algorithm_apdu_id(KeyAlg::Rsa2048, fp), 0x07);
+            assert_eq!(slot_key_algorithm_apdu_id(KeyAlg::EccP256, fp), 0x11);
+            assert_eq!(slot_key_algorithm_apdu_id(KeyAlg::EccP384, fp), 0x14);
+            // No confirmed byte for these three — falls back to
+            // `KeyAlg::id()`'s Yubico default, same as any other fingerprint.
+            assert_eq!(
+                slot_key_algorithm_apdu_id(KeyAlg::Rsa1024, fp),
+                KeyAlg::Rsa1024.id()
+            );
+            assert_eq!(
+                slot_key_algorithm_apdu_id(KeyAlg::Ed25519, fp),
+                KeyAlg::Ed25519.id()
+            );
+            assert_eq!(
+                slot_key_algorithm_apdu_id(KeyAlg::X25519, fp),
+                KeyAlg::X25519.id()
+            );
+            // And the reverse lookup round-trips through the same table.
+            assert_eq!(key_alg_from_apdu_id(0x04, fp), Some(KeyAlg::Rsa4096));
+            assert_eq!(key_alg_from_apdu_id(0x05, fp), Some(KeyAlg::Rsa3072));
         }
     }
 }

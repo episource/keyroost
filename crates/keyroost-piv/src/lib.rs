@@ -391,7 +391,40 @@ pub enum KeyAlg {
 }
 
 impl KeyAlg {
-    /// PIV algorithm identifier byte.
+    /// Every variant, in declaration order — for a UI's algorithm picker (list
+    /// them all, then gate each individually; see
+    /// [`compat::PivExtension::SlotKeyAlgorithm`]) or
+    /// [`compat::key_alg_from_apdu_id`]'s reverse lookup, which walks this to
+    /// find which algorithm a fingerprint's own wire byte names.
+    pub const ALL: [KeyAlg; 8] = [
+        KeyAlg::Rsa1024,
+        KeyAlg::Rsa2048,
+        KeyAlg::Rsa3072,
+        KeyAlg::Rsa4096,
+        KeyAlg::EccP256,
+        KeyAlg::EccP384,
+        KeyAlg::Ed25519,
+        KeyAlg::X25519,
+    ];
+
+    /// PIV algorithm identifier byte — Yubico's own encoding (`ykpiv`'s
+    /// `YKPIV_ALGO_*` constants), used here as keyroost's **default** wire
+    /// mapping, not a universal one. RSA-1024/2048 and ECC P-256/P-384 are
+    /// SP 800-73-4's own standardized values, so every compliant device
+    /// agrees on them regardless; RSA-3072/4096 and the Ed25519/X25519 rows
+    /// have no PIV-standard byte at all — those four are vendor extensions,
+    /// and this table's values for them are specifically Yubico's choice. A
+    /// fingerprint whose own wire byte for a given algorithm differs — HID
+    /// Crescendo's RSA-4096 is a confirmed example, `0x04` there against
+    /// Yubico's `0x16` here, see
+    /// [`fingerprint::hid_crescendo_algorithm_from_id`] — is resolved by a
+    /// caller through [`compat::slot_key_algorithm_apdu_id`]/
+    /// [`compat::key_alg_from_apdu_id`] rather than [`Self::id`]/
+    /// [`Self::from_id`] directly: those two consult a per-fingerprint
+    /// override before falling back to this table, which is the only case
+    /// this method should still be reached for. Whether the algorithm is
+    /// supported at all on a given device is a separate question, gated by
+    /// [`compat::PivExtension::SlotKeyAlgorithm`] and [`compat::resolve`].
     #[must_use]
     pub const fn id(self) -> u8 {
         match self {
@@ -406,7 +439,8 @@ impl KeyAlg {
         }
     }
 
-    /// Resolve a PIV algorithm identifier.
+    /// Resolve a PIV algorithm identifier — the inverse of [`Self::id`], and
+    /// the same Yubico-encoding, default-only caveat: see that method's doc.
     #[must_use]
     pub const fn from_id(id: u8) -> Option<Self> {
         match id {
@@ -954,14 +988,18 @@ fn general_auth_key_agree_data(peer_public_key: &[u8]) -> Vec<u8> {
 
 /// GENERAL AUTHENTICATE in signing mode: ask a key slot to sign/decrypt
 /// `payload` (a PKCS#1 block for RSA, or a raw hash for ECC). The card replies
-/// with `7C L 82 <l> <result>`. `key_alg` is the slot's algorithm (P1),
-/// `key_ref` its slot (P2).
+/// with `7C L 82 <l> <result>`. `alg_id` is the slot's algorithm identifier
+/// byte (P1) — [`KeyAlg::id`]'s Yubico-default encoding, or a fingerprint's
+/// own override resolved via [`compat::slot_key_algorithm_apdu_id`]; this
+/// pure byte-layer function has no fingerprint of its own to resolve
+/// that with, so the caller is expected to have done so already. `key_ref` is
+/// the slot (P2).
 #[must_use]
-pub fn general_auth_sign(key_alg: KeyAlg, key_ref: u8, payload: &[u8]) -> Vec<u8> {
+pub fn general_auth_sign(alg_id: u8, key_ref: u8, payload: &[u8]) -> Vec<u8> {
     build_apdu_ext(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_sign_data(payload),
         Some(0), // large RSA result: request the lot
@@ -983,7 +1021,7 @@ pub fn general_auth_sign(key_alg: KeyAlg, key_ref: u8, payload: &[u8]) -> Vec<u8
 /// identical data chained.
 #[must_use]
 pub fn general_auth_sign_chained(
-    key_alg: KeyAlg,
+    alg_id: u8,
     key_ref: u8,
     payload: &[u8],
     max_chunk: usize,
@@ -991,7 +1029,7 @@ pub fn general_auth_sign_chained(
     chain_apdu(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_sign_data(payload),
         max_chunk,
@@ -1005,14 +1043,15 @@ pub fn general_auth_sign_chained(
 /// card replies with `7C L 82 <l> <Z>`, where `Z` is the raw shared secret
 /// (the x-coordinate for the NIST curves, the 32-byte output for X25519).
 /// `peer_public_key` is `04 || X || Y` for P-256/P-384 or the raw 32-byte
-/// point for X25519; `key_alg` (P1) is the slot's algorithm, `key_ref` (P2)
+/// point for X25519; `alg_id` (P1) is the slot's algorithm identifier byte —
+/// same caveat as [`general_auth_sign`]'s own `alg_id` — and `key_ref` (P2)
 /// its slot.
 #[must_use]
-pub fn general_auth_key_agree(key_alg: KeyAlg, key_ref: u8, peer_public_key: &[u8]) -> Vec<u8> {
+pub fn general_auth_key_agree(alg_id: u8, key_ref: u8, peer_public_key: &[u8]) -> Vec<u8> {
     build_apdu_ext(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_key_agree_data(peer_public_key),
         Some(0),
@@ -1024,7 +1063,7 @@ pub fn general_auth_key_agree(key_alg: KeyAlg, key_ref: u8, peer_public_key: &[u
 /// readers that reject a single extended-`Lc` GENERAL AUTHENTICATE.
 #[must_use]
 pub fn general_auth_key_agree_chained(
-    key_alg: KeyAlg,
+    alg_id: u8,
     key_ref: u8,
     peer_public_key: &[u8],
     max_chunk: usize,
@@ -1032,7 +1071,7 @@ pub fn general_auth_key_agree_chained(
     chain_apdu(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_key_agree_data(peer_public_key),
         max_chunk,
@@ -1042,16 +1081,19 @@ pub fn general_auth_key_agree_chained(
 
 /// GENERATE ASYMMETRIC KEY PAIR in `slot`. The card creates a fresh private key
 /// and returns its public key (`7F49` template). Requires prior management-key
-/// authentication.
+/// authentication. `alg_id` is the algorithm identifier byte (tag `0x80`) —
+/// same caveat as [`general_auth_sign`]'s own `alg_id`: this pure byte-layer
+/// function takes whatever byte the caller resolved and has no fingerprint of
+/// its own to resolve one from.
 #[must_use]
 pub fn generate_key(
     slot: Slot,
-    alg: KeyAlg,
+    alg_id: u8,
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
 ) -> Vec<u8> {
     let mut control = Vec::with_capacity(9);
-    push_tlv(&mut control, &[0x80], &[alg.id()]); // algorithm
+    push_tlv(&mut control, &[0x80], &[alg_id]); // algorithm
     if pin_policy != PinPolicy::Default {
         push_tlv(&mut control, &[0xAA], &[pin_policy.id()]);
     }
@@ -1197,6 +1239,32 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// GeneralizedTime included).
 const MAX_EXPIRATION_YEAR: i64 = 9999;
 
+/// Latest Unix seconds any expiration this crate encodes — a CHUID's
+/// `YYYYMMDD` or an X.509 `not_after` — can represent without producing a
+/// 5-digit year: the last second of [`MAX_EXPIRATION_YEAR`]-12-31. Shared by
+/// `x509::der_time`'s own clamp (so a CHUID and a certificate's validity
+/// period saturate at the identical instant) and by a caller composing
+/// several validity units together (e.g. `--years`/`--months`/`--days`
+/// summed), which needs one final clamp after adding them all rather than
+/// three independent per-unit ones.
+#[must_use]
+pub fn max_expiration_unix_secs() -> i64 {
+    days_from_civil(MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+}
+
+/// Format a Unix timestamp's civil date as the 8 ASCII digits (`YYYYMMDD`) a
+/// CHUID expiration (tag `0x35`) encodes — general enough for a caller that
+/// has already computed an arbitrary end instant itself (e.g. summing
+/// `--days`/`--months`/`--years` together) rather than going through one of
+/// the single-unit `chuid_expiration_in_*` helpers below. Does not clamp;
+/// a caller whose input can run past the calendar's edge should clamp
+/// against [`max_expiration_unix_secs`] first, same as those helpers do
+/// internally.
+#[must_use]
+pub fn yyyymmdd_from_unix_secs(unix_secs: i64) -> [u8; 8] {
+    format_yyyymmdd(civil_from_days(unix_secs.div_euclid(86_400)))
+}
+
 /// The largest "valid for N days from now" a CHUID expiration or a
 /// certificate's validity period can actually represent: the day count from
 /// `now_unix_secs` to `9999-12-31`, the ceiling both
@@ -1228,10 +1296,168 @@ pub fn chuid_expiration_in_days(now_unix_secs: u64, valid_days: u32) -> [u8; 8] 
     let expiry_secs = now_unix_secs.saturating_add(u64::from(valid_days).saturating_mul(86_400));
     let days = (expiry_secs / 86_400) as i64;
     let days = days.min(days_from_civil(MAX_EXPIRATION_YEAR, 12, 31));
-    let (y, m, d) = civil_from_days(days);
+    format_yyyymmdd(civil_from_days(days))
+}
+
+/// Format a civil date as the 8 ASCII digits `chuid_expiration_in_days`/
+/// `chuid_expiration_in_years` both encode into CHUID tag `0x35`.
+fn format_yyyymmdd((y, m, d): (i64, u32, u32)) -> [u8; 8] {
     let mut out = [0u8; 8];
     out.copy_from_slice(format!("{y:04}{m:02}{d:02}").as_bytes());
     out
+}
+
+/// Gregorian leap-year rule: divisible by 4, except centuries, unless also
+/// divisible by 400.
+fn is_leap_year(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// The largest "valid for N calendar years from now" a CHUID expiration or a
+/// certificate's validity period can actually represent — the calendar-year
+/// counterpart of [`max_valid_days`], sizing a "Valid for" input's upper
+/// bound when the input's unit is years rather than days.
+#[must_use]
+pub fn max_valid_years(now_unix_secs: u64) -> u32 {
+    let now_days = (now_unix_secs / 86_400) as i64;
+    let (y, _, _) = civil_from_days(now_days);
+    (MAX_EXPIRATION_YEAR - y).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// `now_unix_secs` plus `years` whole calendar years, keeping the same
+/// month, day, and time-of-day — e.g. 3 years from 2024-06-15 14:00:00 lands
+/// on 2027-06-15 14:00:00, not on some fixed 365.25-day-per-year multiple
+/// the way [`chuid_expiration_in_days`]/a flat `now + days*86_400` would. If
+/// the source day doesn't exist in the target year (a Feb 29 whose target
+/// year isn't a leap year), the day clamps back to the 28th — the same
+/// "same date, N years later" rule every mainstream date library applies to
+/// a leap day. The result is clamped to the last second of
+/// [`MAX_EXPIRATION_YEAR`]-12-31, same ceiling and same shape as
+/// `x509::der_time`'s own clamp, so a certificate's `not_after` computed
+/// this way saturates identically regardless of unit.
+#[must_use]
+pub fn add_calendar_years(now_unix_secs: u64, years: u32) -> i64 {
+    let now_secs = now_unix_secs as i64;
+    let days = now_secs.div_euclid(86_400);
+    let time_of_day = now_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let target_year = y.saturating_add(i64::from(years));
+    let d = if m == 2 && d == 29 && !is_leap_year(target_year) {
+        28
+    } else {
+        d
+    };
+    let new_days = days_from_civil(target_year, m, d);
+    let max_days = days_from_civil(MAX_EXPIRATION_YEAR, 12, 31);
+    if new_days >= max_days {
+        max_days * 86_400 + 86_399
+    } else {
+        new_days * 86_400 + time_of_day
+    }
+}
+
+/// Compute a CHUID expiration date (tag `0x35`, ASCII `YYYYMMDD`) as
+/// `now_unix_secs` plus `valid_years` calendar years — the year-unit
+/// counterpart of [`chuid_expiration_in_days`], built on
+/// [`add_calendar_years`] so the two units agree on what "the same date, N
+/// years later" means.
+#[must_use]
+pub fn chuid_expiration_in_years(now_unix_secs: u64, valid_years: u32) -> [u8; 8] {
+    let expiry_secs = add_calendar_years(now_unix_secs, valid_years);
+    let days = expiry_secs.div_euclid(86_400);
+    format_yyyymmdd(civil_from_days(days))
+}
+
+/// Number of days in a given proleptic-Gregorian (year, month).
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => unreachable!("civil_from_days/days_from_civil only ever produce 1..=12"),
+    }
+}
+
+/// The largest "valid for N calendar months from now" a CHUID expiration or
+/// a certificate's validity period can actually represent — the month-unit
+/// counterpart of [`max_valid_days`]/[`max_valid_years`].
+#[must_use]
+pub fn max_valid_months(now_unix_secs: u64) -> u32 {
+    let now_days = (now_unix_secs / 86_400) as i64;
+    let (y, m, _) = civil_from_days(now_days);
+    let months_remaining = (MAX_EXPIRATION_YEAR - y) * 12 + (12 - i64::from(m));
+    months_remaining.clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// `now_unix_secs` plus `months` whole calendar months, keeping the same
+/// day-of-month and time-of-day — e.g. 2 months from 2026-01-31 14:00:00
+/// lands on 2026-03-31 14:00:00 (skipping February, which has no 31st). If
+/// the source day doesn't exist in the target month (Jan 31 + 1 month, since
+/// February never reaches the 31st), the day clamps down to that month's
+/// last day, the same rule [`add_calendar_years`] applies to a Feb 29 whose
+/// target year isn't a leap year. Clamped to the last second of
+/// [`MAX_EXPIRATION_YEAR`]-12-31, same ceiling and shape as
+/// [`add_calendar_years`]'s own clamp.
+#[must_use]
+pub fn add_calendar_months(now_unix_secs: u64, months: u32) -> i64 {
+    let now_secs = now_unix_secs as i64;
+    let days = now_secs.div_euclid(86_400);
+    let time_of_day = now_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let total_months = i64::from(m - 1) + i64::from(months);
+    let target_year = y + total_months.div_euclid(12);
+    let target_month = (total_months.rem_euclid(12) + 1) as u32;
+    let d = d.min(days_in_month(target_year, target_month));
+    let new_days = days_from_civil(target_year, target_month, d);
+    let max_days = days_from_civil(MAX_EXPIRATION_YEAR, 12, 31);
+    if new_days >= max_days {
+        max_days * 86_400 + 86_399
+    } else {
+        new_days * 86_400 + time_of_day
+    }
+}
+
+/// Compute a CHUID expiration date (tag `0x35`, ASCII `YYYYMMDD`) as
+/// `now_unix_secs` plus `valid_months` calendar months — the month-unit
+/// counterpart of [`chuid_expiration_in_days`]/[`chuid_expiration_in_years`],
+/// built on [`add_calendar_months`].
+#[must_use]
+pub fn chuid_expiration_in_months(now_unix_secs: u64, valid_months: u32) -> [u8; 8] {
+    let expiry_secs = add_calendar_months(now_unix_secs, valid_months);
+    let days = expiry_secs.div_euclid(86_400);
+    format_yyyymmdd(civil_from_days(days))
+}
+
+/// Compose a validity period from independent year/month/day counts that
+/// sum — applied in that order (years first, then months relative to that
+/// point, then a flat day count) — starting at `now_unix_secs`. The shared
+/// implementation behind `keyroostctl`'s combinable `--years`/`--months`/
+/// `--days` flags and the GUI's three-field "Valid for" input, so both agree
+/// bit-for-bit on what e.g. "1 year, 5 days" means, rather than each
+/// re-deriving the composition order. Clamped to
+/// [`max_expiration_unix_secs`], same ceiling every single-unit helper above
+/// already clamps to.
+#[must_use]
+pub fn add_calendar_period(now_unix_secs: u64, years: u32, months: u32, days: u32) -> i64 {
+    let after_years = if years > 0 {
+        add_calendar_years(now_unix_secs, years)
+    } else {
+        now_unix_secs as i64
+    };
+    let after_months = if months > 0 {
+        add_calendar_months(after_years as u64, months)
+    } else {
+        after_years
+    };
+    after_months
+        .saturating_add(i64::from(days) * 86_400)
+        .min(max_expiration_unix_secs())
 }
 
 /// Encode a CHUID data-object value (PIV object [`OBJECT_CHUID`], `5F C1 02`)
@@ -2165,7 +2391,7 @@ mod tests {
         assert_eq!(
             generate_key(
                 Slot::Authentication,
-                KeyAlg::EccP256,
+                KeyAlg::EccP256.id(),
                 PinPolicy::Default,
                 TouchPolicy::Default
             ),
@@ -2179,7 +2405,7 @@ mod tests {
         assert_eq!(
             generate_key(
                 Slot::Signature,
-                KeyAlg::Rsa2048,
+                KeyAlg::Rsa2048.id(),
                 PinPolicy::Once,
                 TouchPolicy::Always
             ),
@@ -2530,6 +2756,153 @@ mod tests {
     }
 
     #[test]
+    fn chuid_expiration_in_years_keeps_month_and_day() {
+        // 1767225600 = 2026-01-01 (same known-answer timestamp the days
+        // tests above use). +1 year keeps 01-01, landing on 2027-01-01.
+        assert_eq!(&chuid_expiration_in_years(1_767_225_600, 0), b"20260101");
+        assert_eq!(&chuid_expiration_in_years(1_767_225_600, 1), b"20270101");
+        assert_eq!(&chuid_expiration_in_years(1_767_225_600, 4), b"20300101");
+    }
+
+    #[test]
+    fn chuid_expiration_in_years_clamps_feb_29_in_a_non_leap_target_year() {
+        // 2024-02-29 (2024 is a leap year). +1 year has no 2025-02-29 to
+        // land on, so it clamps to 2025-02-28 rather than rolling over into
+        // March.
+        let leap_day = (days_from_civil(2024, 2, 29) * 86_400) as u64;
+        assert_eq!(&chuid_expiration_in_years(leap_day, 1), b"20250228");
+        // +4 years lands back on a leap year, so the 29th is preserved.
+        assert_eq!(&chuid_expiration_in_years(leap_day, 4), b"20280229");
+    }
+
+    #[test]
+    fn add_calendar_years_preserves_time_of_day() {
+        // 2026-01-01 01:01:24 UTC (1767225600 + 3684s) + 2 years ->
+        // 2028-01-01 at the same time-of-day.
+        let now = 1_767_225_600u64 + 3_684;
+        let end = add_calendar_years(now, 2);
+        assert_eq!(end, days_from_civil(2028, 1, 1) * 86_400 + 3_684);
+    }
+
+    #[test]
+    fn add_calendar_years_extreme_valid_years_does_not_panic() {
+        // A caller-supplied year count far beyond any realistic UI bound
+        // must degrade (via the year clamp), not panic or overflow.
+        let end = add_calendar_years(0, u32::MAX);
+        assert_eq!(
+            end,
+            days_from_civil(MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+        );
+    }
+
+    #[test]
+    fn max_valid_years_reaches_exactly_year_9999() {
+        let now = 1_767_225_600u64; // 2026-01-01
+        let years = max_valid_years(now);
+        let expiration = chuid_expiration_in_years(now, years);
+        assert_eq!(&expiration, b"99990101"); // same month/day, target year 9999
+                                              // One year more overflows past year 9999 itself (there is no
+                                              // 10000-01-01 to represent), so it clamps to that year's last day
+                                              // rather than a 5-digit year.
+        let expiration = chuid_expiration_in_years(now, years + 1);
+        assert_eq!(&expiration, b"99991231");
+    }
+
+    #[test]
+    fn max_valid_years_never_negative_past_the_year_9999_line() {
+        let far_future_secs = u64::MAX / 2;
+        assert_eq!(max_valid_years(far_future_secs), 0);
+    }
+
+    #[test]
+    fn chuid_expiration_in_months_keeps_day_of_month() {
+        // 1767225600 = 2026-01-01. +1 month keeps the 1st, landing on
+        // 2026-02-01; +13 months crosses a year boundary to 2027-02-01.
+        assert_eq!(&chuid_expiration_in_months(1_767_225_600, 0), b"20260101");
+        assert_eq!(&chuid_expiration_in_months(1_767_225_600, 1), b"20260201");
+        assert_eq!(&chuid_expiration_in_months(1_767_225_600, 13), b"20270201");
+    }
+
+    #[test]
+    fn chuid_expiration_in_months_clamps_the_31st_into_a_shorter_month() {
+        // 2026-01-31 + 1 month has no Feb 31st, so it clamps to Feb 28
+        // (2026 isn't a leap year).
+        let jan_31 = (days_from_civil(2026, 1, 31) * 86_400) as u64;
+        assert_eq!(&chuid_expiration_in_months(jan_31, 1), b"20260228");
+        // +2 months lands on a 31-day month, so the 31st is preserved.
+        assert_eq!(&chuid_expiration_in_months(jan_31, 2), b"20260331");
+    }
+
+    #[test]
+    fn add_calendar_months_preserves_time_of_day() {
+        // 2026-01-01 01:01:24 UTC (1767225600 + 3684s) + 2 months ->
+        // 2026-03-01 at the same time-of-day.
+        let now = 1_767_225_600u64 + 3_684;
+        let end = add_calendar_months(now, 2);
+        assert_eq!(end, days_from_civil(2026, 3, 1) * 86_400 + 3_684);
+    }
+
+    #[test]
+    fn add_calendar_months_extreme_valid_months_does_not_panic() {
+        let end = add_calendar_months(0, u32::MAX);
+        assert_eq!(
+            end,
+            days_from_civil(MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+        );
+    }
+
+    #[test]
+    fn max_valid_months_reaches_exactly_year_9999() {
+        let now = 1_767_225_600u64; // 2026-01-01
+        let months = max_valid_months(now);
+        let expiration = chuid_expiration_in_months(now, months);
+        assert_eq!(&expiration, b"99991201"); // same day, month 12 of year 9999
+                                              // One month more overflows past year 9999 itself, so it clamps to
+                                              // that year's last day rather than rolling into year 10000.
+        let expiration = chuid_expiration_in_months(now, months + 1);
+        assert_eq!(&expiration, b"99991231");
+    }
+
+    #[test]
+    fn max_valid_months_never_negative_past_the_year_9999_line() {
+        let far_future_secs = u64::MAX / 2;
+        assert_eq!(max_valid_months(far_future_secs), 0);
+    }
+
+    #[test]
+    fn add_calendar_period_sums_all_three_units() {
+        // 2026-01-01 + 1 year, 2 months, 5 days -> 2027-03-01, then +5 days
+        // -> 2027-03-06.
+        let now = 1_767_225_600u64; // 2026-01-01
+        let end = add_calendar_period(now, 1, 2, 5);
+        assert_eq!(end, days_from_civil(2027, 3, 6) * 86_400);
+    }
+
+    #[test]
+    fn add_calendar_period_matches_each_unit_alone() {
+        let now = 1_767_225_600u64;
+        assert_eq!(
+            add_calendar_period(now, 1, 0, 0),
+            add_calendar_years(now, 1)
+        );
+        assert_eq!(
+            add_calendar_period(now, 0, 1, 0),
+            add_calendar_months(now, 1)
+        );
+        assert_eq!(add_calendar_period(now, 0, 0, 1), now as i64 + 86_400);
+        assert_eq!(add_calendar_period(now, 0, 0, 0), now as i64);
+    }
+
+    #[test]
+    fn add_calendar_period_clamps_when_the_sum_overshoots_9999() {
+        // Each unit alone would already saturate at year 9999's last day;
+        // summing all three extreme values must land on that same instant,
+        // not overflow past it.
+        let end = add_calendar_period(0, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(end, max_expiration_unix_secs());
+    }
+
+    #[test]
     fn parse_chuid_round_trips_encode_chuid() {
         let guid = [
             0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -2754,7 +3127,7 @@ mod tests {
     fn general_auth_sign_short_and_extended() {
         // Small ECC payload stays in a short APDU:
         // 00 87 11 9A 0A  7C 08 82 00 81 04 <payload>  00
-        let apdu = general_auth_sign(KeyAlg::EccP256, 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        let apdu = general_auth_sign(KeyAlg::EccP256.id(), 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(
             apdu,
             vec![
@@ -2764,7 +3137,7 @@ mod tests {
         );
         // A 256-byte RSA-2048 block forces the extended form: marker 0x00,
         // 2-byte Lc, body, 2-byte Le 0x0000 ("up to 65536").
-        let apdu = general_auth_sign(KeyAlg::Rsa2048, 0x9A, &[0x55; 256]);
+        let apdu = general_auth_sign(KeyAlg::Rsa2048.id(), 0x9A, &[0x55; 256]);
         // data: 7C 82 01 06 ( 82 00  81 82 01 00 <256> )
         assert_eq!(&apdu[..5], &[0x00, 0x87, 0x07, 0x9A, 0x00]);
         let lc = ((apdu[5] as usize) << 8) | apdu[6] as usize;
@@ -2778,7 +3151,7 @@ mod tests {
     fn general_auth_key_agree_uses_tag_85() {
         // Same shape as general_auth_sign but the peer key sits in 0x85, not 0x81:
         // 00 87 11 9D 0A  7C 08 82 00 85 04 <peer>  00
-        let apdu = general_auth_key_agree(KeyAlg::EccP256, 0x9D, &[0x04, 0xAA, 0xBB, 0xCC]);
+        let apdu = general_auth_key_agree(KeyAlg::EccP256.id(), 0x9D, &[0x04, 0xAA, 0xBB, 0xCC]);
         assert_eq!(
             apdu,
             vec![
@@ -2787,7 +3160,7 @@ mod tests {
             ]
         );
         // A large payload forces the extended form; the 0x85 inner tag stays.
-        let apdu = general_auth_key_agree(KeyAlg::EccP256, 0x9D, &[0x04; 256]);
+        let apdu = general_auth_key_agree(KeyAlg::EccP256.id(), 0x9D, &[0x04; 256]);
         assert_eq!(&apdu[..5], &[0x00, 0x87, 0x11, 0x9D, 0x00]);
         assert_eq!(&apdu[7..11], &[0x7C, 0x82, 0x01, 0x06]); // 7C len == sign's, 0x85 body
         assert_eq!(apdu[13], 0x85);
@@ -2796,8 +3169,12 @@ mod tests {
 
     #[test]
     fn general_auth_key_agree_chained_matches_sign_chained_shape() {
-        let chunks =
-            general_auth_key_agree_chained(KeyAlg::EccP256, 0x9D, &[0x04, 0xAA, 0xBB, 0xCC], 254);
+        let chunks = general_auth_key_agree_chained(
+            KeyAlg::EccP256.id(),
+            0x9D,
+            &[0x04, 0xAA, 0xBB, 0xCC],
+            254,
+        );
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0],
@@ -2811,7 +3188,7 @@ mod tests {
     #[test]
     fn general_auth_sign_chained_single_chunk_keeps_le() {
         let chunks =
-            general_auth_sign_chained(KeyAlg::EccP256, 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD], 254);
+            general_auth_sign_chained(KeyAlg::EccP256.id(), 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD], 254);
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0],
@@ -2828,11 +3205,11 @@ mod tests {
         // dynamic-auth template a single extended-length APDU would carry,
         // and only the final chunk carries Le.
         let payload = [0x55u8; 256]; // RSA-2048 prepared block
-        let extended = general_auth_sign(KeyAlg::Rsa2048, 0x9A, &payload);
+        let extended = general_auth_sign(KeyAlg::Rsa2048.id(), 0x9A, &payload);
         let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
         let ext_body = &extended[7..7 + ext_lc];
 
-        let chunks = general_auth_sign_chained(KeyAlg::Rsa2048, 0x9A, &payload, 254);
+        let chunks = general_auth_sign_chained(KeyAlg::Rsa2048.id(), 0x9A, &payload, 254);
         assert!(chunks.len() > 1);
         let last = chunks.len() - 1;
         let mut reassembled = Vec::new();

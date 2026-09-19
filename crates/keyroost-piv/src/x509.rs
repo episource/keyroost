@@ -185,7 +185,7 @@ impl SubjectName {
 /// [`crate::chuid_expiration_in_days`] clamps to, so a CHUID and a
 /// certificate's validity period saturate at the identical date.
 fn max_der_time_unix_secs() -> i64 {
-    crate::days_from_civil(crate::MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+    crate::max_expiration_unix_secs()
 }
 
 /// `Time` per RFC 5280: UTCTime (`YYMMDDHHMMSSZ`) for dates through 2049,
