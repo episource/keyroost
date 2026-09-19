@@ -3681,14 +3681,18 @@ impl PivSession {
     /// both and got interrupted before RESET), this succeeds immediately
     /// with nothing further to burn. Only when that bare attempt comes back
     /// [`TransportError::PivResetNotAllowed`] — RESET's `SW_AUTH_BLOCKED`,
-    /// `SW_CONDITIONS_NOT_SATISFIED`, or `SW_SECURITY_NOT_SATISFIED`, meaning
-    /// the card is enforcing its "PIN and PUK must already be blocked"
-    /// precondition — does this fall through to actually burning
-    /// both: deliberately exhaust the PIN retry counter with wrong values,
-    /// then the PUK counter, then send RESET again. Any other error from the
-    /// bare attempt is returned as-is, with neither counter touched — this
-    /// method only starts burning on the strength of the one error it knows
-    /// how to fix.
+    /// `SW_CONDITIONS_NOT_SATISFIED`, or `SW_SECURITY_NOT_SATISFIED` — does
+    /// this fall through to deliberately exhausting the PIN retry counter
+    /// with wrong values, then trying RESET again *before* touching the PUK
+    /// at all: not every applet's precondition is YubiKey's "PIN and PUK
+    /// must already be blocked" — the Trussed `piv-authenticator` Nitrokey
+    /// runs (<https://github.com/trussed-dev/piv-authenticator>) checks only
+    /// `remaining_pin_retries() == 0`, so RESET already succeeds at this
+    /// point and the PUK is never touched. Only when that second attempt
+    /// also comes back `PivResetNotAllowed` does this burn the PUK counter
+    /// too and send RESET a third time. Any other error from any of the
+    /// three attempts is returned as-is — this method only keeps going on
+    /// the strength of the one error it knows how to work around.
     ///
     /// [`Self::factory_reset`] is what decides this mechanism is the right
     /// one for this fingerprint ([`FactoryResetPlan::BurnPinPukThenReset`])
@@ -3743,6 +3747,24 @@ impl PivSession {
                  there and its PIN retry counter has been spent down. Re-run the \
                  factory reset to finish.",
             ));
+        }
+
+        // The PIN is blocked — try RESET again right away. On a fingerprint
+        // whose precondition is "PIN blocked" alone (Trussed's
+        // `piv-authenticator`, confirmed against its own source: RESET's
+        // handler rejects with `ConditionsOfUseNotSatisfied` purely on
+        // `remaining_pin_retries() != 0`, never consulting the PUK) this
+        // already succeeds — done, with the PUK never guessed at and no
+        // dependence on GET METADATA reporting real PUK retry counts (this
+        // same applet's GET METADATA is an unimplemented stub for the PUK
+        // reference, always answering empty `9000`). A card that really does
+        // need the PUK blocked too (YubiKey's convention) answers the same
+        // `PivResetNotAllowed` here as it did above, and step 2 below still
+        // runs exactly as before.
+        match self.reset(pre_reset_mgmt_auth) {
+            Ok(()) => return Ok(FactoryResetOutcome::Wiped),
+            Err(TransportError::PivResetNotAllowed) => {}
+            Err(e) => return Err(e),
         }
 
         // 2. Block the PUK (via unblock-pin, whose wrong PUK decrements the PUK
