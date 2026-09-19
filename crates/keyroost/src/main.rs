@@ -2099,6 +2099,19 @@ struct PivState {
     chuid_guid: String,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
+    /// True from the moment any PIV device job — status read, PIN/PUK/
+    /// management-key change, key generate/import/delete/move, self-test,
+    /// self-sign/CSR, CHUID write, reset, ... — queues via `spawn_piv_job`
+    /// until that job's apply closure runs. The pane reads this once,
+    /// wrapping everything except the slot tab strip (and the retired-slot
+    /// rail) in a single `add_enabled_ui` (see `cap_piv`) — disabling every
+    /// button/field in the applet-wide and per-slot cards for the duration
+    /// without hooking into each one individually, while scrolling and slot
+    /// selection stay live. Not `self.busy()`: that flips true for *any*
+    /// queued job app-wide (an unrelated OATH or FIDO action among them),
+    /// which would dim the PIV pane over device work that has nothing to do
+    /// with the PIV applet.
+    inflight: bool,
     /// Credential-entry modal for PIN/PUK changes + unblock (open iff `Some`).
     /// The PIN/PUK secret fields above render *inside* this modal, not inline in
     /// the pane, so the entry and its result stay on-screen (issue #31).
@@ -2192,6 +2205,7 @@ impl Default for PivState {
                 .map(|g| keyroost_piv::format_guid(&g))
                 .unwrap_or_default(),
             confirm_reset: None,
+            inflight: false,
             cred_modal: None,
             move_dest: None,
             retired_occupancy: None,
@@ -7490,6 +7504,34 @@ impl App {
         });
     }
 
+    /// Same contract as `spawn_job` (returns whether the job actually
+    /// queued), but also manages `PivState::inflight` for the job's
+    /// lifetime: set the moment it queues, cleared as the very first thing
+    /// the apply closure does — before whatever outcome-specific work `job`
+    /// goes on to do, same ordering `piv_reset` used to hand-roll for
+    /// `reset_inflight` alone. Every PIV device job (status read, PIN/PUK/
+    /// management-key change, key generate/import/delete/move, self-test,
+    /// self-sign/CSR, CHUID write, reset, ...) should queue through this
+    /// rather than `spawn_job` directly, so `cap_piv`'s two
+    /// `add_enabled_ui(!self.piv.inflight, ...)` wraps disable the pane for
+    /// any of them uniformly instead of each call site managing its own flag.
+    fn spawn_piv_job<F>(&mut self, label: impl Into<String>, job: F) -> bool
+    where
+        F: FnOnce() -> ApplyFn + Send + 'static,
+    {
+        let queued = self.spawn_job(label, move || {
+            let apply = job();
+            Box::new(move |app: &mut App| {
+                app.piv.inflight = false;
+                apply(app);
+            }) as ApplyFn
+        });
+        if queued {
+            self.piv.inflight = true;
+        }
+        queued
+    }
+
     /// Read the selected card's read-only PIV status snapshot: status + every
     /// slot's algorithm/subject/policy. `kind` should be `User` only when
     /// this runs because the user clicked "Refresh" — the initial read when
@@ -7509,7 +7551,7 @@ impl App {
         // `status_detailed`'s algorithm fallback to name a slot GET METADATA
         // can't describe yet — see `PivState::pubkey_cache`.
         let pubkey_cache = self.piv.pubkey_cache.clone();
-        self.spawn_job("Reading PIV status\u{2026}", move || {
+        self.spawn_piv_job("Reading PIV status\u{2026}", move || {
             // One transport call gathers the snapshot and every slot's
             // algorithm / Subject DN / PIN-touch policy, reading each slot's
             // GET METADATA and certificate object exactly once. Doing this
@@ -7625,7 +7667,7 @@ impl App {
         }
         let (old, new) = (self.piv.pin_old.clone(), self.piv.pin_new.clone());
         self.piv.notice = None;
-        self.spawn_job("Changing PIV PIN\u{2026}", move || {
+        self.spawn_piv_job("Changing PIV PIN\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 s.change_pin(old.as_bytes(), new.as_bytes())?;
@@ -7652,7 +7694,7 @@ impl App {
         }
         let (old, new) = (self.piv.puk_old.clone(), self.piv.puk_new.clone());
         self.piv.notice = None;
-        self.spawn_job("Changing PUK\u{2026}", move || {
+        self.spawn_piv_job("Changing PUK\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 s.change_puk(old.as_bytes(), new.as_bytes())?;
@@ -7677,7 +7719,7 @@ impl App {
             self.piv.unblock_new_pin.clone(),
         );
         self.piv.notice = None;
-        self.spawn_job("Unblocking PIN\u{2026}", move || {
+        self.spawn_piv_job("Unblocking PIN\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
@@ -7764,7 +7806,7 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.piv.retries_pin_auth.clone());
         let (pin_tries, puk_tries) = (self.piv.retries_pin, self.piv.retries_puk);
         self.piv.notice = None;
-        self.spawn_job("Setting PIV retry counts\u{2026}", move || {
+        self.spawn_piv_job("Setting PIV retry counts\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &mgmt)?;
@@ -7801,7 +7843,7 @@ impl App {
         let (pin_policy, touch_policy) = (self.piv.gen_pin_policy, self.piv.gen_touch_policy);
         self.piv.notice = None;
         self.piv.gen_pubkey_pem = None;
-        self.spawn_job("Generating key\u{2026} (touch if it blinks)", move || {
+        self.spawn_piv_job("Generating key\u{2026} (touch if it blinks)", move || {
             let result = (|| -> Result<
                 (keyroost_piv::PublicKey, keyroost_transport::PivStatus),
                 TransportError,
@@ -7895,7 +7937,7 @@ impl App {
         // through even when this app run knows better.
         let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
-        self.spawn_job("Importing certificate\u{2026}", move || {
+        self.spawn_piv_job("Importing certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let bytes = std::fs::read(&path).map_err(|_| {
                     TransportError::MalformedResponse("cannot read certificate file")
@@ -7935,7 +7977,7 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         self.piv.notice = None;
-        self.spawn_job("Deleting certificate\u{2026}", move || {
+        self.spawn_piv_job("Deleting certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &mgmt)?;
@@ -7998,7 +8040,7 @@ impl App {
             self.piv.chuid_valid_days,
         );
         self.piv.notice = None;
-        self.spawn_job("Writing a new CHUID\u{2026}", move || {
+        self.spawn_piv_job("Writing a new CHUID\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &mgmt)?;
@@ -8031,7 +8073,7 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         self.piv.notice = None;
-        self.spawn_job("Deleting key\u{2026}", move || {
+        self.spawn_piv_job("Deleting key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &mgmt)?;
@@ -8069,7 +8111,7 @@ impl App {
             return;
         };
         self.piv.notice = None;
-        self.spawn_job("Moving key\u{2026}", move || {
+        self.spawn_piv_job("Moving key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &mgmt)?;
@@ -8120,7 +8162,7 @@ impl App {
             return false;
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Reading retired slots\u{2026}", move || {
+        self.spawn_piv_job("Reading retired slots\u{2026}", move || {
             let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
                 keyroost_piv::Slot::retired_all()
                     .into_iter()
@@ -8217,7 +8259,7 @@ impl App {
         } else {
             "Running self-test\u{2026}"
         };
-        self.spawn_job(label, move || {
+        self.spawn_piv_job(label, move || {
             let outcome = run_piv_self_test(&name, slot, pin_required, pin.as_bytes());
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.sign_pin);
@@ -8290,7 +8332,7 @@ impl App {
         // a key generated earlier this app run has to be handed back in.
         let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
-        self.spawn_job(
+        self.spawn_piv_job(
             "Creating self-signed certificate\u{2026} (touch if it blinks)",
             move || {
                 let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
@@ -8342,7 +8384,7 @@ impl App {
         // a key generated earlier this app run has to be handed back in.
         let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
-        self.spawn_job(
+        self.spawn_piv_job(
             "Signing certificate request\u{2026} (touch if it blinks)",
             move || {
                 let result = (|| -> Result<(), TransportError> {
@@ -8389,7 +8431,7 @@ impl App {
         // here.
         let path = self.piv.export_path.trim().to_owned();
         self.piv.notice = None;
-        self.spawn_job("Exporting certificate\u{2026}", move || {
+        self.spawn_piv_job("Exporting certificate\u{2026}", move || {
             let result = (|| -> Result<usize, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 let der = s
@@ -8458,7 +8500,7 @@ impl App {
             None => None,
         };
         self.piv.notice = None;
-        self.spawn_job("Changing management key\u{2026}", move || {
+        self.spawn_piv_job("Changing management key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 piv_authenticate(&mut s, &old)?;
@@ -8502,7 +8544,7 @@ impl App {
             return true; // nothing to do; let the modal close
         };
         self.piv.notice = None;
-        self.spawn_job("Resetting PIV applet\u{2026}", move || {
+        let queued = self.spawn_piv_job("Resetting PIV applet\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 // The PIV pane's "Reset applet" card collects no
@@ -8526,7 +8568,11 @@ impl App {
                     "PIV application reset to factory defaults.".into(),
                 );
             })
-        })
+        });
+        // `queued` still matters here beyond `spawn_piv_job`'s own bookkeeping:
+        // a worker already busy means the confirm modal should stay open for
+        // the caller to retry, rather than closing on a click that did nothing.
+        queued
     }
 
     /// Apply the three rename-dialog actions shared by the security-key hero and
@@ -15288,271 +15334,300 @@ impl App {
 
         // --- PIV smart card status card (full-width, FIDO2 "PIN & sign-in"
         // shape): title + help left, Refresh right, applet/serial/retries body.
-        theme::card_frame(p).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("PIV smart card")
-                        .font(theme::f_sb(14.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                        do_refresh = true;
-                    }
+        //
+        // Wrapped in `add_enabled_ui` rather than gating each button/field
+        // below: egui propagates `enabled` down the whole child tree, so
+        // this one call dims Refresh, the PIN/PUK/retries/management-key/
+        // CHUID actions, and every input among them together, with nothing
+        // to keep in sync as rows are added or reordered. `self.piv.inflight`
+        // covers every PIV job, not just this card's own Refresh, so any
+        // in-flight generate/import/delete/... elsewhere dims this card too.
+        ui.add_enabled_ui(!self.piv.inflight, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PIV smart card")
+                            .font(theme::f_sb(14.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                            do_refresh = true;
+                        }
+                    });
                 });
-            });
-            ui.add_space(8.0);
-            if let Some(err) = &self.piv.error {
-                ui.colored_label(p.err, err);
-                ui.add_space(6.0);
-            }
-            if let Some(n) = &self.piv.notice {
-                ui.colored_label(p.ok, n);
-                ui.add_space(6.0);
-            }
-            // Status body: version / serial / PIN retries collapsed onto one
-            // dotted line.
-            if let Some(st) = &self.piv.status {
-                // Tolerant of any non-empty GET VERSION reply, not just real
-                // Yubico firmware's 3 bytes — some third-party PIV applets
-                // that answer this vendor extension at all use a different
-                // byte count (observed: a Swissbit iShield Key 2 Pro replies
-                // with 4).
-                let ver = st
-                    .version
-                    .as_deref()
-                    .map(keyroost_piv::format_version_bytes)
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let serial = st
-                    .serial
-                    .map_or("\u{2014}".to_string(), keyroost_piv::format_serial_short);
-                let retries = st
-                    .pin_retries
-                    .map_or("\u{2014}".to_string(), |n| n.to_string());
-                // The token's own reported name when it has one (e.g. a
-                // Nitrokey's admin application); otherwise the generic name
-                // for its fingerprinted applet family — same fallback as
-                // `keyroostctl piv status`'s plain-text output.
-                let applet_name = if st.applet_name.is_empty() {
-                    st.applet_fingerprint.applet_name().to_string()
-                } else {
-                    st.applet_name.clone()
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{applet_name} \u{00B7} Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
-                    ))
-                    .font(theme::f_reg(12.5))
-                    .color(p.txt2),
-                );
-                // CHUID — GUID and expiration only. FASC-N carries no
-                // information worth showing here (it's a fixed filler, not
-                // real card data — see keyroost_piv::encode_chuid) and stays
-                // out of the UI; `keyroostctl piv status` still prints it.
-                // The signature and LRC fields are omitted everywhere.
-                if let Some(chuid) = &st.chuid {
+                ui.add_space(8.0);
+                if let Some(err) = &self.piv.error {
+                    ui.colored_label(p.err, err);
+                    ui.add_space(6.0);
+                }
+                if let Some(n) = &self.piv.notice {
+                    ui.colored_label(p.ok, n);
+                    ui.add_space(6.0);
+                }
+                // Status body: version / serial / PIN retries collapsed onto one
+                // dotted line.
+                if let Some(st) = &self.piv.status {
+                    // Tolerant of any non-empty GET VERSION reply, not just real
+                    // Yubico firmware's 3 bytes — some third-party PIV applets
+                    // that answer this vendor extension at all use a different
+                    // byte count (observed: a Swissbit iShield Key 2 Pro replies
+                    // with 4).
+                    //
+                    // `version_firmware` is the token's own firmware version
+                    // (read through a fingerprint-specific probe only some
+                    // tokens answer — currently a Nitrokey only), a separate
+                    // axis from the PIV applet's own version above — see
+                    // `PivStatus::version_firmware`'s doc for why the two
+                    // aren't interchangeable. Shown only when it adds
+                    // information: suppressed when it's absent, and folded
+                    // into the "Applet" segment (rather than repeated as its
+                    // own dotted field) when it equals the applet version, so
+                    // the common case where a token doesn't distinguish the
+                    // two axes doesn't show the same number twice.
+                    let applet_ver = st.version.as_deref().map(keyroost_piv::format_version_bytes);
+                    let fw_ver = st
+                        .version_firmware
+                        .as_deref()
+                        .filter(|fw| Some(*fw) != st.version.as_deref())
+                        .map(keyroost_piv::format_version_bytes);
+                    let applet_field = match (applet_ver, fw_ver) {
+                        (Some(av), Some(fw)) => format!("Applet {av} (FW v{fw})"),
+                        (Some(av), None) => format!("Applet {av}"),
+                        (None, Some(fw)) => format!("Applet FW v{fw}"),
+                        (None, None) => "Applet \u{2014}".to_string(),
+                    };
+                    let serial = st
+                        .serial
+                        .map_or("\u{2014}".to_string(), keyroost_piv::format_serial_short);
+                    let retries = st
+                        .pin_retries
+                        .map_or("\u{2014}".to_string(), |n| n.to_string());
+                    // The token's own reported name when it has one (e.g. a
+                    // Nitrokey's admin application); otherwise the generic name
+                    // for its fingerprinted applet family — same fallback as
+                    // `keyroostctl piv status`'s plain-text output.
+                    let applet_name = if st.applet_name.is_empty() {
+                        st.applet_fingerprint.applet_name().to_string()
+                    } else {
+                        st.applet_name.clone()
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "CHUID: GUID {} \u{00B7} Expires {}",
-                            chuid.guid_display(),
-                            chuid.expiration_display()
+                            "{applet_name} \u{00B7} {applet_field} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
                     );
-                }
-            } else if self.piv.error.is_none() {
-                ui.label(
-                    egui::RichText::new("Reading PIV status\u{2026}")
-                        .font(theme::f_reg(13.0))
-                        .color(p.txt3),
-                );
-            }
-
-            // Applet-wide administration: PIN & PUK, retry counts, and the
-            // management key all apply to the whole applet rather than to one
-            // slot, so they sit with the applet status here.
-            ui.add_space(12.0);
-
-            // PIN & PUK: bold label + help left, the three actions right.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("PIN & PUK")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
-                        open_unblock = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
-                        open_change_puk = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
-                        open_change_pin = true;
-                    }
-                });
-            });
-
-            // Retry counts: label + help left, the tries DragValues and the
-            // apply button right-aligned. SET PIN RETRIES (Yubico `INS
-            // 0xFA`) sets both counters in one APDU, so it's gated by the
-            // single `set_retries_gate` above rather than a pair, unlike
-            // Move/Delete key: `Unsupported` dims both DragValues and the
-            // button together (there's nothing partial to offer) and resets
-            // both counts to their factory default above, rather than
-            // leaving a stale drag-in value behind a disabled field; and
-            // `Unverified` only adds the same warning marker Move key uses,
-            // leaving everything else live.
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Retry counts")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-admin");
-                if matches!(set_retries_gate, FeatureGate::Unverified) {
-                    ui.add_space(4.0);
-                    theme::warn_marker(ui, p).on_hover_text(set_retries_unverified_hint.as_str());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if matches!(set_retries_gate, FeatureGate::Unsupported) {
-                        theme::button_disabled(ui, p, "Set retry counts\u{2026}")
-                            .on_hover_text(set_retries_blocked_hint.as_str());
-                    } else if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}")
-                        .clicked()
-                    {
-                        open_set_retries = true;
-                    }
-                    ui.add_space(8.0);
-                    let retries_unsupported = matches!(set_retries_gate, FeatureGate::Unsupported);
-                    // A disabled `DragValue` still renders whatever number
-                    // `self.piv.retries_{pin,puk}` currently holds — the
-                    // factory-default `3` these two reset to just above, on
-                    // a device that plain doesn't support setting retries at
-                    // all. Left alone, that reads as a real reported count
-                    // rather than the meaningless placeholder it is. Blank
-                    // it via a custom formatter rather than the field's
-                    // value: the value itself still has to stay a real `u8`
-                    // (`DragValue` requires `Numeric`, and the same field
-                    // backs the live, editable count on any device that
-                    // *does* support this), so emptiness lives at the
-                    // display layer, not the data.
-                    let blank_when_unsupported = move |n: f64, _: std::ops::RangeInclusive<usize>| {
-                        if retries_unsupported {
-                            String::new()
-                        } else {
-                            format!("{}", n as u8)
-                        }
-                    };
-                    ui.add_enabled(
-                        !retries_unsupported,
-                        egui::DragValue::new(&mut self.piv.retries_puk)
-                            .range(1..=15u8)
-                            .custom_formatter(blank_when_unsupported),
-                    );
-                    ui.label(
-                        egui::RichText::new("PUK tries")
-                            .font(theme::f_reg(13.0))
+                    // CHUID — GUID and expiration only. FASC-N carries no
+                    // information worth showing here (it's a fixed filler, not
+                    // real card data — see keyroost_piv::encode_chuid) and stays
+                    // out of the UI; `keyroostctl piv status` still prints it.
+                    // The signature and LRC fields are omitted everywhere.
+                    if let Some(chuid) = &st.chuid {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "CHUID: GUID {} \u{00B7} Expires {}",
+                                chuid.guid_display(),
+                                chuid.expiration_display()
+                            ))
+                            .font(theme::f_reg(12.5))
                             .color(p.txt2),
-                    );
-                    ui.add_space(8.0);
-                    ui.add_enabled(
-                        !retries_unsupported,
-                        egui::DragValue::new(&mut self.piv.retries_pin)
-                            .range(1..=15u8)
-                            .custom_formatter(blank_when_unsupported),
-                    );
-                    ui.label(
-                        egui::RichText::new("PIN tries")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
-                    );
-                });
-            });
-
-            // Management key: label + help left, algorithm combo and change
-            // button right-aligned.
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Management key")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-admin");
-                if matches!(change_mgmt_key_gate, FeatureGate::Unverified) {
-                    ui.add_space(4.0);
-                    theme::warn_marker(ui, p)
-                        .on_hover_text(change_mgmt_key_unverified_hint.as_str());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if matches!(change_mgmt_key_gate, FeatureGate::Unsupported) {
-                        theme::button_disabled(ui, p, "Change management key\u{2026}")
-                            .on_hover_text(change_mgmt_key_blocked_hint.as_str());
-                    } else if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
-                        .clicked()
-                    {
-                        open_change_mgmt = true;
-                    }
-                    ui.add_space(8.0);
-                    // HID Crescendo's ACA-only management key only ever
-                    // takes TDES/AES-128, plus the HID-specific "Delete"
-                    // choice — see `PivMgmtAlgSel`'s doc.
-                    let is_hid_crescendo = self.piv.status.as_ref().is_some_and(|s| {
-                        matches!(
-                            s.applet_fingerprint,
-                            keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
-                        )
-                    });
-                    let mgmt_alg_options = if is_hid_crescendo {
-                        &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS[..]
-                    } else {
-                        &PivMgmtAlgSel::ALL[..]
-                    };
-                    // There's nothing to pick an algorithm *for* once the
-                    // device is known unable to accept a new management key
-                    // at all — same `Unsupported`-only gate the "Change
-                    // management key…" button above already uses, so the two
-                    // controls dim together.
-                    let mgmt_key_unsupported = matches!(change_mgmt_key_gate, FeatureGate::Unsupported);
-                    ui.add_enabled_ui(!mgmt_key_unsupported, |ui| {
-                        piv_mgmtalg_combo(
-                            ui,
-                            "piv-new-mgmt-alg",
-                            &mut self.piv.new_mgmt_alg,
-                            mgmt_alg_options,
                         );
-                    })
-                    .response
-                    .on_disabled_hover_text(change_mgmt_key_blocked_hint.as_str());
-                });
-            });
-
-            // CHUID: label + help left, the write action right-aligned.
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("CHUID")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-admin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "New CHUID\u{2026}").clicked() {
-                        open_new_chuid = true;
                     }
+                } else if self.piv.error.is_none() {
+                    ui.label(
+                        egui::RichText::new("Reading PIV status\u{2026}")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt3),
+                    );
+                }
+
+                // Applet-wide administration: PIN & PUK, retry counts, and the
+                // management key all apply to the whole applet rather than to one
+                // slot, so they sit with the applet status here.
+                ui.add_space(12.0);
+
+                // PIN & PUK: bold label + help left, the three actions right.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PIN & PUK")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "pin");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                            open_unblock = true;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                            open_change_puk = true;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                            open_change_pin = true;
+                        }
+                    });
+                });
+
+                // Retry counts: label + help left, the tries DragValues and the
+                // apply button right-aligned. SET PIN RETRIES (Yubico `INS
+                // 0xFA`) sets both counters in one APDU, so it's gated by the
+                // single `set_retries_gate` above rather than a pair, unlike
+                // Move/Delete key: `Unsupported` dims both DragValues and the
+                // button together (there's nothing partial to offer) and resets
+                // both counts to their factory default above, rather than
+                // leaving a stale drag-in value behind a disabled field; and
+                // `Unverified` only adds the same warning marker Move key uses,
+                // leaving everything else live.
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Retry counts")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    if matches!(set_retries_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(set_retries_unverified_hint.as_str());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if matches!(set_retries_gate, FeatureGate::Unsupported) {
+                            theme::button_disabled(ui, p, "Set retry counts\u{2026}")
+                                .on_hover_text(set_retries_blocked_hint.as_str());
+                        } else if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}")
+                            .clicked()
+                        {
+                            open_set_retries = true;
+                        }
+                        ui.add_space(8.0);
+                        let retries_unsupported = matches!(set_retries_gate, FeatureGate::Unsupported);
+                        // A disabled `DragValue` still renders whatever number
+                        // `self.piv.retries_{pin,puk}` currently holds — the
+                        // factory-default `3` these two reset to just above, on
+                        // a device that plain doesn't support setting retries at
+                        // all. Left alone, that reads as a real reported count
+                        // rather than the meaningless placeholder it is. Blank
+                        // it via a custom formatter rather than the field's
+                        // value: the value itself still has to stay a real `u8`
+                        // (`DragValue` requires `Numeric`, and the same field
+                        // backs the live, editable count on any device that
+                        // *does* support this), so emptiness lives at the
+                        // display layer, not the data.
+                        let blank_when_unsupported = move |n: f64, _: std::ops::RangeInclusive<usize>| {
+                            if retries_unsupported {
+                                String::new()
+                            } else {
+                                format!("{}", n as u8)
+                            }
+                        };
+                        ui.add_enabled(
+                            !retries_unsupported,
+                            egui::DragValue::new(&mut self.piv.retries_puk)
+                                .range(1..=15u8)
+                                .custom_formatter(blank_when_unsupported),
+                        );
+                        ui.label(
+                            egui::RichText::new("PUK tries")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                        ui.add_space(8.0);
+                        ui.add_enabled(
+                            !retries_unsupported,
+                            egui::DragValue::new(&mut self.piv.retries_pin)
+                                .range(1..=15u8)
+                                .custom_formatter(blank_when_unsupported),
+                        );
+                        ui.label(
+                            egui::RichText::new("PIN tries")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                    });
+                });
+
+                // Management key: label + help left, algorithm combo and change
+                // button right-aligned.
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Management key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    if matches!(change_mgmt_key_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p)
+                            .on_hover_text(change_mgmt_key_unverified_hint.as_str());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if matches!(change_mgmt_key_gate, FeatureGate::Unsupported) {
+                            theme::button_disabled(ui, p, "Change management key\u{2026}")
+                                .on_hover_text(change_mgmt_key_blocked_hint.as_str());
+                        } else if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                            .clicked()
+                        {
+                            open_change_mgmt = true;
+                        }
+                        ui.add_space(8.0);
+                        // HID Crescendo's ACA-only management key only ever
+                        // takes TDES/AES-128, plus the HID-specific "Delete"
+                        // choice — see `PivMgmtAlgSel`'s doc.
+                        let is_hid_crescendo = self.piv.status.as_ref().is_some_and(|s| {
+                            matches!(
+                                s.applet_fingerprint,
+                                keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
+                            )
+                        });
+                        let mgmt_alg_options = if is_hid_crescendo {
+                            &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS[..]
+                        } else {
+                            &PivMgmtAlgSel::ALL[..]
+                        };
+                        // There's nothing to pick an algorithm *for* once the
+                        // device is known unable to accept a new management key
+                        // at all — same `Unsupported`-only gate the "Change
+                        // management key…" button above already uses, so the two
+                        // controls dim together.
+                        let mgmt_key_unsupported = matches!(change_mgmt_key_gate, FeatureGate::Unsupported);
+                        ui.add_enabled_ui(!mgmt_key_unsupported, |ui| {
+                            piv_mgmtalg_combo(
+                                ui,
+                                "piv-new-mgmt-alg",
+                                &mut self.piv.new_mgmt_alg,
+                                mgmt_alg_options,
+                            );
+                        })
+                        .response
+                        .on_disabled_hover_text(change_mgmt_key_blocked_hint.as_str());
+                    });
+                });
+
+                // CHUID: label + help left, the write action right-aligned.
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("CHUID")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "New CHUID\u{2026}").clicked() {
+                            open_new_chuid = true;
+                        }
+                    });
                 });
             });
         });
@@ -15971,411 +16046,431 @@ impl App {
                 .color(p.txt2),
         );
         ui.add_space(10.0);
-        theme::card_frame(p).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-
-            // --- Generate key: bold label + help left, algorithm combo
-            // and primary button pinned right (FIDO2 setting-row shape).
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Generate key")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-generate");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
-                        open_generate = true;
-                    }
-                    ui.add_space(8.0);
-                    piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
-                });
-            });
-            if let Some(pem) = &self.piv.gen_pubkey_pem {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut pem.as_str())
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.add_space(4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
-                        copy_pem = Some(pem.clone());
-                    }
-                });
-            }
-
-            ui.add_space(12.0);
-            // --- Certificate: subject/validity inputs, then both issue actions
-            // on one right-aligned row — "Sign & save CSR" then "Self-signed ->
-            // slot". Each is signed by the slot's key, so both dim with the same
-            // reason when the slot has none. "Sign & save CSR" opens a save
-            // dialog first (see `drain_file_dialogs`); "Self-signed -> slot"
-            // opens the PIN / management-key modal.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Certificate")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-certificate");
-            });
-            ui.add_space(6.0);
-            text_field(
-                ui,
-                p,
-                "Name",
-                &mut self.piv.cert_subject,
-                "e.g. Alice — or full CN=Alice,O=Example,C=US",
-                300.0,
-            );
-            ui.horizontal(|ui| {
-                // Same 96px label column `text_field` uses for the "Name" row
-                // above, so this label lines up with it and the input below
-                // starts at the same x.
-                ui.add_sized(
-                    [96.0, 22.0],
-                    egui::Label::new(
-                        egui::RichText::new("Valid for")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
-                    ),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.piv.cert_days)
-                        .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
-                        .suffix(" days"),
-                );
-                // right_to_left: add "Self-signed" first so it sits at the far
-                // right, then "Sign & save CSR" to its left.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
-                            .clicked()
-                        {
-                            open_self_sign = true;
-                        }
-                    } else {
-                        theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
-                            .on_hover_text(no_slot_key_hint);
-                    }
-                    ui.add_space(8.0);
-                    if selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR\u{2026}")
-                            .clicked()
-                        {
-                            open_csr = true;
-                        }
-                    } else {
-                        theme::button_disabled(ui, p, "Sign & save CSR\u{2026}")
-                            .on_hover_text(no_slot_key_hint);
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            // --- Import / Export cert: both buttons on one right-aligned row,
-            // "Import certificate" then "Export certificate". Import opens a
-            // file picker then the management-key modal; Export opens a save
-            // dialog and writes straight to the chosen path — no secret (see
-            // `drain_file_dialogs`). Export dims when the slot holds no cert.
-            // Import dims only when the slot is *confirmed* empty
-            // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
-            // unconfirmed reading leaves it enabled, since a matching key may
-            // have been loaded out of band this session can't see.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Import/Export cert")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-import-export");
-                // right_to_left: add "Export" first so it sits at the far
-                // right, then "Import" to its left.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if selected_has_cert {
-                        if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
-                            .clicked()
-                        {
-                            go_export = true;
-                        }
-                    } else {
-                        theme::button_disabled(ui, p, "Export certificate\u{2026}")
-                            .on_hover_text(no_slot_cert_hint);
-                    }
-                    ui.add_space(8.0);
-                    if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
-                        theme::button_disabled(ui, p, "Import certificate\u{2026}")
-                            .on_hover_text(no_import_cert_hint);
-                    } else if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
-                        .clicked()
-                    {
-                        open_import = true;
-                    }
-                });
-            });
-
-            ui.add_space(12.0);
-            // --- Move key: its own row, above Delete. It used to be a button
-            // inside the Delete row, which put a deliberately non-destructive
-            // action under a destructive heading and left it sharing the delete
-            // help text — the one place a user checking "is this safe?" would
-            // look. The row is always shown so the capability stays
-            // discoverable; the button is dimmed with a hover reason when the
-            // slot has no key to move, or on pre-5.7 firmware.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Move key")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-move");
-                // Support-unverified warning sits right after the help dot, by
-                // the operation's own explanation — not out by the button. It
-                // reflects the device's MOVE KEY support, so it shows whether or
-                // not this slot currently has a key for the button to act on
-                // (the button may be dimmed for "no key" underneath it).
-                if matches!(move_key_gate, FeatureGate::Unverified) {
-                    ui.add_space(4.0);
-                    theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match move_key_gate {
-                        // Known-unsupported on this device wins over "no key": the
-                        // firmware reason is the one the user has to resolve
-                        // first, and it holds whether or not the slot is empty.
-                        FeatureGate::Unsupported => {
-                            theme::button_disabled(ui, p, "Move key\u{2026}")
-                                .on_hover_text(move_key_blocked_hint.as_str());
-                        }
-                        // Unverified still runs — the card refuses if it truly
-                        // can't — so the button stays live where there is a key;
-                        // only the warning above marks the doubt.
-                        FeatureGate::Supported | FeatureGate::Unverified => {
-                            if !selected_has_key {
-                                theme::button_disabled(ui, p, "Move key\u{2026}")
-                                    .on_hover_text(no_move_key_hint);
-                            } else if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
-                                .clicked()
-                            {
-                                open_move_key = true;
-                            }
-                        }
-                    }
-                });
-            });
-            ui.add_space(12.0);
-            // --- Delete: bold label + help left, the two delete
-            // actions right-aligned (Delete key is Danger, gated 5.7+).
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Delete")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-delete");
-                // Support-unverified warning for "Delete key" sits here, beside
-                // the row's help dot — not out by the button — so its hover
-                // text names "Delete key" explicitly and spells out that
-                // "Delete certificate" (the other button on this row) is
-                // standard PIV and unaffected.
-                if matches!(delete_key_gate, FeatureGate::Unverified) {
-                    ui.add_space(4.0);
-                    theme::warn_marker(ui, p).on_hover_text(format!(
-                        "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
-                         standard PIV and unaffected."
-                    ));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match delete_key_gate {
-                        // Unsupported blocks outright, regardless of slot
-                        // content — an operation the device can't run at all
-                        // is the reason to lead with, not slot occupancy.
-                        FeatureGate::Unsupported => {
-                            // Kept visible but dimmed on pre-5.7 firmware so the
-                            // action is discoverable; the hover text says why it
-                            // can't run yet.
-                            theme::button_disabled(ui, p, "Delete key\u{2026}")
-                                .on_hover_text(delete_key_blocked_hint.as_str());
-                        }
-                        // Unverified still runs — the card refuses if it truly
-                        // can't — so the button stays live unless the slot's
-                        // emptiness is independently confirmed below; only the
-                        // warning by the help dot marks the firmware doubt.
-                        FeatureGate::Supported | FeatureGate::Unverified => {
-                            if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
-                                theme::button_disabled(ui, p, "Delete key\u{2026}")
-                                    .on_hover_text(no_del_key_hint);
-                            } else if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}")
-                                .clicked()
-                            {
-                                open_delete_key = true;
-                            }
-                        }
-                    }
-                    ui.add_space(6.0);
-                    // "Delete certificate" is standard PIV, so no firmware gate
-                    // — but like Export it needs a certificate to act on. Same
-                    // cert-presence signal, same optimistic fallback for retired
-                    // slots / pre-first-read. "Delete key" only gets the
-                    // equivalent empty-slot treatment when this device actually
-                    // confirms slot occupancy
-                    // (`PivExtension::GetSlotKeyStatus`, checked inside the
-                    // match above via `slot_confirmed_empty`) — everywhere
-                    // else it stays enabled whenever DELETE KEY itself is:
-                    // without a confirmed signal, key presence is simply
-                    // unknown, and a stale key is still worth an attempt to
-                    // erase.
-                    if selected_has_cert {
-                        if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
-                            .clicked()
-                        {
-                            open_delete_cert = true;
-                        }
-                    } else {
-                        theme::button_disabled(ui, p, "Delete certificate\u{2026}")
-                            .on_hover_text(no_del_cert_hint);
-                    }
-                });
-            });
-
-            // --- Test: one button that runs every self-test the selected
-            // slot's key supports (decrypt / key-agree / sign, in that order)
-            // and reports each result. Read-only — the card operates but
-            // nothing is written. Live only when the slot holds a certificate
-            // with a key type keyroost can test. Placed last in the card,
-            // below the other slot actions, since it's a diagnostic rather
-            // than a slot-management action.
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Test")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-test");
-                let (test_alg, test_has_cert) = self.piv_selected_test_target();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if test_has_cert && test_alg.is_some() {
-                        if theme::button(ui, p, BtnKind::Default, "Test\u{2026}").clicked() {
-                            open_self_test = true;
-                        }
-                    } else {
-                        let why = if !test_has_cert {
-                            "Needs a certificate in this slot."
-                        } else {
-                            "The slot's key type is unknown."
-                        };
-                        ui.add_enabled_ui(false, |ui| {
-                            theme::button(ui, p, BtnKind::Default, "Test\u{2026}")
-                        })
-                        .inner
-                        .on_disabled_hover_text(why);
-                    }
-                });
-            });
-        });
-        ui.add_space(12.0);
-
-        // Reset applet — its own destructive card with a red stroke at the
-        // bottom of the pane (mirrors the FIDO2 "Reset this key" card exactly),
-        // full width, description left + red button right.
-        theme::card_frame(p)
-            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-            .show(ui, |ui| {
+        // Same `add_enabled_ui` inheritance trick as the status card above —
+        // one wrap covers the per-slot action card and the "Reset applet"
+        // card below it, dimming Generate/Certificate/Delete/Move/Test and
+        // Reset together for any in-flight PIV job (`self.piv.inflight`).
+        // The slot tab strip and retired-slot rail above this point stay
+        // outside any wrap, so selecting a different slot (or a different
+        // retired key) still works while a job is in flight.
+        ui.add_enabled_ui(!self.piv.inflight, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+
+                // --- Generate key: bold label + help left, algorithm combo
+                // and primary button pinned right (FIDO2 setting-row shape).
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Reset applet")
-                            .font(theme::f_sb(14.5))
-                            .color(p.err),
+                        egui::RichText::new("Generate key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
                     );
                     ui.add_space(6.0);
-                    self.help_dot(ui, p, "reset");
-                    // Same three-way gate as Move key / Delete key, from the
-                    // same `keyroost_piv::compat` known-support table — see
-                    // `reset_gate`'s definition above.
-                    if matches!(reset_gate, FeatureGate::Unverified) {
+                    self.help_dot(ui, p, "piv-generate");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                            open_generate = true;
+                        }
+                        ui.add_space(8.0);
+                        piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
+                    });
+                });
+                if let Some(pem) = &self.piv.gen_pubkey_pem {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut pem.as_str())
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(4.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
+                            copy_pem = Some(pem.clone());
+                        }
+                    });
+                }
+
+                ui.add_space(12.0);
+                // --- Certificate: subject/validity inputs, then both issue actions
+                // on one right-aligned row — "Sign & save CSR" then "Self-signed ->
+                // slot". Each is signed by the slot's key, so both dim with the same
+                // reason when the slot has none. "Sign & save CSR" opens a save
+                // dialog first (see `drain_file_dialogs`); "Self-signed -> slot"
+                // opens the PIN / management-key modal.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Certificate")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-certificate");
+                });
+                ui.add_space(6.0);
+                text_field(
+                    ui,
+                    p,
+                    "Name",
+                    &mut self.piv.cert_subject,
+                    "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                    300.0,
+                );
+                ui.horizontal(|ui| {
+                    // Same 96px label column `text_field` uses for the "Name" row
+                    // above, so this label lines up with it and the input below
+                    // starts at the same x.
+                    ui.add_sized(
+                        [96.0, 22.0],
+                        egui::Label::new(
+                            egui::RichText::new("Valid for")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        ),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.piv.cert_days)
+                            .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
+                            .suffix(" days"),
+                    );
+                    // right_to_left: add "Self-signed" first so it sits at the far
+                    // right, then "Sign & save CSR" to its left.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if selected_has_key {
+                            if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
+                                .clicked()
+                            {
+                                open_self_sign = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
+                                .on_hover_text(no_slot_key_hint);
+                        }
+                        ui.add_space(8.0);
+                        if selected_has_key {
+                            if theme::button(ui, p, BtnKind::Default, "Sign & save CSR\u{2026}")
+                                .clicked()
+                            {
+                                open_csr = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Sign & save CSR\u{2026}")
+                                .on_hover_text(no_slot_key_hint);
+                        }
+                    });
+                });
+
+                ui.add_space(12.0);
+                // --- Import / Export cert: both buttons on one right-aligned row,
+                // "Import certificate" then "Export certificate". Import opens a
+                // file picker then the management-key modal; Export opens a save
+                // dialog and writes straight to the chosen path — no secret (see
+                // `drain_file_dialogs`). Export dims when the slot holds no cert.
+                // Import dims only when the slot is *confirmed* empty
+                // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
+                // unconfirmed reading leaves it enabled, since a matching key may
+                // have been loaded out of band this session can't see.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Import/Export cert")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-import-export");
+                    // right_to_left: add "Export" first so it sits at the far
+                    // right, then "Import" to its left.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if selected_has_cert {
+                            if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
+                                .clicked()
+                            {
+                                go_export = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Export certificate\u{2026}")
+                                .on_hover_text(no_slot_cert_hint);
+                        }
+                        ui.add_space(8.0);
+                        if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
+                            theme::button_disabled(ui, p, "Import certificate\u{2026}")
+                                .on_hover_text(no_import_cert_hint);
+                        } else if theme::button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Import certificate\u{2026}",
+                        )
+                        .clicked()
+                        {
+                            open_import = true;
+                        }
+                    });
+                });
+
+                ui.add_space(12.0);
+                // --- Move key: its own row, above Delete. It used to be a button
+                // inside the Delete row, which put a deliberately non-destructive
+                // action under a destructive heading and left it sharing the delete
+                // help text — the one place a user checking "is this safe?" would
+                // look. The row is always shown so the capability stays
+                // discoverable; the button is dimmed with a hover reason when the
+                // slot has no key to move, or on pre-5.7 firmware.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Move key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-move");
+                    // Support-unverified warning sits right after the help dot, by
+                    // the operation's own explanation — not out by the button. It
+                    // reflects the device's MOVE KEY support, so it shows whether or
+                    // not this slot currently has a key for the button to act on
+                    // (the button may be dimmed for "no key" underneath it).
+                    if matches!(move_key_gate, FeatureGate::Unverified) {
                         ui.add_space(4.0);
-                        theme::warn_marker(ui, p).on_hover_text(reset_unverified_hint.as_str());
+                        theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        match reset_gate {
-                            // Unverified still runs — the card refuses if it
-                            // truly can't — so the button stays live; only
-                            // the warning above marks the doubt.
+                        match move_key_gate {
+                            // Known-unsupported on this device wins over "no key": the
+                            // firmware reason is the one the user has to resolve
+                            // first, and it holds whether or not the slot is empty.
+                            FeatureGate::Unsupported => {
+                                theme::button_disabled(ui, p, "Move key\u{2026}")
+                                    .on_hover_text(move_key_blocked_hint.as_str());
+                            }
+                            // Unverified still runs — the card refuses if it truly
+                            // can't — so the button stays live where there is a key;
+                            // only the warning above marks the doubt.
                             FeatureGate::Supported | FeatureGate::Unverified => {
-                                if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}")
+                                if !selected_has_key {
+                                    theme::button_disabled(ui, p, "Move key\u{2026}")
+                                        .on_hover_text(no_move_key_hint);
+                                } else if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
                                     .clicked()
                                 {
-                                    arm_reset = true;
+                                    open_move_key = true;
                                 }
-                            }
-                            FeatureGate::Unsupported => {
-                                // Kept visible but dimmed so the capability
-                                // stays discoverable; the hover text says why
-                                // it can't run yet.
-                                theme::button_disabled(ui, p, "Reset applet\u{2026}")
-                                    .on_hover_text(reset_blocked_hint.as_str());
                             }
                         }
                     });
                 });
-                ui.label(
-                    egui::RichText::new(if matches!(reset_gate, FeatureGate::Supported) {
-                        // Known-supported: `force_reset_if_known_supported`
-                        // burns the PIN/PUK retry counters itself when
-                        // needed, so the precondition below no longer
-                        // applies to what this button actually does.
-                        "Wipes ALL PIV keys, certificates, and PINs."
-                    } else {
-                        "Wipes ALL PIV keys, certificates, and PINs. Typically requires both \
-                         the PIN and PUK to already be blocked."
-                    })
-                    .font(theme::f_reg(12.5))
-                    .color(p.txt2),
-                );
-                if reset_long_running {
-                    ui.add_space(4.0);
+                ui.add_space(12.0);
+                // --- Delete: bold label + help left, the two delete
+                // actions right-aligned (Delete key is Danger, gated 5.7+).
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(
-                            keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT,
-                        )
-                        .font(theme::f_reg(12.5))
-                        .color(p.warn),
+                        egui::RichText::new("Delete")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
                     );
-                }
-                if show_reset_global_alternative {
                     ui.add_space(6.0);
-                    // Same click-sense-label style as the Overview cards' own
-                    // "Manage →" jump (`App::card_head`) — an accent-colored
-                    // text link, not a button, since this isn't itself an
-                    // action, just a pointer to where the action lives; same
-                    // browser-style pointing-hand cursor on hover, too.
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new("Factory reset supported \u{2192}")
-                                    .font(theme::f_sb(12.5))
-                                    .color(p.accent),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        go_to_overview = true;
+                    self.help_dot(ui, p, "piv-delete");
+                    // Support-unverified warning for "Delete key" sits here, beside
+                    // the row's help dot — not out by the button — so its hover
+                    // text names "Delete key" explicitly and spells out that
+                    // "Delete certificate" (the other button on this row) is
+                    // standard PIV and unaffected.
+                    if matches!(delete_key_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(format!(
+                            "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
+                         standard PIV and unaffected."
+                        ));
                     }
-                }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match delete_key_gate {
+                            // Unsupported blocks outright, regardless of slot
+                            // content — an operation the device can't run at all
+                            // is the reason to lead with, not slot occupancy.
+                            FeatureGate::Unsupported => {
+                                // Kept visible but dimmed on pre-5.7 firmware so the
+                                // action is discoverable; the hover text says why it
+                                // can't run yet.
+                                theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                    .on_hover_text(delete_key_blocked_hint.as_str());
+                            }
+                            // Unverified still runs — the card refuses if it truly
+                            // can't — so the button stays live unless the slot's
+                            // emptiness is independently confirmed below; only the
+                            // warning by the help dot marks the firmware doubt.
+                            FeatureGate::Supported | FeatureGate::Unverified => {
+                                if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key)
+                                {
+                                    theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                        .on_hover_text(no_del_key_hint);
+                                } else if theme::button(
+                                    ui,
+                                    p,
+                                    BtnKind::Danger,
+                                    "Delete key\u{2026}",
+                                )
+                                .clicked()
+                                {
+                                    open_delete_key = true;
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                        // "Delete certificate" is standard PIV, so no firmware gate
+                        // — but like Export it needs a certificate to act on. Same
+                        // cert-presence signal, same optimistic fallback for retired
+                        // slots / pre-first-read. "Delete key" only gets the
+                        // equivalent empty-slot treatment when this device actually
+                        // confirms slot occupancy
+                        // (`PivExtension::GetSlotKeyStatus`, checked inside the
+                        // match above via `slot_confirmed_empty`) — everywhere
+                        // else it stays enabled whenever DELETE KEY itself is:
+                        // without a confirmed signal, key presence is simply
+                        // unknown, and a stale key is still worth an attempt to
+                        // erase.
+                        if selected_has_cert {
+                            if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                                .clicked()
+                            {
+                                open_delete_cert = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Delete certificate\u{2026}")
+                                .on_hover_text(no_del_cert_hint);
+                        }
+                    });
+                });
+
+                // --- Test: one button that runs every self-test the selected
+                // slot's key supports (decrypt / key-agree / sign, in that order)
+                // and reports each result. Read-only — the card operates but
+                // nothing is written. Live only when the slot holds a certificate
+                // with a key type keyroost can test. Placed last in the card,
+                // below the other slot actions, since it's a diagnostic rather
+                // than a slot-management action.
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Test")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-test");
+                    let (test_alg, test_has_cert) = self.piv_selected_test_target();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if test_has_cert && test_alg.is_some() {
+                            if theme::button(ui, p, BtnKind::Default, "Test\u{2026}").clicked() {
+                                open_self_test = true;
+                            }
+                        } else {
+                            let why = if !test_has_cert {
+                                "Needs a certificate in this slot."
+                            } else {
+                                "The slot's key type is unknown."
+                            };
+                            ui.add_enabled_ui(false, |ui| {
+                                theme::button(ui, p, BtnKind::Default, "Test\u{2026}")
+                            })
+                            .inner
+                            .on_disabled_hover_text(why);
+                        }
+                    });
+                });
             });
+            ui.add_space(12.0);
+
+            // Reset applet — its own destructive card with a red stroke at the
+            // bottom of the pane (mirrors the FIDO2 "Reset this key" card exactly),
+            // full width, description left + red button right.
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Reset applet")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                        ui.add_space(6.0);
+                        self.help_dot(ui, p, "reset");
+                        // Same three-way gate as Move key / Delete key, from the
+                        // same `keyroost_piv::compat` known-support table — see
+                        // `reset_gate`'s definition above.
+                        if matches!(reset_gate, FeatureGate::Unverified) {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p).on_hover_text(reset_unverified_hint.as_str());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match reset_gate {
+                                // Unverified still runs — the card refuses if it
+                                // truly can't — so the button stays live; only
+                                // the warning above marks the doubt.
+                                FeatureGate::Supported | FeatureGate::Unverified => {
+                                    if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}")
+                                        .clicked()
+                                    {
+                                        arm_reset = true;
+                                    }
+                                }
+                                FeatureGate::Unsupported => {
+                                    // Kept visible but dimmed so the capability
+                                    // stays discoverable; the hover text says why
+                                    // it can't run yet.
+                                    theme::button_disabled(ui, p, "Reset applet\u{2026}")
+                                        .on_hover_text(reset_blocked_hint.as_str());
+                                }
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(if matches!(reset_gate, FeatureGate::Supported) {
+                            // Known-supported: `force_reset_if_known_supported`
+                            // burns the PIN/PUK retry counters itself when
+                            // needed, so the precondition below no longer
+                            // applies to what this button actually does.
+                            "Wipes ALL PIV keys, certificates, and PINs."
+                        } else {
+                            "Wipes ALL PIV keys, certificates, and PINs. Typically requires both \
+                         the PIN and PUK to already be blocked."
+                        })
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                    );
+                    if reset_long_running {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT,
+                            )
+                            .font(theme::f_reg(12.5))
+                            .color(p.warn),
+                        );
+                    }
+                    if show_reset_global_alternative {
+                        ui.add_space(6.0);
+                        // Same click-sense-label style as the Overview cards' own
+                        // "Manage →" jump (`App::card_head`) — an accent-colored
+                        // text link, not a button, since this isn't itself an
+                        // action, just a pointer to where the action lives; same
+                        // browser-style pointing-hand cursor on hover, too.
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new("Factory reset supported \u{2192}")
+                                        .font(theme::f_sb(12.5))
+                                        .color(p.accent),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            go_to_overview = true;
+                        }
+                    }
+                });
+        });
 
         // Apply collected intents now that the card borrows have ended.
         if let Some(slot) = clicked_slot {
@@ -17968,8 +18063,7 @@ mod tests {
             "{warned}"
         );
 
-        let not_warned =
-            factory_reset_confirm_summary("SN", "Model", &plan, preview, false, false);
+        let not_warned = factory_reset_confirm_summary("SN", "Model", &plan, preview, false, false);
         assert!(
             !not_warned.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
             "{not_warned}"
