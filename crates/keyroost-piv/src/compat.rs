@@ -649,6 +649,59 @@ struct VersionQuirks {
     quirks: &'static [PivQuirk],
 }
 
+/// Which cross-axis merge policy [`resolve`]/[`resolve_quirks`] uses to
+/// combine a fingerprint's applet-version-axis and firmware-version-axis
+/// results into one, selected per fingerprint via [`axis_merge_mode`] rather
+/// than hard-coded once for every fingerprint — a knob for a future
+/// fingerprint that needs a different reconciliation policy than today's
+/// uniform default, exactly as [`PivQuirk`] is a per-fingerprint knob rather
+/// than a single global behavior.
+///
+/// Every fingerprint is seeded on [`Self::MergeRelaxed`] today (see each
+/// `_AXIS_MERGE_MODE` const, one per fingerprint group). **This has no
+/// observable effect on any resolved verdict or quirk right now:** no
+/// fingerprint reports genuinely conflicting data on both axes for the same
+/// extension. The one fingerprint with real verdict data on both axes,
+/// `Trussed(NitroKey)`, has its applet-axis and firmware-axis rows agree
+/// wherever both have an opinion (see [`TRUSSED_NITROKEY_APPLET_VERDICTS`]'s
+/// doc) — so [`Self::MergeRelaxed`] and [`Self::MergeStrict`] resolve
+/// identically for it, and [`Self::AppletWins`]/[`Self::FirmwareWins`]'s
+/// tie-break never triggers for it either, since there's no conflict to
+/// break. This mode selection exists so a fingerprint that starts reporting
+/// two genuinely divergent axis values has somewhere to declare how they
+/// reconcile, without [`resolve`]/[`resolve_quirks`] needing new logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisMergeMode {
+    /// Verdicts: a real verdict ([`FeatureGate::Supported`]/
+    /// [`FeatureGate::Unsupported`]) on one axis wins over
+    /// [`FeatureGate::Unverified`] on the other; two real but *conflicting*
+    /// verdicts (one `Supported`, the other `Unsupported`) soften to
+    /// `Unverified` instead of either winning outright — see
+    /// [`combine_relaxed`]. Quirks: unioned, identical to
+    /// [`Self::MergeStrict`] — this mode only changes verdict combination.
+    MergeRelaxed,
+    /// Verdicts: [`FeatureGate::Unsupported`] on either axis wins outright,
+    /// even against [`FeatureGate::Supported`] on the other — see
+    /// [`combine_strict`]. Quirks: unioned, identical to
+    /// [`Self::MergeRelaxed`].
+    MergeStrict,
+    /// Verdicts: a real verdict wins over [`FeatureGate::Unverified`] on the
+    /// other axis, same as [`Self::MergeRelaxed`] — but when *both* axes
+    /// carry a real verdict and they genuinely conflict, the applet axis's
+    /// own verdict wins outright instead of softening to `Unverified` — see
+    /// [`combine_preferring`]. Quirks: when both an applet version and a
+    /// firmware version were reported, the applet axis's quirks entry
+    /// replaces the union outright (the firmware axis's entry for that
+    /// version is dropped); when only one axis (or neither) reported a
+    /// version, quirks still union normally, same as every other mode.
+    AppletWins,
+    /// Mirror image of [`Self::AppletWins`] for both verdicts and quirks:
+    /// the firmware axis's verdict wins a genuine conflict, and the
+    /// firmware axis's quirks entry replaces the union when both versions
+    /// were reported.
+    FirmwareWins,
+}
+
 /// The commonly-mimicked YubiKey PIV factory-default management key: 24
 /// bytes of `01 02 03 04 05 06 07 08` repeated three times (3-DES /
 /// AES-192) —
@@ -896,14 +949,55 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
     }
 }
 
+/// `fingerprint`'s selected [`AxisMergeMode`] — dispatches to one const per
+/// fingerprint (see each const's own doc), the same shape as
+/// [`applet_quirks`]/[`firmware_quirks`] above.
+#[must_use]
+fn axis_merge_mode(fingerprint: AppletFingerprint) -> AxisMergeMode {
+    match fingerprint {
+        AppletFingerprint::YubiKey => YUBIKEY_AXIS_MERGE_MODE,
+        AppletFingerprint::Token2 => TOKEN2_AXIS_MERGE_MODE,
+        AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2) => {
+            SWISSBIT_ISHIELD2_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::OpenFips201(OpenFips201Variant::Generic) => {
+            OPENFIPS201_GENERIC_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::Thetis => THETIS_AXIS_MERGE_MODE,
+        AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic) => {
+            AREKINATH_GENERIC_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1) => {
+            AREKINATH_SWISSBIT_ISHIELD1_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300) => {
+            HID_CRESCENDO_C2300_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000) => {
+            HID_CRESCENDO_C4000_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic) => {
+            HID_CRESCENDO_GENERIC_AXIS_MERGE_MODE
+        }
+        AppletFingerprint::Generic => GENERIC_AXIS_MERGE_MODE,
+        AppletFingerprint::AuthentrendATKey => AUTHENTREND_ATKEY_AXIS_MERGE_MODE,
+        AppletFingerprint::Feitian => FEITIAN_AXIS_MERGE_MODE,
+        AppletFingerprint::IdPrime => IDPRIME_AXIS_MERGE_MODE,
+        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => TRUSSED_NITROKEY_AXIS_MERGE_MODE,
+        AppletFingerprint::UTrust(UTrustVariant::Generic) => UTRUST_GENERIC_AXIS_MERGE_MODE,
+        AppletFingerprint::UTrust(UTrustVariant::Gov) => UTRUST_GOV_AXIS_MERGE_MODE,
+    }
+}
+
 // --- Per-device tables ---------------------------------------------------
 //
-// Four consts per fingerprint below, always in the same order — applet-axis
-// known-support verdicts, firmware-axis known-support verdicts, applet-axis
-// quirks, then firmware-axis quirks — so a device's complete data set sits
-// together as one block, rather than being split across separate
-// axis-at-a-time or verdicts/quirks-at-a-time tables. Looked up through
-// `applet_verdicts`/`firmware_verdicts` (verdicts) and
+// Five consts per fingerprint below, always in the same order — the
+// fingerprint's `AxisMergeMode` selection, applet-axis known-support
+// verdicts, firmware-axis known-support verdicts, applet-axis quirks, then
+// firmware-axis quirks — so a device's complete data set sits together as
+// one block, rather than being split across separate axis-at-a-time or
+// verdicts/quirks-at-a-time tables. Looked up through `axis_merge_mode`
+// (merge mode), `applet_verdicts`/`firmware_verdicts` (verdicts), and
 // `applet_quirks`/`firmware_quirks` (quirks) — see each function's own doc
 // for its axis' lookup semantics.
 //
@@ -924,6 +1018,9 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
 // The default management key itself is not known to be version-gated for
 // any seeded fingerprint, so it's simply carried on every entry of a const
 // instead of modeling a fourth axis for it.
+
+/// YubiKey's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const YUBIKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// YubiKey's applet-axis known-support table:
 ///
@@ -1141,6 +1238,9 @@ const YUBIKEY_APPLET_QUIRKS: &[VersionQuirks] = &[
 /// const below is empty for the same reason.
 const YUBIKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// Token2's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const TOKEN2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// Token2's applet-axis known-support table:
 ///
 /// * [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
@@ -1261,6 +1361,10 @@ const TOKEN2_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const TOKEN2_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// The Swissbit iShield 2 Pro's (`OpenFips201::SwissbitIShield2`) cross-axis
+/// merge mode — see [`AxisMergeMode`]'s doc.
+const SWISSBIT_ISHIELD2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// The Swissbit iShield 2 Pro's (`OpenFips201::SwissbitIShield2`) applet-axis
 /// known-support table:
@@ -1452,6 +1556,10 @@ const SWISSBIT_ISHIELD2_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const SWISSBIT_ISHIELD2_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// The Thetis PRO FIDO2 Security Key with PinPlex's cross-axis merge mode —
+/// see [`AxisMergeMode`]'s doc.
+const THETIS_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// The Thetis PRO FIDO2 Security Key with PinPlex's
 /// (`AppletFingerprint::Thetis`) applet-axis known-support table:
 ///
@@ -1562,6 +1670,10 @@ const THETIS_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const THETIS_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// `ArekinathPivApplet::Generic`'s cross-axis merge mode — see
+/// [`AxisMergeMode`]'s doc.
+const AREKINATH_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// `ArekinathPivApplet::Generic`'s (<https://github.com/arekinath/PivApplet>)
 /// applet-axis known-support table. Identical in shape and version thresholds
@@ -1712,6 +1824,10 @@ const AREKINATH_GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const AREKINATH_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// `ArekinathPivApplet::SwissbitIShield1`'s cross-axis merge mode — see
+/// [`AxisMergeMode`]'s doc.
+const AREKINATH_SWISSBIT_ISHIELD1_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// `ArekinathPivApplet::SwissbitIShield1`'s
 /// (<https://github.com/swissbit-eis/PivApplet>) applet-axis known-support
 /// table — identical to [`AREKINATH_GENERIC_APPLET_VERDICTS`] above (see its
@@ -1832,6 +1948,9 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQui
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const AREKINATH_SWISSBIT_ISHIELD1_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// HID Crescendo C2300's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// HID Crescendo C2300's applet-axis known-support table. Each bullet below
 /// still walks its extension's own reasoning individually, even though every
@@ -2069,6 +2188,9 @@ const HID_CRESCENDO_C2300_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const HID_CRESCENDO_C2300_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// HID Crescendo C4000's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// HID Crescendo C4000's applet-axis known-support table — same shape and
 /// reasoning throughout as [`HID_CRESCENDO_C2300_APPLET_VERDICTS`] (see its
 /// doc for the per-extension detail), with two differences:
@@ -2182,6 +2304,10 @@ const HID_CRESCENDO_C4000_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const HID_CRESCENDO_C4000_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// HID Crescendo Generic's cross-axis merge mode — see [`AxisMergeMode`]'s
+/// doc.
+const HID_CRESCENDO_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// HID Crescendo Generic's (matched via select identity only — neither C2300
 /// nor C4000 applies) applet-axis known-support table:
 ///
@@ -2260,6 +2386,10 @@ const HID_CRESCENDO_GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const HID_CRESCENDO_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// [`AppletFingerprint::Generic`]'s cross-axis merge mode — see
+/// [`AxisMergeMode`]'s doc.
+const GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// [`AppletFingerprint::Generic`]'s applet-axis known-support table — a
 /// single [`PivExtension::ResetGlobal`] entry, [`Verdict::KnownUnsupportedSince`]
 /// at the universal `[]` version. Every non-HID-Crescendo fingerprint's table
@@ -2308,6 +2438,9 @@ const GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// Authentrend's ATkey's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const AUTHENTREND_ATKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// Authentrend's ATkey's applet-axis known-support table — see
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry.
@@ -2332,6 +2465,9 @@ const AUTHENTREND_ATKEY_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const AUTHENTREND_ATKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// Feitian's cross-axis merge mode — see [`AxisMergeMode`]'s doc.
+const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Feitian's applet-axis known-support table — see
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
@@ -2398,6 +2534,10 @@ const FEITIAN_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// Gemalto/Thales IDPrime's cross-axis merge mode — see [`AxisMergeMode`]'s
+/// doc.
+const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// Gemalto/Thales IDPrime's applet-axis known-support table — see
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry.
@@ -2419,6 +2559,10 @@ const IDPRIME_APPLET_QUIRKS: &[VersionQuirks] = &[];
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const IDPRIME_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// The Trussed-based Nitrokey's (`Trussed::NitroKey`) cross-axis merge mode
+/// — see [`AxisMergeMode`]'s doc.
+const TRUSSED_NITROKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// The Trussed-based Nitrokey's (`Trussed::NitroKey`) applet-axis
 /// known-support table — see [`GENERIC_APPLET_VERDICTS`]'s doc for why this
@@ -2609,6 +2753,10 @@ const TRUSSED_NITROKEY_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const TRUSSED_NITROKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 
+/// `OpenFips201::Generic`'s cross-axis merge mode — see [`AxisMergeMode`]'s
+/// doc.
+const OPENFIPS201_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
+
 /// `OpenFips201::Generic`'s applet-axis known-support table — see
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry. Distinct from
@@ -2643,6 +2791,10 @@ const OPENFIPS201_GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[];
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const OPENFIPS201_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// Identiv/Hirsch's uTrust Generic's cross-axis merge mode — see
+/// [`AxisMergeMode`]'s doc.
+const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Identiv/Hirsch's uTrust Generic (the general-purpose FIDO2 Security Keys
 /// line — [`UTrustVariant::Generic`])'s applet-axis known-support table —
@@ -2695,6 +2847,10 @@ const UTRUST_GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const UTRUST_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
+
+/// Identiv/Hirsch's uTrust Gov's (`UTrustVariant::Gov`) cross-axis merge
+/// mode — see [`AxisMergeMode`]'s doc.
+const UTRUST_GOV_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Identiv/Hirsch's uTrust Gov ([`UTrustVariant::Gov`])'s applet-axis
 /// known-support table. Nothing currently fingerprints this variant (see
@@ -2854,20 +3010,20 @@ impl FeatureGate {
 ///      known-unsupported knowledge brackets this version, so it is treated as
 ///      authoritative: [`FeatureGate::Unsupported`].
 ///
-/// The two per-axis outcomes are then combined, in order:
-///
-/// 1. Either axis is [`FeatureGate::Unsupported`] → combined result is
-///    [`FeatureGate::Unsupported`] (a known-incompatible verdict on either
-///    axis blocks the control).
-/// 2. Else, either axis is [`FeatureGate::Supported`] → combined result is
-///    [`FeatureGate::Supported`].
-/// 3. Else → combined result is [`FeatureGate::Unverified`].
-///
-/// This means when only one of `applet_version`/`firmware_version` carries
-/// data for `fingerprint`, the other axis resolves to
-/// [`FeatureGate::Unverified`] and — per the rule above — simply doesn't
-/// change the outcome, so the combined result equals the one axis that has an
-/// opinion.
+/// The two per-axis outcomes are then combined by [`merge_gates`], per
+/// `fingerprint`'s own [`AxisMergeMode`] (looked up via [`axis_merge_mode`]):
+/// see that enum's doc for what each of its four modes does. Every
+/// fingerprint is seeded on [`AxisMergeMode::MergeRelaxed`] today, whose
+/// rule is: either axis reporting a real verdict
+/// ([`FeatureGate::Supported`]/[`FeatureGate::Unsupported`]) wins over
+/// [`FeatureGate::Unverified`] on the other, and two *conflicting* real
+/// verdicts soften to [`FeatureGate::Unverified`] rather than either winning
+/// outright. This means when only one of `applet_version`/`firmware_version`
+/// carries data for `fingerprint` — the common case, and the only case any
+/// currently-seeded fingerprint is in — the other axis resolves to
+/// [`FeatureGate::Unverified`] and simply doesn't change the outcome under
+/// any of the four modes, so the combined result equals the one axis that
+/// has an opinion.
 ///
 /// **One special case, ahead of all of the above:**
 /// [`PivExtension::GetSlotKeyStatus`] falls through entirely to
@@ -2914,18 +3070,74 @@ pub fn resolve(
     };
     let applet_gate = resolve_in(applet_verdicts(fingerprint, extension), applet_version);
     let firmware_gate = resolve_in(firmware_verdicts(fingerprint, extension), firmware_version);
-    combine(applet_gate, firmware_gate)
+    merge_gates(axis_merge_mode(fingerprint), applet_gate, firmware_gate)
 }
 
-/// Combine the two per-axis [`FeatureGate`]s into one, per the rule documented
-/// on [`resolve`]: [`FeatureGate::Unsupported`] wins outright; otherwise
-/// [`FeatureGate::Supported`] wins; otherwise [`FeatureGate::Unverified`].
+/// [`AxisMergeMode::MergeStrict`]'s rule: [`FeatureGate::Unsupported`] wins
+/// outright; otherwise [`FeatureGate::Supported`] wins; otherwise
+/// [`FeatureGate::Unverified`]. Named to pair with [`combine_relaxed`]/
+/// [`combine_preferring`] — this was keyroost's only cross-axis rule before
+/// [`AxisMergeMode`] existed.
 #[must_use]
-fn combine(a: FeatureGate, b: FeatureGate) -> FeatureGate {
+fn combine_strict(a: FeatureGate, b: FeatureGate) -> FeatureGate {
     match (a, b) {
         (FeatureGate::Unsupported, _) | (_, FeatureGate::Unsupported) => FeatureGate::Unsupported,
         (FeatureGate::Supported, _) | (_, FeatureGate::Supported) => FeatureGate::Supported,
         (FeatureGate::Unverified, FeatureGate::Unverified) => FeatureGate::Unverified,
+    }
+}
+
+/// [`AxisMergeMode::MergeRelaxed`]'s rule: a real verdict
+/// ([`FeatureGate::Supported`]/[`FeatureGate::Unsupported`]) wins over
+/// [`FeatureGate::Unverified`] on the other side — same as
+/// [`combine_strict`] in every case but one — but two real, *conflicting*
+/// verdicts (one `Supported`, the other `Unsupported`) soften to
+/// [`FeatureGate::Unverified`] instead of letting `Unsupported` win outright
+/// the way [`combine_strict`] does.
+#[must_use]
+fn combine_relaxed(a: FeatureGate, b: FeatureGate) -> FeatureGate {
+    match (a, b) {
+        (FeatureGate::Unsupported, FeatureGate::Supported)
+        | (FeatureGate::Supported, FeatureGate::Unsupported) => FeatureGate::Unverified,
+        (FeatureGate::Unsupported, _) | (_, FeatureGate::Unsupported) => FeatureGate::Unsupported,
+        (FeatureGate::Supported, _) | (_, FeatureGate::Supported) => FeatureGate::Supported,
+        (FeatureGate::Unverified, FeatureGate::Unverified) => FeatureGate::Unverified,
+    }
+}
+
+/// The shared tie-break rule behind [`AxisMergeMode::AppletWins`]/
+/// [`AxisMergeMode::FirmwareWins`]: a real verdict wins over
+/// [`FeatureGate::Unverified`] on the other side — same as
+/// [`combine_relaxed`] — but when `a` and `b` are both real verdicts that
+/// genuinely conflict, `preferred` (the selected axis's own gate — `a` for
+/// `AppletWins`, `b` for `FirmwareWins`) wins outright instead of softening
+/// to [`FeatureGate::Unverified`] the way [`combine_relaxed`] would.
+#[must_use]
+fn combine_preferring(a: FeatureGate, b: FeatureGate, preferred: FeatureGate) -> FeatureGate {
+    match (a, b) {
+        (FeatureGate::Unverified, FeatureGate::Unverified) => FeatureGate::Unverified,
+        (FeatureGate::Unverified, real) | (real, FeatureGate::Unverified) => real,
+        (x, y) if x == y => x,
+        _ => preferred,
+    }
+}
+
+/// Dispatch to the right per-axis combination primitive for `mode` — the
+/// [`resolve`] orchestrator [`AxisMergeMode`]'s doc describes; see each
+/// primitive's own doc for its exact rule.
+#[must_use]
+fn merge_gates(
+    mode: AxisMergeMode,
+    applet_gate: FeatureGate,
+    firmware_gate: FeatureGate,
+) -> FeatureGate {
+    match mode {
+        AxisMergeMode::MergeStrict => combine_strict(applet_gate, firmware_gate),
+        AxisMergeMode::MergeRelaxed => combine_relaxed(applet_gate, firmware_gate),
+        AxisMergeMode::AppletWins => combine_preferring(applet_gate, firmware_gate, applet_gate),
+        AxisMergeMode::FirmwareWins => {
+            combine_preferring(applet_gate, firmware_gate, firmware_gate)
+        }
     }
 }
 
@@ -3152,13 +3364,15 @@ fn latest_quirks<'a>(quirks: &'a [VersionQuirks], version: &[u8]) -> Option<&'a 
 /// 2. If `firmware_version` is available, take `fingerprint`'s
 ///    [`firmware_quirks`] entry with the highest version `<=`
 ///    `firmware_version` (if any).
-/// 3. Merge the [`VersionQuirks::quirks`] from whichever of (1)/(2) matched
-///    into a single set.
-///
-/// Unlike [`resolve`], there's no known-support reasoning here: each
-/// axis contributes at most one entry's quirks, and quirks only ever
-/// accumulate — nothing in this table can suppress a quirk another entry
-/// added.
+/// 3. Merge the two per [`merge_quirk_sets`], per `fingerprint`'s own
+///    [`AxisMergeMode`] (looked up via [`axis_merge_mode`]) — see that
+///    enum's doc for what each of its four modes does on this axis. Every
+///    fingerprint is seeded on [`AxisMergeMode::MergeRelaxed`] today, whose
+///    rule for quirks — shared with [`AxisMergeMode::MergeStrict`] — is a
+///    plain union: unlike [`resolve`], there's no known-support reasoning
+///    here, each axis contributes at most one entry's quirks, and quirks
+///    only ever accumulate — nothing in either entry can suppress a quirk
+///    the other added.
 #[must_use]
 pub fn resolve_quirks(
     fingerprint: AppletFingerprint,
@@ -3171,17 +3385,22 @@ pub fn resolve_quirks(
         (None, None) => (Some(&[][..]), Some(&[][..])),
         versions => versions,
     };
-    resolve_quirks_in(
+    merge_quirk_sets(
+        axis_merge_mode(fingerprint),
         applet_quirks(fingerprint),
-        firmware_quirks(fingerprint),
         applet_version,
+        firmware_quirks(fingerprint),
         firmware_version,
     )
 }
 
 /// [`resolve_quirks`] against explicit applet/firmware quirk lists, so a
 /// test can supply its own without wiring one into the const tables — same
-/// role [`resolve_in`] plays for [`resolve`].
+/// role [`resolve_in`] plays for [`resolve`]. Always unions whatever each
+/// axis's [`latest_quirks`] entry contributes — the [`AxisMergeMode::MergeRelaxed`]/
+/// [`AxisMergeMode::MergeStrict`] rule, and [`merge_quirk_sets`]'s fallback
+/// for [`AxisMergeMode::AppletWins`]/[`AxisMergeMode::FirmwareWins`] whenever
+/// they don't have both axes' versions to pick an exclusive winner from.
 fn resolve_quirks_in(
     applet_entries: &[VersionQuirks],
     firmware_entries: &[VersionQuirks],
@@ -3200,6 +3419,44 @@ fn resolve_quirks_in(
         }
     }
     quirks
+}
+
+/// Dispatch to the right cross-axis quirk-merging rule for `mode` — the
+/// quirks counterpart of [`merge_gates`]. [`AxisMergeMode::MergeRelaxed`]/
+/// [`AxisMergeMode::MergeStrict`] both fall through to [`resolve_quirks_in`]'s
+/// plain union — quirks have no known-support notion to make those two modes
+/// diverge on this axis, unlike [`merge_gates`]. [`AxisMergeMode::AppletWins`]/
+/// [`AxisMergeMode::FirmwareWins`] only pick an exclusive winner when *both*
+/// `applet_version` and `firmware_version` were reported — quirks have no
+/// `FeatureGate`-shaped notion of "conflict" to tie-break on the way
+/// [`combine_preferring`] does for verdicts, so with only one axis (or
+/// neither) reporting a version, this falls back to the same union
+/// [`AxisMergeMode::MergeRelaxed`]/[`AxisMergeMode::MergeStrict`] always use.
+#[must_use]
+fn merge_quirk_sets(
+    mode: AxisMergeMode,
+    applet_entries: &[VersionQuirks],
+    applet_version: Option<&[u8]>,
+    firmware_entries: &[VersionQuirks],
+    firmware_version: Option<&[u8]>,
+) -> BTreeSet<PivQuirk> {
+    let both_reported = applet_version.is_some() && firmware_version.is_some();
+    match mode {
+        AxisMergeMode::AppletWins if both_reported => applet_version
+            .and_then(|v| latest_quirks(applet_entries, v))
+            .map(|e| e.quirks.iter().copied().collect())
+            .unwrap_or_default(),
+        AxisMergeMode::FirmwareWins if both_reported => firmware_version
+            .and_then(|v| latest_quirks(firmware_entries, v))
+            .map(|e| e.quirks.iter().copied().collect())
+            .unwrap_or_default(),
+        _ => resolve_quirks_in(
+            applet_entries,
+            firmware_entries,
+            applet_version,
+            firmware_version,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3656,66 +3913,254 @@ mod tests {
         }
     }
 
-    // --- combine(): the cross-axis rule -----------------------------------
+    // --- combine_strict(): AxisMergeMode::MergeStrict's cross-axis rule ----
 
     #[test]
-    fn combine_prefers_unsupported_over_anything_else() {
+    fn combine_strict_prefers_unsupported_over_anything_else() {
         assert_eq!(
-            combine(FeatureGate::Unsupported, FeatureGate::Supported),
+            combine_strict(FeatureGate::Unsupported, FeatureGate::Supported),
             FeatureGate::Unsupported
         );
         assert_eq!(
-            combine(FeatureGate::Supported, FeatureGate::Unsupported),
+            combine_strict(FeatureGate::Supported, FeatureGate::Unsupported),
             FeatureGate::Unsupported
         );
         assert_eq!(
-            combine(FeatureGate::Unverified, FeatureGate::Unsupported),
+            combine_strict(FeatureGate::Unverified, FeatureGate::Unsupported),
             FeatureGate::Unsupported
         );
         assert_eq!(
-            combine(FeatureGate::Unsupported, FeatureGate::Unverified),
+            combine_strict(FeatureGate::Unsupported, FeatureGate::Unverified),
             FeatureGate::Unsupported
         );
     }
 
     #[test]
-    fn combine_prefers_supported_over_unverified() {
+    fn combine_strict_prefers_supported_over_unverified() {
         assert_eq!(
-            combine(FeatureGate::Supported, FeatureGate::Unverified),
+            combine_strict(FeatureGate::Supported, FeatureGate::Unverified),
             FeatureGate::Supported
         );
         assert_eq!(
-            combine(FeatureGate::Unverified, FeatureGate::Supported),
+            combine_strict(FeatureGate::Unverified, FeatureGate::Supported),
             FeatureGate::Supported
         );
     }
 
     #[test]
-    fn combine_of_only_unverified_is_unverified() {
+    fn combine_strict_of_only_unverified_is_unverified() {
         assert_eq!(
-            combine(FeatureGate::Unverified, FeatureGate::Unverified),
+            combine_strict(FeatureGate::Unverified, FeatureGate::Unverified),
             FeatureGate::Unverified
         );
     }
 
     #[test]
-    fn combine_is_symmetric_and_idempotent() {
+    fn combine_strict_is_symmetric_and_idempotent() {
         for gate in [
             FeatureGate::Supported,
             FeatureGate::Unverified,
             FeatureGate::Unsupported,
         ] {
             // Combining a gate with itself is that gate again...
-            assert_eq!(combine(gate, gate), gate);
+            assert_eq!(combine_strict(gate, gate), gate);
             for other in [
                 FeatureGate::Supported,
                 FeatureGate::Unverified,
                 FeatureGate::Unsupported,
             ] {
                 // ...and argument order never matters.
-                assert_eq!(combine(gate, other), combine(other, gate));
+                assert_eq!(combine_strict(gate, other), combine_strict(other, gate));
             }
         }
+    }
+
+    // --- combine_relaxed(): AxisMergeMode::MergeRelaxed's cross-axis rule --
+
+    #[test]
+    fn combine_relaxed_softens_a_genuine_conflict_to_unverified() {
+        // The one case combine_relaxed disagrees with combine_strict on:
+        // a real Supported vs. a real Unsupported neither wins outright.
+        assert_eq!(
+            combine_relaxed(FeatureGate::Unsupported, FeatureGate::Supported),
+            FeatureGate::Unverified
+        );
+        assert_eq!(
+            combine_relaxed(FeatureGate::Supported, FeatureGate::Unsupported),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn combine_relaxed_prefers_a_real_verdict_over_unverified() {
+        assert_eq!(
+            combine_relaxed(FeatureGate::Supported, FeatureGate::Unverified),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            combine_relaxed(FeatureGate::Unverified, FeatureGate::Supported),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            combine_relaxed(FeatureGate::Unsupported, FeatureGate::Unverified),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            combine_relaxed(FeatureGate::Unverified, FeatureGate::Unsupported),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn combine_relaxed_of_only_unverified_is_unverified() {
+        assert_eq!(
+            combine_relaxed(FeatureGate::Unverified, FeatureGate::Unverified),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn combine_relaxed_is_symmetric_and_idempotent() {
+        for gate in [
+            FeatureGate::Supported,
+            FeatureGate::Unverified,
+            FeatureGate::Unsupported,
+        ] {
+            assert_eq!(combine_relaxed(gate, gate), gate);
+            for other in [
+                FeatureGate::Supported,
+                FeatureGate::Unverified,
+                FeatureGate::Unsupported,
+            ] {
+                assert_eq!(combine_relaxed(gate, other), combine_relaxed(other, gate));
+            }
+        }
+    }
+
+    // --- combine_preferring(): AppletWins/FirmwareWins's tie-break ---------
+
+    #[test]
+    fn combine_preferring_agrees_with_relaxed_when_there_is_no_conflict() {
+        // No real-vs-real conflict in any of these — `preferred` never gets
+        // consulted, so the outcome matches `combine_relaxed` exactly.
+        for (a, b) in [
+            (FeatureGate::Supported, FeatureGate::Unverified),
+            (FeatureGate::Unverified, FeatureGate::Supported),
+            (FeatureGate::Unsupported, FeatureGate::Unverified),
+            (FeatureGate::Unverified, FeatureGate::Unsupported),
+            (FeatureGate::Unverified, FeatureGate::Unverified),
+            (FeatureGate::Supported, FeatureGate::Supported),
+            (FeatureGate::Unsupported, FeatureGate::Unsupported),
+        ] {
+            for preferred in [FeatureGate::Supported, FeatureGate::Unsupported] {
+                assert_eq!(
+                    combine_preferring(a, b, preferred),
+                    combine_relaxed(a, b),
+                    "a={a:?} b={b:?} preferred={preferred:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn combine_preferring_lets_preferred_win_a_genuine_conflict() {
+        // Same conflicting inputs `combine_relaxed` softens to Unverified —
+        // here `preferred` decides instead, regardless of which side of the
+        // conflict it came from.
+        assert_eq!(
+            combine_preferring(
+                FeatureGate::Unsupported,
+                FeatureGate::Supported,
+                FeatureGate::Unsupported
+            ),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            combine_preferring(
+                FeatureGate::Unsupported,
+                FeatureGate::Supported,
+                FeatureGate::Supported
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            combine_preferring(
+                FeatureGate::Supported,
+                FeatureGate::Unsupported,
+                FeatureGate::Unsupported
+            ),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            combine_preferring(
+                FeatureGate::Supported,
+                FeatureGate::Unsupported,
+                FeatureGate::Supported
+            ),
+            FeatureGate::Supported
+        );
+    }
+
+    // --- merge_gates(): mode dispatch ---------------------------------------
+
+    #[test]
+    fn merge_gates_dispatches_strict_and_relaxed_to_their_own_primitive() {
+        // A genuine conflict is exactly where strict and relaxed disagree —
+        // the case that actually proves each mode reaches its own primitive
+        // rather than both collapsing onto the same behavior.
+        let (a, b) = (FeatureGate::Unsupported, FeatureGate::Supported);
+        assert_eq!(
+            merge_gates(AxisMergeMode::MergeStrict, a, b),
+            combine_strict(a, b)
+        );
+        assert_eq!(
+            merge_gates(AxisMergeMode::MergeRelaxed, a, b),
+            combine_relaxed(a, b)
+        );
+        assert_eq!(
+            merge_gates(AxisMergeMode::MergeStrict, a, b),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            merge_gates(AxisMergeMode::MergeRelaxed, a, b),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn merge_gates_applet_wins_and_firmware_wins_break_a_conflict_toward_their_own_axis() {
+        let (applet_gate, firmware_gate) = (FeatureGate::Unsupported, FeatureGate::Supported);
+        assert_eq!(
+            merge_gates(AxisMergeMode::AppletWins, applet_gate, firmware_gate),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            merge_gates(AxisMergeMode::FirmwareWins, applet_gate, firmware_gate),
+            FeatureGate::Supported
+        );
+    }
+
+    #[test]
+    fn merge_gates_applet_wins_and_firmware_wins_still_let_a_real_verdict_beat_unverified() {
+        // No conflict here (one side is Unverified) — AppletWins/FirmwareWins
+        // must not override a lone real verdict just because it happens to
+        // sit on the "losing" axis.
+        assert_eq!(
+            merge_gates(
+                AxisMergeMode::AppletWins,
+                FeatureGate::Unverified,
+                FeatureGate::Supported
+            ),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            merge_gates(
+                AxisMergeMode::FirmwareWins,
+                FeatureGate::Supported,
+                FeatureGate::Unverified
+            ),
+            FeatureGate::Supported
+        );
     }
 
     // --- The resolve() rules, exercised against a synthetic row ---------
@@ -4020,6 +4465,119 @@ mod tests {
             resolve_quirks(AppletFingerprint::IdPrime, Some(&[1, 0]), Some(&[1, 0])),
             BTreeSet::new()
         );
+    }
+
+    // --- merge_quirk_sets(): AppletWins/FirmwareWins's exclusive pick -------
+
+    #[test]
+    fn merge_quirk_sets_unions_for_relaxed_and_strict_exactly_like_resolve_quirks_in() {
+        let applet_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }];
+        let firmware_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::ResetLongRunning],
+        }];
+        let expected: BTreeSet<PivQuirk> =
+            [PivQuirk::InsF8SerialIsBcd, PivQuirk::ResetLongRunning].into();
+        for mode in [AxisMergeMode::MergeRelaxed, AxisMergeMode::MergeStrict] {
+            assert_eq!(
+                merge_quirk_sets(
+                    mode,
+                    applet_entries,
+                    Some(&[1, 0]),
+                    firmware_entries,
+                    Some(&[1, 0])
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn merge_quirk_sets_applet_wins_and_firmware_wins_pick_exclusively_when_both_reported() {
+        let applet_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }];
+        let firmware_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::ResetLongRunning],
+        }];
+        assert_eq!(
+            merge_quirk_sets(
+                AxisMergeMode::AppletWins,
+                applet_entries,
+                Some(&[1, 0]),
+                firmware_entries,
+                Some(&[1, 0])
+            ),
+            [PivQuirk::InsF8SerialIsBcd].into()
+        );
+        assert_eq!(
+            merge_quirk_sets(
+                AxisMergeMode::FirmwareWins,
+                applet_entries,
+                Some(&[1, 0]),
+                firmware_entries,
+                Some(&[1, 0])
+            ),
+            [PivQuirk::ResetLongRunning].into()
+        );
+    }
+
+    #[test]
+    fn merge_quirk_sets_applet_wins_and_firmware_wins_fall_back_to_union_with_only_one_axis_reported(
+    ) {
+        // Only the applet axis reported a version — AppletWins/FirmwareWins
+        // have nothing to pick an exclusive winner from, so both fall back
+        // to the ordinary union (identical to `MergeRelaxed`/`MergeStrict`).
+        let applet_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::InsF8SerialIsBcd],
+        }];
+        let firmware_entries: &[VersionQuirks] = &[VersionQuirks {
+            version: &[],
+            quirks: &[PivQuirk::ResetLongRunning],
+        }];
+        for mode in [AxisMergeMode::AppletWins, AxisMergeMode::FirmwareWins] {
+            assert_eq!(
+                merge_quirk_sets(mode, applet_entries, Some(&[1, 0]), firmware_entries, None),
+                [PivQuirk::InsF8SerialIsBcd].into()
+            );
+        }
+    }
+
+    // --- Every fingerprint's default AxisMergeMode --------------------------
+
+    #[test]
+    fn every_fingerprint_defaults_to_merge_relaxed() {
+        // A deliberate, visible assertion: today every fingerprint is seeded
+        // on `MergeRelaxed` (see `AxisMergeMode`'s own doc for why that has
+        // no live effect yet). Changing any one fingerprint's mode should
+        // break this test, not drift by silently.
+        for fp in [
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::Token2,
+            AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+            AppletFingerprint::Thetis,
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+            AppletFingerprint::Generic,
+            AppletFingerprint::AuthentrendATKey,
+            AppletFingerprint::Feitian,
+            AppletFingerprint::IdPrime,
+            AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+            AppletFingerprint::UTrust(UTrustVariant::Generic),
+            AppletFingerprint::UTrust(UTrustVariant::Gov),
+        ] {
+            assert_eq!(axis_merge_mode(fp), AxisMergeMode::MergeRelaxed, "{fp:?}");
+        }
     }
 
     // --- Token2: the seeded BCD-serial quirk ------------------------------
