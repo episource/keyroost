@@ -146,13 +146,25 @@ pub struct PivStatus {
     /// formatting.
     pub version: Option<Vec<u8>>,
     /// The applet's own firmware version, when a specific fingerprint's probe
-    /// discovered one — currently a Nitrokey (`Trussed(NitroKey)`, via
-    /// Trussed's admin application) only. Not necessarily equal to
-    /// [`Self::version`]: that field is the *PIV applet's* own version
-    /// (Yubico's `GET VERSION` extension, when the card answers it at all), a
-    /// different number on cards where this one is populated. `None` when no
-    /// such probe applies to this fingerprint, or the probe ran and found
-    /// nothing parseable — same best-effort degradation as [`Self::applet_name`].
+    /// discovered one — a Nitrokey (`Trussed(NitroKey)`, via Trussed's admin
+    /// application) or a Token2 (`AppletFingerprint::Token2` only, not
+    /// `Thetis`). Not necessarily equal to [`Self::version`]: that field is
+    /// the *PIV applet's* own version (Yubico's `GET VERSION` extension,
+    /// when the card answers it at all), a different number on cards where
+    /// this one is populated. `None` when no such probe applies to this
+    /// fingerprint, or the probe ran and found nothing parseable — same
+    /// best-effort degradation as [`Self::applet_name`].
+    ///
+    /// The two populated fingerprints differ in kind, not just source: a
+    /// Nitrokey's value is genuinely device-reported (its admin
+    /// application's own `GET_VERSION`), while Token2's is *derived* — its
+    /// applet never answers a real firmware-version query at all, so this is
+    /// instead [`keyroost_piv::fingerprint::token2_firmware_from_serial`]'s
+    /// fixed encoding of the hardware generation (`[3, 3]`/`[3, 4]`) its
+    /// serial prefix identifies, read via the same on-device OTP-applet
+    /// probe that supplies [`Self::serial`] for this fingerprint (see
+    /// [`PivSession::probe_token2_otp_serial`]) — nothing Token2's firmware
+    /// itself ever puts on the wire.
     pub version_firmware: Option<Vec<u8>>,
     /// Device serial number. Ordinarily the Yubico GET SERIAL extension
     /// (widened to `u128` — see [`keyroost_piv::parse_serial`]); when a
@@ -1051,15 +1063,19 @@ impl PivSession {
     /// further, fingerprint-specific step produces `applet_name`/version/
     /// serial: a Nitrokey (`Trussed(NitroKey)`) gets
     /// [`Self::probe_nitrokey_admin`] for its firmware, hardware variant, and
-    /// serial; a YubiKey names itself from its own `GET VERSION` reply; and
-    /// HID Crescendo (C2300 and C4000) names itself from its SELECT
-    /// response's Application Label (already read above as
-    /// `select_identity`) and, since neither family answers the Yubico
-    /// extension at all, gets its *applet* version from its own GET PIV
-    /// PROPERTIES response instead — see [`Self::hid_crescendo_version`]'s
-    /// doc. Every probe here always re-selects PIV afterward so the session
-    /// is left exactly as any other caller of [`Self::status`] expects,
-    /// whether or not the probe itself succeeded.
+    /// serial; a YubiKey names itself from its own `GET VERSION` reply; HID
+    /// Crescendo (C2300 and C4000) names itself from its SELECT response's
+    /// Application Label (already read above as `select_identity`) and,
+    /// since neither family answers the Yubico extension at all, gets its
+    /// *applet* version from its own GET PIV PROPERTIES response instead —
+    /// see [`Self::hid_crescendo_version`]'s doc; and Token2 or Thetis get
+    /// [`Self::probe_token2_otp_serial`] for their serial (the PIV applet's
+    /// own `GET SERIAL` answers with a BCD-truncated one), with Token2 alone
+    /// (not Thetis) additionally deriving `version_firmware` from that same
+    /// probed serial — see [`PivStatus::version_firmware`]'s doc. Every
+    /// probe here always re-selects PIV afterward so the session is left
+    /// exactly as any other caller of [`Self::status`] expects, whether or
+    /// not the probe itself succeeded.
     ///
     /// Returns `(fingerprint, name, version, version_firmware, serial)`:
     /// `version` fetches Yubico's own `GET VERSION` extension itself (no
@@ -1070,9 +1086,11 @@ impl PivSession {
     /// is nothing to merge, only to prefer, and this method does that
     /// itself rather than handing a caller two values to reconcile.
     /// `version_firmware` is the separate, genuinely-distinct-from-the-applet
-    /// firmware version axis (currently Nitrokey only) — see
-    /// [`PivStatus::version_firmware`]'s doc for why the two axes aren't
-    /// interchangeable.
+    /// firmware version axis (Nitrokey, genuinely device-reported, or Token2,
+    /// derived from its serial prefix) — see [`PivStatus::version_firmware`]'s
+    /// doc for why the two axes aren't interchangeable, and for the
+    /// device-reported/derived distinction between Token2 and Nitrokey's own
+    /// values on this same axis.
     fn applet_fingerprint(&mut self) -> AppletFingerprintResult {
         // Cached from an earlier call in this same session — most callers
         // reach this via `Self::refresh`'s own resolution already having run
@@ -1236,15 +1254,33 @@ impl PivSession {
             // like HidCrescendo's CPLC probe above; `None` falls through to
             // the BCD-decoded GET SERIAL fallback in
             // `Self::status`/`Self::status_detailed`.
-            fingerprint::AppletFingerprint::Token2 | fingerprint::AppletFingerprint::Thetis => {
+            //
+            // Token2 alone additionally derives `version_firmware` from that
+            // same probed serial, via
+            // `keyroost_piv::fingerprint::token2_firmware_from_serial`'s
+            // prefix lookup (Token2's own published serial-number-prefix
+            // reference — that function's doc has the source and the
+            // derived-not-reported caveat). Thetis does not get this: its
+            // serial numbering is its own, independent scheme, not Token2's.
+            fingerprint::AppletFingerprint::Token2 => {
+                let serial = self.probe_token2_otp_serial();
                 AppletFingerprintResult {
                     fingerprint: id,
                     name: String::new(),
                     version,
-                    version_firmware: None,
-                    serial: self.probe_token2_otp_serial(),
+                    version_firmware: serial
+                        .and_then(keyroost_piv::fingerprint::token2_firmware_from_serial)
+                        .map(<[u8]>::to_vec),
+                    serial,
                 }
             }
+            fingerprint::AppletFingerprint::Thetis => AppletFingerprintResult {
+                fingerprint: id,
+                name: String::new(),
+                version,
+                version_firmware: None,
+                serial: self.probe_token2_otp_serial(),
+            },
             _ => AppletFingerprintResult {
                 fingerprint: id,
                 name: String::new(),
