@@ -8072,8 +8072,8 @@ fn resolve_mgmt_key(
     use_default: bool,
     session: &mut keyroost_transport::PivSession,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let prefix = env_prefix_for(label);
     if use_default {
-        let prefix = env_prefix_for(label);
         return session
             .default_management_key()
             .map(|key| zeroize::Zeroizing::new(key.to_vec()))
@@ -8084,6 +8084,19 @@ fn resolve_mgmt_key(
                 )
                 .into()
             });
+    }
+    // read_secret's generic "no source" message only knows about --*-env/
+    // --*-stdin. When neither was supplied, add the --*-default hint too —
+    // but only if this device actually has a known factory-default on
+    // record (`session` is already open, so this is the same
+    // `default_management_key` check `--{prefix}default` itself would use);
+    // otherwise the hint would send the caller toward a flag that just fails
+    // with "no known factory-default" right after.
+    if env.is_none() && !from_stdin && session.default_management_key().is_some() {
+        return Err(format!(
+            "no source for {label}: pass --{prefix}env VAR or --{prefix}stdin or --{prefix}default"
+        )
+        .into());
     }
     read_mgmt_key(label, env, from_stdin)
 }
