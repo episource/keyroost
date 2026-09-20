@@ -715,6 +715,29 @@ fn decode_serial_if_bcd(
     }
 }
 
+/// Resolve the serial [`PivStatus`]/[`PivStatusDetailed`] report: a
+/// fingerprint probe's own serial when it supplied one (Token2 and Thetis's
+/// OTP-applet GET_INFO, HID Crescendo's CPLC read — see
+/// [`PivSession::applet_fingerprint`]) is already the full, correct value, so
+/// it bypasses BCD decoding entirely and `yubico_serial` is never even
+/// called; otherwise falls back to `yubico_serial`'s raw Yubico GET SERIAL
+/// reply, run through [`decode_serial_if_bcd`] same as always. `yubico_serial`
+/// is a closure (rather than a plain `Option<u128>`) so that GET SERIAL round
+/// trip is skipped whenever `fingerprint_serial` already answers the
+/// question. Shared by [`PivSession::status`] and
+/// [`PivSession::status_detailed`].
+fn resolve_serial(
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+    fingerprint_serial: Option<u128>,
+    yubico_serial: impl FnOnce() -> Option<u128>,
+) -> Option<u128> {
+    fingerprint_serial.or_else(|| {
+        decode_serial_if_bcd(fingerprint, applet_version, firmware_version, yubico_serial())
+    })
+}
+
 /// Strip `md`'s algorithm identifier (tag `0x01`) and public key (tag `0x04`)
 /// when `quirks` contains
 /// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`] — on an
@@ -882,6 +905,49 @@ impl PivSession {
         // Restore PIV as the selected applet before returning — see this
         // method's doc for why that's always required now, unlike when this
         // ran before PIV was ever selected in the first place.
+        let _ = self.select();
+        serial
+    }
+
+    /// Read a Token2 or Thetis unit's full serial via the on-device OTP applet
+    /// (`keyroost_token2otp::OTP_APPLET_AID`) — SELECTs it, issues its
+    /// `GET_INFO` serial request (`keyroost_token2otp::read_serial_request`),
+    /// then decodes the reply via
+    /// [`keyroost_token2otp::parse_otp_serial`]. Unlike the FIDO applet's
+    /// answer to the same request (double-encoded ASCII-hex, decoded via
+    /// `keyroost_token2otp::parse_serial`), the OTP applet's reply is the
+    /// serial itself in plain ASCII decimal — `parse_otp_serial` parses that
+    /// text directly rather than hex-decoding it. Called directly from
+    /// [`Self::applet_fingerprint`]'s arm matching `Token2` or `Thetis`, once
+    /// classification already narrowed the fingerprint to one of those, so
+    /// this never runs blind against a device with no reason to answer it.
+    ///
+    /// Same self-contained shape as every other mid-session identification
+    /// probe in this file (see e.g. [`Self::probe_hid_crescendo_cplc_serial`]):
+    /// SELECTs a second applet, reads what it needs, then unconditionally
+    /// re-SELECTs PIV before returning, so the caller gets the session back
+    /// exactly as any caller of [`Self::status`]/[`Self::status_detailed`]
+    /// expects.
+    ///
+    /// `None` when the OTP applet doesn't SELECT (`SW != 9000`), when
+    /// `GET_INFO` is refused, or when the reply doesn't parse as
+    /// `D1 len ascii-decimal...` — callers fall back to the BCD-decoded
+    /// `GET SERIAL` reply ([`decode_serial_if_bcd`]) in that case.
+    fn probe_token2_otp_serial(&mut self) -> Option<u128> {
+        let selected = matches!(
+            self.transmit_full(&piv::select_by_aid(&keyroost_token2otp::OTP_APPLET_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let serial = if selected {
+            self.transmit_full(&keyroost_token2otp::read_serial_request())
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| keyroost_token2otp::parse_otp_serial(&data).ok())
+        } else {
+            None
+        };
+        // Restore PIV as the selected applet before returning — mirrors
+        // `probe_hid_crescendo_cplc_serial`.
         let _ = self.select();
         serial
     }
@@ -1162,6 +1228,23 @@ impl PivSession {
                 version_firmware: None,
                 serial: self.probe_hid_crescendo_cplc_serial(),
             },
+            // Token2 and Thetis both answer GET SERIAL (`Self::serial`) with
+            // a packed-BCD value truncated to 4 bytes
+            // (`PivQuirk::InsF8SerialIsBcd`), and both expose the same
+            // on-device OTP applet whose own GET_INFO reports the full
+            // serial instead. That full serial is preferred here exactly
+            // like HidCrescendo's CPLC probe above; `None` falls through to
+            // the BCD-decoded GET SERIAL fallback in
+            // `Self::status`/`Self::status_detailed`.
+            fingerprint::AppletFingerprint::Token2 | fingerprint::AppletFingerprint::Thetis => {
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: String::new(),
+                    version,
+                    version_firmware: None,
+                    serial: self.probe_token2_otp_serial(),
+                }
+            }
             _ => AppletFingerprintResult {
                 fingerprint: id,
                 name: String::new(),
@@ -1310,11 +1393,12 @@ impl PivSession {
             version_firmware,
             serial: fingerprint_serial,
         } = self.applet_fingerprint();
-        let serial = decode_serial_if_bcd(
+        let serial = resolve_serial(
             applet_fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-            fingerprint_serial.or_else(|| self.serial()),
+            fingerprint_serial,
+            || self.serial(),
         );
         let pin_retries = self.pin_retries();
         // Best-effort: a transport hiccup reading the CHUID shouldn't fail
@@ -1395,11 +1479,12 @@ impl PivSession {
             version_firmware,
             serial: fingerprint_serial,
         } = self.applet_fingerprint();
-        let serial = decode_serial_if_bcd(
+        let serial = resolve_serial(
             applet_fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-            fingerprint_serial.or_else(|| self.serial()),
+            fingerprint_serial,
+            || self.serial(),
         );
         let pin_retries = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
@@ -4068,6 +4153,7 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         _ if aid == fingerprint::GLOBAL_PLATFORM_ISD_AID => {
             Some("GlobalPlatform Issuer Security Domain")
         }
+        _ if aid == keyroost_token2otp::OTP_APPLET_AID => Some("Token2 OTP applet"),
         _ => None,
     }
 }
@@ -4205,6 +4291,15 @@ fn describe_apdu(apdu: &[u8]) -> String {
         None if apdu == piv::fingerprint::GLOBAL_PLATFORM_GET_CPLC => {
             "GET DATA (GlobalPlatform CPLC)".to_string()
         }
+        // Token2's own `GET_INFO` (INS 0x33, vendor's name — see
+        // `keyroost_token2otp::cmd::READ_SERIAL_INS`'s doc) against the OTP
+        // applet: not a `piv::Instruction` (it's a Token2 vendor command, not
+        // PIV), so `from_code` answers `None` and this would otherwise print
+        // as a bare "INS 0x33". Only used today by
+        // `PivSession::probe_token2_otp_serial` to read a Token2 or Thetis
+        // unit's full serial, after that probe has already SELECTed the OTP
+        // applet.
+        None if ins == 0x33 => "GET_INFO (Token2 OTP applet)".to_string(),
         None => format!("INS {ins:#04X}"),
     }
 }
@@ -4587,6 +4682,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_serial_skips_bcd_decode_and_the_yubico_round_trip_when_a_fingerprint_probe_answers()
+    {
+        use keyroost_piv::fingerprint::AppletFingerprint;
+
+        // A fingerprint probe (Token2 and Thetis's OTP-applet GET_INFO, HID
+        // Crescendo's CPLC read) already supplied the full, correct serial:
+        // it wins outright, unprocessed — even though Token2 carries
+        // `InsF8SerialIsBcd`, this value must not be BCD-decoded a second
+        // time. The `yubico_serial` closure panics if called at all, proving
+        // the GET SERIAL round trip is skipped entirely.
+        assert_eq!(
+            resolve_serial(AppletFingerprint::Token2, None, None, Some(0x1234_5678), || {
+                panic!("yubico GET SERIAL must not be issued when a fingerprint probe answered")
+            }),
+            Some(0x1234_5678)
+        );
+        // No fingerprint-probe serial: falls back to the raw Yubico GET
+        // SERIAL reply, BCD-decoded because Token2 carries the quirk —
+        // exactly `decode_serial_if_bcd`'s own behaviour.
+        assert_eq!(
+            resolve_serial(AppletFingerprint::Token2, None, None, None, || Some(0x1234_5678)),
+            Some(12_345_678)
+        );
+        // Neither source has a serial: still `None`.
+        assert_eq!(
+            resolve_serial(AppletFingerprint::Token2, None, None, None, || None),
+            None
+        );
+    }
+
+    #[test]
     fn clear_metadata_if_quirky_strips_algorithm_and_public_key_together() {
         use keyroost_piv::compat::PivQuirk;
 
@@ -4740,10 +4866,25 @@ mod tests {
             )),
             "SELECT (Nitrokey admin AID)"
         );
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(&keyroost_token2otp::OTP_APPLET_AID)),
+            "SELECT (Token2 OTP applet)"
+        );
         // An AID none of the probes use stays plain, unlabeled SELECT.
         assert_eq!(
             describe_apdu(&piv::select_by_aid(&[0xA0, 0x00, 0x00, 0x00, 0x03])),
             "SELECT"
+        );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_token2_otp_get_info() {
+        // Token2's own GET_INFO (INS 0x33) isn't a `piv::Instruction` at
+        // all — `PivSession::probe_token2_otp_serial`'s only use of it — so
+        // without this it would fall through to the bare "INS 0x33".
+        assert_eq!(
+            describe_apdu(&keyroost_token2otp::read_serial_request()),
+            "GET_INFO (Token2 OTP applet)"
         );
     }
 
