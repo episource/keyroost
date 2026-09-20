@@ -386,6 +386,7 @@ pub enum KeyAlg {
     Rsa4096,
     EccP256,
     EccP384,
+    EccP521,
     Ed25519,
     X25519,
 }
@@ -396,13 +397,14 @@ impl KeyAlg {
     /// [`compat::PivExtension::SlotKeyAlgorithm`]) or
     /// [`compat::key_alg_from_apdu_id`]'s reverse lookup, which walks this to
     /// find which algorithm a fingerprint's own wire byte names.
-    pub const ALL: [KeyAlg; 8] = [
+    pub const ALL: [KeyAlg; 9] = [
         KeyAlg::Rsa1024,
         KeyAlg::Rsa2048,
         KeyAlg::Rsa3072,
         KeyAlg::Rsa4096,
         KeyAlg::EccP256,
         KeyAlg::EccP384,
+        KeyAlg::EccP521,
         KeyAlg::Ed25519,
         KeyAlg::X25519,
     ];
@@ -411,20 +413,31 @@ impl KeyAlg {
     /// `YKPIV_ALGO_*` constants), used here as keyroost's **default** wire
     /// mapping, not a universal one. RSA-1024/2048 and ECC P-256/P-384 are
     /// SP 800-73-4's own standardized values, so every compliant device
-    /// agrees on them regardless; RSA-3072/4096 and the Ed25519/X25519 rows
-    /// have no PIV-standard byte at all — those four are vendor extensions,
-    /// and this table's values for them are specifically Yubico's choice. A
-    /// fingerprint whose own wire byte for a given algorithm differs — HID
-    /// Crescendo's RSA-4096 is a confirmed example, `0x04` there against
-    /// Yubico's `0x16` here, see
-    /// [`fingerprint::hid_crescendo_algorithm_from_id`] — is resolved by a
-    /// caller through [`compat::slot_key_algorithm_apdu_id`]/
-    /// [`compat::key_alg_from_apdu_id`] rather than [`Self::id`]/
-    /// [`Self::from_id`] directly: those two consult a per-fingerprint
-    /// override before falling back to this table, which is the only case
-    /// this method should still be reached for. Whether the algorithm is
-    /// supported at all on a given device is a separate question, gated by
-    /// [`compat::PivExtension::SlotKeyAlgorithm`] and [`compat::resolve`].
+    /// agrees on them regardless. ECC P-521 similarly has a standard byte,
+    /// just not from SP 800-73-4/SP 800-78-4 (which doesn't approve the
+    /// curve for federal PIV use at all): INCITS 504-1's own broader
+    /// cryptographic-algorithm-identifier table reserves `0x15` for it, and
+    /// IDEMIA's own public comments to NIST confirm this is the byte their
+    /// P-521-capable PIV products actually use — so `0x15` is used here as
+    /// the default too, on the same "standardized, not any one vendor's
+    /// choice" footing as the SP 800-73-4 rows, even though it comes from
+    /// the adjacent standard. RSA-3072/4096 and the Ed25519/X25519 rows have
+    /// no standard byte at all — those four are genuine vendor extensions,
+    /// and this table's value for them is specifically Yubico's choice,
+    /// since YubiKey supports all four. A fingerprint whose own wire byte
+    /// for a given algorithm differs from this table — HID Crescendo's
+    /// RSA-4096 is a confirmed example, `0x04` there against Yubico's `0x16`
+    /// here, see [`fingerprint::hid_crescendo_algorithm_from_id`]; a
+    /// Swissbit iShield Pro 2 (OpenFIPS201 applet v1.4.1, firmware v1.1.2)
+    /// is a confirmed example for EccP521 specifically, `0x32` there against
+    /// INCITS 504-1's `0x15` here — is resolved by a caller through
+    /// [`compat::slot_key_algorithm_apdu_id`]/[`compat::key_alg_from_apdu_id`]
+    /// rather than [`Self::id`]/[`Self::from_id`] directly: those two
+    /// consult a per-fingerprint override before falling back to this
+    /// table, which is the only case this method should still be reached
+    /// for. Whether the algorithm is supported at all on a given device is
+    /// a separate question, gated by [`compat::PivExtension::SlotKeyAlgorithm`]
+    /// and [`compat::resolve`].
     #[must_use]
     pub const fn id(self) -> u8 {
         match self {
@@ -434,6 +447,7 @@ impl KeyAlg {
             KeyAlg::Rsa4096 => 0x16,
             KeyAlg::EccP256 => 0x11,
             KeyAlg::EccP384 => 0x14,
+            KeyAlg::EccP521 => 0x15,
             KeyAlg::Ed25519 => 0xE0,
             KeyAlg::X25519 => 0xE1,
         }
@@ -450,6 +464,7 @@ impl KeyAlg {
             0x16 => Some(KeyAlg::Rsa4096),
             0x11 => Some(KeyAlg::EccP256),
             0x14 => Some(KeyAlg::EccP384),
+            0x15 => Some(KeyAlg::EccP521),
             0xE0 => Some(KeyAlg::Ed25519),
             0xE1 => Some(KeyAlg::X25519),
             _ => None,
@@ -466,6 +481,7 @@ impl KeyAlg {
             KeyAlg::Rsa4096 => "RSA-4096",
             KeyAlg::EccP256 => "ECC P-256",
             KeyAlg::EccP384 => "ECC P-384",
+            KeyAlg::EccP521 => "ECC P-521",
             KeyAlg::Ed25519 => "Ed25519",
             KeyAlg::X25519 => "X25519",
         }
@@ -2353,6 +2369,7 @@ mod tests {
             KeyAlg::Rsa4096,
             KeyAlg::EccP256,
             KeyAlg::EccP384,
+            KeyAlg::EccP521,
             KeyAlg::Ed25519,
             KeyAlg::X25519,
         ] {
@@ -2360,6 +2377,7 @@ mod tests {
         }
         assert_eq!(KeyAlg::Rsa2048.id(), 0x07);
         assert_eq!(KeyAlg::EccP256.id(), 0x11);
+        assert_eq!(KeyAlg::EccP521.id(), 0x15);
     }
 
     #[test]

@@ -1577,20 +1577,37 @@ impl PivSession {
     /// GENERATE ASYMMETRIC KEY PAIR / GENERAL AUTHENTICATE APDUs: this
     /// fingerprint's own override if it has one, or [`KeyAlg::id`]'s
     /// Yubico-default byte otherwise. See
-    /// [`keyroost_piv::compat::slot_key_algorithm_apdu_id`]. Cached via
-    /// [`Self::fingerprint`], so this costs no extra round trip once the
+    /// [`keyroost_piv::compat::slot_key_algorithm_apdu_id`] — passed this
+    /// session's firmware version too, via [`Self::identity`], since that
+    /// function's `Trussed`/`NitroKey` entry is gated by it. Cached via
+    /// [`Self::identity`], so this costs no extra round trip once the
     /// fingerprint has already been probed this session.
     fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
-        keyroost_piv::compat::slot_key_algorithm_apdu_id(alg, self.fingerprint())
+        let SessionIdentity {
+            fingerprint,
+            version_firmware,
+            ..
+        } = self.identity();
+        keyroost_piv::compat::slot_key_algorithm_apdu_id(
+            alg,
+            fingerprint,
+            version_firmware.as_deref(),
+        )
     }
 
     /// The inverse of [`Self::slot_key_algorithm_apdu_id`]: resolve a
     /// device-reported algorithm-identifier byte (GET METADATA tag `0x01`)
     /// back to a [`KeyAlg`], preferring this fingerprint's own override over
     /// [`KeyAlg::from_id`]'s Yubico-default table. See
-    /// [`keyroost_piv::compat::key_alg_from_apdu_id`].
+    /// [`keyroost_piv::compat::key_alg_from_apdu_id`] — same firmware-version
+    /// pass-through as [`Self::slot_key_algorithm_apdu_id`] above.
     fn key_alg_from_apdu_id(&mut self, id: u8) -> Option<KeyAlg> {
-        keyroost_piv::compat::key_alg_from_apdu_id(id, self.fingerprint())
+        let SessionIdentity {
+            fingerprint,
+            version_firmware,
+            ..
+        } = self.identity();
+        keyroost_piv::compat::key_alg_from_apdu_id(id, fingerprint, version_firmware.as_deref())
     }
 
     /// GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a slot
@@ -4259,7 +4276,7 @@ impl PivSession {
 
 /// Turn to-be-signed bytes into the block the card's GENERAL AUTHENTICATE
 /// expects: PKCS#1 v1.5 over SHA-256 for RSA (the card does raw RSA), the bare
-/// SHA-256/384 digest for ECDSA, and the unhashed message for Ed25519.
+/// SHA-256/384/512 digest for ECDSA, and the unhashed message for Ed25519.
 fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
     use keyroost_piv::x509::{self, SigHash};
     match x509::signature_hash(alg).map_err(TransportError::X509)? {
@@ -4278,6 +4295,7 @@ fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
             })
         }
         SigHash::Sha384 => Ok(keyroost_proto::sha512::sha384(tbs).to_vec()),
+        SigHash::Sha512 => Ok(keyroost_proto::sha512::sha512(tbs).to_vec()),
         SigHash::None => Ok(tbs.to_vec()),
     }
 }
