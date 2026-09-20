@@ -16123,6 +16123,23 @@ impl App {
         // on hover — same treatment as the Move/Delete-key rows.
         let no_slot_key_hint = "This slot has no key. Generate a key in this slot first \u{2014} \
              a self-signed certificate and a CSR are both signed by it.";
+        // Both certificate actions need the slot's key to actually sign —
+        // X25519 (and any future key-agreement-only algorithm) can only do
+        // ECDH on this card, so `keyroost_piv::x509::signature_hash` rejects
+        // it. Building a certificate for such a key needs a different
+        // enrollment mechanism (CRMF/CMP-style, proving possession via key
+        // agreement instead of a signature) that keyroost doesn't implement,
+        // so the buttons dim rather than fail deep in the signing flow.
+        // `None` (algorithm not yet known — e.g. a retired slot, which
+        // `slot_keys` never covers) doesn't block: same "don't guess"
+        // treatment the Test row gives an unknown algorithm.
+        let sel_key_can_sign = self
+            .piv_selected_test_target()
+            .0
+            .is_none_or(|a| keyroost_piv::x509::signature_hash(a).is_ok());
+        let cant_sign_hint = "This slot's key only supports key agreement, not signing \u{2014} \
+             it can't produce a self-signed certificate or a CSR. keyroost has no CRMF/CMP-style \
+             enrollment for that kind of key.";
         let no_slot_cert_hint =
             "This slot holds no certificate to export. Import one, or create a self-signed \
              certificate above.";
@@ -16418,26 +16435,36 @@ impl App {
                     // right_to_left: add "Self-signed" first so it sits at the
                     // far right, then "Sign & save CSR" to its left.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if selected_has_key {
+                        if selected_has_key && sel_key_can_sign {
                             if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
                                 .clicked()
                             {
                                 open_self_sign = true;
                             }
                         } else {
-                            theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
-                                .on_hover_text(no_slot_key_hint);
+                            theme::button_disabled(ui, p, "Self-signed \u{2192} slot").on_hover_text(
+                                if selected_has_key {
+                                    cant_sign_hint
+                                } else {
+                                    no_slot_key_hint
+                                },
+                            );
                         }
                         ui.add_space(8.0);
-                        if selected_has_key {
+                        if selected_has_key && sel_key_can_sign {
                             if theme::button(ui, p, BtnKind::Default, "Sign & save CSR\u{2026}")
                                 .clicked()
                             {
                                 open_csr = true;
                             }
                         } else {
-                            theme::button_disabled(ui, p, "Sign & save CSR\u{2026}")
-                                .on_hover_text(no_slot_key_hint);
+                            theme::button_disabled(ui, p, "Sign & save CSR\u{2026}").on_hover_text(
+                                if selected_has_key {
+                                    cant_sign_hint
+                                } else {
+                                    no_slot_key_hint
+                                },
+                            );
                         }
                     });
                 });
