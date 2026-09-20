@@ -7337,11 +7337,27 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_default,
             keygen,
         } => {
+            // Know whether the target key can sign before spending the PIN
+            // or the management key on a request that's doomed anyway — the
+            // algorithm is knowable from `--algorithm`/`--load-pubkey` with
+            // no card I/O at all, or from the slot's existing key with a
+            // read-only GET METADATA/certificate read once a session is
+            // open.
+            if keygen.generate_key {
+                guard_signable_alg(keygen.algorithm.to_alg())?;
+            } else if let Some(path) = load_pubkey {
+                guard_signable_alg(load_pubkey_material(path)?.0)?;
+            }
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            if !keygen.generate_key && load_pubkey.is_none() {
+                if let Some(alg) = s.slot_key_algorithm(slot.to_slot()) {
+                    guard_signable_alg(alg)?;
+                }
+            }
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut s = if keygen.generate_key {
+            if keygen.generate_key {
                 // The key-generation step needs management-key auth; the CSR
                 // signature that follows still only needs the PIN.
-                let mut s = open_piv(reader.as_deref(), debug)?;
                 let mgmt = resolve_mgmt_key(
                     "management key",
                     mgmt_key_env.as_deref(),
@@ -7351,15 +7367,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )?;
                 authenticate_piv(&mut s, &mgmt)?;
                 inline_generate_key(&mut s, slot.to_slot(), keygen)?;
-                s
-            } else {
-                let mut s = open_piv(reader.as_deref(), debug)?;
-                if let Some(path) = load_pubkey {
-                    let (alg, key) = load_pubkey_material(path)?;
-                    s.remember_pubkey(slot.to_slot(), alg, key);
-                }
-                s
-            };
+            } else if let Some(path) = load_pubkey {
+                let (alg, key) = load_pubkey_material(path)?;
+                s.remember_pubkey(slot.to_slot(), alg, key);
+            }
             eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
             let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes())?;
             match file {
@@ -7394,10 +7405,19 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
+            // Know whether the target key can sign before spending the PIN
+            // or the management key on a certificate that's doomed anyway.
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            if keygen.generate_key {
+                guard_signable_alg(keygen.algorithm.to_alg())?;
+            } else if let Some(path) = load_pubkey {
+                guard_signable_alg(load_pubkey_material(path)?.0)?;
+            } else if let Some(alg) = s.slot_key_algorithm(slot.to_slot()) {
+                guard_signable_alg(alg)?;
+            }
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             // Management-key auth covers the certificate import; the PIN
             // covers the signature itself.
-            let mut s = open_piv(reader.as_deref(), debug)?;
             let mgmt = resolve_mgmt_key(
                 "management key",
                 mgmt_key_env.as_deref(),
@@ -7959,6 +7979,29 @@ fn guard_piv_policy_value(
         "{value_label} is known to be unsupported on this device. Pass --force to run anyway."
     )
     .into())
+}
+
+/// Refuse early when `alg` can't produce a signature — currently just
+/// X25519, whose only card operation is ECDH key agreement (see
+/// [`keyroost_piv::x509::signature_hash`]). Issuing a certificate for such a
+/// key needs a different enrollment mechanism (CRMF/CMP-style, proving
+/// possession via key agreement rather than a signature), which keyroost
+/// doesn't implement. `piv self-sign` / `piv request-cert` call this as soon
+/// as the target algorithm is known — before any PIN/management-key prompt
+/// or card write — so a doomed request fails fast instead of after a touch
+/// prompt.
+fn guard_signable_alg(alg: keyroost_piv::KeyAlg) -> Result<(), Box<dyn std::error::Error>> {
+    keyroost_piv::x509::signature_hash(alg)
+        .map(|_| ())
+        .map_err(|_| {
+            format!(
+                "{} keys can't sign a certificate or certificate request \u{2014} that key type \
+                 only supports key agreement. keyroost doesn't implement the CRMF/CMP-style \
+                 enrollment such a key would need.",
+                alg.label()
+            )
+            .into()
+        })
 }
 
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
@@ -12038,6 +12081,24 @@ mod cli_tests {
         // Explicitly passing `--days 0` (nothing else) also resolves to an
         // all-zero period, and must be rejected the same way.
         assert!(ValidFor::resolve(Some(0), None, None).check().is_err());
+    }
+
+    /// `guard_signable_alg` is the early-exit `piv self-sign` / `piv
+    /// request-cert` call before any PIN/management-key prompt or card
+    /// write: every signing-capable algorithm passes, and X25519 — the one
+    /// key-agreement-only algorithm keyroost supports — is rejected with a
+    /// message naming the key type, mirroring
+    /// `keyroost_piv::x509::signature_hash`'s own verdict exactly.
+    #[test]
+    fn guard_signable_alg_rejects_only_x25519() {
+        use keyroost_piv::KeyAlg;
+        for alg in KeyAlg::ALL {
+            let guard_ok = guard_signable_alg(alg).is_ok();
+            let x509_ok = keyroost_piv::x509::signature_hash(alg).is_ok();
+            assert_eq!(guard_ok, x509_ok, "mismatch for {alg:?}");
+        }
+        let err = guard_signable_alg(KeyAlg::X25519).unwrap_err();
+        assert!(err.to_string().contains("X25519"));
     }
 
     #[test]
