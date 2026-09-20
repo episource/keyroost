@@ -190,6 +190,20 @@ impl Palette {
         v.window_corner_radius = CornerRadius::same(14);
         v.window_stroke = Stroke::new(1.0, self.line);
         ctx.set_visuals(v);
+        // Solid (space-reserving) scroll bars everywhere, not just wherever a
+        // pane happens to opt in locally. egui's default "floating" bars
+        // reserve no layout space and instead grow their own hit-rect on
+        // hover (`floating_width` -> the wider `bar_width`), overlapping
+        // whatever is drawn underneath; the underlying widget and the bar then
+        // fight over hover each frame the pointer sits on that boundary,
+        // which reads as a rapidly flickering scrollbar (and, short of that,
+        // can clip the last pixels of whatever the bar sits on top of). A
+        // `ui.spacing_mut()` override only reaches that one `Ui` and its
+        // children — it can't fix a `ComboBox`/menu popup, since `Popup`
+        // always rebuilds its content `Ui` from this ambient context style
+        // rather than inheriting the caller's local one. Setting it here,
+        // once, for both themes, is what actually reaches every dropdown.
+        ctx.all_styles_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::solid());
     }
 }
 

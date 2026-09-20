@@ -570,37 +570,46 @@ enum Cmd {
         /// is only known once it's fingerprinted: running this command
         /// without a management key (or, depending on the card, a PIN)
         /// either succeeds outright, or refuses and asks you to re-run it
-        /// with --mgmt-key-env/--mgmt-key-stdin or --pin-env/--pin-stdin
-        /// supplied. This flag is the management key, as hex, read from
-        /// this environment variable. Mutually exclusive with the PIN
-        /// options below — pick whichever credential you actually have.
+        /// with --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
+        /// --pin-env/--pin-stdin supplied. This flag is the management key,
+        /// as hex, read from this environment variable. Mutually exclusive
+        /// with the PIN options below — pick whichever credential you
+        /// actually have.
         #[arg(
             long,
             value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_stdin", "pin_env", "pin_stdin"]
+            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
         )]
         mgmt_key_env: Option<String>,
         /// Same credential, read from stdin (one line, hex) instead of an
         /// environment variable.
         #[arg(
             long,
-            conflicts_with_all = ["mgmt_key_env", "pin_env", "pin_stdin"]
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
         )]
         mgmt_key_stdin: bool,
+        /// Same credential, but not typed in: try this device's well-known
+        /// factory-default management key, if one is known; fails with a
+        /// clear error if it isn't.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_default: bool,
         /// Same requirement, satisfied with a PIN instead of the management
         /// key — only useful when the selected card actually accepts a PIN
         /// for it. Read from this environment variable.
         #[arg(
             long,
             value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_stdin"]
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
         )]
         pin_env: Option<String>,
         /// Same PIN, read from stdin (one line) instead of an environment
         /// variable.
         #[arg(
             long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env"]
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
         )]
         pin_stdin: bool,
     },
@@ -725,6 +734,8 @@ enum CliPivKeyAlg {
     EccP256,
     #[value(name = "eccp384")]
     EccP384,
+    #[value(name = "eccp521")]
+    EccP521,
     Ed25519,
     X25519,
 }
@@ -739,6 +750,7 @@ impl CliPivKeyAlg {
             CliPivKeyAlg::Rsa4096 => Rsa4096,
             CliPivKeyAlg::EccP256 => EccP256,
             CliPivKeyAlg::EccP384 => EccP384,
+            CliPivKeyAlg::EccP521 => EccP521,
             CliPivKeyAlg::Ed25519 => Ed25519,
             CliPivKeyAlg::X25519 => X25519,
         }
@@ -908,10 +920,14 @@ enum PivCmd {
         pin_tries: u8,
         #[arg(long, value_name = "N")]
         puk_tries: u8,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
@@ -926,10 +942,17 @@ enum PivCmd {
     ChangeManagementKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with = "old_mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"])]
         old_mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_default"])]
         old_mgmt_key_stdin: bool,
+        /// Authenticate with this device's well-known factory-default
+        /// management key, if one is known; fails with a clear error if it
+        /// isn't. Only applies to the OLD (current) key — there's no
+        /// equivalent for NEW, since installing a known-weak key on purpose
+        /// isn't what this convenience is for.
+        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_stdin"])]
+        old_mgmt_key_default: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "new_mgmt_key_stdin")]
         new_mgmt_key_env: Option<String>,
         #[arg(long)]
@@ -963,10 +986,14 @@ enum PivCmd {
         /// (firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         touch_policy: CliTouchPolicy,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         /// Also write the generated public key (PEM) to this path. Needed to
         /// `request-cert`/`self-sign` this same key from a *later*, separate
         /// `keyroostctl` invocation on cards that don't support GET METADATA
@@ -1003,10 +1030,14 @@ enum PivCmd {
         /// Path to a `.der` or `.pem` certificate file.
         #[arg(long, value_name = "PATH")]
         file: std::path::PathBuf,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
     },
     /// Export a slot's certificate (DER) to a file or stdout. No PIN required.
     ExportCert {
@@ -1049,12 +1080,26 @@ enum PivCmd {
         #[arg(
             long,
             value_name = "VAR",
-            conflicts_with = "mgmt_key_stdin",
+            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"],
             requires = "generate_key"
         )]
         mgmt_key_env: Option<String>,
-        #[arg(long, requires = "generate_key")]
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"],
+            requires = "generate_key"
+        )]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't. Same
+        /// scope as `--mgmt-key-env`/`--mgmt-key-stdin` above — only
+        /// consulted with `--generate-key`.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"],
+            requires = "generate_key"
+        )]
+        mgmt_key_default: bool,
         #[command(flatten)]
         keygen: InlineKeyGen,
     },
@@ -1091,10 +1136,14 @@ enum PivCmd {
         pin_env: Option<String>,
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         /// Also write the certificate as PEM to this path.
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
@@ -1134,10 +1183,14 @@ enum PivCmd {
     NewChuid {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         /// CHUID expiration, in whole calendar years from now, applied
         /// before `--months`/`--days` — the same month and day as today,
         /// that many years later (a Feb 29 clamps to Feb 28 in a target
@@ -1177,7 +1230,8 @@ enum PivCmd {
     /// is only known once it's fingerprinted: running this command without a
     /// management key (or, depending on the card, a PIN) either succeeds
     /// outright, or refuses and asks you to re-run it with
-    /// --mgmt-key-env/--mgmt-key-stdin or --pin-env/--pin-stdin supplied.
+    /// --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
+    /// --pin-env/--pin-stdin supplied.
     Reset {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1193,30 +1247,38 @@ enum PivCmd {
         #[arg(
             long,
             value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_stdin", "pin_env", "pin_stdin"]
+            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
         )]
         mgmt_key_env: Option<String>,
         /// Same credential, read from stdin (one line, hex) instead of an
         /// environment variable.
         #[arg(
             long,
-            conflicts_with_all = ["mgmt_key_env", "pin_env", "pin_stdin"]
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
         )]
         mgmt_key_stdin: bool,
+        /// Same credential, but not typed in: try this device's well-known
+        /// factory-default management key, if one is known; fails with a
+        /// clear error if it isn't.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_default: bool,
         /// Same requirement, satisfied with a PIN instead of the management
         /// key — only useful when the selected card actually accepts a PIN
         /// for it. Read from this environment variable.
         #[arg(
             long,
             value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_stdin"]
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
         )]
         pin_env: Option<String>,
         /// Same PIN, read from stdin (one line) instead of an environment
         /// variable.
         #[arg(
             long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env"]
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
         )]
         pin_stdin: bool,
     },
@@ -1228,10 +1290,14 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         #[arg(long)]
         yes: bool,
     },
@@ -1248,10 +1314,14 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         #[arg(long)]
         yes: bool,
         /// Run even on a device known to be incompatible (the operation will likely fail).
@@ -1276,10 +1346,14 @@ enum PivCmd {
         /// PC/SC reader substring (skips auto-detection).
         #[arg(long)]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         /// Run even on a device known to be incompatible (the operation will likely fail).
         #[arg(long)]
         force: bool,
@@ -3190,6 +3264,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         yes,
         mgmt_key_env,
         mgmt_key_stdin,
+        mgmt_key_default,
         pin_env,
         pin_stdin,
     } = cmd
@@ -3200,6 +3275,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.debug,
             mgmt_key_env.as_deref(),
             *mgmt_key_stdin,
+            *mgmt_key_default,
             pin_env.as_deref(),
             *pin_stdin,
         );
@@ -4597,12 +4673,17 @@ const FACTORY_RESET_CONSENT: &str =
      Each applet that completes comes back in factory condition, and every step \
      reports its own outcome)";
 
+// One more `--mgmt-key-*` source (`mgmt_key_default`) pushed this past
+// clippy's default 7-argument threshold; every argument here is a distinct
+// CLI flag, so a struct would just move the sprawl rather than reduce it.
+#[allow(clippy::too_many_arguments)]
 fn run_factory_reset(
     reader: Option<&str>,
     yes: bool,
     debug: bool,
     mgmt_key_env: Option<&str>,
     mgmt_key_stdin: bool,
+    mgmt_key_default: bool,
     pin_env: Option<&str>,
     pin_stdin: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4677,12 +4758,15 @@ fn run_factory_reset(
                     // applying is handled — abort here, before anything
                     // destructive, rather than let the PIV step discover it
                     // partway through the plan.
+                    let pin_gate = s.pin_management_auth_gate();
                     Some(resolve_reset_cli_auth(
                         mgmt_key_env,
                         mgmt_key_stdin,
+                        mgmt_key_default,
                         pin_env,
                         pin_stdin,
-                        s.pin_management_auth_gate(),
+                        pin_gate,
+                        Some(&mut s),
                     )?)
                 } else {
                     None
@@ -5192,30 +5276,31 @@ fn piv_factory_reset_failure(err: &str) -> String {
     )
 }
 
-/// How `--mgmt-key-env`/`--mgmt-key-stdin`/`--pin-env`/`--pin-stdin` resolved:
-/// the management key or a PIN for whichever RESET mechanism actually
-/// consumes it — `PivSession::factory_reset` (today, always HID Crescendo's
-/// ACA instance when it runs the device-wide step) for `factory-reset`'s PIV
-/// step, or a plain `PivSession::authenticate_management_current` +
-/// `PivSession::reset` for `piv reset`'s own credential prompt — see
-/// `resolve_reset_cli_auth`'s doc. Mirrors the GUI's `GlobalResetAuth` — same
-/// two-way shape, same eventual conversion into
-/// `keyroost_transport::CurrentMgmtAuth`.
+/// How `--mgmt-key-env`/`--mgmt-key-stdin`/`--mgmt-key-default`/`--pin-env`/
+/// `--pin-stdin` resolved: the management key or a PIN for whichever RESET
+/// mechanism actually consumes it — `PivSession::factory_reset` (today,
+/// always HID Crescendo's ACA instance when it runs the device-wide step)
+/// for `factory-reset`'s PIV step, or a plain
+/// `PivSession::authenticate_management_current` + `PivSession::reset` for
+/// `piv reset`'s own credential prompt — see `resolve_reset_cli_auth`'s doc.
+/// Mirrors the GUI's `GlobalResetAuth` — same two-way shape, same eventual
+/// conversion into `keyroost_transport::CurrentMgmtAuth`.
 enum ResetCliAuth {
     Key(zeroize::Zeroizing<Vec<u8>>),
     Pin(zeroize::Zeroizing<String>),
 }
 
-/// Resolve [`ResetCliAuth`] from a RESET command's four `--mgmt-key-*`/
+/// Resolve [`ResetCliAuth`] from a RESET command's five `--mgmt-key-*`/
 /// `--pin-*` flags, already mutually exclusive by construction (each
-/// `conflicts_with_all`s the other three) — shared by `factory-reset`'s PIV
+/// `conflicts_with_all`s the other four) — shared by `factory-reset`'s PIV
 /// step and `piv reset`, the two commands that can hit `PivQuirk::
-/// ResetNeedsManagementAuth`'s precondition. No CLI equivalent of the GUI's
-/// "Use default XAUTH key" convenience: unlike the interactive dialog, a
-/// scripted `--yes` run should never silently reach for a well-known key —
-/// if the caller wants HID's documented all-zero factory default, they pass
-/// it explicitly via `--mgmt-key-env`/`-stdin`, the same as any other
-/// credential this CLI takes.
+/// ResetNeedsManagementAuth`'s precondition. `--mgmt-key-default` is the CLI
+/// equivalent of the GUI's "Use default XAUTH key" convenience: unlike the
+/// typed/piped forms, it never touches argv or stdin and instead reaches for
+/// keyroost's own per-fingerprint quirks-table default
+/// (`PivSession::default_management_key`) — a deliberate CLI-side opt-in, so
+/// a scripted `--yes` run only reaches for a well-known key when the caller
+/// explicitly asked it to via this flag, not silently.
 ///
 /// `pin_gate` is `PivSession::pin_management_auth_gate`'s live verdict for
 /// the device being reset, consulted only for the error below: the abort
@@ -5224,13 +5309,36 @@ enum ResetCliAuth {
 /// candidate at all, rather than always offering it (`PivQuirk::
 /// ResetNeedsManagementAuth` says a credential is needed; it says nothing
 /// about which kinds this fingerprint actually accepts).
+///
+/// `session` is only consulted for `--mgmt-key-default` — every other branch
+/// ignores it. Both real call sites already have one open (fingerprinting
+/// the device is how `PivQuirk::ResetNeedsManagementAuth` gets checked in
+/// the first place) and pass `Some`; it's `Option` rather than a required
+/// reference purely so the credential-resolution unit tests below, which
+/// exercise `mgmt_key_default: false` and have no reader to open a real
+/// session against, can pass `None`.
 fn resolve_reset_cli_auth(
     mgmt_key_env: Option<&str>,
     mgmt_key_stdin: bool,
+    mgmt_key_default: bool,
     pin_env: Option<&str>,
     pin_stdin: bool,
     pin_gate: keyroost_piv::compat::FeatureGate,
+    session: Option<&mut keyroost_transport::PivSession>,
 ) -> Result<ResetCliAuth, Box<dyn std::error::Error>> {
+    if mgmt_key_default {
+        let session = session.expect(
+            "--mgmt-key-default always runs with an already-open PivSession at both call sites",
+        );
+        return session
+            .default_management_key()
+            .map(|key| ResetCliAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
+            .ok_or_else(|| {
+                "--mgmt-key-default: keyroost has no known factory-default management key \
+                 on record for this device; pass --mgmt-key-env/--mgmt-key-stdin instead"
+                    .into()
+            });
+    }
     if mgmt_key_env.is_some() || mgmt_key_stdin {
         return Ok(ResetCliAuth::Key(read_mgmt_key(
             "reset management key",
@@ -5258,7 +5366,7 @@ fn resolve_reset_cli_auth(
     };
     Err(format!(
         "this device needs a management-key credential to reset PIV \u{2014} pass \
-         --mgmt-key-env/--mgmt-key-stdin{pin_hint}"
+         --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default{pin_hint}"
     )
     .into())
 }
@@ -6965,6 +7073,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             puk_tries,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             pin_env,
             pin_stdin,
         } => {
@@ -6975,9 +7084,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .into(),
                 );
             }
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.verify_pin(pin.as_bytes())?;
             s.set_pin_retries(*pin_tries, *puk_tries)?;
             println!(
@@ -6990,17 +7106,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             old_mgmt_key_env,
             old_mgmt_key_stdin,
+            old_mgmt_key_default,
             new_mgmt_key_env,
             new_mgmt_key_stdin,
             new_algorithm,
             touch,
             force,
         } => {
-            let old = read_mgmt_key(
-                "old management key",
-                old_mgmt_key_env.as_deref(),
-                *old_mgmt_key_stdin,
-            )?;
             let new = read_mgmt_key(
                 "new management key",
                 new_mgmt_key_env.as_deref(),
@@ -7019,6 +7131,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
             let mut s = open_piv(reader.as_deref(), debug)?;
+            let old = resolve_mgmt_key(
+                "old management key",
+                old_mgmt_key_env.as_deref(),
+                *old_mgmt_key_stdin,
+                *old_mgmt_key_default,
+                &mut s,
+            )?;
             guard_piv_feature(
                 &mut s,
                 keyroost_piv::compat::PivExtension::SetManagementKey,
@@ -7052,10 +7171,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             touch_policy,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             save_pubkey,
             force,
         } => {
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let alg = algorithm.to_alg();
             // Gate the PIN/touch policy — Yubico extensions to GENERATE
             // ASYMMETRIC KEYPAIR, not SP 800-73-4 — on the applet's
@@ -7065,6 +7184,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // needs neither extension, so both checks are skipped outright
             // when the caller didn't ask for anything non-default.
             let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
             // Unlike PIN/touch policy, every algorithm choice is gated —
             // there's no "default" that's exempt: even the SP 800-73-4
             // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
@@ -7146,12 +7272,20 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             file,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
         } => {
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let bytes =
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.import_certificate(slot.to_slot(), &der)?;
             println!(
                 "Imported {}-byte certificate into {}.",
@@ -7200,15 +7334,22 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             load_pubkey,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             keygen,
         } => {
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let mut s = if keygen.generate_key {
                 // The key-generation step needs management-key auth; the CSR
                 // signature that follows still only needs the PIN.
-                let mgmt =
-                    read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-                let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+                let mut s = open_piv(reader.as_deref(), debug)?;
+                let mgmt = resolve_mgmt_key(
+                    "management key",
+                    mgmt_key_env.as_deref(),
+                    *mgmt_key_stdin,
+                    *mgmt_key_default,
+                    &mut s,
+                )?;
+                authenticate_piv(&mut s, &mgmt)?;
                 inline_generate_key(&mut s, slot.to_slot(), keygen)?;
                 s
             } else {
@@ -7246,17 +7387,25 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_stdin,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             file,
             load_pubkey,
             keygen,
         } => {
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             // Management-key auth covers the certificate import; the PIN
             // covers the signature itself.
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             if keygen.generate_key {
                 inline_generate_key(&mut s, slot.to_slot(), keygen)?;
             } else if let Some(path) = load_pubkey {
@@ -7384,6 +7533,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             days,
             months,
             years,
@@ -7399,8 +7549,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 None => keyroost_transport::random_chuid_guid()?,
             };
             let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.new_chuid(&guid, &expiration)?;
             println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
         }
@@ -7411,6 +7568,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             force,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             pin_env,
             pin_stdin,
         } => {
@@ -7443,12 +7601,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // than let the bare RESET below fail with a raw status word.
             let auth = match s.plan_factory_reset() {
                 keyroost_transport::FactoryResetPlan::NeedsManagementAuth => {
+                    let pin_gate = s.pin_management_auth_gate();
                     Some(resolve_reset_cli_auth(
                         mgmt_key_env.as_deref(),
                         *mgmt_key_stdin,
+                        *mgmt_key_default,
                         pin_env.as_deref(),
                         *pin_stdin,
-                        s.pin_management_auth_gate(),
+                        pin_gate,
+                        Some(&mut s),
                     )?)
                 }
                 _ => None,
@@ -7489,6 +7650,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             slot,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             yes,
         } => {
             if !yes {
@@ -7499,8 +7661,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.clear_certificate(slot.to_slot())?;
             println!(
                 "Cleared the certificate in {} (the private key remains).",
@@ -7513,6 +7682,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             slot,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             yes,
             force,
         } => {
@@ -7524,10 +7694,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
             let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
             guard_piv_feature(
                 &mut s,
                 keyroost_piv::compat::PivExtension::DeleteKey,
@@ -7547,10 +7723,17 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             force,
         } => {
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt = resolve_mgmt_key(
+                "management key",
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                &mut s,
+            )?;
             guard_piv_feature(&mut s, keyroost_piv::compat::PivExtension::MoveKey, *force)?;
             authenticate_piv(&mut s, &mgmt)?;
             s.move_key(from.to_slot(), to.to_slot())?;
@@ -7596,24 +7779,15 @@ fn open_piv(
     Ok(session)
 }
 
-/// [`open_piv`], then [`authenticate_piv`].
-fn open_piv_authed(
-    reader: Option<&str>,
-    debug: bool,
-    mgmt_key: &[u8],
-) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
-    let mut session = open_piv(reader, debug)?;
-    authenticate_piv(&mut session, mgmt_key)?;
-    Ok(session)
-}
-
 /// Authenticate the management key on an already-open [`PivSession`] against
 /// the card's own algorithm — with a friendly wrong-length message *before*
 /// the card sees anything, instead of a bare transport error afterwards.
 ///
-/// Split from [`open_piv_authed`] so a caller can do work on the plain session
-/// first (e.g. [`guard_piv_feature`], which must run before auth because its
-/// fingerprint probe re-SELECTs PIV and clears the auth state).
+/// Every call site opens the plain session with [`open_piv`] first, since
+/// resolving `--mgmt-key-default` (via [`resolve_mgmt_key`]) and feature
+/// gates like [`guard_piv_feature`] both need one already open — the latter's
+/// fingerprint probe re-SELECTs PIV and clears the auth state, so it must run
+/// before this, not after.
 fn authenticate_piv(
     session: &mut keyroost_transport::PivSession,
     mgmt_key: &[u8],
@@ -7833,6 +8007,42 @@ fn read_mgmt_key(
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
     let hex = read_secret(label, env, from_stdin)?;
     Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
+}
+
+/// Resolve a management-key credential from the three `--{prefix}env`/
+/// `--{prefix}stdin`/`--{prefix}default` flags a PIV command offers for it
+/// (`{prefix}` is [`env_prefix_for`]'s mapping for `label`, e.g. "management
+/// key" \u{2192} "mgmt-key-"). The first two are [`read_mgmt_key`], unchanged;
+/// `--{prefix}default` instead reaches for `session`'s well-known
+/// factory-default management key
+/// ([`keyroost_transport::PivSession::default_management_key`], which reads
+/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`] off the
+/// session's already-resolved fingerprint) and fails with a clear message
+/// when keyroost has none on record for this device \u{2014} the same
+/// "no known default" signal that disables the GUI's "use default"
+/// convenience. `session` must already be open (and PIV selected) since
+/// resolving the default needs this device's fingerprint.
+fn resolve_mgmt_key(
+    label: &str,
+    env: Option<&str>,
+    from_stdin: bool,
+    use_default: bool,
+    session: &mut keyroost_transport::PivSession,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    if use_default {
+        let prefix = env_prefix_for(label);
+        return session
+            .default_management_key()
+            .map(|key| zeroize::Zeroizing::new(key.to_vec()))
+            .ok_or_else(|| {
+                format!(
+                    "--{prefix}default: keyroost has no known factory-default {label} on \
+                     record for this device; pass --{prefix}env/--{prefix}stdin instead"
+                )
+                .into()
+            });
+    }
+    read_mgmt_key(label, env, from_stdin)
 }
 
 /// Write `data` to `path` with owner-only permissions (0600) on Unix, failing
@@ -10680,15 +10890,32 @@ mod cli_tests {
         // reason the GUI's analogous `PivMgmtAuth` skips it too), so match
         // rather than `.expect_err()`.
         use keyroost_piv::compat::FeatureGate;
-        match resolve_reset_cli_auth(None, false, None, false, FeatureGate::Unsupported) {
+        match resolve_reset_cli_auth(
+            None,
+            false,
+            false,
+            None,
+            false,
+            FeatureGate::Unsupported,
+            None,
+        ) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
                 assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(msg.contains("--mgmt-key-default"), "{msg}");
                 assert!(!msg.contains("--pin-env"), "{msg}");
             }
         }
-        match resolve_reset_cli_auth(None, false, None, false, FeatureGate::Supported) {
+        match resolve_reset_cli_auth(
+            None,
+            false,
+            false,
+            None,
+            false,
+            FeatureGate::Supported,
+            None,
+        ) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
@@ -10697,7 +10924,15 @@ mod cli_tests {
                 assert!(!msg.contains("unverified"), "{msg}");
             }
         }
-        match resolve_reset_cli_auth(None, false, None, false, FeatureGate::Unverified) {
+        match resolve_reset_cli_auth(
+            None,
+            false,
+            false,
+            None,
+            false,
+            FeatureGate::Unverified,
+            None,
+        ) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
@@ -10710,8 +10945,9 @@ mod cli_tests {
 
     #[test]
     fn factory_reset_global_reset_credential_flags_are_mutually_exclusive() {
-        // Any two of the four (mgmt-key-env/mgmt-key-stdin/pin-env/pin-stdin)
-        // at once must refuse -- only one credential source at a time.
+        // Any two of the five (mgmt-key-env/mgmt-key-stdin/mgmt-key-default/
+        // pin-env/pin-stdin) at once must refuse -- only one credential
+        // source at a time.
         assert!(parse(&[
             "keyroostctl",
             "factory-reset",
@@ -10730,6 +10966,37 @@ mod cli_tests {
             "--pin-stdin",
         ])
         .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--mgmt-key-env",
+            "XAUTH",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--pin-stdin",
+        ])
+        .is_err());
+        match parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-default",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::FactoryReset {
+                mgmt_key_default, ..
+            }) => assert!(mgmt_key_default),
+            _ => panic!("expected factory-reset"),
+        }
     }
 
     #[test]
@@ -11393,8 +11660,9 @@ mod cli_tests {
 
     #[test]
     fn piv_reset_credential_flags_are_mutually_exclusive() {
-        // Any two of the four (mgmt-key-env/mgmt-key-stdin/pin-env/pin-stdin)
-        // at once must refuse -- only one credential source at a time.
+        // Any two of the five (mgmt-key-env/mgmt-key-stdin/mgmt-key-default/
+        // pin-env/pin-stdin) at once must refuse -- only one credential
+        // source at a time.
         assert!(parse(&[
             "keyroostctl",
             "piv",
@@ -11415,6 +11683,36 @@ mod cli_tests {
             "--pin-stdin",
         ])
         .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--mgmt-key-stdin",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--pin-env",
+            "GPIN",
+        ])
+        .is_err());
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--mgmt-key-default"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset {
+                    mgmt_key_default, ..
+                },
+            }) => assert!(mgmt_key_default),
+            _ => panic!("expected piv reset"),
+        }
     }
 
     #[test]

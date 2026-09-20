@@ -9232,7 +9232,36 @@ fn chuid_label_width(ctx: &egui::Context) -> f32 {
     w + 8.0
 }
 
-/// A PIV slot picker combo.
+/// `ui.selectable_value`'s own row, but sized the same whether or not the
+/// pointer is hovering it. Plain `ui.selectable_value` builds on
+/// `Button::selectable`, which only forces `frame_when_inactive(true)` for
+/// the *currently selected* row; every other row paints no stroke at rest
+/// and reserves no space for one either. This app's theme (`Palette::apply`)
+/// gives the `inactive` widget state a real 1px stroke width too — for text
+/// fields' own visible boundary — where egui's own default is 0, so an
+/// *unselected* row ends up measurably shorter at rest than hovered: 1px is
+/// exactly what egui's frame math sets aside for the stroke it isn't
+/// painting. In a combo popup with a small, fixed option list sitting close
+/// to the popup's height cap, that per-row wobble was enough to tip the
+/// whole list into needing a scrollbar the instant the pointer landed on a
+/// row — every PIV dropdown built from a `for` loop over a fixed option set
+/// (algorithm, management-key algorithm, PIN/touch policy, move destination)
+/// hits this the same way. Forcing the frame on unconditionally makes the
+/// reserved space — and so the row's height — independent of hover.
+fn stable_selectable_value<'a, T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    text: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let selected = *current == value;
+    let resp = ui.add(egui::Button::selectable(selected, text).frame_when_inactive(true));
+    if resp.clicked() && *current != value {
+        *current = value;
+    }
+    resp
+}
+
 /// A PIV key-algorithm picker combo, listing every `keyroost_piv::KeyAlg`
 /// variant. `gate_of` resolves each candidate's
 /// `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm` gate on the live
@@ -9254,7 +9283,7 @@ fn piv_keyalg_combo(
             for opt in keyroost_piv::KeyAlg::ALL {
                 let enabled = gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported;
                 ui.add_enabled_ui(enabled, |ui| {
-                    ui.selectable_value(sel, opt, opt.label());
+                    stable_selectable_value(ui, sel, opt, opt.label());
                 });
             }
         });
@@ -9340,7 +9369,7 @@ fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             for &opt in options {
-                ui.selectable_value(sel, opt, opt.label());
+                stable_selectable_value(ui, sel, opt, opt.label());
             }
         });
 }
@@ -9377,7 +9406,7 @@ fn piv_mgmtalg_combo(
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             for &opt in options {
-                ui.selectable_value(sel, opt, opt.label());
+                stable_selectable_value(ui, sel, opt, opt.label());
             }
         });
 }
@@ -10743,11 +10772,13 @@ impl App {
                                 // Salted per tab so each pane keeps its own
                                 // scroll position.
                                 //
-                                // Solid bar style: reserve a real gutter for the
-                                // scrollbar instead of floating it over the cards'
-                                // right edge (the floating bar sat on top of card
-                                // borders and the panes' top-right action buttons).
-                                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                                // Solid (space-reserving) scroll bars are the
+                                // app-wide default set in `theme::Palette::apply`
+                                // — no local override needed here. That default
+                                // is what keeps this bar from floating over the
+                                // cards' right edge (it used to sit on top of
+                                // card borders and the panes' top-right action
+                                // buttons).
                                 egui::ScrollArea::vertical()
                                     .id_salt(("cap-pane", self.cap_tab as u8))
                                     .auto_shrink([false, false])
@@ -14426,7 +14457,8 @@ impl App {
                                     .selected_text(sel_text)
                                     .show_ui(ui, |ui| {
                                         for dest in &move_dests {
-                                            ui.selectable_value(
+                                            stable_selectable_value(
+                                                ui,
                                                 &mut self.piv.move_dest,
                                                 Some(*dest),
                                                 dest.label(),
@@ -17993,6 +18025,92 @@ mod tests {
         status.applet_fingerprint = fingerprint;
         status.version = version;
         status
+    }
+
+    /// A row built with `stable_selectable_value` must occupy the same
+    /// height whether or not the pointer is hovering it — the property every
+    /// PIV dropdown built from it (algorithm, management-key algorithm,
+    /// PIN/touch policy, move destination) relies on to keep a combo popup
+    /// sized close to its scroll cap from needing a scrollbar the instant
+    /// the pointer lands on a row. Plain `ui.selectable_value` doesn't have
+    /// this property: `Button::selectable` only reserves its frame's stroke
+    /// width for the *currently selected* row, and this app's theme gives
+    /// the `inactive` widget state a non-zero stroke width too (a text-field
+    /// boundary fix, where egui's own default is zero), so an *unselected*
+    /// row is measurably shorter at rest than hovered — see
+    /// `stable_selectable_value`'s own doc for the exact mechanism.
+    /// Exercises an *unselected* value, since that's the one plain
+    /// `ui.selectable_value` sized inconsistently.
+    #[test]
+    fn stable_selectable_value_row_height_is_hover_invariant() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        Palette::new(Mode::Dark, Palette::ACCENTS[0], false).apply(&ctx, Mode::Dark);
+        let mut current = keyroost_piv::KeyAlg::Rsa2048;
+        let unselected = keyroost_piv::KeyAlg::Rsa3072;
+        assert_ne!(current, unselected);
+        let mut heights = vec![];
+        let mut row_rect: Option<egui::Rect> = None;
+        // Frame 0: no pointer — establishes the unhovered row's rect.
+        // Frame 1: pointer moved onto that rect (registers as input, doesn't
+        // yet affect layout — egui reads *last* frame's response to decide
+        // *this* frame's widget state).
+        // Frame 2: rendered again under sustained hover.
+        for frame in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 1200.0),
+                )),
+                ..Default::default()
+            };
+            if let Some(r) = row_rect.filter(|_| frame >= 1) {
+                input.events.push(egui::Event::PointerMoved(r.center()));
+            }
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_min_width(160.0);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    let resp =
+                        stable_selectable_value(ui, &mut current, unselected, unselected.label());
+                    heights.push(resp.rect.height());
+                    row_rect = Some(resp.rect);
+                });
+            });
+        }
+        assert_eq!(
+            heights[0], heights[2],
+            "row height must not change once the pointer starts hovering it: {heights:?}"
+        );
+    }
+
+    /// `Palette::apply` must set solid (space-reserving) scroll bars as the
+    /// *ambient context style*, not a local `Ui`-scoped one — a `ComboBox`
+    /// popup (`egui::containers::Popup`) always rebuilds its content `Ui`
+    /// from `Context::style()`/`all_styles_mut`'s targets rather than
+    /// inheriting whatever the calling `Ui` had locally overridden, so this
+    /// is the only place a scroll style actually reaches a dropdown's own
+    /// list. Without it, the default floating scroll bar grows its hit-rect
+    /// on hover (`floating_width` -> `bar_width`) right over the row
+    /// underneath, and the two fight for hover each frame the pointer sits on
+    /// that boundary — the "generate key" algorithm dropdown's flickering
+    /// scrollbar. Checked on both themes since `all_styles_mut` (unlike
+    /// `set_visuals`) touches the style egui caches per `Theme`, not just
+    /// whichever one is active when `apply` runs.
+    #[test]
+    fn palette_apply_sets_solid_scroll_bars_for_both_themes() {
+        let ctx = egui::Context::default();
+        for mode in [Mode::Dark, Mode::Light] {
+            Palette::new(mode, Palette::ACCENTS[0], false).apply(&ctx, mode);
+        }
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(theme, |s| {
+                assert!(
+                    !s.spacing.scroll.floating,
+                    "{theme:?} scroll style should be solid, not the default floating"
+                );
+            });
+        }
     }
 
     #[test]

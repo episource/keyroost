@@ -425,6 +425,7 @@ const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
 const OID_P256: &str = "1.2.840.10045.3.1.7";
 const OID_P384: &str = "1.3.132.0.34";
+const OID_P521: &str = "1.3.132.0.35";
 const OID_ED25519: &str = "1.3.101.112";
 const OID_X25519: &str = "1.3.101.110";
 
@@ -495,6 +496,7 @@ pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseE
             Ok(match curve_oid.as_str() {
                 OID_P256 => Some(KeyAlg::EccP256),
                 OID_P384 => Some(KeyAlg::EccP384),
+                OID_P521 => Some(KeyAlg::EccP521),
                 _ => None,
             })
         }
@@ -598,6 +600,7 @@ fn parse_spki_content(content: &[u8]) -> Result<(KeyAlg, PublicKey), X509ParseEr
             let alg = match curve_oid.as_str() {
                 OID_P256 => KeyAlg::EccP256,
                 OID_P384 => KeyAlg::EccP384,
+                OID_P521 => KeyAlg::EccP521,
                 _ => return Err(X509ParseError::Malformed),
             };
             Ok((
@@ -963,6 +966,12 @@ mod tests {
                 crate::KeyAlg::EccP384,
                 PublicKey::Ecc {
                     point: ec_point(97),
+                },
+            ),
+            (
+                crate::KeyAlg::EccP521,
+                PublicKey::Ecc {
+                    point: ec_point(133),
                 },
             ),
             (

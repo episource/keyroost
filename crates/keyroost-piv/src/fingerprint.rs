@@ -741,14 +741,16 @@ pub fn hid_crescendo_algorithm_from_id(id: u8) -> Option<crate::KeyAlg> {
 /// field, RSA-4096's `0x04` (not Yubico's `0x16`) included — so this is
 /// that function's `id -> KeyAlg` direction run backward rather than a
 /// second, independently-sourced table. `None` for
-/// [`crate::KeyAlg::Rsa1024`], [`crate::KeyAlg::Ed25519`], and
-/// [`crate::KeyAlg::X25519`]: none of the three appear in that P1 table, so
-/// this crate has no known byte for them on this family. In practice this
+/// [`crate::KeyAlg::Rsa1024`], [`crate::KeyAlg::EccP521`],
+/// [`crate::KeyAlg::Ed25519`], and [`crate::KeyAlg::X25519`]: none of the
+/// four appear in that P1 table (its EC rows stop at 384 bits — HID has no
+/// documented P-521 support on this family), so this crate has no known byte
+/// for them on this family. In practice this
 /// never fires for a value [`crate::KeyAlg`] round-trips through
 /// [`hid_crescendo_algorithm_from_id`] first (as
 /// `keyroost_transport::PivSession::hid_crescendo_slot_algorithm` always
 /// does before calling [`hid_crescendo_c4000_delete_key`]), since that
-/// function can't produce any of the three either — kept total (returning
+/// function can't produce any of the four either — kept total (returning
 /// `Option`, not panicking) for a caller that hands this an algorithm from
 /// somewhere else.
 #[must_use]
@@ -759,7 +761,10 @@ pub fn hid_crescendo_c4000_algorithm_id(alg: crate::KeyAlg) -> Option<u8> {
         crate::KeyAlg::Rsa2048 => Some(0x07),
         crate::KeyAlg::EccP256 => Some(0x11),
         crate::KeyAlg::EccP384 => Some(0x14),
-        crate::KeyAlg::Rsa1024 | crate::KeyAlg::Ed25519 | crate::KeyAlg::X25519 => None,
+        crate::KeyAlg::Rsa1024
+        | crate::KeyAlg::EccP521
+        | crate::KeyAlg::Ed25519
+        | crate::KeyAlg::X25519 => None,
     }
 }
 
@@ -784,9 +789,12 @@ pub fn hid_crescendo_c4000_algorithm_id(alg: crate::KeyAlg) -> Option<u8> {
 /// P1's bit 7 clear means "last (or only) command" — no chained calls
 /// follow, per the page's own P1 bit table — and its low bits are the
 /// coarse `00h`(RSA)/`03h`(EC) split that table gives for a non-chained
-/// call; C2300 draws no finer distinction between RSA key sizes at this
-/// layer, unlike C4000 (see [`hid_crescendo_c4000_delete_key`]), so any RSA
-/// [`crate::KeyAlg`] resolves the same `00h`/`0xA3` pair. The Data field's
+/// call; C2300 draws no finer distinction between RSA key sizes — or EC
+/// curves, [`crate::KeyAlg::EccP521`] included, despite this family's own
+/// GENERATE KEY PAIR reference confirming no support for it (see
+/// [`crate::compat::PivExtension::SlotKeyAlgorithm`]'s C2300 known-support
+/// table) — at this layer, unlike C4000 (see [`hid_crescendo_c4000_delete_key`]),
+/// so any RSA [`crate::KeyAlg`] resolves the same `00h`/`0xA3` pair. The Data field's
 /// own length rule — both the RSA and EC tables state "0 bytes to remove
 /// the corresponding key, in this case the following bytes are absent" for
 /// the Length-of-Key-Data field — is what turns an ordinary key-install
@@ -812,7 +820,7 @@ pub fn hid_crescendo_c2300_delete_key(alg: crate::KeyAlg, key_ref: u8) -> Option
         | crate::KeyAlg::Rsa2048
         | crate::KeyAlg::Rsa3072
         | crate::KeyAlg::Rsa4096 => (0x00, 0xA3),
-        crate::KeyAlg::EccP256 | crate::KeyAlg::EccP384 => (0x03, 0xB1),
+        crate::KeyAlg::EccP256 | crate::KeyAlg::EccP384 | crate::KeyAlg::EccP521 => (0x03, 0xB1),
         crate::KeyAlg::Ed25519 | crate::KeyAlg::X25519 => return None,
     };
     Some(vec![0x80, 0xD8, p1, key_ref, 0x03, 0x00, alg_id, 0x00])
@@ -2415,6 +2423,10 @@ mod tests {
             None
         );
         assert_eq!(
+            hid_crescendo_c4000_algorithm_id(crate::KeyAlg::EccP521),
+            None
+        );
+        assert_eq!(
             hid_crescendo_c4000_algorithm_id(crate::KeyAlg::Ed25519),
             None
         );
@@ -2444,9 +2456,15 @@ mod tests {
 
     #[test]
     fn hid_crescendo_c2300_delete_key_ec_frames_the_generic_ec_alg_id() {
+        // EccP521 folds into the same coarse EC pair as the other two curves
+        // — C2300's delete-key framing doesn't distinguish by curve, only
+        // RSA vs. EC — even though this family has no confirmed GENERATE
+        // KEY PAIR support for it (a different axis; see
+        // `HID_CRESCENDO_C2300_APPLET_VERDICTS` in `compat`).
         for (alg, key_ref) in [
             (crate::KeyAlg::EccP256, 0x9C),
             (crate::KeyAlg::EccP384, 0x9D),
+            (crate::KeyAlg::EccP521, 0x9E),
         ] {
             assert_eq!(
                 hid_crescendo_c2300_delete_key(alg, key_ref),
@@ -2489,6 +2507,10 @@ mod tests {
     fn hid_crescendo_c4000_delete_key_rejects_algorithms_with_no_known_p1() {
         assert_eq!(
             hid_crescendo_c4000_delete_key(crate::KeyAlg::Rsa1024, 0x9A),
+            None
+        );
+        assert_eq!(
+            hid_crescendo_c4000_delete_key(crate::KeyAlg::EccP521, 0x9A),
             None
         );
         assert_eq!(
