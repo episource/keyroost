@@ -16407,10 +16407,22 @@ impl App {
                             .font(egui::TextStyle::Monospace),
                     );
                     ui.add_space(4.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
-                            copy_pem = Some(pem.clone());
-                        }
+                    // `with_layout` must be nested inside a `ui.horizontal` (as
+                    // every other right-aligned action row in this pane does),
+                    // not called directly on the card's top-down `ui`: called
+                    // bare, its child `Ui` inherits the *entire remaining
+                    // vertical space* of the card as its max_rect, and
+                    // `Align::Center` then centers the button within all of
+                    // that leftover height — which the row then allocates back
+                    // into the parent as its own height. On a window taller
+                    // than default that reads as a big dead gap here with the
+                    // button floating in the middle of it.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
+                                copy_pem = Some(pem.clone());
+                            }
+                        });
                     });
                 }
 
