@@ -886,6 +886,86 @@ pub fn parse_dotted_version(s: &str) -> Option<Vec<u8>> {
     s.split('.').map(|part| part.parse::<u8>().ok()).collect()
 }
 
+/// Token2's own published serial-number-prefix reference for its PIN+ PIV+
+/// product line, condensed to just `(prefix, generation)` — the leading 5
+/// decimal digits of a unit's full serial, and the synthetic version bytes
+/// [`token2_firmware_from_serial`] reports for it —
+/// <https://www.token2.com/site/page/pin-firmware-feature-support-matrix-openpgp-fido2-otp-and-piv-across-releases#pin-serial-number-prefix-reference>.
+/// Model and branding columns from that page are dropped entirely; nothing
+/// in this crate consumes them.
+///
+/// **Only the `R3.3 (PIV)` and `R3.4 (PIV + OTP Protection)` rows are
+/// represented — every earlier revision (Initial/R1, R2, R3, R3.1, R3.2) is
+/// left out on purpose, not just unmapped.** This table is only ever
+/// consulted once a card has already fingerprinted as a Token2 **PIV**
+/// applet at all, and per the vendor's own revision naming no such applet
+/// exists before R3.3 — a pre-R3.3 prefix can't actually reach
+/// [`token2_firmware_from_serial`] in practice. That also sidesteps the one
+/// row on the vendor page that isn't a clean 5-digit prefix (`R3.1`'s
+/// "Custom system access card" batch, published as the explicit numeric
+/// range `70000001`–`70002000`): it predates R3.3, so it predates PIV
+/// entirely and has no business being in a PIV-only lookup regardless of its
+/// odd shape.
+const TOKEN2_SERIAL_PREFIX_GENERATION: &[(&str, &[u8])] = &[
+    // R3.3 (PIV)
+    ("66105", &[3, 3]),
+    ("66104", &[3, 3]),
+    ("66103", &[3, 3]),
+    ("66107", &[3, 3]),
+    ("66106", &[3, 3]),
+    ("66114", &[3, 3]),
+    ("66113", &[3, 3]),
+    ("66202", &[3, 3]),
+    ("66102", &[3, 3]),
+    ("66302", &[3, 3]),
+    ("66101", &[3, 3]),
+    ("66111", &[3, 3]),
+    ("72113", &[3, 3]),
+    ("24133", &[3, 3]),
+    // R3.4 (PIV + OTP Protection)
+    ("65103", &[3, 4]),
+    ("65104", &[3, 4]),
+    ("72114", &[3, 4]),
+    ("65101", &[3, 4]),
+    ("65111", &[3, 4]),
+    ("65202", &[3, 4]),
+    ("65102", &[3, 4]),
+    ("65302", &[3, 4]),
+];
+
+/// Derive a Token2 PIV unit's hardware generation from its full device
+/// serial (as read via the on-device OTP applet's `GET_INFO` — see
+/// `keyroost_transport::PivSession::probe_token2_otp_serial`; this must be
+/// the full serial, not the BCD-truncated 4-byte value the PIV applet's own
+/// `GET SERIAL` extension answers with, since that truncation strips exactly
+/// the prefix this function keys on), by matching the leading 5 digits of
+/// `serial`'s decimal representation against
+/// [`TOKEN2_SERIAL_PREFIX_GENERATION`].
+///
+/// The returned bytes are **not** anything Token2's firmware reports
+/// itself — they're a fixed encoding this crate assigns to the vendor's own
+/// named revisions (`[3, 3]` for R3.3, `[3, 4]` for R3.4), solely so
+/// `keyroost_transport::PivStatus::version_firmware`'s existing
+/// firmware-version axis has something to hold for a device whose applet
+/// never answers a real firmware-version query at all. `serial.to_string()`
+/// is used as-is with no leading-zero handling: no prefix in the table
+/// starts with `0`, so a genuine Token2 serial can't collide with one that
+/// lost a leading zero somewhere upstream.
+///
+/// `None` when `serial`'s decimal form is shorter than 5 digits, or its
+/// prefix isn't in the table — a pre-R3.3 unit (see
+/// [`TOKEN2_SERIAL_PREFIX_GENERATION`]'s doc for why those are absent by
+/// construction) or a future revision this table hasn't been updated for.
+#[must_use]
+pub fn token2_firmware_from_serial(serial: u128) -> Option<&'static [u8]> {
+    let text = serial.to_string();
+    let prefix = text.get(..5)?;
+    TOKEN2_SERIAL_PREFIX_GENERATION
+        .iter()
+        .find(|(p, _)| *p == prefix)
+        .map(|(_, generation)| *generation)
+}
+
 /// Decode the hardware variant out of a [`NITROKEY_GET_ADMIN_STATUS`]
 /// response: byte offset 4 of the firmware's `AdminStatus::serialize()`
 /// layout (init-status flags, IFS block count, EFS block count as
@@ -1958,6 +2038,35 @@ mod tests {
                                                         // A component that doesn't fit in a u8 makes the whole thing
                                                         // unparsable rather than silently truncating it.
         assert_eq!(parse_dotted_version("3.999.0"), None);
+    }
+
+    // --- Token2 serial prefix -> hardware generation ------------------------
+
+    #[test]
+    fn token2_firmware_from_serial_matches_r3_3_and_r3_4_prefixes() {
+        // R3.3 (PIV): USB-A NFC PIN+ PIV+, branded.
+        assert_eq!(
+            token2_firmware_from_serial(66105_1234567_u128),
+            Some(&[3, 3][..])
+        );
+        // R3.4 (PIV + OTP Protection): PIN+ Dual Ace, unbranded.
+        assert_eq!(
+            token2_firmware_from_serial(65104_7654321_u128),
+            Some(&[3, 4][..])
+        );
+    }
+
+    #[test]
+    fn token2_firmware_from_serial_rejects_unrecognised_or_short_serial() {
+        // A well-formed but unknown prefix (no row on either R3.3 or R3.4).
+        assert_eq!(token2_firmware_from_serial(99999_0000000_u128), None);
+        // A pre-R3.3 prefix (R1's `86105`) is deliberately absent — no PIV
+        // applet exists on that hardware to ever call this in practice, but
+        // a prefix that did somehow reach this function still resolves to
+        // `None` like any other unrecognised one, rather than panicking.
+        assert_eq!(token2_firmware_from_serial(86105_0000000_u128), None);
+        // Fewer than 5 digits: nothing to match a prefix against.
+        assert_eq!(token2_firmware_from_serial(1234_u128), None);
     }
 
     // --- HID Crescendo C2300: GET PIV PROPERTIES ----------------------------
