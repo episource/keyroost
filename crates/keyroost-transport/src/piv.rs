@@ -13,7 +13,7 @@ use crate::gzip::gunzip_capped;
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State};
 use std::collections::{BTreeSet, HashMap};
 use zeroize::Zeroizing;
 
@@ -469,6 +469,208 @@ enum HidCrescendoXauthKeyOp<'a> {
     Delete,
 }
 
+/// Everything about a [`PivSession`] that's expensive to resolve and safe to
+/// carry to a *later* session on the same physical card: the resolved
+/// applet identity, the applet-specific byte cache, and the in-session
+/// public-key cache — plus, meaningful only on a copy a caller is holding
+/// between sessions, the raw signals [`PivSession::open_cached`] diffs a
+/// reconnect against to prove that later session really is still talking to
+/// the same card before trusting any of the rest.
+///
+/// A fresh [`PivSession::open`]/[`PivSession::open_with_debug`] always
+/// starts from [`Self::default`] and resolves everything from nothing —
+/// there is still no on-disk or cross-process persistence.
+/// [`PivSession::open_cached`] is the one constructor where a caller-held
+/// copy of this (typically kept in process-lifetime UI state, one per
+/// reader) can skip that resolution — and only after its own checks prove
+/// the card hasn't changed since this copy was captured. A caller that
+/// doesn't keep one around loses nothing beyond that shortcut: `open`/
+/// `open_with_debug` behave exactly as before.
+#[derive(Clone, Default)]
+pub struct PivSessionState {
+    /// The PC/SC-layer identity (reader name, card insertion/removal
+    /// generation, ATR) this state was captured against — checked first and
+    /// unconditionally by [`PivSession::open_cached`], before anything else:
+    /// every other field here is only meaningful once this is confirmed
+    /// unchanged. See [`PcscIdentity`] for what each of its three parts
+    /// checks and why.
+    pcsc_identity: PcscIdentity,
+    /// Algorithm + public key of any slot a session carrying this state
+    /// generated a key in, keyed by key reference. A fallback source only,
+    /// for cards that don't answer GET METADATA (pre-5.3 firmware, or
+    /// non-Yubico PIV): `slot_key` (the shared source for CSR/self-sign)
+    /// falls back to this when metadata comes back empty. Populated by
+    /// `generate_key`, or explicitly by a caller via
+    /// [`PivSession::remember_pubkey`] — never by reading a card back, so
+    /// it's exactly as trustworthy as whoever put it there. Cleared by
+    /// [`PivSession::refresh`] (and so, transitively, by a fresh
+    /// [`PivSession::open`]/[`open_with_debug`], both of which call it), and
+    /// any operation that changes what's in a slot (`delete_key`,
+    /// `move_key`, `reset`) invalidates the corresponding entries — see
+    /// [`PivSession::slot_key`]. Living in `PivSessionState` rather than a
+    /// [`PivSession`] field of its own is what lets a caller hand this
+    /// straight to [`PivSession::open_cached`] instead of re-seeding each
+    /// slot one at a time via `remember_pubkey` after the fact.
+    pubkey_cache: PubkeyCache,
+    /// PIN/touch policy of any slot successfully resolved via the ATTEST
+    /// fallback — including the read [`PivSession::generate_key`] performs
+    /// on itself afterward, precisely because the *request* it just sent
+    /// isn't trustworthy enough to cache directly (a card is free to
+    /// translate or normalize a requested policy on its own terms) — keyed
+    /// by key reference; see [`PolicyCache`] for the full lifecycle. Exists
+    /// for the same reason `pubkey_cache` does: cards without GET METADATA
+    /// make [`PivSession::resolve_policy`] pay for a real ATTEST APDU and a
+    /// certificate parse on every single call otherwise, for a value that's
+    /// fixed for the life of the slot's current key.
+    policy_cache: PolicyCache,
+    /// Raw response body of the most recent SELECT (full or short AID) —
+    /// the FCI a spec-compliant card returns since both builders request it
+    /// via a case-4 `Le`. Feeds [`keyroost_piv::fingerprint::select_identity`]
+    /// during fingerprint resolution, and — held in a caller's stored copy —
+    /// is the last of [`PivSession::open_cached`]'s four validity checks: a
+    /// reconnect that SELECTs PIV and gets back a *different* FCI is reason
+    /// enough on its own to distrust the rest of this state, whatever the
+    /// cheaper PC/SC-level signals said. Empty when SELECT never returned a
+    /// body (a card that answers `9000` with nothing), never absent
+    /// otherwise: fingerprint resolution and cache validation both treat
+    /// empty and never-resolved the same way — a definite, comparable value.
+    select_response: Vec<u8>,
+    /// [`PivSession::applet_fingerprint`]'s cache: `None` until first
+    /// resolved, then that method's full result — fingerprint, name,
+    /// version, version/firmware bytes, serial. [`PivSession::identity`] is
+    /// a thinner view over the same cached value. Safe to cache — unlike the
+    /// read-through data a session deliberately never caches (certs, PIN
+    /// retries, slot occupancy; see [`PivSession::status_detailed`]'s doc) —
+    /// because the applet's identity and reported versions cannot change
+    /// while the physical card stays the same, which is exactly what
+    /// [`PivSession::open_cached`]'s three checks exist to prove before this
+    /// field is trusted across a reconnect at all. Resolving it from
+    /// scratch can cost a handful of extra APDUs (some fingerprints need a
+    /// live SELECT probe or a second applet's worth of round trips), so
+    /// skipping that on a proven-unchanged reconnect is the entire point of
+    /// this type.
+    identity: Option<AppletFingerprintResult>,
+    /// Applet-specific data resolved once and reused for the rest of a
+    /// session's lineage — see [`AppletCache`]/[`AppletCacheKey`] for what's
+    /// stored and why this is a dict keyed by enum rather than a dedicated
+    /// field per value. Today's sole entry: [`PivSession::hid_crescendo_properties_raw`]'s
+    /// cache (the raw response body of a HID Crescendo GET PIV PROPERTIES
+    /// read — C2300 or C4000, both expose this over differently-framed
+    /// requests but a compatible response structure — one read serves both
+    /// the per-slot algorithm list, [`PivSession::hid_crescendo_slot_key_algorithms`],
+    /// and this applet's own version, [`PivSession::hid_crescendo_version`]/
+    /// [`PivSession::applet_fingerprint`]'s HID Crescendo branch, including
+    /// once per slot [`PivSession::status_detailed`] asks about — so this
+    /// exists purely to avoid re-issuing that read for each of those; a
+    /// failed read caches as an empty `Vec`, same "resolved, with or without
+    /// data" convention as `identity`. The CPLC serial
+    /// [`PivSession::probe_hid_crescendo_cplc_serial`] reads doesn't need a
+    /// second entry here: it's called directly from
+    /// [`PivSession::applet_fingerprint`]'s `HidCrescendo` arms, so its
+    /// result already rides along in the [`AppletFingerprintResult`]
+    /// `identity` caches — storing it a second time here would just be the
+    /// same value kept in two places.
+    applet_cache: AppletCache,
+}
+
+impl PivSessionState {
+    /// Algorithm + public key this state has cached for `slot`, if any — the
+    /// same fallback [`PivSession::slot_key`] consults internally, exposed
+    /// so a caller holding a `PivSessionState` between sessions (e.g. to
+    /// show a just-generated key's PEM again after reconnecting to the same
+    /// card) doesn't need a live session just to read it back.
+    pub fn cached_pubkey(&self, slot: Slot) -> Option<(KeyAlg, &PublicKey)> {
+        self.pubkey_cache
+            .get(slot.key_ref())
+            .map(|(alg, key)| (*alg, key))
+    }
+}
+
+/// The PC/SC-layer identity [`PivSession::open_cached`] diffs a reconnect
+/// against, *before* ever talking to the PIV applet: which reader, which
+/// card-presence generation on that reader, and what ATR it answered with.
+/// Grouped into one type because the three are always read and compared
+/// together, in that order — a mismatch on an earlier field makes checking
+/// a later one pointless. `select_response` — the fourth and last check
+/// `open_cached` makes — deliberately isn't part of this type: it's a
+/// PIV-*applet*-level answer (obtained only after selecting the applet),
+/// not a PC/SC-layer property of the reader/card generically, so it stays
+/// its own field directly on [`PivSessionState`].
+#[derive(Clone, Default)]
+struct PcscIdentity {
+    /// The PC/SC reader name this identity was captured on. Checked first
+    /// and unconditionally: `event_count`/`atr` are each only meaningful
+    /// when compared against a *previous reading from that same reader* —
+    /// nothing about them ties a [`PivSessionState`] to a reader on its own,
+    /// since it's a plain, freely-movable value, and a caller's own
+    /// key-value store might not key by reader name at all (`keyroost`'s
+    /// GUI keys by device identity, which can outlive a reader-name change
+    /// across a replug — e.g. when that identity resolves through an
+    /// effective serial number rather than the reader string). Without this
+    /// check, two different readers whose event counters happened to
+    /// coincide (both untouched since `pcscd` started, for instance — an
+    /// easy coincidence with small counts) would look "unchanged" against
+    /// each other despite being unrelated hardware. Empty on a
+    /// [`Self::default`] (never resolved), which a bare `String` comparison
+    /// rejects as a mismatch against any real reader name, same as this
+    /// type's other never-resolved fields (`event_count: None`, empty
+    /// `atr`) fail their own checks by construction.
+    reader_name: String,
+    /// PC/SC's own per-reader card insertion/removal counter
+    /// (`ReaderState::event_count` — the high word of `dwEventState`,
+    /// incremented only by an actual insertion or removal, per that
+    /// method's own doc), observed (via `Context::get_status_change`, no
+    /// card connection needed) at the moment this identity was last
+    /// confirmed current. Compared against a fresh reading on the next
+    /// [`PivSession::open_cached`] call for the same reader: any difference
+    /// means a card was inserted or removed on this reader since, however
+    /// briefly — including a removal immediately followed by a reinsertion
+    /// that settles back into an outwardly identical `PRESENT` state.
+    ///
+    /// Deliberately *not* the `SCARD_STATE_CHANGED` flag bit
+    /// ([`State::CHANGED`]) this crate used here originally: that flag also
+    /// trips on reader-state churn unrelated to the card itself —
+    /// `SCARD_STATE_INUSE`/`EXCLUSIVE` toggling from *any* connection to
+    /// this reader, including this app's own previous PIV session, or a
+    /// completely different applet's session sharing the same physical
+    /// multi-applet token — which made it read "changed" on essentially
+    /// every call in practice, defeating the cache entirely. The event
+    /// counter is the signal actually documented for "did the card
+    /// change", and [`State`]'s own bitflags definition tops out well under
+    /// `0x1_0000` (see [`ReaderState::event_state`]'s use of
+    /// `from_bits_truncate`), so the counter — the *high* word — isn't
+    /// even reachable through a stored [`State`] value; it has to be read
+    /// via `event_count()` directly and kept as its own field.
+    ///
+    /// `None` before this identity has ever been through `open_cached` (a
+    /// fresh [`Self::default`]) — treated there as "nothing to compare
+    /// against", which just means this check can't vouch for reuse, same
+    /// outcome as any other failed check.
+    event_count: Option<u32>,
+    /// ATR observed at that same moment. A third, independent corroborating
+    /// check: even in the unexpected case a presence transition went
+    /// unreported in `event_count`, a different ATR here still proves a
+    /// different card. Not sufficient by itself the other way around — cards
+    /// from the same production batch can share an ATR byte-for-byte — which
+    /// is why every check here has to agree, not just this one.
+    atr: Vec<u8>,
+}
+
+impl PcscIdentity {
+    /// Whether `fresh` — a reading just taken, on the reader named by
+    /// `fresh.reader_name` — proves the card `self` was captured from is
+    /// still the one connected: every field must agree. See each field's
+    /// own doc for why it's checked and what it catches; `event_count`'s
+    /// comparison specifically goes through [`pcsc_event_count_unchanged`]
+    /// rather than plain equality, since two never-resolved (`None`)
+    /// counters must not read as "unchanged".
+    fn matches(&self, fresh: &Self) -> bool {
+        self.reader_name == fresh.reader_name
+            && pcsc_event_count_unchanged(self.event_count, fresh.event_count)
+            && self.atr == fresh.atr
+    }
+}
+
 /// An open PIV applet session on one PC/SC reader.
 pub struct PivSession {
     card: Card,
@@ -482,85 +684,32 @@ pub struct PivSession {
     /// failed" and the #101 status-word fallback never got a status word to
     /// act on), so waiting for a refusal is not a strategy there.
     t0: bool,
-    /// Algorithm + public key of any slot this session itself generated a key
-    /// in, keyed by key reference. This is a fallback source only, for cards
-    /// that don't answer GET METADATA (pre-5.3 firmware, or non-Yubico PIV):
-    /// `slot_key` (the shared source for CSR/self-sign) falls back to this
-    /// when metadata comes back empty. It's populated by `generate_key`, or
-    /// explicitly by a caller via [`Self::remember_pubkey`] — never by reading a
-    /// card back, so it's exactly as trustworthy as whoever put it there. It
-    /// lives only as long as this session (a fresh `open()` on reconnect
-    /// starts empty, and there is deliberately no on-disk or cross-process
-    /// persistence — see [`Self::remember_pubkey`] for how a caller bridges
-    /// that) and any operation that changes what's in a slot (`delete_key`,
-    /// `move_key`, `reset`) invalidates the corresponding entries — see
-    /// [`PivSession::slot_key`].
-    pubkey_cache: PubkeyCache,
-    /// Raw response body of the most recent SELECT (full or short AID) —
-    /// the FCI a spec-compliant card returns since both builders request it
-    /// via a case-4 `Le`. Feeds [`keyroost_piv::fingerprint::select_identity`].
-    /// Empty when SELECT never returned a body (a card that answers `9000`
-    /// with nothing), never `None`: fingerprint resolution treats empty and
-    /// absent the same way.
-    select_response: Vec<u8>,
-    /// [`Self::applet_fingerprint`]'s cache: `None` until first resolved,
-    /// then that method's full result — fingerprint, name, version,
-    /// version/firmware bytes, serial — for the rest of the session.
-    /// [`Self::identity`] is a thinner view over the same cached value (just
-    /// the fingerprint/version/version_firmware fields [`Self::fingerprint`],
-    /// [`Self::quirks`], and [`Self::extension_gate`] need). Safe to cache —
-    /// unlike the read-through data this session deliberately doesn't cache
-    /// (certs, PIN retries, slot occupancy; see [`Self::status_detailed`]'s
-    /// doc) — because the applet's identity and reported versions cannot
-    /// change while the card stays connected, but resolving them can cost a
-    /// handful of extra APDUs (some fingerprints need a live SELECT probe or
-    /// a second applet's worth of round trips), so it's worth not repeating
-    /// on every call — [`Self::status`], [`Self::status_detailed`], and
-    /// [`Self::feature_gate`] each call [`Self::applet_fingerprint`] in their
-    /// own right (they need `name`/`serial`, which [`Self::identity`] doesn't
-    /// expose), and used to each pay the full resolution cost again on top
-    /// of the one [`Self::refresh`] already ran.
-    identity: Option<AppletFingerprintResult>,
-    /// Applet-specific data resolved once and reused for the rest of the
-    /// session — see [`AppletCache`]/[`AppletCacheKey`] for what's stored and
-    /// why this is a dict keyed by enum rather than a dedicated field per
-    /// value. Today's sole entry: [`Self::hid_crescendo_properties_raw`]'s
-    /// cache (the raw response body of a HID Crescendo GET PIV PROPERTIES
-    /// read — C2300 or C4000, both expose this over differently-framed
-    /// requests but a compatible response structure — one read serves both
-    /// the per-slot algorithm list, [`Self::hid_crescendo_slot_key_algorithms`],
-    /// and this applet's own version, [`Self::hid_crescendo_version`]/
-    /// [`Self::applet_fingerprint`]'s HID Crescendo branch, including once
-    /// per slot [`Self::status_detailed`] asks about — so this exists purely
-    /// to avoid re-issuing that read for each of those; a failed read caches
-    /// as an empty `Vec`, same "resolved, with or without data" convention as
-    /// [`Self::identity`]). The CPLC serial [`Self::probe_hid_crescendo_cplc_serial`]
-    /// reads doesn't need a second entry here: it's called directly from
-    /// [`Self::applet_fingerprint`]'s `HidCrescendo` arms, so its result
-    /// already rides along in the [`AppletFingerprintResult`] `identity`
-    /// caches — storing it a second time here would just be the same value
-    /// kept in two places.
-    applet_cache: AppletCache,
+    /// Everything about this session that's expensive to resolve and safe to
+    /// carry to a later session on the same card — see [`PivSessionState`].
+    /// [`Self::open`]/[`Self::open_with_debug`] always start this from
+    /// [`PivSessionState::default`]; [`Self::open_cached`] is the one
+    /// constructor that can seed it from a caller-held copy instead of
+    /// resolving from scratch.
+    state: PivSessionState,
 }
 
 /// The in-session public-key cache behind `PivSession`, keyed by PIV key
-/// reference. Exactly five transitions exist, each mirroring the card
+/// reference. A handful of transitions exist, each mirroring the card
 /// operation that makes it true; the session methods are one-line callers so
 /// the unit tests below can pin the semantics without a live card:
 ///
-/// * a fresh session starts empty (`new` — deliberately no persistence),
+/// * a fresh cache starts empty (`Default` — deliberately no persistence),
 /// * `generate_key` / `remember_pubkey` make the slot's entry exactly the new
 ///   key (`remember`),
 /// * `delete_key` leaves nothing to fall back to (`evict`),
 /// * `move_key` relocates the key material, so its entry follows (`migrate`),
-/// * `reset` wipes every slot (`clear`).
+/// * `reset` wipes every slot — via `PivSessionState::default`, which drops
+///   this whole cache along with everything else `refresh` rebuilds, not a
+///   dedicated method here.
+#[derive(Clone, Default)]
 struct PubkeyCache(HashMap<u8, (KeyAlg, PublicKey)>);
 
 impl PubkeyCache {
-    fn new() -> Self {
-        Self(HashMap::new())
-    }
-
     /// The slot now holds exactly this key — `generate_key` minted it there,
     /// or the caller vouched for it via `remember_pubkey`. Replaces any
     /// previous entry: after a regenerate, the old pubkey must not survive to
@@ -587,14 +736,63 @@ impl PubkeyCache {
         }
     }
 
-    /// The applet was factory-reset (`reset`, which `factory_reset` also
-    /// funnels into): every slot is empty, nothing cached survives.
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-
     fn get(&self, key_ref: u8) -> Option<&(KeyAlg, PublicKey)> {
         self.0.get(&key_ref)
+    }
+}
+
+/// The in-session PIN/touch-policy cache behind `PivSession`, keyed by PIV
+/// key reference — [`PubkeyCache`]'s exact same lifecycle, for the exact
+/// same reason: a slot's policy is fixed at key-generation time and can't
+/// change until that slot's key does, but resolving it from nothing is
+/// expensive on any card GET METADATA doesn't cover it on (see
+/// [`PivSession::resolve_policy`]'s doc) — a real ATTEST APDU plus a
+/// certificate parse, paid again on every `status_detailed` call otherwise,
+/// for a value that was already fixed the moment the key was generated.
+///
+/// * a fresh cache starts empty (`Default`),
+/// * `generate_key` knows the policy for free — it's the caller's own
+///   `pin_policy`/`touch_policy` arguments — so it seeds this directly
+///   (`remember`) rather than waiting for a later `resolve_policy` to pay
+///   for an ATTEST read of a value it already had in hand,
+/// * `resolve_policy` itself also seeds this on a successful ATTEST
+///   fallback, so the *next* slot read (or the next session entirely, via
+///   `PivSessionState`) doesn't pay for it again,
+/// * `delete_key` leaves nothing to fall back to (`evict`),
+/// * `move_key` relocates the key material, so its entry follows (`migrate`),
+/// * `reset` wipes every slot — via `PivSessionState::default`, same as
+///   [`PubkeyCache`], not a dedicated method here.
+#[derive(Clone, Default)]
+struct PolicyCache(HashMap<u8, (PinPolicy, TouchPolicy)>);
+
+impl PolicyCache {
+    /// The slot now has exactly this policy — `generate_key` set it there
+    /// (the arguments it was called with), or a successful ATTEST fallback
+    /// in [`PivSession::resolve_policy`] just read it. Replaces any previous
+    /// entry: after a regenerate, a stale policy must not survive to
+    /// describe the new key.
+    fn remember(&mut self, key_ref: u8, policy: (PinPolicy, TouchPolicy)) {
+        self.0.insert(key_ref, policy);
+    }
+
+    /// The slot's key material is gone (`delete_key` succeeded): a stale
+    /// entry here would misreport the (now nonexistent) key's policy.
+    /// Evicting an uncached slot is a no-op.
+    fn evict(&mut self, key_ref: u8) {
+        self.0.remove(&key_ref);
+    }
+
+    /// The key itself relocated (`move_key` succeeded) — its policy travels
+    /// with it, same as [`PubkeyCache::migrate`]. An uncached `src` carries
+    /// nothing and invents nothing at `dest`.
+    fn migrate(&mut self, src: u8, dest: u8) {
+        if let Some(cached) = self.0.remove(&src) {
+            self.0.insert(dest, cached);
+        }
+    }
+
+    fn get(&self, key_ref: u8) -> Option<(PinPolicy, TouchPolicy)> {
+        self.0.get(&key_ref).copied()
     }
 }
 
@@ -620,14 +818,10 @@ enum AppletCacheKey {
 /// [`PivSession::probe_hid_crescendo_cplc_serial`]'s doc for why a serial
 /// doesn't belong here) has nowhere to fit until one actually needs this
 /// treatment — no speculative value-type abstraction ahead of that.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AppletCache(HashMap<AppletCacheKey, Vec<u8>>);
 
 impl AppletCache {
-    fn new() -> Self {
-        Self(HashMap::new())
-    }
-
     /// `key`'s cached bytes, if resolved. `None` means only "never
     /// resolved" — a caller that caches a failed read as an empty `Vec`
     /// (see [`PivSession::hid_crescendo_properties_raw`]) gets `Some(&[])`
@@ -638,14 +832,6 @@ impl AppletCache {
 
     fn set_bytes(&mut self, key: AppletCacheKey, value: Vec<u8>) {
         self.0.insert(key, value);
-    }
-
-    /// Drop every entry at once — [`PivSession::refresh`]'s full-rebuild uses
-    /// this rather than reassigning `AppletCache::new()` in place, same
-    /// "clear via a method on the cache itself" convention
-    /// [`PubkeyCache::clear`] already follows.
-    fn clear(&mut self) {
-        self.0.clear();
     }
 }
 
@@ -781,6 +967,49 @@ fn clear_metadata_if_quirky(
     md
 }
 
+/// Whether a fresh PC/SC reading, `event_count` and all, is even usable —
+/// `false` when the query outright failed (`state` is `None`) or the reader
+/// itself is reporting a state this crate has no business trusting
+/// (`UNKNOWN`/`UNAVAILABLE`/`MUTE`), regardless of what the event counter
+/// says. Split out as a pure function over [`State`] so this rule is
+/// testable without hardware.
+fn pcsc_reading_usable(state: Option<State>) -> bool {
+    matches!(
+        state,
+        Some(st) if !st.intersects(State::UNKNOWN | State::UNAVAILABLE | State::MUTE)
+    )
+}
+
+/// Whether PC/SC's per-reader insertion/removal counter proves no card
+/// change happened between `cached` (what [`PcscIdentity::event_count`]
+/// held) and `fresh` (a reading just taken): both present and numerically
+/// equal. `None` on either side — never resolved before, or this reading's
+/// query failed — can't prove anything, so it doesn't count as unchanged.
+/// See [`PcscIdentity::matches`] for the rule this feeds into, and
+/// [`PcscIdentity::event_count`]'s doc for why the counter, not the
+/// `CHANGED` flag bit, is what's compared here.
+fn pcsc_event_count_unchanged(cached: Option<u32>, fresh: Option<u32>) -> bool {
+    matches!((cached, fresh), (Some(c), Some(f)) if c == f)
+}
+
+/// [`PivSession::open_cached`]'s reuse decision as a pure function: all of
+/// its independent checks must agree, or the cache is not trusted —
+/// `pcsc_trustworthy` (is this fresh PC/SC reading even usable, via
+/// [`pcsc_reading_usable`]), `pcsc_identity_matches` (reader name, event
+/// counter, and ATR all agree, via [`PcscIdentity::matches`]), and
+/// `select_response_matches` (plain equality the caller performs inline).
+/// Kept separate from those so the *combining* rule (currently a flat AND,
+/// but the one place that could change if a future check needed different
+/// weighting) is pinned by a test independent of how each individual check
+/// is computed.
+fn piv_session_cache_reusable(
+    pcsc_trustworthy: bool,
+    pcsc_identity_matches: bool,
+    select_response_matches: bool,
+) -> bool {
+    pcsc_trustworthy && pcsc_identity_matches && select_response_matches
+}
+
 impl PivSession {
     /// Connect to `reader_name` and SELECT the PIV application. Returns
     /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
@@ -805,18 +1034,161 @@ impl PivSession {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
+        let mut session = Self::connect_and_select(&ctx, &cstr, reader_name, debug)?;
+        session.fingerprint();
+        Ok(session)
+    }
+
+    /// Connect to `reader` (`reader_name`, already-converted to a `CStr` by
+    /// the caller) on an already-established `ctx` and SELECT PIV, starting
+    /// from a wholly fresh [`PivSessionState`] — except for
+    /// `state.pcsc_identity.reader_name`, seeded with `reader_name` right
+    /// away so it's correct even if a caller never goes on to populate the
+    /// rest (see [`PcscIdentity::reader_name`]'s doc for why it's checked
+    /// ahead of everything else). The shared first half of
+    /// [`Self::open_with_debug`] and [`Self::open_cached_with_debug`], which
+    /// differ only in what they do with the applet identity after this
+    /// point: the former always resolves it fresh; the latter only when a
+    /// caller-held state doesn't check out.
+    fn connect_and_select(
+        ctx: &Context,
+        reader: &std::ffi::CStr,
+        reader_name: &str,
+        debug: bool,
+    ) -> Result<Self, TransportError> {
+        let card = ctx.connect(reader, ShareMode::Shared, Protocols::ANY)?;
         let t0 = negotiated_t0(&card);
         let mut session = Self {
             card,
             debug,
             t0,
-            pubkey_cache: PubkeyCache::new(),
-            select_response: Vec::new(),
-            identity: None,
-            applet_cache: AppletCache::new(),
+            state: PivSessionState {
+                pcsc_identity: PcscIdentity {
+                    reader_name: reader_name.to_owned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         };
-        session.refresh()?;
+        session.select()?;
+        Ok(session)
+    }
+
+    /// [`Self::open`], but first try to reuse `cached` — a
+    /// [`PivSessionState`] a caller is holding from an earlier session on
+    /// the same reader — instead of resolving the applet identity from
+    /// scratch. Equivalent to [`Self::open_cached_with_debug`]`(reader_name,
+    /// cached, false)` — see that constructor's doc for the full validation
+    /// story and [`Self::open_with_debug`]'s doc for why `--debug` tracing
+    /// has to be requested here rather than via [`Self::set_debug`]
+    /// afterward.
+    pub fn open_cached(reader_name: &str, cached: PivSessionState) -> Result<Self, TransportError> {
+        Self::open_cached_with_debug(reader_name, cached, false)
+    }
+
+    /// This session's current [`PivSessionState`] — everything cached or
+    /// resolved so far (identity, applet cache, public-key cache) plus
+    /// whatever validity anchors [`Self::open_cached`] last recorded (unset
+    /// on a session opened via the plain [`Self::open`]/[`Self::open_with_debug`],
+    /// which never populates them). A caller that wants a later session on
+    /// this same reader to be able to skip re-resolving identity should
+    /// clone this out before this session drops and hand it to
+    /// `open_cached` next time.
+    pub fn state(&self) -> PivSessionState {
+        self.state.clone()
+    }
+
+    /// [`Self::open_cached`], but with per-APDU stderr tracing already
+    /// enabled for the SELECT this constructor issues.
+    ///
+    /// Two independent checks gate reuse of `cached`, each proxying "is this
+    /// reconnect still talking to the same physical card, on the same
+    /// reader, still selected on PIV, that `cached` was captured from":
+    ///
+    /// 1. **PC/SC-layer identity** — reader name, insertion/removal counter,
+    ///    and ATR, via [`PcscIdentity::matches`] on `cached.pcsc_identity`
+    ///    against a fresh reading (`Context::get_status_change` with zero
+    ///    timeout for the first two — no APDU, no connection — plus this
+    ///    call's own connect for the ATR). See that type's doc for what each
+    ///    of its three parts catches and why the reader name is checked
+    ///    ahead of the other two.
+    /// 2. **The raw SELECT response** — this call's own connect always issues
+    ///    a real SELECT PIV regardless of check 1 (a working session needs
+    ///    one either way), so comparing its FCI against
+    ///    `cached.select_response` costs nothing extra and catches anything
+    ///    the PC/SC-layer signals didn't.
+    ///
+    /// Either disagreeing invalidates `cached` and this falls back to
+    /// exactly the same resolution [`Self::open_with_debug`] always does,
+    /// from nothing — so a caller can always reach for this instead of
+    /// `open`, with no downside beyond the (cheap) validation checks when the
+    /// cache turns out to be stale, and no risk of ever trusting a different
+    /// card's identity because the reader name happened to match.
+    ///
+    /// Returns the opened session, same as [`Self::open_with_debug`] — its
+    /// [`Self::state`] is `cached` unchanged (validation anchors refreshed to
+    /// this connection's own readings) when reused, or a freshly resolved
+    /// one when it wasn't. A caller that wants to keep caching across
+    /// sessions should read `state()` back out whenever it's done with this
+    /// session (typically right before it drops, after whatever
+    /// authenticate/write/status calls it went on to make — those mutate
+    /// `state` further, e.g. `generate_key`'s own `pubkey_cache` update, so
+    /// the state worth keeping is whatever this session ends with, not the
+    /// snapshot from the moment it opened) and store that back over whatever
+    /// it held before, so the *next* `open_cached` call has an up-to-date
+    /// anchor to diff against either way — even on this same, unchanged
+    /// card, letting `cached` go stale here would just mean the next call
+    /// re-validates from an older baseline than it needs to.
+    pub fn open_cached_with_debug(
+        reader_name: &str,
+        cached: PivSessionState,
+        debug: bool,
+    ) -> Result<Self, TransportError> {
+        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let cstr = std::ffi::CString::new(reader_name)
+            .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
+
+        // Check 1: card-free. The input baseline here doesn't matter for
+        // what's actually compared (the event counter, read unconditionally
+        // below) — `State::UNAWARE` just asks for "current state, no
+        // diffing", which a zero timeout returns immediately either way.
+        let mut states = [ReaderState::new(cstr.clone(), State::UNAWARE)];
+        let (fresh_state, fresh_event_count) =
+            match ctx.get_status_change(std::time::Duration::ZERO, &mut states) {
+                Ok(()) | Err(PcscError::Timeout) => {
+                    (Some(states[0].event_state()), Some(states[0].event_count()))
+                }
+                // Can't ask PC/SC at all (service hiccup, reader mid-teardown) —
+                // the `connect` just below surfaces the real error if the reader
+                // is genuinely gone; here, just don't trust the cache.
+                Err(_) => (None, None),
+            };
+        let pcsc_trustworthy = pcsc_reading_usable(fresh_state);
+
+        // Checks 2-4 need a live connection either way, so make one
+        // regardless of what check 1 found.
+        let mut session = Self::connect_and_select(&ctx, &cstr, reader_name, debug)?;
+        let fresh_identity = PcscIdentity {
+            reader_name: reader_name.to_owned(),
+            event_count: fresh_event_count,
+            atr: session.atr(),
+        };
+
+        if piv_session_cache_reusable(
+            pcsc_trustworthy,
+            cached.pcsc_identity.matches(&fresh_identity),
+            session.state.select_response == cached.select_response,
+        ) {
+            session.state = cached;
+        } else {
+            session.fingerprint();
+        }
+        // Whichever branch ran, this connect's own readings are the
+        // freshest anchor available for the *next* `open_cached` call on
+        // this reader — store them regardless of whether this call reused
+        // `cached` or resolved fresh.
+        session.state.pcsc_identity = fresh_identity;
+
         Ok(session)
     }
 
@@ -832,14 +1204,26 @@ impl PivSession {
     /// `App::load_piv_status`) — this method is that same rebuild, available
     /// to run in place on a session a caller is already holding.
     ///
-    /// Drops `pubkey_cache`, `select_response`, `identity`, and
-    /// `applet_cache`, re-`SELECT`s PIV, then resolves the fingerprint fresh
-    /// (via [`Self::fingerprint`], caching it in `identity` the same as any
-    /// other first resolution) — genuinely starting over, the applet's
+    /// Replaces [`Self::state`](`PivSessionState`) with a fresh
+    /// [`PivSessionState::default`] — dropping `pubkey_cache`,
+    /// `select_response`, `identity`, `applet_cache`, and the
+    /// [`PcscIdentity`] validation anchor (`pcsc_identity`) all at once —
+    /// then re-`SELECT`s PIV and resolves the fingerprint fresh (via
+    /// [`Self::fingerprint`], caching it in `state.identity` the same as any
+    /// other first resolution): genuinely starting over, the applet's
     /// identity included, rather than carrying forward what an earlier
-    /// resolution in this same session found. Also drops any management-key
+    /// resolution in this same session found, or what a caller-supplied
+    /// [`PivSessionState`] held. Also drops any management-key
     /// authentication in force, same as a bare re-`select()` always has —
     /// this rebuilds, it doesn't preserve.
+    ///
+    /// Leaving `pcsc_identity` at its reset-away default (rather than, say,
+    /// re-querying it here to seed a fully-populated state) costs nothing
+    /// beyond a guaranteed cache miss on whichever `open_cached` call is the
+    /// very next one to see a [`PivSessionState`] extracted from this
+    /// session: that call always records a fresh reading itself regardless
+    /// of what it found (see its doc), so the miss is a one-time thing, not
+    /// a standing inefficiency.
     ///
     /// That one resolution already covers a `HidCrescendo` fingerprint's own
     /// serial: [`Self::applet_fingerprint`]'s `HidCrescendo` arms call
@@ -853,10 +1237,7 @@ impl PivSession {
     /// from the very session it just reset sees the same fully-rebuilt state
     /// a reopen would have given it, without actually reopening.
     pub fn refresh(&mut self) -> Result<(), TransportError> {
-        self.pubkey_cache.clear();
-        self.select_response = Vec::new();
-        self.identity = None;
-        self.applet_cache.clear();
+        self.state = PivSessionState::default();
 
         self.select()?;
         self.fingerprint();
@@ -981,10 +1362,13 @@ impl PivSession {
                     card,
                     debug: false,
                     t0,
-                    pubkey_cache: PubkeyCache::new(),
-                    select_response: Vec::new(),
-                    identity: None,
-                    applet_cache: AppletCache::new(),
+                    state: PivSessionState {
+                        pcsc_identity: PcscIdentity {
+                            reader_name: name.to_string_lossy().into_owned(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -1010,13 +1394,13 @@ impl PivSession {
         if sw == piv::SW_NOT_FOUND {
             let (data, sw) = self.transmit_full(&piv::select())?;
             if sw == piv::SW_NOT_FOUND {
-                self.select_response.clear();
+                self.state.select_response.clear();
                 return Err(TransportError::NoPivApplet);
             }
-            self.select_response = data;
+            self.state.select_response = data;
             return ok_or_apdu("select piv applet (short aid)", sw);
         }
-        self.select_response = data;
+        self.state.select_response = data;
         ok_or_apdu("select piv applet", sw)
     }
 
@@ -1098,7 +1482,7 @@ impl PivSession {
         // including a GET VERSION a HidCrescendo never answers and a second
         // applet-select round trip for the fingerprints that need one
         // (Nitrokey's admin app, Swissbit/Feitian/IdPrime's RID/AID probes).
-        if let Some(cached) = &self.identity {
+        if let Some(cached) = &self.state.identity {
             return cached.clone();
         }
 
@@ -1107,7 +1491,7 @@ impl PivSession {
         let atr = self.atr();
         let atr_identity =
             fingerprint::atr_historical_bytes(&atr).and_then(fingerprint::atr_identity);
-        let select_identity = fingerprint::select_identity(&self.select_response);
+        let select_identity = fingerprint::select_identity(&self.state.select_response);
 
         let swissbit_rid_selectable = fingerprint::wants_swissbit_probe(select_identity.as_deref())
             && self.probe_swissbit_rid();
@@ -1289,7 +1673,7 @@ impl PivSession {
                 serial: None,
             },
         };
-        self.identity = Some(result.clone());
+        self.state.identity = Some(result.clone());
         result
     }
 
@@ -1800,6 +2184,7 @@ impl PivSession {
         use keyroost_piv::fingerprint::{self, HidCrescendoVariant};
 
         if let Some(raw) = self
+            .state
             .applet_cache
             .bytes(AppletCacheKey::HidCrescendoPropertiesRaw)
         {
@@ -1821,7 +2206,8 @@ impl PivSession {
             .filter(|(_, sw)| *sw == piv::SW_OK)
             .map(|(data, _)| data)
             .unwrap_or_default();
-        self.applet_cache
+        self.state
+            .applet_cache
             .set_bytes(AppletCacheKey::HidCrescendoPropertiesRaw, raw.clone());
         raw
     }
@@ -2640,6 +3026,18 @@ impl PivSession {
     /// hand it to a later session via [`Self::remember_pubkey`]; see that
     /// method's doc comment for why this deliberately doesn't do that on its
     /// own.
+    ///
+    /// Also seeds [`PolicyCache`] — not with `pin_policy`/`touch_policy`
+    /// themselves (a request, not a result: this instruction's response is
+    /// the public key blob alone, no policy confirmation, and a card is
+    /// free to translate a requested policy into something else on its own
+    /// terms — e.g. a `Default` axis becomes *some* concrete native default
+    /// only the card knows, but nothing rules out a card normalizing even
+    /// an explicit request to a value of its own choosing either), but with
+    /// whatever [`Self::slot_policy`] reads back afterward — a real GET
+    /// METADATA, falling back to ATTEST, exactly like any other resolution.
+    /// Best-effort: a failed read here just leaves the slot uncached, same
+    /// as any other [`Self::slot_policy`] miss.
     pub fn generate_key(
         &mut self,
         slot: Slot,
@@ -2655,7 +3053,14 @@ impl PivSession {
         // The new key just overwrote whatever was in `slot`; any existing
         // certificate now names a public key that no longer matches it.
         self.clear_certificate(slot)?;
-        self.pubkey_cache.remember(slot.key_ref(), alg, key.clone());
+        self.state
+            .pubkey_cache
+            .remember(slot.key_ref(), alg, key.clone());
+        // `slot_policy` reads (and, on a successful ATTEST fallback,
+        // caches) the policy the card actually ended up applying — the
+        // *request* above is not trustworthy enough to cache directly, so
+        // this doesn't try to shortcut from `pin_policy`/`touch_policy`.
+        let _ = self.slot_policy(slot);
         Ok(key)
     }
 
@@ -2681,7 +3086,7 @@ impl PivSession {
     /// certificate whose SPKI doesn't match the private key that actually
     /// signed it.
     pub fn remember_pubkey(&mut self, slot: Slot, alg: KeyAlg, key: PublicKey) {
-        self.pubkey_cache.remember(slot.key_ref(), alg, key);
+        self.state.pubkey_cache.remember(slot.key_ref(), alg, key);
     }
 
     /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
@@ -2931,7 +3336,8 @@ impl PivSession {
             let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
             ok_or_write("piv delete key", sw)?;
         }
-        self.pubkey_cache.evict(slot.key_ref());
+        self.state.pubkey_cache.evict(slot.key_ref());
+        self.state.policy_cache.evict(slot.key_ref());
         Ok(())
     }
 
@@ -3069,11 +3475,18 @@ impl PivSession {
     /// 1. GET METADATA, tried unconditionally — cards that don't support it
     ///    (pre-5.3 firmware, or non-Yubico PIV) simply answer with something
     ///    other than `9000`/no policy, which falls through to step 2.
-    /// 2. The ATTEST certificate's Yubico key-policy extension
+    /// 2. This session's [`PolicyCache`] — `generate_key`'s own arguments,
+    ///    or an earlier successful step 3 resolution, this session or an
+    ///    earlier one carried in via [`Self::open_cached`]. Skips a real
+    ///    APDU round trip for a value that's fixed for the life of the
+    ///    slot's current key.
+    /// 3. The ATTEST certificate's Yubico key-policy extension
     ///    (`1.3.6.1.4.1.41482.3.8`) — GET METADATA predates policy reporting,
     ///    but ATTEST itself has existed since 4.3. ATTEST is itself a Yubico
     ///    vendor instruction, so a non-Yubico PIV card refuses it too; that
     ///    refusal is handled the same as everything else here, not specially.
+    ///    A successful resolution here is cached for step 2's benefit next
+    ///    time.
     ///
     /// `None` throughout means "not available for display", not a wire
     /// error — this is an informational read, not a precondition for a write,
@@ -3084,28 +3497,34 @@ impl PivSession {
         self.resolve_policy(slot, meta.as_ref())
     }
 
-    /// [`Self::slot_policy`]'s two-step resolution from a GET METADATA reply
-    /// the caller already has: its `policy` bytes, else the ATTEST
-    /// certificate's key-policy extension. Split out so [`Self::status_detailed`]
-    /// shares the exact same order without a second GET METADATA.
+    /// [`Self::slot_policy`]'s resolution from a GET METADATA reply the
+    /// caller already has: its `policy` bytes, else this session's
+    /// [`PolicyCache`], else the ATTEST certificate's key-policy extension
+    /// (cached for next time on success). Split out so
+    /// [`Self::status_detailed`] shares the exact same order without a
+    /// second GET METADATA.
     fn resolve_policy(
         &mut self,
         slot: Slot,
         meta: Option<&Metadata>,
     ) -> Option<(PinPolicy, TouchPolicy)> {
-        let (pin, touch) = if let Some(policy) = meta.and_then(|m| m.policy) {
-            policy
-        } else {
-            // Non-Yubico PIV cards refuse this vendor instruction outright
-            // (a status word, not `9000`) — `.ok()?` turns that refusal
-            // into the same "no policy available" `None` as every other
-            // failure mode here.
-            let cert = self.attest(slot).ok()?;
-            keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
-                .ok()
-                .flatten()?
-        };
-        Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?))
+        if let Some((pin, touch)) = meta.and_then(|m| m.policy) {
+            return Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?));
+        }
+        if let Some(policy) = self.state.policy_cache.get(slot.key_ref()) {
+            return Some(policy);
+        }
+        // Non-Yubico PIV cards refuse this vendor instruction outright
+        // (a status word, not `9000`) — `.ok()?` turns that refusal
+        // into the same "no policy available" `None` as every other
+        // failure mode here.
+        let cert = self.attest(slot).ok()?;
+        let (pin, touch) = keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
+            .ok()
+            .flatten()?;
+        let policy = (PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?);
+        self.state.policy_cache.remember(slot.key_ref(), policy);
+        Some(policy)
     }
 
     /// Read `slot`'s key algorithm for display, compatible with any PIV
@@ -3160,7 +3579,7 @@ impl PivSession {
     fn algorithm_without_cert(&mut self, slot: Slot, meta: Option<&Metadata>) -> Option<KeyAlg> {
         meta.and_then(|m| m.algorithm)
             .and_then(|id| self.key_alg_from_apdu_id(id))
-            .or_else(|| self.pubkey_cache.get(slot.key_ref()).map(|(alg, _)| *alg))
+            .or_else(|| self.state.pubkey_cache.get(slot.key_ref()).map(|(alg, _)| *alg))
     }
 
     /// Ask `slot`'s private key to sign a *prepared* block via GENERAL
@@ -3326,7 +3745,7 @@ impl PivSession {
                 return Ok((alg, key));
             }
         }
-        if let Some(cached) = self.pubkey_cache.get(key_ref).cloned() {
+        if let Some(cached) = self.state.pubkey_cache.get(key_ref).cloned() {
             return Ok(cached);
         }
         Err(TransportError::MalformedResponse(
@@ -3419,10 +3838,13 @@ impl PivSession {
         }
         let (_, sw) = self.transmit_full(&piv::move_key(src, dest))?;
         ok_or_write("piv move key", sw)?;
-        // The key itself relocated, not just its reference — carry a cached
-        // entry along with it rather than dropping it, so a subsequent
-        // CSR/self-sign at `dest` still works on metadata-less firmware.
-        self.pubkey_cache.migrate(src.key_ref(), dest.key_ref());
+        // The key itself relocated, not just its reference — carry both
+        // cached entries along with it rather than dropping them, so a
+        // subsequent CSR/self-sign, or policy display, at `dest` still
+        // works on metadata-less firmware without paying to re-resolve
+        // either.
+        self.state.pubkey_cache.migrate(src.key_ref(), dest.key_ref());
+        self.state.policy_cache.migrate(src.key_ref(), dest.key_ref());
         Ok(())
     }
 
@@ -5161,7 +5583,7 @@ mod tests {
     fn pubkey_cache_starts_empty_and_remember_seeds_exactly_one_slot() {
         // A fresh open() has nothing to fall back to — there is deliberately
         // no on-disk or cross-process persistence.
-        let mut cache = PubkeyCache::new();
+        let mut cache = PubkeyCache::default();
         assert!(cache.0.is_empty());
         cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
         assert_eq!(cache.0.len(), 1);
@@ -5174,7 +5596,7 @@ mod tests {
     fn remember_replaces_the_slots_previous_entry() {
         // generate_key over an occupied slot mints a new keypair: the old
         // cached pubkey must not survive to describe the new private key.
-        let mut cache = PubkeyCache::new();
+        let mut cache = PubkeyCache::default();
         cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
         cache.remember(0x9A, KeyAlg::Rsa2048, rsa(2));
         assert_eq!(cache.0.len(), 1);
@@ -5183,7 +5605,7 @@ mod tests {
 
     #[test]
     fn evict_forgets_only_the_deleted_slot() {
-        let mut cache = PubkeyCache::new();
+        let mut cache = PubkeyCache::default();
         cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
         cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
         cache.evict(0x9A);
@@ -5198,7 +5620,7 @@ mod tests {
 
     #[test]
     fn migrate_carries_the_entry_and_leaves_nothing_at_src() {
-        let mut cache = PubkeyCache::new();
+        let mut cache = PubkeyCache::default();
         cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
         cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
         cache.migrate(0x9A, 0x82);
@@ -5215,7 +5637,7 @@ mod tests {
     fn migrate_of_an_uncached_src_changes_nothing() {
         // Moving a key this session never generated: there is nothing to
         // carry, and crucially nothing gets invented at dest.
-        let mut cache = PubkeyCache::new();
+        let mut cache = PubkeyCache::default();
         cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
         cache.migrate(0x9A, 0x82);
         assert_eq!(cache.get(0x82), None);
@@ -5229,7 +5651,7 @@ mod tests {
         // present here is stale by definition (e.g. remember_pubkey of a slot
         // that was later emptied out-of-session) — the key that actually
         // arrived must win.
-        let mut cache = PubkeyCache::new();
+        let mut cache = PubkeyCache::default();
         cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
         cache.remember(0x82, KeyAlg::EccP384, ecc(9));
         cache.migrate(0x9A, 0x82);
@@ -5239,16 +5661,104 @@ mod tests {
     }
 
     #[test]
-    fn clear_wipes_every_slot() {
-        // reset() factory-wipes the applet, and factory_reset funnels into the
-        // same reset() at the end of its path — both end here, with no
-        // survivors for any slot.
-        let mut cache = PubkeyCache::new();
-        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
-        cache.remember(0x9C, KeyAlg::Rsa2048, rsa(2));
-        cache.remember(0x82, KeyAlg::Ed25519, ecc(3));
-        cache.clear();
+    fn default_starts_empty() {
+        assert!(PubkeyCache::default().0.is_empty());
+    }
+
+    // --- policy cache transitions — mirrors the pubkey cache tests above,
+    // same lifecycle, different value shape -------------------------------
+
+    #[test]
+    fn policy_cache_starts_empty_and_remember_seeds_exactly_one_slot() {
+        let mut cache = PolicyCache::default();
         assert!(cache.0.is_empty());
+        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
+        assert_eq!(cache.0.len(), 1);
+        assert_eq!(
+            cache.get(0x9A),
+            Some((PinPolicy::Once, TouchPolicy::Always))
+        );
+        // Seeding 9A says nothing about any other slot.
+        assert_eq!(cache.get(0x9C), None);
+    }
+
+    #[test]
+    fn policy_remember_replaces_the_slots_previous_entry() {
+        // A regenerate mints a new keypair with a (possibly different)
+        // policy: the old cached policy must not survive to describe it.
+        let mut cache = PolicyCache::default();
+        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
+        cache.remember(0x9A, (PinPolicy::Never, TouchPolicy::Cached));
+        assert_eq!(cache.0.len(), 1);
+        assert_eq!(
+            cache.get(0x9A),
+            Some((PinPolicy::Never, TouchPolicy::Cached))
+        );
+    }
+
+    #[test]
+    fn policy_evict_forgets_only_the_deleted_slot() {
+        let mut cache = PolicyCache::default();
+        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
+        cache.remember(0x9C, (PinPolicy::Always, TouchPolicy::Never));
+        cache.evict(0x9A);
+        assert_eq!(cache.get(0x9A), None);
+        assert_eq!(
+            cache.get(0x9C),
+            Some((PinPolicy::Always, TouchPolicy::Never))
+        );
+        // Deleting a slot this session never cached is a quiet no-op.
+        cache.evict(0x82);
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn policy_migrate_carries_the_entry_and_leaves_nothing_at_src() {
+        let mut cache = PolicyCache::default();
+        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
+        cache.remember(0x9C, (PinPolicy::Always, TouchPolicy::Never));
+        cache.migrate(0x9A, 0x82);
+        assert_eq!(cache.get(0x9A), None);
+        assert_eq!(
+            cache.get(0x82),
+            Some((PinPolicy::Once, TouchPolicy::Always))
+        );
+        assert_eq!(
+            cache.get(0x9C),
+            Some((PinPolicy::Always, TouchPolicy::Never))
+        );
+    }
+
+    #[test]
+    fn policy_migrate_of_an_uncached_src_changes_nothing() {
+        let mut cache = PolicyCache::default();
+        cache.remember(0x9C, (PinPolicy::Always, TouchPolicy::Never));
+        cache.migrate(0x9A, 0x82);
+        assert_eq!(cache.get(0x82), None);
+        assert_eq!(
+            cache.get(0x9C),
+            Some((PinPolicy::Always, TouchPolicy::Never))
+        );
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn policy_migrate_replaces_a_stale_dest_entry() {
+        let mut cache = PolicyCache::default();
+        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
+        cache.remember(0x82, (PinPolicy::Always, TouchPolicy::Never));
+        cache.migrate(0x9A, 0x82);
+        assert_eq!(
+            cache.get(0x82),
+            Some((PinPolicy::Once, TouchPolicy::Always))
+        );
+        assert_eq!(cache.get(0x9A), None);
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn policy_cache_default_starts_empty() {
+        assert!(PolicyCache::default().0.is_empty());
     }
 
     // --- metadata-vs-cache fallback gate ---------------------------------
@@ -5899,5 +6409,138 @@ mod chain_upfront_rule {
         // The #101 fallback covers a T=1 card that refuses extended length
         // with a status word; nothing here may pre-empt that path.
         assert!(!chain_upfront_for(false, false));
+    }
+}
+
+/// [`open_cached`](PivSession::open_cached)'s cache-validity rules, pinned
+/// without a card via the pure functions the live checks feed into — see
+/// [`pcsc_reading_usable`], [`pcsc_event_count_unchanged`], and
+/// [`piv_session_cache_reusable`].
+#[cfg(test)]
+mod open_cached_validity_rules {
+    use super::{pcsc_event_count_unchanged, pcsc_reading_usable, piv_session_cache_reusable, State};
+
+    #[test]
+    fn an_unreadable_reader_status_is_never_usable() {
+        // `None` stands for "the status query itself failed" — indistinguishable
+        // from "don't trust it" to every caller.
+        assert!(!pcsc_reading_usable(None));
+    }
+
+    #[test]
+    fn a_plain_present_reading_is_usable() {
+        assert!(pcsc_reading_usable(Some(State::PRESENT)));
+    }
+
+    #[test]
+    fn a_changed_bit_alone_does_not_disqualify_a_reading() {
+        // This is the exact fix, pinned so it can't regress: `CHANGED` also
+        // trips on reader-state churn that has nothing to do with the card
+        // (INUSE/EXCLUSIVE toggling from *any* connection to the reader,
+        // including this crate's own previous session) — relying on it here
+        // made every reconnect look "changed" and defeated the cache
+        // entirely. `pcsc_event_count_unchanged` is what actually decides
+        // whether the card itself changed; this function only screens out
+        // readings PC/SC says are outright unusable.
+        assert!(pcsc_reading_usable(Some(State::PRESENT | State::CHANGED)));
+    }
+
+    #[test]
+    fn unknown_unavailable_and_mute_are_never_usable() {
+        assert!(!pcsc_reading_usable(Some(State::UNKNOWN)));
+        assert!(!pcsc_reading_usable(Some(State::UNAVAILABLE)));
+        assert!(!pcsc_reading_usable(Some(State::MUTE)));
+    }
+
+    #[test]
+    fn matching_event_counts_are_unchanged() {
+        assert!(pcsc_event_count_unchanged(Some(5), Some(5)));
+        assert!(pcsc_event_count_unchanged(Some(0), Some(0)));
+    }
+
+    #[test]
+    fn a_different_event_count_is_a_change() {
+        // The exact case `open_cached` exists to catch: a removal — even one
+        // immediately followed by a reinsertion that settles back into an
+        // outwardly identical `PRESENT` state — always bumps this counter.
+        assert!(!pcsc_event_count_unchanged(Some(5), Some(6)));
+    }
+
+    #[test]
+    fn a_missing_count_on_either_side_proves_nothing() {
+        // Never resolved before, or this reading's query failed: neither is
+        // "proof of no change".
+        assert!(!pcsc_event_count_unchanged(None, Some(5)));
+        assert!(!pcsc_event_count_unchanged(Some(5), None));
+        assert!(!pcsc_event_count_unchanged(None, None));
+    }
+
+    #[test]
+    fn reuse_requires_every_check_to_agree() {
+        assert!(piv_session_cache_reusable(true, true, true));
+        assert!(!piv_session_cache_reusable(false, true, true));
+        assert!(!piv_session_cache_reusable(true, false, true));
+        assert!(!piv_session_cache_reusable(true, true, false));
+        assert!(!piv_session_cache_reusable(false, false, false));
+    }
+}
+
+/// [`PcscIdentity::matches`]'s field-by-field rules, pinned without a card —
+/// see [`open_cached_validity_rules`] for the lower-level pieces
+/// (`pcsc_event_count_unchanged`) this builds on.
+#[cfg(test)]
+mod pcsc_identity_matching {
+    use super::PcscIdentity;
+
+    fn identity(reader_name: &str, event_count: u32, atr: &[u8]) -> PcscIdentity {
+        PcscIdentity {
+            reader_name: reader_name.to_owned(),
+            event_count: Some(event_count),
+            atr: atr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_identical_reading_matches() {
+        let a = identity("Reader 0", 3, &[0x3B, 0x00]);
+        let b = identity("Reader 0", 3, &[0x3B, 0x00]);
+        assert!(a.matches(&b));
+    }
+
+    #[test]
+    fn a_different_reader_name_never_matches() {
+        // The exact case this whole type exists to catch: two readers whose
+        // event counter and ATR both happen to agree (an easy coincidence —
+        // both untouched since `pcscd` started, say, or two of the same
+        // card model in two different ports) must never be trusted for each
+        // other just because a caller's own storage isn't keyed by reader
+        // name.
+        let a = identity("Reader 0", 0, &[0x3B, 0x00]);
+        let b = identity("Reader 1", 0, &[0x3B, 0x00]);
+        assert!(!a.matches(&b));
+    }
+
+    #[test]
+    fn a_different_event_count_never_matches() {
+        let a = identity("Reader 0", 3, &[0x3B, 0x00]);
+        let b = identity("Reader 0", 4, &[0x3B, 0x00]);
+        assert!(!a.matches(&b));
+    }
+
+    #[test]
+    fn a_different_atr_never_matches() {
+        let a = identity("Reader 0", 3, &[0x3B, 0x00]);
+        let b = identity("Reader 0", 3, &[0x3B, 0xFF]);
+        assert!(!a.matches(&b));
+    }
+
+    #[test]
+    fn two_never_resolved_identities_do_not_match() {
+        // Both `PcscIdentity::default()`: same (empty) reader name, same
+        // (empty) ATR, but neither has a real event count — `None` on both
+        // sides must not read as "unchanged" (see
+        // `pcsc_event_count_unchanged`'s own tests), so this must not match
+        // either, even though the surface fields line up.
+        assert!(!PcscIdentity::default().matches(&PcscIdentity::default()));
     }
 }

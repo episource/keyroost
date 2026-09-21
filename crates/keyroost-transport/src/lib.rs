@@ -46,7 +46,8 @@ mod gzip;
 mod piv;
 pub use piv::{
     random_chuid_guid, CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan,
-    PivResetPreview, PivSession, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
+    PivResetPreview, PivSession, PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus,
+    PivStatusDetailed,
 };
 
 mod token2otp;
