@@ -13,7 +13,9 @@ use crate::gzip::gunzip_capped;
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
-use pcsc::{Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State};
+use pcsc::{
+    Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State, Transaction,
+};
 use std::collections::{BTreeSet, HashMap};
 use zeroize::Zeroizing;
 
@@ -473,24 +475,24 @@ enum HidCrescendoXauthKeyOp<'a> {
 /// carry to a *later* session on the same physical card: the resolved
 /// applet identity, the applet-specific byte cache, and the in-session
 /// public-key cache — plus, meaningful only on a copy a caller is holding
-/// between sessions, the raw signals [`PivSession::open_cached`] diffs a
+/// between sessions, the raw signals [`PivSession::with_cached_transaction`] diffs a
 /// reconnect against to prove that later session really is still talking to
 /// the same card before trusting any of the rest.
 ///
-/// A fresh [`PivSession::open`]/[`PivSession::open_with_debug`] always
+/// A fresh [`PivSession::with_transaction`]/[`PivSession::with_transaction_debug`] always
 /// starts from [`Self::default`] and resolves everything from nothing —
 /// there is still no on-disk or cross-process persistence.
-/// [`PivSession::open_cached`] is the one constructor where a caller-held
+/// [`PivSession::with_cached_transaction`] is the one constructor where a caller-held
 /// copy of this (typically kept in process-lifetime UI state, one per
 /// reader) can skip that resolution — and only after its own checks prove
 /// the card hasn't changed since this copy was captured. A caller that
-/// doesn't keep one around loses nothing beyond that shortcut: `open`/
-/// `open_with_debug` behave exactly as before.
+/// doesn't keep one around loses nothing beyond that shortcut: `with_transaction`/
+/// `with_transaction_debug` behave exactly as before.
 #[derive(Clone, Default)]
 pub struct PivSessionState {
     /// The PC/SC-layer identity (reader name, card insertion/removal
     /// generation, ATR) this state was captured against — checked first and
-    /// unconditionally by [`PivSession::open_cached`], before anything else:
+    /// unconditionally by [`PivSession::with_cached_transaction`], before anything else:
     /// every other field here is only meaningful once this is confirmed
     /// unchanged. See [`PcscIdentity`] for what each of its three parts
     /// checks and why.
@@ -499,7 +501,7 @@ pub struct PivSessionState {
     /// the FCI a spec-compliant card returns since both builders request it
     /// via a case-4 `Le`. Feeds [`keyroost_piv::fingerprint::select_identity`]
     /// during fingerprint resolution. No longer part of
-    /// [`PivSession::open_cached`]'s reuse decision — see [`PcscIdentity`]'s
+    /// [`PivSession::with_cached_transaction`]'s reuse decision — see [`PcscIdentity`]'s
     /// doc for why comparing it stopped earning its keep — so a value
     /// carried over from a cache hit is trusted as-is, unconfirmed against
     /// this connection's own card, until whatever real SELECT
@@ -519,7 +521,7 @@ pub struct PivSessionState {
     /// write path to keep it honest as the underlying card state actually
     /// changes — because the applet's identity and reported versions cannot
     /// change while the physical card stays the same, which is exactly what
-    /// [`PivSession::open_cached`]'s three checks exist to prove before this
+    /// [`PivSession::with_cached_transaction`]'s three checks exist to prove before this
     /// field is trusted across a reconnect at all. Resolving it from
     /// scratch can cost a handful of extra APDUs (some fingerprints need a
     /// live SELECT probe or a second applet's worth of round trips), so
@@ -545,11 +547,11 @@ pub struct PivSessionState {
     ///   whose declared public key needs to match what actually signs it).
     ///
     /// Cleared by [`PivSession::refresh`] (and so, transitively, by a fresh
-    /// [`PivSession::open`]/[`open_with_debug`], both of which call it), and
+    /// [`PivSession::with_transaction`]/[`with_transaction_debug`], both of which call it), and
     /// any operation that changes what's in a slot (`delete_key`,
     /// `move_key`, `reset`) invalidates the corresponding entries. Living in
     /// `PivSessionState` rather than a [`PivSession`] field of its own is
-    /// what lets a caller hand this straight to [`PivSession::open_cached`]
+    /// what lets a caller hand this straight to [`PivSession::with_cached_transaction`]
     /// instead of re-seeding each slot one at a time via `remember_pubkey`
     /// after the fact.
     pubkey_cache: PubkeyCache,
@@ -572,7 +574,7 @@ pub struct PivSessionState {
     /// every status read and every `slot_key_algorithm` certificate
     /// fallback.
     cert_cache: CertCache,
-    /// The card's CHUID, once read this session (and, via `open_cached`, any
+    /// The card's CHUID, once read this session (and, via `with_cached_transaction`, any
     /// later session on a proven-same card) — `None` until the first
     /// [`PivSession::read_chuid`] call, then that call's own result cached
     /// for the rest of the lineage. [`PivSession::new_chuid`] invalidates
@@ -636,12 +638,12 @@ impl PivSessionState {
     }
 }
 
-/// The PC/SC-layer identity [`PivSession::open_cached`] diffs a reconnect
+/// The PC/SC-layer identity [`PivSession::with_cached_transaction`] diffs a reconnect
 /// against, *before* ever talking to the PIV applet: which reader, which
 /// card-presence generation on that reader, and what ATR it answered with.
 /// Grouped into one type because the three are always read and compared
 /// together, in that order — a mismatch on an earlier field makes checking
-/// a later one pointless. This is `open_cached`'s *entire* reuse check now —
+/// a later one pointless. This is `with_cached_transaction`'s *entire* reuse check now —
 /// a raw SELECT-response diff used to run alongside it, but comparing that
 /// meant issuing a real SELECT PIV on every reconnect just to have something
 /// to compare, which defeated the point of a cache hit skipping SELECT
@@ -678,7 +680,7 @@ struct PcscIdentity {
     /// method's own doc), observed (via `Context::get_status_change`, no
     /// card connection needed) at the moment this identity was last
     /// confirmed current. Compared against a fresh reading on the next
-    /// [`PivSession::open_cached`] call for the same reader: any difference
+    /// [`PivSession::with_cached_transaction`] call for the same reader: any difference
     /// means a card was inserted or removed on this reader since, however
     /// briefly — including a removal immediately followed by a reinsertion
     /// that settles back into an outwardly identical `PRESENT` state.
@@ -698,7 +700,7 @@ struct PcscIdentity {
     /// even reachable through a stored [`State`] value; it has to be read
     /// via `event_count()` directly and kept as its own field.
     ///
-    /// `None` before this identity has ever been through `open_cached` (a
+    /// `None` before this identity has ever been through `with_cached_transaction` (a
     /// fresh [`Self::default`]) — treated there as "nothing to compare
     /// against", which just means this check can't vouch for reuse, same
     /// outcome as any other failed check.
@@ -727,9 +729,19 @@ impl PcscIdentity {
     }
 }
 
-/// An open PIV applet session on one PC/SC reader.
-pub struct PivSession {
-    card: Card,
+/// An open PIV applet session on one PC/SC reader — for exactly the
+/// duration of one [`Self::with_transaction_debug`]/
+/// [`Self::with_cached_transaction_debug`] call. `'tx` ties this session to
+/// the single PC/SC transaction that call holds open around it: every APDU
+/// this session issues, from the initial SELECT PIV through whatever the
+/// caller's closure goes on to do, is exclusive-access-locked against every
+/// other process (and every other thread's own session) on the same card.
+/// A session can no longer outlive that one call — see
+/// [`Self::with_transaction_debug`]'s doc for why that's the trade-off for
+/// getting a transaction-scoped `card` field at all, `pcsc::Transaction`
+/// being a borrow guard rather than an owned handle.
+pub struct PivSession<'tx> {
+    card: Transaction<'tx>,
     debug: bool,
     /// True when the reader negotiated T=0 with the card. T=0 cannot carry
     /// extended-length APDUs at all (ISO 7816-3 — the protocol has no way to
@@ -744,18 +756,18 @@ pub struct PivSession {
     /// from anything in [`PivSessionState`], which can carry a
     /// `select_response`/`identity` restored from a cache hit without this
     /// connection itself having sent the APDU that produced them. Starts
-    /// `false` on every fresh [`Self::connect`]; set only by the outcome of
-    /// an actual [`Self::select`] call. [`Self::ensure_selected`] is the sole
-    /// reader — every real PIV command reaches the card through
+    /// `false` on every fresh [`Self::from_transaction`]; set only by the
+    /// outcome of an actual [`Self::select`] call. [`Self::ensure_selected`]
+    /// is the sole reader — every real PIV command reaches the card through
     /// [`Self::transmit_full`], which checks this first and issues the
     /// actual SELECT lazily, once, the first time it's `false`.
     applet_selected: bool,
     /// Everything about this session that's expensive to resolve and safe to
     /// carry to a later session on the same card — see [`PivSessionState`].
-    /// [`Self::open`]/[`Self::open_with_debug`] always start this from
-    /// [`PivSessionState::default`]; [`Self::open_cached`] is the one
-    /// constructor that can seed it from a caller-held copy instead of
-    /// resolving from scratch.
+    /// [`Self::with_transaction`]/[`Self::with_transaction_debug`] always
+    /// start this from [`PivSessionState::default`]; [`Self::with_cached_transaction`]
+    /// is the one constructor that can seed it from a caller-held copy
+    /// instead of resolving from scratch.
     state: PivSessionState,
 }
 
@@ -1122,7 +1134,7 @@ fn pcsc_event_count_unchanged(cached: Option<u32>, fresh: Option<u32>) -> bool {
     matches!((cached, fresh), (Some(c), Some(f)) if c == f)
 }
 
-/// [`PivSession::open_cached`]'s reuse decision as a pure function: both of
+/// [`PivSession::with_cached_transaction`]'s reuse decision as a pure function: both of
 /// its independent checks must agree, or the cache is not trusted —
 /// `pcsc_trustworthy` (is this fresh PC/SC reading even usable, via
 /// [`pcsc_reading_usable`]) and `pcsc_identity_matches` (reader name, event
@@ -1136,64 +1148,107 @@ fn piv_session_cache_reusable(pcsc_trustworthy: bool, pcsc_identity_matches: boo
     pcsc_trustworthy && pcsc_identity_matches
 }
 
-impl PivSession {
-    /// Connect to `reader_name` and SELECT the PIV application. Returns
-    /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
-    /// Equivalent to [`Self::open_with_debug`]`(reader_name, false)` — see
-    /// that constructor's doc for why a caller that wants `--debug`-style
-    /// tracing of *this very SELECT* has to ask for it here, up front,
-    /// rather than via [`Self::set_debug`] afterward.
-    pub fn open(reader_name: &str) -> Result<Self, TransportError> {
-        Self::open_with_debug(reader_name, false)
+impl<'tx> PivSession<'tx> {
+    /// Connect to `reader_name`, SELECT the PIV application, and run `f` —
+    /// the entire session — with every APDU it issues, from that initial
+    /// SELECT through whatever `f` goes on to do, wrapped in one PC/SC
+    /// transaction. Returns [`TransportError::NoPivApplet`] when the card has
+    /// no PIV applet. Equivalent to [`Self::with_transaction_debug`]`(reader_name,
+    /// false, f)` — see that constructor's doc for why a caller that wants
+    /// `--debug`-style tracing of *this very SELECT* has to ask for it here,
+    /// up front, rather than via [`Self::set_debug`] inside `f`, and for why
+    /// a session can no longer outlive this one call.
+    ///
+    /// `f`'s error type `E` only needs [`From<TransportError>`] — not to be
+    /// `TransportError` itself — so a caller whose own error type already
+    /// covers other failures (a CLI command's `Box<dyn std::error::Error>`,
+    /// say) can freely mix `?` on session methods with `?` on anything else
+    /// inside `f`, exactly as it could before this session lived inside a
+    /// closure.
+    pub fn with_transaction<R, E: From<TransportError>>(
+        reader_name: &str,
+        f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
+    ) -> Result<R, E> {
+        Self::with_transaction_debug(reader_name, false, f)
     }
 
-    /// [`Self::open`], but with per-APDU stderr tracing already enabled for
-    /// the initial SELECT this constructor itself issues. `open` followed by
-    /// [`Self::set_debug`] — the only other way to turn tracing on — is
-    /// always one APDU too late for that: the SELECT has already happened by
-    /// the time `set_debug` runs, so it silently never appears in a
-    /// `--debug` trace. Front ends that know their debug flag before opening
-    /// (which is all of them — it comes from a CLI flag or a GUI setting,
-    /// not from anything the card says) should call this instead of the
-    /// open-then-set_debug pattern.
-    pub fn open_with_debug(reader_name: &str, debug: bool) -> Result<Self, TransportError> {
+    /// [`Self::with_transaction`], but with per-APDU stderr tracing already
+    /// enabled for the initial SELECT this constructor itself issues.
+    /// `with_transaction` followed by [`Self::set_debug`] inside `f` — the
+    /// only other way to turn tracing on — is always one APDU too late for
+    /// that: the SELECT has already happened by the time `f` runs, so it
+    /// silently never appears in a `--debug` trace. Front ends that know
+    /// their debug flag before opening (which is all of them — it comes from
+    /// a CLI flag or a GUI setting, not from anything the card says) should
+    /// call this instead of `with_transaction` plus a `set_debug` inside `f`.
+    ///
+    /// A session can no longer outlive a single call the way it once could:
+    /// `pcsc::Transaction` is a borrow guard over `&mut Card`, not an owned
+    /// handle, so the only way for a `PivSession` to hold one for its entire
+    /// life is for that life to be exactly the span of one function call —
+    /// this one. The `Card` itself, and the [`Transaction`] begun on it, live
+    /// here as locals; `session` only ever borrows the transaction, and `f`
+    /// only ever borrows `session`. The transaction begins right after
+    /// connecting, before the first APDU (SELECT included), and is
+    /// guaranteed to end before this function returns — successfully,
+    /// erroring out of `f`, or unwinding through it — because
+    /// [`pcsc::Transaction`]'s own `Drop` issues `SCardEndTransaction`
+    /// unconditionally when `session` goes out of scope, which happens no
+    /// matter how `f` exits. That closes the gap the old
+    /// open-then-drop-whenever-the-caller-feels-like-it shape left open:
+    /// another process (or another thread's own Molto2/OATH/PIV session)
+    /// could otherwise interleave a command between two of this session's
+    /// own APDUs.
+    pub fn with_transaction_debug<R, E: From<TransportError>>(
+        reader_name: &str,
+        debug: bool,
+        f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
+    ) -> Result<R, E> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let mut session = Self::connect(&ctx, &cstr, reader_name, debug)?;
+        let mut card = ctx
+            .connect(&cstr, ShareMode::Shared, Protocols::ANY)
+            .map_err(TransportError::from)?;
+        let txn = card.transaction().map_err(TransportError::from)?;
+        let mut session = Self::from_transaction(txn, reader_name, debug);
         session.select()?;
         session.fingerprint();
-        Ok(session)
+        f(&mut session)
     }
 
-    /// Connect to `reader` (`reader_name`, already-converted to a `CStr` by
-    /// the caller) on an already-established `ctx`, starting from a wholly
-    /// fresh [`PivSessionState`] — except for `state.pcsc_identity.reader_name`,
-    /// seeded with `reader_name` right away so it's correct even if a caller
-    /// never goes on to populate the rest (see [`PcscIdentity::reader_name`]'s
-    /// doc for why it's checked ahead of everything else). The shared first
-    /// half of [`Self::open_with_debug`] and [`Self::open_cached_with_debug`].
+    /// Build a fresh, unselected [`PivSession`] around `txn` — an
+    /// already-begun transaction on an already-connected card — starting
+    /// from a wholly fresh [`PivSessionState`] except for
+    /// `state.pcsc_identity.reader_name`, seeded with `reader_name` right
+    /// away so it's correct even if a caller never goes on to populate the
+    /// rest (see [`PcscIdentity::reader_name`]'s doc for why it's checked
+    /// ahead of everything else). The shared second half of
+    /// [`Self::with_transaction_debug`] and
+    /// [`Self::with_cached_transaction_debug`], both of which begin the
+    /// transaction themselves — before this runs, so it covers the SELECT
+    /// too — and connect the card that backs it.
     ///
-    /// Deliberately does *not* SELECT PIV — that decision now belongs to each
-    /// caller: [`Self::open_with_debug`] always wants a fresh identity, so it
-    /// selects and fingerprints right after this returns; a plain
-    /// `let mut session = Self::connect(...)?;` at the top of
-    /// [`Self::open_cached_with_debug`] does the same. That one, though, only
-    /// when its own cheap PC/SC-layer check doesn't pan out — otherwise it
-    /// leaves SELECT for [`Self::ensure_selected`] to issue lazily, on
-    /// whatever real PIV command actually needs it first. `applet_selected`
-    /// starts `false` here regardless of which path the caller takes next —
-    /// it's set only by an actual, successful [`Self::select`] call.
-    fn connect(
-        ctx: &Context,
-        reader: &std::ffi::CStr,
+    /// Deliberately does *not* SELECT PIV — that decision belongs to each
+    /// caller: [`Self::with_transaction_debug`] always wants a fresh
+    /// identity, so it selects and fingerprints right after this returns; a
+    /// plain `let mut session = Self::from_transaction(...);` at the top of
+    /// [`Self::with_cached_transaction_debug`] does the same. That one,
+    /// though, only when its own cheap PC/SC-layer check doesn't pan out —
+    /// otherwise it leaves SELECT for [`Self::ensure_selected`] to issue
+    /// lazily, on whatever real PIV command actually needs it first (still
+    /// inside the very same transaction — that guard was already begun
+    /// before this call, regardless of which path the caller takes next).
+    /// `applet_selected` starts `false` here regardless, too — it's set only
+    /// by an actual, successful [`Self::select`] call.
+    fn from_transaction<'a>(
+        txn: Transaction<'a>,
         reader_name: &str,
         debug: bool,
-    ) -> Result<Self, TransportError> {
-        let card = ctx.connect(reader, ShareMode::Shared, Protocols::ANY)?;
-        let t0 = negotiated_t0(&card);
-        Ok(Self {
-            card,
+    ) -> PivSession<'a> {
+        let t0 = negotiated_t0(&txn);
+        PivSession {
+            card: txn,
             debug,
             t0,
             applet_selected: false,
@@ -1204,29 +1259,34 @@ impl PivSession {
                 },
                 ..Default::default()
             },
-        })
+        }
     }
 
-    /// [`Self::open`], but first try to reuse `cached` — a
+    /// [`Self::with_transaction`], but first try to reuse `cached` — a
     /// [`PivSessionState`] a caller is holding from an earlier session on
     /// the same reader — instead of resolving the applet identity from
-    /// scratch. Equivalent to [`Self::open_cached_with_debug`]`(reader_name,
-    /// cached, false)` — see that constructor's doc for the full validation
-    /// story and [`Self::open_with_debug`]'s doc for why `--debug` tracing
-    /// has to be requested here rather than via [`Self::set_debug`]
-    /// afterward.
-    pub fn open_cached(reader_name: &str, cached: PivSessionState) -> Result<Self, TransportError> {
-        Self::open_cached_with_debug(reader_name, cached, false)
+    /// scratch. Equivalent to [`Self::with_cached_transaction_debug`]`(reader_name,
+    /// cached, false, f)` — see that constructor's doc for the full
+    /// validation story and [`Self::with_transaction_debug`]'s doc for why
+    /// `--debug` tracing has to be requested here rather than via
+    /// [`Self::set_debug`] inside `f`.
+    pub fn with_cached_transaction<R, E: From<TransportError>>(
+        reader_name: &str,
+        cached: PivSessionState,
+        f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
+    ) -> Result<R, E> {
+        Self::with_cached_transaction_debug(reader_name, cached, false, f)
     }
 
     /// This session's current [`PivSessionState`] — everything cached or
     /// resolved so far (identity, applet cache, public-key cache) plus
-    /// whatever validity anchors [`Self::open_cached`] last recorded (unset
-    /// on a session opened via the plain [`Self::open`]/[`Self::open_with_debug`],
-    /// which never populates them). A caller that wants a later session on
-    /// this same reader to be able to skip re-resolving identity should
-    /// clone this out before this session drops and hand it to
-    /// `open_cached` next time.
+    /// whatever validity anchors [`Self::with_cached_transaction`] last
+    /// recorded (unset on a session opened via the plain
+    /// [`Self::with_transaction`]/[`Self::with_transaction_debug`], which
+    /// never populates them). A caller that wants a later session on this
+    /// same reader to be able to skip re-resolving identity should read this
+    /// from inside `f`, before it returns, and hand it to
+    /// `with_cached_transaction` next time.
     pub fn state(&self) -> PivSessionState {
         self.state.clone()
     }
@@ -1235,10 +1295,10 @@ impl PivSession {
     /// the public face of `applet_selected`. `false` means every accessor
     /// called on this session so far ([`Self::status_detailed`]/
     /// [`Self::status`] included) was answered entirely out of the state
-    /// [`Self::open_cached`] carried in, with no live APDU exchanged; a
-    /// caller that wants to tell a genuine card read apart from a fully
-    /// cache-served one (for logging, say) reads this right after making its
-    /// calls, before anything later might trigger the lazy SELECT
+    /// [`Self::with_cached_transaction`] carried in, with no live APDU
+    /// exchanged; a caller that wants to tell a genuine card read apart from
+    /// a fully cache-served one (for logging, say) reads this right after
+    /// making its calls, before anything later might trigger the lazy SELECT
     /// [`Self::ensure_selected`] issues. Once true, it stays true for the
     /// life of the session — there's no way to "un-select" PIV, so a caller
     /// checking this after a mixed session (some fields cached, one not)
@@ -1247,9 +1307,9 @@ impl PivSession {
         self.applet_selected
     }
 
-    /// [`Self::open_cached`], but with per-APDU stderr tracing already
-    /// enabled for whatever APDUs this call and the session it returns go on
-    /// to issue.
+    /// [`Self::with_cached_transaction`], but with per-APDU stderr tracing
+    /// already enabled for whatever APDUs this call and the session it hands
+    /// to `f` go on to issue.
     ///
     /// One cheap check gates reuse of `cached`, proxying "is this reconnect
     /// still talking to the same physical card, on the same reader, that
@@ -1266,12 +1326,12 @@ impl PivSession {
     /// the entire point of a cache hit being allowed to skip SELECT.
     ///
     /// A stale check falls back to exactly the same resolution
-    /// [`Self::open_with_debug`] always does — SELECT, then fingerprint,
-    /// right here, immediately — so a caller can always reach for this
-    /// instead of `open`, with no downside beyond the (cheap) validation
-    /// check when the cache turns out to be stale, and no risk of ever
-    /// trusting a different card's identity because the reader name happened
-    /// to match.
+    /// [`Self::with_transaction_debug`] always does — SELECT, then
+    /// fingerprint, right here, immediately — so a caller can always reach
+    /// for this instead of `with_transaction`, with no downside beyond the
+    /// (cheap) validation check when the cache turns out to be stale, and no
+    /// risk of ever trusting a different card's identity because the reader
+    /// name happened to match.
     ///
     /// A check that *does* pass skips SELECT entirely for now: `cached` —
     /// its `select_response`/`identity`/every other read cache — is trusted
@@ -1279,28 +1339,30 @@ impl PivSession {
     /// SELECT PIV this session eventually needs is left for
     /// [`Self::ensure_selected`] to issue lazily, immediately before
     /// whatever the first genuine PIV command this session runs turns out to
-    /// be. A caller that opens a session and only reads already-cached state
-    /// (or does nothing at all with it) never pays for that SELECT.
+    /// be. A caller whose `f` only reads already-cached state (or does
+    /// nothing at all with the session) never pays for that SELECT.
     ///
-    /// Returns the opened session, same as [`Self::open_with_debug`] — its
-    /// [`Self::state`] is `cached` unchanged (validation anchors refreshed to
-    /// this connection's own readings) when reused, or a freshly resolved
-    /// one when it wasn't. A caller that wants to keep caching across
-    /// sessions should read `state()` back out whenever it's done with this
-    /// session (typically right before it drops, after whatever
-    /// authenticate/write/status calls it went on to make — those mutate
-    /// `state` further, e.g. `generate_key`'s own `pubkey_cache` update, so
-    /// the state worth keeping is whatever this session ends with, not the
-    /// snapshot from the moment it opened) and store that back over whatever
-    /// it held before, so the *next* `open_cached` call has an up-to-date
-    /// anchor to diff against either way — even on this same, unchanged
-    /// card, letting `cached` go stale here would just mean the next call
-    /// re-validates from an older baseline than it needs to.
-    pub fn open_cached_with_debug(
+    /// Runs `f` against the opened session, same as
+    /// [`Self::with_transaction_debug`] — its [`Self::state`] is `cached`
+    /// unchanged (validation anchors refreshed to this connection's own
+    /// readings) when reused, or a freshly resolved one when it wasn't. A
+    /// caller that wants to keep caching across sessions should read
+    /// `state()` from inside `f`, right before `f` returns — after whatever
+    /// authenticate/write/status calls it went on to make, since those
+    /// mutate `state` further (e.g. `generate_key`'s own `pubkey_cache`
+    /// update), so the state worth keeping is whatever the session ends
+    /// with, not the snapshot from the moment it opened — and store that
+    /// back over whatever it held before, so the *next*
+    /// `with_cached_transaction` call has an up-to-date anchor to diff
+    /// against either way — even on this same, unchanged card, letting
+    /// `cached` go stale here would just mean the next call re-validates
+    /// from an older baseline than it needs to.
+    pub fn with_cached_transaction_debug<R, E: From<TransportError>>(
         reader_name: &str,
         cached: PivSessionState,
         debug: bool,
-    ) -> Result<Self, TransportError> {
+        f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
+    ) -> Result<R, E> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
@@ -1316,49 +1378,58 @@ impl PivSession {
                     (Some(states[0].event_state()), Some(states[0].event_count()))
                 }
                 // Can't ask PC/SC at all (service hiccup, reader mid-teardown) —
-                // the `connect` just below surfaces the real error if the reader
+                // the connect just below surfaces the real error if the reader
                 // is genuinely gone; here, just don't trust the cache.
                 Err(_) => (None, None),
             };
         let pcsc_trustworthy = pcsc_reading_usable(fresh_state);
 
         // The ATR needs a live connection either way, so make one regardless
-        // of what the card-free check found — but this deliberately doesn't
-        // SELECT: that's deferred to whichever branch below actually needs
-        // it, immediately, rather than paid for on every reconnect up front.
-        let mut session = Self::connect(&ctx, &cstr, reader_name, debug)?;
+        // of what the card-free check found, and begin the transaction on it
+        // immediately — before either branch below sends anything, SELECT
+        // included, so the transaction genuinely covers the whole session
+        // regardless of which branch runs.
+        let mut card = ctx
+            .connect(&cstr, ShareMode::Shared, Protocols::ANY)
+            .map_err(TransportError::from)?;
+        let txn = card.transaction().map_err(TransportError::from)?;
+        let mut session = Self::from_transaction(txn, reader_name, debug);
         let fresh_identity = PcscIdentity {
             reader_name: reader_name.to_owned(),
             event_count: fresh_event_count,
             atr: session.atr(),
         };
 
-        if piv_session_cache_reusable(pcsc_trustworthy, cached.pcsc_identity.matches(&fresh_identity)) {
+        if piv_session_cache_reusable(
+            pcsc_trustworthy,
+            cached.pcsc_identity.matches(&fresh_identity),
+        ) {
             session.state = cached;
         } else {
             session.select()?;
             session.fingerprint();
         }
         // Whichever branch ran, this connect's own readings are the
-        // freshest anchor available for the *next* `open_cached` call on
-        // this reader — store them regardless of whether this call reused
-        // `cached` or resolved fresh.
+        // freshest anchor available for the *next* `with_cached_transaction`
+        // call on this reader — store them regardless of whether this call
+        // reused `cached` or resolved fresh.
         session.state.pcsc_identity = fresh_identity;
 
-        Ok(session)
+        f(&mut session)
     }
 
     /// Rebuild every piece of in-session state this session caches or
     /// resolves from the card, from nothing — the same "start over"
-    /// sequence [`Self::open_with_debug`] itself runs to build a session in
-    /// the first place, just replayed on the existing PC/SC connection
-    /// (`card`/`t0`/`debug` are per-connection, not per-selected-applet
-    /// state, so they're untouched here) rather than reconnecting. This is
-    /// exactly what every front end's "Refresh" action already does today by
-    /// discarding its whole [`PivSession`] and calling
-    /// [`Self::open`]/[`Self::open_with_debug`] again (see e.g. `keyroost`'s
-    /// `App::load_piv_status`) — this method is that same rebuild, available
-    /// to run in place on a session a caller is already holding.
+    /// sequence [`Self::with_transaction_debug`] itself runs to build a
+    /// session in the first place, just replayed on the existing PC/SC
+    /// connection and transaction (`card`/`t0`/`debug` are per-connection,
+    /// not per-selected-applet state, so they're untouched here) rather than
+    /// reconnecting. This is exactly what every front end's "Refresh" action
+    /// already does today by discarding its whole [`PivSession`] and calling
+    /// [`Self::with_transaction`]/[`Self::with_transaction_debug`] again (see
+    /// e.g. `keyroost`'s `App::load_piv_status`) — this method is that same
+    /// rebuild, available to run in place on a session a caller is already
+    /// holding.
     ///
     /// Replaces [`Self::state`](`PivSessionState`) with a fresh
     /// [`PivSessionState::default`] — dropping `pubkey_cache`,
@@ -1377,11 +1448,11 @@ impl PivSession {
     ///
     /// Leaving `pcsc_identity` at its reset-away default (rather than, say,
     /// re-querying it here to seed a fully-populated state) costs nothing
-    /// beyond a guaranteed cache miss on whichever `open_cached` call is the
-    /// very next one to see a [`PivSessionState`] extracted from this
-    /// session: that call always records a fresh reading itself regardless
-    /// of what it found (see its doc), so the miss is a one-time thing, not
-    /// a standing inefficiency.
+    /// beyond a guaranteed cache miss on whichever `with_cached_transaction`
+    /// call is the very next one to see a [`PivSessionState`] extracted from
+    /// this session: that call always records a fresh reading itself
+    /// regardless of what it found (see its doc), so the miss is a one-time
+    /// thing, not a standing inefficiency.
     ///
     /// That one resolution already covers a `HidCrescendo` fingerprint's own
     /// serial: [`Self::applet_fingerprint`]'s `HidCrescendo` arms call
@@ -1403,8 +1474,9 @@ impl PivSession {
     }
 
     /// Enable per-APDU stderr tracing. Only affects APDUs sent *after* this
-    /// call — [`Self::open_with_debug`] is the way to also trace the initial
-    /// SELECT [`Self::open`]/this constructor issues before returning.
+    /// call — [`Self::with_transaction_debug`] is the way to also trace the
+    /// initial SELECT [`Self::with_transaction`]/that constructor issues
+    /// before `f` ever runs.
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;
     }
@@ -1514,28 +1586,21 @@ impl PivSession {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
-                let t0 = negotiated_t0(&card);
-                let mut session = PivSession {
-                    card,
-                    debug: false,
-                    t0,
-                    applet_selected: false,
-                    state: PivSessionState {
-                        pcsc_identity: PcscIdentity {
-                            reader_name: name.to_string_lossy().into_owned(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                };
-                if session.select().is_ok() {
-                    out.push(name.to_string_lossy().into_owned());
+            if let Ok(mut card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+                if let Ok(txn) = card.transaction() {
+                    let mut session = Self::from_transaction(txn, &name.to_string_lossy(), false);
+                    if session.select().is_ok() {
+                        out.push(name.to_string_lossy().into_owned());
+                    }
+                    // `session` — and the transaction it holds — drops here,
+                    // at the end of this block. `Transaction`'s own `Drop`
+                    // always ends it with `LeaveCard`, before the disconnect
+                    // below runs.
                 }
                 // Release without resetting (pcsc's `Drop` hard-codes
                 // ResetCard) — probing must not disturb cards other sessions
                 // hold open.
-                let _ = session.card.disconnect(pcsc::Disposition::LeaveCard);
+                let _ = card.disconnect(pcsc::Disposition::LeaveCard);
             }
         }
         Ok(out)
@@ -1576,7 +1641,7 @@ impl PivSession {
     }
 
     /// Issue the real SELECT PIV APDU if this connection hasn't already sent
-    /// one — the lazy half of [`Self::open_cached_with_debug`]'s validity
+    /// one — the lazy half of [`Self::with_cached_transaction_debug`]'s validity
     /// check: the cheap PC/SC-layer identity comparison runs immediately at
     /// connect time, but the SELECT itself (and the round trip it costs) is
     /// deferred until something actually needs PIV selected.
@@ -2099,7 +2164,7 @@ impl PivSession {
     ///
     /// On a *later* call — another slot method reusing what this one just
     /// resolved, a tab reselect, or a whole new session on the same card via
-    /// [`Self::open_cached`] — even that one read each may not happen at
+    /// [`Self::with_cached_transaction`] — even that one read each may not happen at
     /// all: [`Self::read_certificate`]/[`Self::cached_slot_key`]/
     /// [`Self::slot_policy`] each check [`CertCache`]/[`PubkeyCache`]/
     /// [`PolicyCache`] first, so a slot whose key and certificate haven't
@@ -2424,7 +2489,9 @@ impl PivSession {
         if let Some((pin, touch)) = md.as_ref().and_then(|m| m.policy) {
             if let (Some(pin), Some(touch)) = (PinPolicy::from_id(pin), TouchPolicy::from_id(touch))
             {
-                self.state.policy_cache.remember(key_ref, Some((pin, touch)));
+                self.state
+                    .policy_cache
+                    .remember(key_ref, Some((pin, touch)));
             }
         }
         md.as_ref()
@@ -2911,7 +2978,8 @@ impl PivSession {
     fn aca_xauth_unlock(&mut self, key: &[u8]) -> Result<(), TransportError> {
         use keyroost_piv::fingerprint;
 
-        let (challenge, sw) = self.transmit_full_raw(&fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE)?;
+        let (challenge, sw) =
+            self.transmit_full_raw(&fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE)?;
         ok_or_apdu("piv aca get challenge", sw)?;
         let alg = fingerprint::hid_crescendo_xauth_key_alg(challenge.len())
             .ok_or(TransportError::PivBadKeyLength)?;
@@ -3666,7 +3734,7 @@ impl PivSession {
     ///
     /// Invalidates [`PivSessionState::chuid_cache`] back to "unresolved" on
     /// success, so the next [`Self::read_chuid`] — this session or, via
-    /// `open_cached`, a later one on the same card — sees the value just
+    /// `with_cached_transaction`, a later one on the same card — sees the value just
     /// written instead of whatever was cached before it.
     pub fn new_chuid(
         &mut self,
@@ -3915,7 +3983,7 @@ impl PivSession {
     ///
     /// 1. [`PolicyCache`] — already resolved this lineage, by either of the
     ///    two channels below, this session or an earlier one carried in via
-    ///    [`Self::open_cached`]. Skips both remaining steps for a value
+    ///    [`Self::with_cached_transaction`]. Skips both remaining steps for a value
     ///    that's fixed for the life of the slot's current key.
     /// 2. GET METADATA's own `policy` field, via [`Self::cached_slot_key`] —
     ///    shares that method's one live round trip (and its own
@@ -3961,7 +4029,9 @@ impl PivSession {
                     .ok()
                     .flatten()
             })
-            .and_then(|(pin, touch)| Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?)));
+            .and_then(|(pin, touch)| {
+                Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?))
+            });
         self.state.policy_cache.remember(key_ref, policy);
         policy
     }
@@ -4157,13 +4227,14 @@ impl PivSession {
     /// handed to it via `remember_pubkey`), or a cached entry was invalidated
     /// by a later delete/move/reset.
     pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
-        self.confirmed_slot_key(slot).ok_or(TransportError::MalformedResponse(
-            "slot has no key, or GET METADATA doesn't name this slot's key and \
+        self.confirmed_slot_key(slot)
+            .ok_or(TransportError::MalformedResponse(
+                "slot has no key, or GET METADATA doesn't name this slot's key and \
              the key material wasn't handed to this session — run `piv generate-key` \
              on this slot in this same session, or pass its previously saved \
              key material to this command, so it can be cached for \
              CSR/self-sign",
-        ))
+            ))
     }
 
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
@@ -5250,7 +5321,7 @@ fn chain_upfront_for(t0: bool, forced: bool) -> bool {
     forced || t0
 }
 
-impl PivSession {
+impl<'tx> PivSession<'tx> {
     fn chain_upfront(&self) -> bool {
         chain_upfront_for(self.t0, force_chaining())
     }
@@ -6850,13 +6921,15 @@ mod chain_upfront_rule {
     }
 }
 
-/// [`open_cached`](PivSession::open_cached)'s cache-validity rules, pinned
+/// [`with_cached_transaction`](PivSession::with_cached_transaction)'s cache-validity rules, pinned
 /// without a card via the pure functions the live checks feed into — see
 /// [`pcsc_reading_usable`], [`pcsc_event_count_unchanged`], and
 /// [`piv_session_cache_reusable`].
 #[cfg(test)]
 mod open_cached_validity_rules {
-    use super::{pcsc_event_count_unchanged, pcsc_reading_usable, piv_session_cache_reusable, State};
+    use super::{
+        pcsc_event_count_unchanged, pcsc_reading_usable, piv_session_cache_reusable, State,
+    };
 
     #[test]
     fn an_unreadable_reader_status_is_never_usable() {
@@ -6898,7 +6971,7 @@ mod open_cached_validity_rules {
 
     #[test]
     fn a_different_event_count_is_a_change() {
-        // The exact case `open_cached` exists to catch: a removal — even one
+        // The exact case `with_cached_transaction` exists to catch: a removal — even one
         // immediately followed by a reinsertion that settles back into an
         // outwardly identical `PRESENT` state — always bumps this counter.
         assert!(!pcsc_event_count_unchanged(Some(5), Some(6)));
