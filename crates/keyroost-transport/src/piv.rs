@@ -479,7 +479,7 @@ enum HidCrescendoXauthKeyOp<'a> {
 /// reconnect against to prove that later session really is still talking to
 /// the same card before trusting any of the rest.
 ///
-/// A fresh [`PivSession::with_transaction`]/[`PivSession::with_transaction_debug`] always
+/// A fresh [`PivSession::with_transaction`]/[`PivSession::with_transaction_traced`] always
 /// starts from [`Self::default`] and resolves everything from nothing —
 /// there is still no on-disk or cross-process persistence.
 /// [`PivSession::with_cached_transaction`] is the one constructor where a caller-held
@@ -487,7 +487,7 @@ enum HidCrescendoXauthKeyOp<'a> {
 /// reader) can skip that resolution — and only after its own checks prove
 /// the card hasn't changed since this copy was captured. A caller that
 /// doesn't keep one around loses nothing beyond that shortcut: `with_transaction`/
-/// `with_transaction_debug` behave exactly as before.
+/// `with_transaction_traced` behave exactly as before.
 #[derive(Clone, Default)]
 pub struct PivSessionState {
     /// The PC/SC-layer identity (reader name, card insertion/removal
@@ -547,7 +547,7 @@ pub struct PivSessionState {
     ///   whose declared public key needs to match what actually signs it).
     ///
     /// Cleared by [`PivSession::refresh`] (and so, transitively, by a fresh
-    /// [`PivSession::with_transaction`]/[`with_transaction_debug`], both of which call it), and
+    /// [`PivSession::with_transaction`]/[`with_transaction_traced`], both of which call it), and
     /// any operation that changes what's in a slot (`delete_key`,
     /// `move_key`, `reset`) invalidates the corresponding entries. Living in
     /// `PivSessionState` rather than a [`PivSession`] field of its own is
@@ -730,19 +730,19 @@ impl PcscIdentity {
 }
 
 /// An open PIV applet session on one PC/SC reader — for exactly the
-/// duration of one [`Self::with_transaction_debug`]/
-/// [`Self::with_cached_transaction_debug`] call. `'tx` ties this session to
+/// duration of one [`Self::with_transaction_traced`]/
+/// [`Self::with_cached_transaction_traced`] call. `'tx` ties this session to
 /// the single PC/SC transaction that call holds open around it: every APDU
 /// this session issues, from the initial SELECT PIV through whatever the
 /// caller's closure goes on to do, is exclusive-access-locked against every
 /// other process (and every other thread's own session) on the same card.
 /// A session can no longer outlive that one call — see
-/// [`Self::with_transaction_debug`]'s doc for why that's the trade-off for
+/// [`Self::with_transaction_traced`]'s doc for why that's the trade-off for
 /// getting a transaction-scoped `card` field at all, `pcsc::Transaction`
 /// being a borrow guard rather than an owned handle.
 pub struct PivSession<'tx> {
     card: Transaction<'tx>,
-    debug: bool,
+    traced: bool,
     /// True when the reader negotiated T=0 with the card. T=0 cannot carry
     /// extended-length APDUs at all (ISO 7816-3 — the protocol has no way to
     /// frame them), so every large-payload command must be chained from the
@@ -764,7 +764,7 @@ pub struct PivSession<'tx> {
     applet_selected: bool,
     /// Everything about this session that's expensive to resolve and safe to
     /// carry to a later session on the same card — see [`PivSessionState`].
-    /// [`Self::with_transaction`]/[`Self::with_transaction_debug`] always
+    /// [`Self::with_transaction`]/[`Self::with_transaction_traced`] always
     /// start this from [`PivSessionState::default`]; [`Self::with_cached_transaction`]
     /// is the one constructor that can seed it from a caller-held copy
     /// instead of resolving from scratch.
@@ -1153,10 +1153,10 @@ impl<'tx> PivSession<'tx> {
     /// the entire session — with every APDU it issues, from that initial
     /// SELECT through whatever `f` goes on to do, wrapped in one PC/SC
     /// transaction. Returns [`TransportError::NoPivApplet`] when the card has
-    /// no PIV applet. Equivalent to [`Self::with_transaction_debug`]`(reader_name,
+    /// no PIV applet. Equivalent to [`Self::with_transaction_traced`]`(reader_name,
     /// false, f)` — see that constructor's doc for why a caller that wants
     /// `--debug`-style tracing of *this very SELECT* has to ask for it here,
-    /// up front, rather than via [`Self::set_debug`] inside `f`, and for why
+    /// up front, rather than via [`Self::set_traced`] inside `f`, and for why
     /// a session can no longer outlive this one call.
     ///
     /// `f`'s error type `E` only needs [`From<TransportError>`] — not to be
@@ -1169,18 +1169,18 @@ impl<'tx> PivSession<'tx> {
         reader_name: &str,
         f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
     ) -> Result<R, E> {
-        Self::with_transaction_debug(reader_name, false, f)
+        Self::with_transaction_traced(reader_name, false, f)
     }
 
     /// [`Self::with_transaction`], but with per-APDU stderr tracing already
     /// enabled for the initial SELECT this constructor itself issues.
-    /// `with_transaction` followed by [`Self::set_debug`] inside `f` — the
+    /// `with_transaction` followed by [`Self::set_traced`] inside `f` — the
     /// only other way to turn tracing on — is always one APDU too late for
     /// that: the SELECT has already happened by the time `f` runs, so it
     /// silently never appears in a `--debug` trace. Front ends that know
     /// their debug flag before opening (which is all of them — it comes from
     /// a CLI flag or a GUI setting, not from anything the card says) should
-    /// call this instead of `with_transaction` plus a `set_debug` inside `f`.
+    /// call this instead of `with_transaction` plus a `set_traced` inside `f`.
     ///
     /// A session can no longer outlive a single call the way it once could:
     /// `pcsc::Transaction` is a borrow guard over `&mut Card`, not an owned
@@ -1199,9 +1199,9 @@ impl<'tx> PivSession<'tx> {
     /// another process (or another thread's own Molto2/OATH/PIV session)
     /// could otherwise interleave a command between two of this session's
     /// own APDUs.
-    pub fn with_transaction_debug<R, E: From<TransportError>>(
+    pub fn with_transaction_traced<R, E: From<TransportError>>(
         reader_name: &str,
-        debug: bool,
+        traced: bool,
         f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
     ) -> Result<R, E> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
@@ -1211,7 +1211,7 @@ impl<'tx> PivSession<'tx> {
             .connect(&cstr, ShareMode::Shared, Protocols::ANY)
             .map_err(TransportError::from)?;
         let txn = card.transaction().map_err(TransportError::from)?;
-        let mut session = Self::from_transaction(txn, reader_name, debug);
+        let mut session = Self::from_transaction(txn, reader_name, traced);
         session.select()?;
         session.fingerprint();
         f(&mut session)
@@ -1224,16 +1224,16 @@ impl<'tx> PivSession<'tx> {
     /// away so it's correct even if a caller never goes on to populate the
     /// rest (see [`PcscIdentity::reader_name`]'s doc for why it's checked
     /// ahead of everything else). The shared second half of
-    /// [`Self::with_transaction_debug`] and
-    /// [`Self::with_cached_transaction_debug`], both of which begin the
+    /// [`Self::with_transaction_traced`] and
+    /// [`Self::with_cached_transaction_traced`], both of which begin the
     /// transaction themselves — before this runs, so it covers the SELECT
     /// too — and connect the card that backs it.
     ///
     /// Deliberately does *not* SELECT PIV — that decision belongs to each
-    /// caller: [`Self::with_transaction_debug`] always wants a fresh
+    /// caller: [`Self::with_transaction_traced`] always wants a fresh
     /// identity, so it selects and fingerprints right after this returns; a
     /// plain `let mut session = Self::from_transaction(...);` at the top of
-    /// [`Self::with_cached_transaction_debug`] does the same. That one,
+    /// [`Self::with_cached_transaction_traced`] does the same. That one,
     /// though, only when its own cheap PC/SC-layer check doesn't pan out —
     /// otherwise it leaves SELECT for [`Self::ensure_selected`] to issue
     /// lazily, on whatever real PIV command actually needs it first (still
@@ -1244,12 +1244,12 @@ impl<'tx> PivSession<'tx> {
     fn from_transaction<'a>(
         txn: Transaction<'a>,
         reader_name: &str,
-        debug: bool,
+        traced: bool,
     ) -> PivSession<'a> {
         let t0 = negotiated_t0(&txn);
         PivSession {
             card: txn,
-            debug,
+            traced,
             t0,
             applet_selected: false,
             state: PivSessionState {
@@ -1265,24 +1265,24 @@ impl<'tx> PivSession<'tx> {
     /// [`Self::with_transaction`], but first try to reuse `cached` — a
     /// [`PivSessionState`] a caller is holding from an earlier session on
     /// the same reader — instead of resolving the applet identity from
-    /// scratch. Equivalent to [`Self::with_cached_transaction_debug`]`(reader_name,
+    /// scratch. Equivalent to [`Self::with_cached_transaction_traced`]`(reader_name,
     /// cached, false, f)` — see that constructor's doc for the full
-    /// validation story and [`Self::with_transaction_debug`]'s doc for why
+    /// validation story and [`Self::with_transaction_traced`]'s doc for why
     /// `--debug` tracing has to be requested here rather than via
-    /// [`Self::set_debug`] inside `f`.
+    /// [`Self::set_traced`] inside `f`.
     pub fn with_cached_transaction<R, E: From<TransportError>>(
         reader_name: &str,
         cached: PivSessionState,
         f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
     ) -> Result<R, E> {
-        Self::with_cached_transaction_debug(reader_name, cached, false, f)
+        Self::with_cached_transaction_traced(reader_name, cached, false, f)
     }
 
     /// This session's current [`PivSessionState`] — everything cached or
     /// resolved so far (identity, applet cache, public-key cache) plus
     /// whatever validity anchors [`Self::with_cached_transaction`] last
     /// recorded (unset on a session opened via the plain
-    /// [`Self::with_transaction`]/[`Self::with_transaction_debug`], which
+    /// [`Self::with_transaction`]/[`Self::with_transaction_traced`], which
     /// never populates them). A caller that wants a later session on this
     /// same reader to be able to skip re-resolving identity should read this
     /// from inside `f`, before it returns, and hand it to
@@ -1326,7 +1326,7 @@ impl<'tx> PivSession<'tx> {
     /// the entire point of a cache hit being allowed to skip SELECT.
     ///
     /// A stale check falls back to exactly the same resolution
-    /// [`Self::with_transaction_debug`] always does — SELECT, then
+    /// [`Self::with_transaction_traced`] always does — SELECT, then
     /// fingerprint, right here, immediately — so a caller can always reach
     /// for this instead of `with_transaction`, with no downside beyond the
     /// (cheap) validation check when the cache turns out to be stale, and no
@@ -1343,7 +1343,7 @@ impl<'tx> PivSession<'tx> {
     /// nothing at all with the session) never pays for that SELECT.
     ///
     /// Runs `f` against the opened session, same as
-    /// [`Self::with_transaction_debug`] — its [`Self::state`] is `cached`
+    /// [`Self::with_transaction_traced`] — its [`Self::state`] is `cached`
     /// unchanged (validation anchors refreshed to this connection's own
     /// readings) when reused, or a freshly resolved one when it wasn't. A
     /// caller that wants to keep caching across sessions should read
@@ -1357,10 +1357,10 @@ impl<'tx> PivSession<'tx> {
     /// against either way — even on this same, unchanged card, letting
     /// `cached` go stale here would just mean the next call re-validates
     /// from an older baseline than it needs to.
-    pub fn with_cached_transaction_debug<R, E: From<TransportError>>(
+    pub fn with_cached_transaction_traced<R, E: From<TransportError>>(
         reader_name: &str,
         cached: PivSessionState,
-        debug: bool,
+        traced: bool,
         f: impl FnOnce(&mut PivSession<'_>) -> Result<R, E>,
     ) -> Result<R, E> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
@@ -1393,7 +1393,7 @@ impl<'tx> PivSession<'tx> {
             .connect(&cstr, ShareMode::Shared, Protocols::ANY)
             .map_err(TransportError::from)?;
         let txn = card.transaction().map_err(TransportError::from)?;
-        let mut session = Self::from_transaction(txn, reader_name, debug);
+        let mut session = Self::from_transaction(txn, reader_name, traced);
         let fresh_identity = PcscIdentity {
             reader_name: reader_name.to_owned(),
             event_count: fresh_event_count,
@@ -1420,13 +1420,13 @@ impl<'tx> PivSession<'tx> {
 
     /// Rebuild every piece of in-session state this session caches or
     /// resolves from the card, from nothing — the same "start over"
-    /// sequence [`Self::with_transaction_debug`] itself runs to build a
+    /// sequence [`Self::with_transaction_traced`] itself runs to build a
     /// session in the first place, just replayed on the existing PC/SC
-    /// connection and transaction (`card`/`t0`/`debug` are per-connection,
+    /// connection and transaction (`card`/`t0`/`traced` are per-connection,
     /// not per-selected-applet state, so they're untouched here) rather than
     /// reconnecting. This is exactly what every front end's "Refresh" action
     /// already does today by discarding its whole [`PivSession`] and calling
-    /// [`Self::with_transaction`]/[`Self::with_transaction_debug`] again (see
+    /// [`Self::with_transaction`]/[`Self::with_transaction_traced`] again (see
     /// e.g. `keyroost`'s `App::load_piv_status`) — this method is that same
     /// rebuild, available to run in place on a session a caller is already
     /// holding.
@@ -1474,11 +1474,11 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Enable per-APDU stderr tracing. Only affects APDUs sent *after* this
-    /// call — [`Self::with_transaction_debug`] is the way to also trace the
+    /// call — [`Self::with_transaction_traced`] is the way to also trace the
     /// initial SELECT [`Self::with_transaction`]/that constructor issues
     /// before `f` ever runs.
-    pub fn set_debug(&mut self, on: bool) {
-        self.debug = on;
+    pub fn set_traced(&mut self, on: bool) {
+        self.traced = on;
     }
 
     /// Read a HID Crescendo unit's on-card printed serial number via
@@ -1641,7 +1641,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Issue the real SELECT PIV APDU if this connection hasn't already sent
-    /// one — the lazy half of [`Self::with_cached_transaction_debug`]'s validity
+    /// one — the lazy half of [`Self::with_cached_transaction_traced`]'s validity
     /// check: the cheap PC/SC-layer identity comparison runs immediately at
     /// connect time, but the SELECT itself (and the round trip it costs) is
     /// deferred until something actually needs PIV selected.
@@ -2745,7 +2745,7 @@ impl<'tx> PivSession<'tx> {
             MgmtAlg::Aes192,
             MgmtAlg::Aes256,
         ];
-        trace::line(self.debug, || {
+        trace::line(self.traced, || {
             "piv mgmt-key: GET METADATA unsupported; probing every GENERAL \
              AUTHENTICATE P1 with a witness request"
                 .to_string()
@@ -2760,7 +2760,7 @@ impl<'tx> PivSession<'tx> {
                 piv::KEY_REF_MANAGEMENT,
             ))?;
             let ok = sw == piv::SW_OK;
-            trace::line(self.debug, || {
+            trace::line(self.traced, || {
                 format!(
                     "piv mgmt-key: probe {} (P1={:#04x}) -> {}",
                     alg.label(),
@@ -2778,12 +2778,12 @@ impl<'tx> PivSession<'tx> {
         }
 
         if accepted.is_empty() {
-            trace::line(self.debug, || {
+            trace::line(self.traced, || {
                 "piv mgmt-key: card accepted no probe; falling back to key length".to_string()
             });
         }
         let chosen = pick_mgmt_alg(&accepted, key_len).ok_or(TransportError::PivBadKeyLength)?;
-        trace::line(self.debug, || {
+        trace::line(self.traced, || {
             format!("piv mgmt-key: selected {}", chosen.label())
         });
         Ok(chosen)
@@ -2889,7 +2889,7 @@ impl<'tx> PivSession<'tx> {
             // Say so in the trace: the assurance on this card is one-sided,
             // and a reviewer (or a user wondering why a swapped card was
             // accepted) should be able to see that the weaker path was taken.
-            trace::line(self.debug, || {
+            trace::line(self.traced, || {
                 "! piv authenticate: card returned no 0x82 challenge response; \
                  accepting host-only (client) authentication — this card cannot \
                  prove it holds the management key"
@@ -3002,7 +3002,7 @@ impl<'tx> PivSession<'tx> {
             // "authentication did not succeed" — but the raw status
             // word still reaches `--debug` output here, for whoever's
             // diagnosing a real device against this.
-            trace::line(self.debug, || {
+            trace::line(self.traced, || {
                 format!("piv aca external authenticate: rejected (SW {sw:04X})")
             });
             return Err(TransportError::PivManagementAuthFailed);
@@ -3385,7 +3385,7 @@ impl<'tx> PivSession<'tx> {
             if let Err(e) =
                 self.verify_pin_hid_crescendo_aca(fingerprint::HID_CRESCENDO_ACA_PIN_AFTER_RESET)
             {
-                trace::line(self.debug, || {
+                trace::line(self.traced, || {
                     format!(
                         "piv aca reauth after reset card (restore factory default): \
                          failed ({e})"
@@ -3406,7 +3406,7 @@ impl<'tx> PivSession<'tx> {
                 Some(apdu) => match self.transmit_full_raw(&apdu) {
                     Ok((_, sw)) if sw == piv::SW_OK => FactoryResetOutcome::WipedGlobal,
                     Ok((_, sw)) => {
-                        trace::line(self.debug, || {
+                        trace::line(self.traced, || {
                             format!(
                                 "piv aca put xauth key (restore factory default): \
                                  rejected (SW {sw:04X})"
@@ -3593,7 +3593,7 @@ impl<'tx> PivSession<'tx> {
         let tag = slot.cert_object_tag();
         let apdu = piv::put_data(&tag, &value);
         let sw = if self.chain_upfront() {
-            trace::line(self.debug, || {
+            trace::line(self.traced, || {
                 format!(
                     "! piv import certificate: command chaining up front ({})",
                     self.chain_reason()
@@ -3608,7 +3608,7 @@ impl<'tx> PivSession<'tx> {
             let direct = self.transmit_full(&apdu);
             if retry_chained_after(&direct, extended) {
                 if let Err(e) = &direct {
-                    trace::line(self.debug, || {
+                    trace::line(self.traced, || {
                         format!(
                             "! piv import certificate: extended length failed at the PC/SC \
                              layer ({e}); retrying with command chaining"
@@ -3624,7 +3624,7 @@ impl<'tx> PivSession<'tx> {
                 if sw == piv::SW_OK || !extended {
                     sw
                 } else {
-                    trace::line(self.debug, || {
+                    trace::line(self.traced, || {
                         format!(
                             "! piv import certificate: extended length rejected (SW={sw:04X}); \
                              retrying with command chaining"
@@ -4167,7 +4167,7 @@ impl<'tx> PivSession<'tx> {
         chained: &[Vec<u8>],
     ) -> Result<Vec<u8>, TransportError> {
         let (data, sw) = if self.chain_upfront() {
-            trace::line(self.debug, || {
+            trace::line(self.traced, || {
                 format!(
                     "! {label}: command chaining up front ({})",
                     self.chain_reason()
@@ -4179,7 +4179,7 @@ impl<'tx> PivSession<'tx> {
             if sw == piv::SW_OK || !uses_extended_length(single) {
                 (data, sw)
             } else {
-                trace::line(self.debug, || {
+                trace::line(self.traced, || {
                     format!(
                         "! {label}: extended length rejected (SW={sw:04X}); retrying with \
                          command chaining"
@@ -5001,7 +5001,7 @@ impl<'tx> PivSession<'tx> {
         };
         crate::transmit_applet(
             &self.card,
-            self.debug,
+            self.traced,
             &IO,
             apdu,
             cmd_sensitive,
