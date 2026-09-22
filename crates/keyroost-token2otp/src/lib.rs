@@ -932,7 +932,10 @@ mod tests {
         // Leading zeros in the ASCII text don't error, just aren't preserved
         // in the returned integer (same tradeoff as the BCD-serial decoders
         // elsewhere in the workspace).
-        assert_eq!(parse_otp_serial(&resp).unwrap().to_string(), "1000000123456");
+        assert_eq!(
+            parse_otp_serial(&resp).unwrap().to_string(),
+            "1000000123456"
+        );
 
         // Non-decimal ASCII: rejected rather than silently misparsed.
         let mut bad = vec![0xD1, 0x03];
