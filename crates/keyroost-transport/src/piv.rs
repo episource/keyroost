@@ -495,54 +495,30 @@ pub struct PivSessionState {
     /// unchanged. See [`PcscIdentity`] for what each of its three parts
     /// checks and why.
     pcsc_identity: PcscIdentity,
-    /// Algorithm + public key of any slot a session carrying this state
-    /// generated a key in, keyed by key reference. A fallback source only,
-    /// for cards that don't answer GET METADATA (pre-5.3 firmware, or
-    /// non-Yubico PIV): `slot_key` (the shared source for CSR/self-sign)
-    /// falls back to this when metadata comes back empty. Populated by
-    /// `generate_key`, or explicitly by a caller via
-    /// [`PivSession::remember_pubkey`] — never by reading a card back, so
-    /// it's exactly as trustworthy as whoever put it there. Cleared by
-    /// [`PivSession::refresh`] (and so, transitively, by a fresh
-    /// [`PivSession::open`]/[`open_with_debug`], both of which call it), and
-    /// any operation that changes what's in a slot (`delete_key`,
-    /// `move_key`, `reset`) invalidates the corresponding entries — see
-    /// [`PivSession::slot_key`]. Living in `PivSessionState` rather than a
-    /// [`PivSession`] field of its own is what lets a caller hand this
-    /// straight to [`PivSession::open_cached`] instead of re-seeding each
-    /// slot one at a time via `remember_pubkey` after the fact.
-    pubkey_cache: PubkeyCache,
-    /// PIN/touch policy of any slot successfully resolved via the ATTEST
-    /// fallback — including the read [`PivSession::generate_key`] performs
-    /// on itself afterward, precisely because the *request* it just sent
-    /// isn't trustworthy enough to cache directly (a card is free to
-    /// translate or normalize a requested policy on its own terms) — keyed
-    /// by key reference; see [`PolicyCache`] for the full lifecycle. Exists
-    /// for the same reason `pubkey_cache` does: cards without GET METADATA
-    /// make [`PivSession::resolve_policy`] pay for a real ATTEST APDU and a
-    /// certificate parse on every single call otherwise, for a value that's
-    /// fixed for the life of the slot's current key.
-    policy_cache: PolicyCache,
     /// Raw response body of the most recent SELECT (full or short AID) —
     /// the FCI a spec-compliant card returns since both builders request it
     /// via a case-4 `Le`. Feeds [`keyroost_piv::fingerprint::select_identity`]
-    /// during fingerprint resolution, and — held in a caller's stored copy —
-    /// is the last of [`PivSession::open_cached`]'s four validity checks: a
-    /// reconnect that SELECTs PIV and gets back a *different* FCI is reason
-    /// enough on its own to distrust the rest of this state, whatever the
-    /// cheaper PC/SC-level signals said. Empty when SELECT never returned a
-    /// body (a card that answers `9000` with nothing), never absent
-    /// otherwise: fingerprint resolution and cache validation both treat
-    /// empty and never-resolved the same way — a definite, comparable value.
+    /// during fingerprint resolution. No longer part of
+    /// [`PivSession::open_cached`]'s reuse decision — see [`PcscIdentity`]'s
+    /// doc for why comparing it stopped earning its keep — so a value
+    /// carried over from a cache hit is trusted as-is, unconfirmed against
+    /// this connection's own card, until whatever real SELECT
+    /// [`PivSession::ensure_selected`] eventually issues overwrites it (or a
+    /// stale-cache miss resolves fresh immediately instead). Empty when
+    /// SELECT never returned a body (a card that answers `9000` with
+    /// nothing) or hasn't run yet this connection, never absent otherwise:
+    /// fingerprint resolution treats empty and never-resolved the same way —
+    /// a definite, comparable value.
     select_response: Vec<u8>,
     /// [`PivSession::applet_fingerprint`]'s cache: `None` until first
     /// resolved, then that method's full result — fingerprint, name,
     /// version, version/firmware bytes, serial. [`PivSession::identity`] is
-    /// a thinner view over the same cached value. Safe to cache — unlike the
-    /// read-through data a session deliberately never caches (certs, PIN
-    /// retries, slot occupancy; see [`PivSession::status_detailed`]'s doc) —
-    /// because the applet's identity and reported versions cannot change
-    /// while the physical card stays the same, which is exactly what
+    /// a thinner view over the same cached value. Safe to cache
+    /// unconditionally — unlike `pubkey_cache`/`policy_cache`/`cert_cache`/
+    /// `chuid_cache`/`pin_retries_cache` below, each of which needs its own
+    /// write path to keep it honest as the underlying card state actually
+    /// changes — because the applet's identity and reported versions cannot
+    /// change while the physical card stays the same, which is exactly what
     /// [`PivSession::open_cached`]'s three checks exist to prove before this
     /// field is trusted across a reconnect at all. Resolving it from
     /// scratch can cost a handful of extra APDUs (some fingerprints need a
@@ -550,6 +526,76 @@ pub struct PivSessionState {
     /// skipping that on a proven-unchanged reconnect is the entire point of
     /// this type.
     identity: Option<AppletFingerprintResult>,
+    /// Algorithm + public key of any slot this lineage has resolved, keyed
+    /// by key reference, from either of two provenances — see
+    /// [`PubkeyCache`] for the full lifecycle and why they're not kept
+    /// distinguishable once stored:
+    ///
+    /// * self-known: `generate_key` (the key it just minted) or
+    ///   [`PivSession::remember_pubkey`] (a caller vouching for a value from
+    ///   outside this session) — never verified against the card, so exactly
+    ///   as trustworthy as whoever put it there;
+    /// * device-reported: [`PivSession::resolve_slot_from_device`]'s GET
+    ///   METADATA decode, feeding [`PivSession::cached_slot_key`] (the
+    ///   cache-preferring reads `status_detailed`/`slot_key_algorithm`/
+    ///   `slot_has_key` use) and [`PivSession::confirmed_slot_key`] (the
+    ///   always-reconfirm-live read `slot_key` uses for `generate_csr`/
+    ///   `self_signed_certificate`, which — unlike the display paths — must
+    ///   not trust a possibly-stale cached value: it mints a certificate
+    ///   whose declared public key needs to match what actually signs it).
+    ///
+    /// Cleared by [`PivSession::refresh`] (and so, transitively, by a fresh
+    /// [`PivSession::open`]/[`open_with_debug`], both of which call it), and
+    /// any operation that changes what's in a slot (`delete_key`,
+    /// `move_key`, `reset`) invalidates the corresponding entries. Living in
+    /// `PivSessionState` rather than a [`PivSession`] field of its own is
+    /// what lets a caller hand this straight to [`PivSession::open_cached`]
+    /// instead of re-seeding each slot one at a time via `remember_pubkey`
+    /// after the fact.
+    pubkey_cache: PubkeyCache,
+    /// PIN/touch policy of any slot this lineage has resolved, keyed by key
+    /// reference, from either a GET METADATA reply's own `policy` field
+    /// ([`PivSession::resolve_slot_from_device`], sharing the one round trip
+    /// `pubkey_cache` resolves from) or the ATTEST-certificate fallback for
+    /// cards whose GET METADATA (supported or not) never reports one at all
+    /// — see [`PolicyCache`] for the full lifecycle. [`PivSession::slot_policy`]
+    /// is the sole writer, and always leaves this resolved one way or the
+    /// other, so a card needing the ATTEST fallback doesn't pay for another
+    /// APDU plus a certificate parse on every single `status_detailed` call.
+    policy_cache: PolicyCache,
+    /// DER certificates read from each slot's data object, keyed by key
+    /// reference — see [`CertCache`]. A slot's certificate only changes on
+    /// an explicit [`PivSession::import_certificate`]/
+    /// [`PivSession::clear_certificate`] (or a `generate_key` that clears
+    /// the old one first), all of which keep this cache in step, so a plain
+    /// read is free to reuse it rather than paying a GET DATA round trip on
+    /// every status read and every `slot_key_algorithm` certificate
+    /// fallback.
+    cert_cache: CertCache,
+    /// The card's CHUID, once read this session (and, via `open_cached`, any
+    /// later session on a proven-same card) — `None` until the first
+    /// [`PivSession::read_chuid`] call, then that call's own result cached
+    /// for the rest of the lineage. [`PivSession::new_chuid`] invalidates
+    /// this back to `None` on a successful write, the same "evict, let the
+    /// next read resolve it fresh" treatment as every other cache here gets
+    /// on the operation that invalidates it — there's exactly one CHUID
+    /// object, so a scalar `Option` is enough; no per-key-reference map like
+    /// `cert_cache` needed.
+    chuid_cache: Option<Option<keyroost_piv::Chuid>>,
+    /// Remaining PIV application-PIN tries, resolved via a no-op VERIFY —
+    /// see [`PivSession::pin_retries`]. `None` until first resolved this
+    /// lineage; the inner `Option<u8>` mirrors that method's own return
+    /// value (`None` there means "already verified" or "not reportable",
+    /// not "unresolved" — this outer `Option` is what distinguishes the
+    /// two). Invalidated by [`PivSession::verify_pin`],
+    /// [`PivSession::change_pin`], [`PivSession::unblock_pin`], and
+    /// [`PivSession::set_pin_retries`] — every operation that can move the
+    /// counter, whether by consuming a try or resetting it — so a stale
+    /// count never survives past the call that changed it. Deliberately
+    /// *not* touched by [`PivSession::verify_pin_hid_crescendo_aca`], which
+    /// authenticates a wholly different PIN reference (HID Crescendo's ACA
+    /// instance, not the standard PIV application PIN this cache tracks).
+    pin_retries_cache: Option<Option<u8>>,
     /// Applet-specific data resolved once and reused for the rest of a
     /// session's lineage — see [`AppletCache`]/[`AppletCacheKey`] for what's
     /// stored and why this is a dict keyed by enum rather than a dedicated
@@ -575,13 +621,17 @@ pub struct PivSessionState {
 
 impl PivSessionState {
     /// Algorithm + public key this state has cached for `slot`, if any — the
-    /// same fallback [`PivSession::slot_key`] consults internally, exposed
-    /// so a caller holding a `PivSessionState` between sessions (e.g. to
-    /// show a just-generated key's PEM again after reconnecting to the same
-    /// card) doesn't need a live session just to read it back.
+    /// same cache [`PivSession::slot_key`] consults internally, exposed so a
+    /// caller holding a `PivSessionState` between sessions (e.g. to show a
+    /// just-generated key's PEM again after reconnecting to the same card)
+    /// doesn't need a live session just to read it back. Flattens away the
+    /// "never asked" vs. "asked, confirmed empty" distinction the cache
+    /// itself tracks (see [`PubkeyCache`]) — both look like "nothing to
+    /// show" from here.
     pub fn cached_pubkey(&self, slot: Slot) -> Option<(KeyAlg, &PublicKey)> {
         self.pubkey_cache
             .get(slot.key_ref())
+            .flatten()
             .map(|(alg, key)| (*alg, key))
     }
 }
@@ -591,11 +641,17 @@ impl PivSessionState {
 /// card-presence generation on that reader, and what ATR it answered with.
 /// Grouped into one type because the three are always read and compared
 /// together, in that order — a mismatch on an earlier field makes checking
-/// a later one pointless. `select_response` — the fourth and last check
-/// `open_cached` makes — deliberately isn't part of this type: it's a
-/// PIV-*applet*-level answer (obtained only after selecting the applet),
-/// not a PC/SC-layer property of the reader/card generically, so it stays
-/// its own field directly on [`PivSessionState`].
+/// a later one pointless. This is `open_cached`'s *entire* reuse check now —
+/// a raw SELECT-response diff used to run alongside it, but comparing that
+/// meant issuing a real SELECT PIV on every reconnect just to have something
+/// to compare, which defeated the point of a cache hit skipping SELECT
+/// entirely; it was dropped once its only genuine catch — cards from the
+/// same production batch sharing an ATR byte-for-byte — was judged not
+/// worth paying that cost on every reconnect for. That gap is real but
+/// narrow (a same-model swap PC/SC's own event counter would also have
+/// missed), and everything downstream still runs against whatever card
+/// actually answers once [`PivSession::ensure_selected`] issues its lazy
+/// SELECT.
 #[derive(Clone, Default)]
 struct PcscIdentity {
     /// The PC/SC reader name this identity was captured on. Checked first
@@ -684,6 +740,16 @@ pub struct PivSession {
     /// failed" and the #101 status-word fallback never got a status word to
     /// act on), so waiting for a refusal is not a strategy there.
     t0: bool,
+    /// Whether this *connection* has actually sent SELECT PIV yet — distinct
+    /// from anything in [`PivSessionState`], which can carry a
+    /// `select_response`/`identity` restored from a cache hit without this
+    /// connection itself having sent the APDU that produced them. Starts
+    /// `false` on every fresh [`Self::connect`]; set only by the outcome of
+    /// an actual [`Self::select`] call. [`Self::ensure_selected`] is the sole
+    /// reader — every real PIV command reaches the card through
+    /// [`Self::transmit_full`], which checks this first and issues the
+    /// actual SELECT lazily, once, the first time it's `false`.
+    applet_selected: bool,
     /// Everything about this session that's expensive to resolve and safe to
     /// carry to a later session on the same card — see [`PivSessionState`].
     /// [`Self::open`]/[`Self::open_with_debug`] always start this from
@@ -693,34 +759,69 @@ pub struct PivSession {
     state: PivSessionState,
 }
 
-/// The in-session public-key cache behind `PivSession`, keyed by PIV key
-/// reference. A handful of transitions exist, each mirroring the card
+/// The in-session key-material cache behind `PivSession`, keyed by PIV key
+/// reference — the single per-slot source of "what's `slot`'s current
+/// algorithm and public key", regardless of *how* that came to be known.
+/// Two provenances feed it, deliberately without distinguishing between them
+/// once stored, and a handful of transitions exist, each mirroring the card
 /// operation that makes it true; the session methods are one-line callers so
 /// the unit tests below can pin the semantics without a live card:
 ///
 /// * a fresh cache starts empty (`Default` — deliberately no persistence),
-/// * `generate_key` / `remember_pubkey` make the slot's entry exactly the new
-///   key (`remember`),
+/// * self-known: `generate_key` (the key it just minted, straight from the
+///   GENERATE response) and `remember_pubkey` (a caller vouching for a value
+///   from outside this session) both write `Some((alg, key))` — see
+///   [`PivSession::remember_pubkey`]'s own doc for why that one is "not
+///   verified against the card in any way",
+/// * device-reported: [`PivSession::resolve_slot_from_device`] writes
+///   whatever GET METADATA decoded — `Some((alg, key))` when it named both,
+///   or `None` once a live read comes back with neither, so a confirmed-empty
+///   slot doesn't cost another round trip on the next read. This is what
+///   lets [`PivSession::cached_slot_key`]'s callers (`status_detailed`,
+///   `slot_key_algorithm`, `slot_has_key`) skip the APDU on repeat calls —
+///   including for a slot that's genuinely empty, the common case, not an
+///   edge case: most standard and retired slots on any real device never
+///   hold a key,
+/// * neither provenance is preferred over the other once stored — whichever
+///   wrote most recently wins, matching the two facts they establish (this
+///   session made or was told this key; the device just confirmed something)
+///   never being expected to disagree in the same lineage. The one place
+///   that needs an *independent*, never-self-vouched channel
+///   ([`PivSession::slot_key_status_algorithm`], backing
+///   [`PivSession::reject_certificate_key_mismatch`]'s fallback check) never
+///   reads this cache at all, by design — see that method's own doc,
+/// * [`PivSession::slot_key`] (via [`PivSession::confirmed_slot_key`]) always
+///   re-confirms live before trusting a cached value for `generate_csr`/
+///   `self_signed_certificate` — a stale value there wouldn't just be an
+///   outdated display, it would mint a certificate whose declared public key
+///   doesn't match what actually signs it — but a device that answers
+///   nothing new doesn't get to *erase* an existing entry: see
+///   [`PivSession::confirmed_slot_key`]'s doc,
 /// * `delete_key` leaves nothing to fall back to (`evict`),
 /// * `move_key` relocates the key material, so its entry follows (`migrate`),
 /// * `reset` wipes every slot — via `PivSessionState::default`, which drops
 ///   this whole cache along with everything else `refresh` rebuilds, not a
 ///   dedicated method here.
 #[derive(Clone, Default)]
-struct PubkeyCache(HashMap<u8, (KeyAlg, PublicKey)>);
+struct PubkeyCache(HashMap<u8, Option<(KeyAlg, PublicKey)>>);
 
 impl PubkeyCache {
-    /// The slot now holds exactly this key — `generate_key` minted it there,
-    /// or the caller vouched for it via `remember_pubkey`. Replaces any
-    /// previous entry: after a regenerate, the old pubkey must not survive to
+    /// The slot's key material is now known to be exactly `value` — a
+    /// self-known write's `Some(_)`, or a device-reported resolution's
+    /// verdict either way (`None` meaning "asked, card names neither
+    /// algorithm nor public key for this slot"). Replaces any previous
+    /// entry: after a regenerate, the old pubkey must not survive to
     /// describe the new private key.
-    fn remember(&mut self, key_ref: u8, alg: KeyAlg, key: PublicKey) {
-        self.0.insert(key_ref, (alg, key));
+    fn remember(&mut self, key_ref: u8, value: Option<(KeyAlg, PublicKey)>) {
+        self.0.insert(key_ref, value);
     }
 
     /// The slot's key material is gone (`delete_key` succeeded): a stale
     /// entry here would produce a CSR/self-signed cert for a key that no
-    /// longer exists. Evicting an uncached slot is a no-op.
+    /// longer exists. Evicting an uncached slot is a no-op. Distinct from
+    /// `remember(key_ref, None)`: eviction means "we no longer know",
+    /// forcing the next read to ask again; `remember(_, None)` means "we
+    /// asked, and confirmed there's nothing here."
     fn evict(&mut self, key_ref: u8) {
         self.0.remove(&key_ref);
     }
@@ -736,43 +837,54 @@ impl PubkeyCache {
         }
     }
 
-    fn get(&self, key_ref: u8) -> Option<&(KeyAlg, PublicKey)> {
-        self.0.get(&key_ref)
+    /// `Some(_)` — with an inner `None` or `Some((alg, key))` — when `slot`
+    /// has already been resolved this lineage, by either provenance; bare
+    /// `None` means "never asked", the caller's cue to issue a real APDU.
+    fn get(&self, key_ref: u8) -> Option<Option<&(KeyAlg, PublicKey)>> {
+        self.0.get(&key_ref).map(Option::as_ref)
     }
 }
 
 /// The in-session PIN/touch-policy cache behind `PivSession`, keyed by PIV
-/// key reference — [`PubkeyCache`]'s exact same lifecycle, for the exact
-/// same reason: a slot's policy is fixed at key-generation time and can't
-/// change until that slot's key does, but resolving it from nothing is
-/// expensive on any card GET METADATA doesn't cover it on (see
-/// [`PivSession::resolve_policy`]'s doc) — a real ATTEST APDU plus a
-/// certificate parse, paid again on every `status_detailed` call otherwise,
-/// for a value that was already fixed the moment the key was generated.
+/// key reference — the single per-slot source of "what's `slot`'s current
+/// policy", from whichever channel resolves it: a GET METADATA reply's own
+/// `policy` field (decoded by [`PivSession::resolve_slot_from_device`], the
+/// same call [`PubkeyCache`] shares its one round trip with), or — only once
+/// that channel has nothing to say — the ATTEST certificate's key-policy
+/// extension. `Option<(PinPolicy, TouchPolicy)>` values, not a bare pair, so
+/// "resolved: neither channel reports a policy for this slot" is itself a
+/// cacheable fact, same reason [`PubkeyCache`]/[`CertCache`] use the same
+/// shape: without it, a card whose GET METADATA never carries policy at all
+/// (pre-5.3 firmware, non-Yubico PIV) would re-pay for a full ATTEST APDU
+/// plus a certificate parse on every single `status_detailed`/`slot_policy`
+/// call, forever.
 ///
 /// * a fresh cache starts empty (`Default`),
-/// * `generate_key` knows the policy for free — it's the caller's own
-///   `pin_policy`/`touch_policy` arguments — so it seeds this directly
-///   (`remember`) rather than waiting for a later `resolve_policy` to pay
-///   for an ATTEST read of a value it already had in hand,
-/// * `resolve_policy` itself also seeds this on a successful ATTEST
-///   fallback, so the *next* slot read (or the next session entirely, via
-///   `PivSessionState`) doesn't pay for it again,
+/// * `generate_key` does *not* seed this from its own `pin_policy`/
+///   `touch_policy` arguments — a request, not a result: the card is free to
+///   translate or normalize what was asked for — it calls `slot_policy`
+///   afterward instead, which resolves (and caches) the policy the card
+///   actually ended up applying,
+/// * [`PivSession::slot_policy`] is this cache's sole writer: directly from
+///   [`PivSession::resolve_slot_from_device`]'s decode when the reply
+///   carries a policy, or from a successful (or exhausted) ATTEST fallback
+///   otherwise — either way, every call through `slot_policy` leaves this
+///   cache resolved one way or another, so the *next* slot read never pays
+///   for either APDU again,
 /// * `delete_key` leaves nothing to fall back to (`evict`),
 /// * `move_key` relocates the key material, so its entry follows (`migrate`),
 /// * `reset` wipes every slot — via `PivSessionState::default`, same as
 ///   [`PubkeyCache`], not a dedicated method here.
 #[derive(Clone, Default)]
-struct PolicyCache(HashMap<u8, (PinPolicy, TouchPolicy)>);
+struct PolicyCache(HashMap<u8, Option<(PinPolicy, TouchPolicy)>>);
 
 impl PolicyCache {
-    /// The slot now has exactly this policy — `generate_key` set it there
-    /// (the arguments it was called with), or a successful ATTEST fallback
-    /// in [`PivSession::resolve_policy`] just read it. Replaces any previous
-    /// entry: after a regenerate, a stale policy must not survive to
-    /// describe the new key.
-    fn remember(&mut self, key_ref: u8, policy: (PinPolicy, TouchPolicy)) {
-        self.0.insert(key_ref, policy);
+    /// The slot's policy is now known to be exactly `value` (`None` meaning
+    /// "resolved: neither GET METADATA nor ATTEST names one"). Replaces any
+    /// previous entry: after a regenerate, a stale policy must not survive
+    /// to describe the new key.
+    fn remember(&mut self, key_ref: u8, value: Option<(PinPolicy, TouchPolicy)>) {
+        self.0.insert(key_ref, value);
     }
 
     /// The slot's key material is gone (`delete_key` succeeded): a stale
@@ -791,8 +903,49 @@ impl PolicyCache {
         }
     }
 
-    fn get(&self, key_ref: u8) -> Option<(PinPolicy, TouchPolicy)> {
+    /// `Some(_)` — with an inner `None` or `Some((pin, touch))` — when
+    /// `slot`'s policy has already been resolved this lineage; bare `None`
+    /// means "never asked", the caller's cue to resolve it for real.
+    fn get(&self, key_ref: u8) -> Option<Option<(PinPolicy, TouchPolicy)>> {
         self.0.get(&key_ref).copied()
+    }
+}
+
+/// The in-session certificate cache behind [`PivSession::cert_object`],
+/// keyed by PIV key reference — same shape as [`PubkeyCache`], for the
+/// same reason: a slot's certificate object only changes via an explicit
+/// write this crate already intercepts.
+///
+/// * a fresh cache starts empty (`Default`),
+/// * [`PivSession::cert_object`] is the sole writer on a plain read
+///   (`remember`, `Ok(None)` meaning "asked, slot has no certificate
+///   object"; `Err(reason)` meaning "asked, slot holds a certificate that
+///   can't be read" — see [`CertUnreadable`]),
+/// * [`PivSession::import_certificate`] remembers the exact DER it just
+///   wrote, for free — no need to read it back,
+/// * [`PivSession::clear_certificate`] remembers `Ok(None)` — again for free,
+/// * `move_key`/`delete_key` leave this cache alone: neither operation
+///   touches a slot's certificate object (a private key relocating or
+///   disappearing says nothing about what's stored on top of it),
+/// * `reset` wipes every slot — via [`PivSessionState::default`], same as
+///   every other cache here, not a dedicated method here.
+#[derive(Clone, Default)]
+struct CertCache(HashMap<u8, Result<Option<Vec<u8>>, CertUnreadable>>);
+
+impl CertCache {
+    /// `slot`'s certificate object is now known to resolve to exactly `cert`
+    /// (`Ok(None)` meaning "asked (or just cleared), slot has no
+    /// certificate"; `Err(reason)` meaning "asked, slot's certificate can't
+    /// be read").
+    fn remember(&mut self, key_ref: u8, cert: Result<Option<Vec<u8>>, CertUnreadable>) {
+        self.0.insert(key_ref, cert);
+    }
+
+    /// `Some(_)` when `slot`'s certificate has already been resolved this
+    /// lineage; bare `None` means "never asked", the caller's cue to issue a
+    /// real APDU.
+    fn get(&self, key_ref: u8) -> Option<Result<Option<Vec<u8>>, CertUnreadable>> {
+        self.0.get(&key_ref).cloned()
     }
 }
 
@@ -913,29 +1066,6 @@ fn decode_serial_if_bcd(
     }
 }
 
-/// Resolve the serial [`PivStatus`]/[`PivStatusDetailed`] report: a
-/// fingerprint probe's own serial when it supplied one (Token2 and Thetis's
-/// OTP-applet GET_INFO, HID Crescendo's CPLC read — see
-/// [`PivSession::applet_fingerprint`]) is already the full, correct value, so
-/// it bypasses BCD decoding entirely and `yubico_serial` is never even
-/// called; otherwise falls back to `yubico_serial`'s raw Yubico GET SERIAL
-/// reply, run through [`decode_serial_if_bcd`] same as always. `yubico_serial`
-/// is a closure (rather than a plain `Option<u128>`) so that GET SERIAL round
-/// trip is skipped whenever `fingerprint_serial` already answers the
-/// question. Shared by [`PivSession::status`] and
-/// [`PivSession::status_detailed`].
-fn resolve_serial(
-    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
-    applet_version: Option<&[u8]>,
-    firmware_version: Option<&[u8]>,
-    fingerprint_serial: Option<u128>,
-    yubico_serial: impl FnOnce() -> Option<u128>,
-) -> Option<u128> {
-    fingerprint_serial.or_else(|| {
-        decode_serial_if_bcd(fingerprint, applet_version, firmware_version, yubico_serial())
-    })
-}
-
 /// Strip `md`'s algorithm identifier (tag `0x01`) and public key (tag `0x04`)
 /// when `quirks` contains
 /// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`] — on an
@@ -992,22 +1122,18 @@ fn pcsc_event_count_unchanged(cached: Option<u32>, fresh: Option<u32>) -> bool {
     matches!((cached, fresh), (Some(c), Some(f)) if c == f)
 }
 
-/// [`PivSession::open_cached`]'s reuse decision as a pure function: all of
+/// [`PivSession::open_cached`]'s reuse decision as a pure function: both of
 /// its independent checks must agree, or the cache is not trusted —
 /// `pcsc_trustworthy` (is this fresh PC/SC reading even usable, via
-/// [`pcsc_reading_usable`]), `pcsc_identity_matches` (reader name, event
-/// counter, and ATR all agree, via [`PcscIdentity::matches`]), and
-/// `select_response_matches` (plain equality the caller performs inline).
-/// Kept separate from those so the *combining* rule (currently a flat AND,
-/// but the one place that could change if a future check needed different
-/// weighting) is pinned by a test independent of how each individual check
-/// is computed.
-fn piv_session_cache_reusable(
-    pcsc_trustworthy: bool,
-    pcsc_identity_matches: bool,
-    select_response_matches: bool,
-) -> bool {
-    pcsc_trustworthy && pcsc_identity_matches && select_response_matches
+/// [`pcsc_reading_usable`]) and `pcsc_identity_matches` (reader name, event
+/// counter, and ATR all agree, via [`PcscIdentity::matches`]). Kept separate
+/// from those so the *combining* rule (currently a flat AND, but the one
+/// place that could change if a future check needed different weighting) is
+/// pinned by a test independent of how each individual check is computed. A
+/// raw SELECT-response diff used to be a third input here — see
+/// [`PcscIdentity`]'s doc for why it was dropped.
+fn piv_session_cache_reusable(pcsc_trustworthy: bool, pcsc_identity_matches: bool) -> bool {
+    pcsc_trustworthy && pcsc_identity_matches
 }
 
 impl PivSession {
@@ -1034,23 +1160,31 @@ impl PivSession {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
-        let mut session = Self::connect_and_select(&ctx, &cstr, reader_name, debug)?;
+        let mut session = Self::connect(&ctx, &cstr, reader_name, debug)?;
+        session.select()?;
         session.fingerprint();
         Ok(session)
     }
 
     /// Connect to `reader` (`reader_name`, already-converted to a `CStr` by
-    /// the caller) on an already-established `ctx` and SELECT PIV, starting
-    /// from a wholly fresh [`PivSessionState`] — except for
-    /// `state.pcsc_identity.reader_name`, seeded with `reader_name` right
-    /// away so it's correct even if a caller never goes on to populate the
-    /// rest (see [`PcscIdentity::reader_name`]'s doc for why it's checked
-    /// ahead of everything else). The shared first half of
-    /// [`Self::open_with_debug`] and [`Self::open_cached_with_debug`], which
-    /// differ only in what they do with the applet identity after this
-    /// point: the former always resolves it fresh; the latter only when a
-    /// caller-held state doesn't check out.
-    fn connect_and_select(
+    /// the caller) on an already-established `ctx`, starting from a wholly
+    /// fresh [`PivSessionState`] — except for `state.pcsc_identity.reader_name`,
+    /// seeded with `reader_name` right away so it's correct even if a caller
+    /// never goes on to populate the rest (see [`PcscIdentity::reader_name`]'s
+    /// doc for why it's checked ahead of everything else). The shared first
+    /// half of [`Self::open_with_debug`] and [`Self::open_cached_with_debug`].
+    ///
+    /// Deliberately does *not* SELECT PIV — that decision now belongs to each
+    /// caller: [`Self::open_with_debug`] always wants a fresh identity, so it
+    /// selects and fingerprints right after this returns; a plain
+    /// `let mut session = Self::connect(...)?;` at the top of
+    /// [`Self::open_cached_with_debug`] does the same. That one, though, only
+    /// when its own cheap PC/SC-layer check doesn't pan out — otherwise it
+    /// leaves SELECT for [`Self::ensure_selected`] to issue lazily, on
+    /// whatever real PIV command actually needs it first. `applet_selected`
+    /// starts `false` here regardless of which path the caller takes next —
+    /// it's set only by an actual, successful [`Self::select`] call.
+    fn connect(
         ctx: &Context,
         reader: &std::ffi::CStr,
         reader_name: &str,
@@ -1058,10 +1192,11 @@ impl PivSession {
     ) -> Result<Self, TransportError> {
         let card = ctx.connect(reader, ShareMode::Shared, Protocols::ANY)?;
         let t0 = negotiated_t0(&card);
-        let mut session = Self {
+        Ok(Self {
             card,
             debug,
             t0,
+            applet_selected: false,
             state: PivSessionState {
                 pcsc_identity: PcscIdentity {
                     reader_name: reader_name.to_owned(),
@@ -1069,9 +1204,7 @@ impl PivSession {
                 },
                 ..Default::default()
             },
-        };
-        session.select()?;
-        Ok(session)
+        })
     }
 
     /// [`Self::open`], but first try to reuse `cached` — a
@@ -1098,32 +1231,56 @@ impl PivSession {
         self.state.clone()
     }
 
+    /// Whether this session has actually sent SELECT PIV to the card yet —
+    /// the public face of `applet_selected`. `false` means every accessor
+    /// called on this session so far ([`Self::status_detailed`]/
+    /// [`Self::status`] included) was answered entirely out of the state
+    /// [`Self::open_cached`] carried in, with no live APDU exchanged; a
+    /// caller that wants to tell a genuine card read apart from a fully
+    /// cache-served one (for logging, say) reads this right after making its
+    /// calls, before anything later might trigger the lazy SELECT
+    /// [`Self::ensure_selected`] issues. Once true, it stays true for the
+    /// life of the session — there's no way to "un-select" PIV, so a caller
+    /// checking this after a mixed session (some fields cached, one not)
+    /// correctly sees a real read happened, not a cache hit.
+    pub fn touched_card(&self) -> bool {
+        self.applet_selected
+    }
+
     /// [`Self::open_cached`], but with per-APDU stderr tracing already
-    /// enabled for the SELECT this constructor issues.
+    /// enabled for whatever APDUs this call and the session it returns go on
+    /// to issue.
     ///
-    /// Two independent checks gate reuse of `cached`, each proxying "is this
-    /// reconnect still talking to the same physical card, on the same
-    /// reader, still selected on PIV, that `cached` was captured from":
+    /// One cheap check gates reuse of `cached`, proxying "is this reconnect
+    /// still talking to the same physical card, on the same reader, that
+    /// `cached` was captured from": **PC/SC-layer identity** — reader name,
+    /// insertion/removal counter, and ATR, via [`PcscIdentity::matches`] on
+    /// `cached.pcsc_identity` against a fresh reading
+    /// (`Context::get_status_change` with zero timeout for the first two —
+    /// no APDU, no connection — plus this call's own connect for the ATR).
+    /// See that type's own doc for what each of its three parts catches, why
+    /// the reader name is checked ahead of the other two, and why a second
+    /// check — diffing the raw SELECT response — used to run alongside this
+    /// one and no longer does: that comparison forced a real SELECT PIV on
+    /// every single reconnect just to have something to diff, which defeated
+    /// the entire point of a cache hit being allowed to skip SELECT.
     ///
-    /// 1. **PC/SC-layer identity** — reader name, insertion/removal counter,
-    ///    and ATR, via [`PcscIdentity::matches`] on `cached.pcsc_identity`
-    ///    against a fresh reading (`Context::get_status_change` with zero
-    ///    timeout for the first two — no APDU, no connection — plus this
-    ///    call's own connect for the ATR). See that type's doc for what each
-    ///    of its three parts catches and why the reader name is checked
-    ///    ahead of the other two.
-    /// 2. **The raw SELECT response** — this call's own connect always issues
-    ///    a real SELECT PIV regardless of check 1 (a working session needs
-    ///    one either way), so comparing its FCI against
-    ///    `cached.select_response` costs nothing extra and catches anything
-    ///    the PC/SC-layer signals didn't.
+    /// A stale check falls back to exactly the same resolution
+    /// [`Self::open_with_debug`] always does — SELECT, then fingerprint,
+    /// right here, immediately — so a caller can always reach for this
+    /// instead of `open`, with no downside beyond the (cheap) validation
+    /// check when the cache turns out to be stale, and no risk of ever
+    /// trusting a different card's identity because the reader name happened
+    /// to match.
     ///
-    /// Either disagreeing invalidates `cached` and this falls back to
-    /// exactly the same resolution [`Self::open_with_debug`] always does,
-    /// from nothing — so a caller can always reach for this instead of
-    /// `open`, with no downside beyond the (cheap) validation checks when the
-    /// cache turns out to be stale, and no risk of ever trusting a different
-    /// card's identity because the reader name happened to match.
+    /// A check that *does* pass skips SELECT entirely for now: `cached` —
+    /// its `select_response`/`identity`/every other read cache — is trusted
+    /// as-is, unconfirmed against this connection's own card, and the real
+    /// SELECT PIV this session eventually needs is left for
+    /// [`Self::ensure_selected`] to issue lazily, immediately before
+    /// whatever the first genuine PIV command this session runs turns out to
+    /// be. A caller that opens a session and only reads already-cached state
+    /// (or does nothing at all with it) never pays for that SELECT.
     ///
     /// Returns the opened session, same as [`Self::open_with_debug`] — its
     /// [`Self::state`] is `cached` unchanged (validation anchors refreshed to
@@ -1148,10 +1305,10 @@ impl PivSession {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
 
-        // Check 1: card-free. The input baseline here doesn't matter for
-        // what's actually compared (the event counter, read unconditionally
-        // below) — `State::UNAWARE` just asks for "current state, no
-        // diffing", which a zero timeout returns immediately either way.
+        // Card-free. The input baseline here doesn't matter for what's
+        // actually compared (the event counter, read unconditionally below)
+        // — `State::UNAWARE` just asks for "current state, no diffing",
+        // which a zero timeout returns immediately either way.
         let mut states = [ReaderState::new(cstr.clone(), State::UNAWARE)];
         let (fresh_state, fresh_event_count) =
             match ctx.get_status_change(std::time::Duration::ZERO, &mut states) {
@@ -1165,22 +1322,21 @@ impl PivSession {
             };
         let pcsc_trustworthy = pcsc_reading_usable(fresh_state);
 
-        // Checks 2-4 need a live connection either way, so make one
-        // regardless of what check 1 found.
-        let mut session = Self::connect_and_select(&ctx, &cstr, reader_name, debug)?;
+        // The ATR needs a live connection either way, so make one regardless
+        // of what the card-free check found — but this deliberately doesn't
+        // SELECT: that's deferred to whichever branch below actually needs
+        // it, immediately, rather than paid for on every reconnect up front.
+        let mut session = Self::connect(&ctx, &cstr, reader_name, debug)?;
         let fresh_identity = PcscIdentity {
             reader_name: reader_name.to_owned(),
             event_count: fresh_event_count,
             atr: session.atr(),
         };
 
-        if piv_session_cache_reusable(
-            pcsc_trustworthy,
-            cached.pcsc_identity.matches(&fresh_identity),
-            session.state.select_response == cached.select_response,
-        ) {
+        if piv_session_cache_reusable(pcsc_trustworthy, cached.pcsc_identity.matches(&fresh_identity)) {
             session.state = cached;
         } else {
+            session.select()?;
             session.fingerprint();
         }
         // Whichever branch ran, this connect's own readings are the
@@ -1206,10 +1362,12 @@ impl PivSession {
     ///
     /// Replaces [`Self::state`](`PivSessionState`) with a fresh
     /// [`PivSessionState::default`] — dropping `pubkey_cache`,
-    /// `select_response`, `identity`, `applet_cache`, and the
-    /// [`PcscIdentity`] validation anchor (`pcsc_identity`) all at once —
-    /// then re-`SELECT`s PIV and resolves the fingerprint fresh (via
-    /// [`Self::fingerprint`], caching it in `state.identity` the same as any
+    /// `select_response`, `identity`, `applet_cache`, every other read cache
+    /// (`policy_cache`, `cert_cache`, `chuid_cache`, `pin_retries_cache`),
+    /// and the [`PcscIdentity`] validation anchor (`pcsc_identity`) all at
+    /// once — then re-`SELECT`s PIV and resolves the
+    /// fingerprint fresh (via [`Self::fingerprint`], caching it in
+    /// `state.identity` the same as any
     /// other first resolution): genuinely starting over, the applet's
     /// identity included, rather than carrying forward what an earlier
     /// resolution in this same session found, or what a caller-supplied
@@ -1284,11 +1442,11 @@ impl PivSession {
         use keyroost_piv::fingerprint;
 
         let selected = matches!(
-            self.transmit_full(&piv::select_by_aid(&fingerprint::GLOBAL_PLATFORM_ISD_AID)),
+            self.transmit_full_raw(&piv::select_by_aid(&fingerprint::GLOBAL_PLATFORM_ISD_AID)),
             Ok((_, sw)) if sw == piv::SW_OK
         );
         let serial = if selected {
-            self.transmit_full(&fingerprint::GLOBAL_PLATFORM_GET_CPLC)
+            self.transmit_full_raw(&fingerprint::GLOBAL_PLATFORM_GET_CPLC)
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| fingerprint::parse_cplc_serial(&data))
@@ -1328,11 +1486,11 @@ impl PivSession {
     /// `GET SERIAL` reply ([`decode_serial_if_bcd`]) in that case.
     fn probe_token2_otp_serial(&mut self) -> Option<u128> {
         let selected = matches!(
-            self.transmit_full(&piv::select_by_aid(&keyroost_token2otp::OTP_APPLET_AID)),
+            self.transmit_full_raw(&piv::select_by_aid(&keyroost_token2otp::OTP_APPLET_AID)),
             Ok((_, sw)) if sw == piv::SW_OK
         );
         let serial = if selected {
-            self.transmit_full(&keyroost_token2otp::read_serial_request())
+            self.transmit_full_raw(&keyroost_token2otp::read_serial_request())
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| keyroost_token2otp::parse_otp_serial(&data).ok())
@@ -1362,6 +1520,7 @@ impl PivSession {
                     card,
                     debug: false,
                     t0,
+                    applet_selected: false,
                     state: PivSessionState {
                         pcsc_identity: PcscIdentity {
                             reader_name: name.to_string_lossy().into_owned(),
@@ -1382,6 +1541,13 @@ impl PivSession {
         Ok(out)
     }
 
+    /// Issues the actual SELECT APDU(s) unconditionally — a caller that only
+    /// wants this to run once per connection goes through
+    /// [`Self::ensure_selected`] instead. Sets `applet_selected` to match the
+    /// outcome: `true` on a confirmed PIV select, `false` on anything else
+    /// (no applet, or a transport failure), so a failed attempt here can't
+    /// leave a later [`Self::ensure_selected`] wrongly convinced there's
+    /// nothing left to do.
     fn select(&mut self) -> Result<(), TransportError> {
         // Try the full, spec-mandated AID first — some PIV implementations
         // (Nitrokey's `piv-authenticator`) only answer an exact-length AID
@@ -1390,18 +1556,40 @@ impl PivSession {
         // fault on the full-AID attempt still surfaces immediately rather
         // than being masked by a second, unrelated SELECT. See `piv::AID`'s
         // doc comment for the full story.
-        let (data, sw) = self.transmit_full(&piv::select_full())?;
+        let (data, sw) = self.transmit_full_raw(&piv::select_full())?;
         if sw == piv::SW_NOT_FOUND {
-            let (data, sw) = self.transmit_full(&piv::select())?;
+            let (data, sw) = self.transmit_full_raw(&piv::select())?;
             if sw == piv::SW_NOT_FOUND {
                 self.state.select_response.clear();
+                self.applet_selected = false;
                 return Err(TransportError::NoPivApplet);
             }
             self.state.select_response = data;
-            return ok_or_apdu("select piv applet (short aid)", sw);
+            let result = ok_or_apdu("select piv applet (short aid)", sw);
+            self.applet_selected = result.is_ok();
+            return result;
         }
         self.state.select_response = data;
-        ok_or_apdu("select piv applet", sw)
+        let result = ok_or_apdu("select piv applet", sw);
+        self.applet_selected = result.is_ok();
+        result
+    }
+
+    /// Issue the real SELECT PIV APDU if this connection hasn't already sent
+    /// one — the lazy half of [`Self::open_cached_with_debug`]'s validity
+    /// check: the cheap PC/SC-layer identity comparison runs immediately at
+    /// connect time, but the SELECT itself (and the round trip it costs) is
+    /// deferred until something actually needs PIV selected.
+    /// [`Self::transmit_full`] calls this first, so every genuine PIV
+    /// command pays for the SELECT on whichever call turns out to be first
+    /// in a session's life, and every later one on the same connection is
+    /// free. A caller that opens a session and never issues a real command
+    /// never pays for it at all.
+    fn ensure_selected(&mut self) -> Result<(), TransportError> {
+        if self.applet_selected {
+            return Ok(());
+        }
+        self.select()
     }
 
     /// The connected card's raw ATR (contact) or PC/SC-synthesised
@@ -1474,7 +1662,16 @@ impl PivSession {
     /// derived from its serial prefix) — see [`PivStatus::version_firmware`]'s
     /// doc for why the two axes aren't interchangeable, and for the
     /// device-reported/derived distinction between Token2 and Nitrokey's own
-    /// values on this same axis.
+    /// values on this same axis. `serial` is resolved here too, by whichever
+    /// source is right for the matched fingerprint (a dedicated probe, or —
+    /// `YubiKey` and the generic catch-all only — Yubico's GET SERIAL,
+    /// BCD-decoded when this fingerprint's quirks call for it): unlike
+    /// `version`, there's no single shared call site that fits every arm, so
+    /// each arm resolves its own rather than this method doing it once
+    /// afterward. Resolving it here rather than lazily in
+    /// [`Self::status`]/[`Self::status_detailed`] is what lets it ride along
+    /// in this method's own unconditional cache instead of paying for a live
+    /// GET SERIAL round trip on every single status read.
     fn applet_fingerprint(&mut self) -> AppletFingerprintResult {
         // Cached from an earlier call in this same session — most callers
         // reach this via `Self::refresh`'s own resolution already having run
@@ -1558,16 +1755,28 @@ impl PivSession {
             fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::NitroKey) => {
                 self.probe_nitrokey_admin(id, version)
             }
-            fingerprint::AppletFingerprint::YubiKey => AppletFingerprintResult {
-                fingerprint: id,
-                name: version
-                    .as_deref()
-                    .and_then(fingerprint::format_yubikey_name)
-                    .unwrap_or_default(),
-                version,
-                version_firmware: None,
-                serial: None,
-            },
+            fingerprint::AppletFingerprint::YubiKey => {
+                // Yubico's own GET SERIAL, resolved right here rather than
+                // lazily in `Self::status`/`Self::status_detailed`: a real
+                // YubiKey's answer is directly trustworthy (unlike a
+                // Nitrokey's, which fakes this same extension — see
+                // `Self::status`'s doc for that trap), so there's no reason
+                // to defer it, and resolving it now means it rides along in
+                // `identity`'s own unconditional cache instead of needing
+                // one of its own that every status read would otherwise
+                // have to check.
+                let serial = decode_serial_if_bcd(id, version.as_deref(), None, self.serial());
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: version
+                        .as_deref()
+                        .and_then(fingerprint::format_yubikey_name)
+                        .unwrap_or_default(),
+                    version,
+                    version_firmware: None,
+                    serial,
+                }
+            }
             // HID Crescendo (either family — both are documented/observed to
             // answer a standard PIV SELECT, so there's no reason to expect
             // this to differ between them) names itself in its SELECT
@@ -1665,13 +1874,23 @@ impl PivSession {
                 version_firmware: None,
                 serial: self.probe_token2_otp_serial(),
             },
-            _ => AppletFingerprintResult {
-                fingerprint: id,
-                name: String::new(),
-                version,
-                version_firmware: None,
-                serial: None,
-            },
+            // Unclassified/generic PIV applet — plenty of non-Yubico
+            // implementations answer this extension too (see
+            // `PivStatus::version`'s own doc), and there's no dedicated
+            // probe to prefer over it here, so resolve it the same way the
+            // `YubiKey` arm above does, for the same reason: it rides along
+            // in `identity`'s own unconditional cache instead of needing one
+            // of its own.
+            _ => {
+                let serial = decode_serial_if_bcd(id, version.as_deref(), None, self.serial());
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: String::new(),
+                    version,
+                    version_firmware: None,
+                    serial,
+                }
+            }
         };
         self.state.identity = Some(result.clone());
         result
@@ -1685,7 +1904,7 @@ impl PivSession {
     /// cheaper to check first.
     fn probe_feitian_rid(&mut self) -> bool {
         let selectable = matches!(
-            self.transmit_full(&piv::select_by_aid(&keyroost_piv::fingerprint::FEITIAN_RID)),
+            self.transmit_full_raw(&piv::select_by_aid(&keyroost_piv::fingerprint::FEITIAN_RID)),
             Ok((_, sw)) if sw == piv::SW_OK
         );
         let _ = self.select();
@@ -1702,7 +1921,7 @@ impl PivSession {
     /// [`Self::applet_fingerprint`].
     fn probe_idprime_aid(&mut self) -> bool {
         let selectable = matches!(
-            self.transmit_full(&piv::select_by_aid(&keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID)),
+            self.transmit_full_raw(&piv::select_by_aid(&keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID)),
             Ok((_, sw)) if sw == piv::SW_OK || sw == 0x6999
         );
         let _ = self.select();
@@ -1718,7 +1937,7 @@ impl PivSession {
     /// the point of use than anything this fingerprinting probe could add.
     fn probe_swissbit_rid(&mut self) -> bool {
         let selectable = matches!(
-            self.transmit_full(&piv::select_by_aid(&keyroost_piv::fingerprint::SWISSBIT_RID)),
+            self.transmit_full_raw(&piv::select_by_aid(&keyroost_piv::fingerprint::SWISSBIT_RID)),
             Ok((_, sw)) if sw == piv::SW_OK
         );
         let _ = self.select();
@@ -1762,24 +1981,24 @@ impl PivSession {
         use keyroost_piv::fingerprint;
 
         let selected = matches!(
-            self.transmit_full(&piv::select_by_aid(&fingerprint::NITROKEY_ADMIN_AID)),
+            self.transmit_full_raw(&piv::select_by_aid(&fingerprint::NITROKEY_ADMIN_AID)),
             Ok((_, sw)) if sw == piv::SW_OK
         );
         let (name, version_firmware, serial) = if selected {
             let name = self
-                .transmit_full(&fingerprint::NITROKEY_GET_ADMIN_STATUS)
+                .transmit_full_raw(&fingerprint::NITROKEY_GET_ADMIN_STATUS)
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| fingerprint::parse_nitrokey_variant(&data))
                 .map(fingerprint::format_nitrokey_name);
             let version_firmware = self
-                .transmit_full(&fingerprint::NITROKEY_GET_VERSION_STRING)
+                .transmit_full_raw(&fingerprint::NITROKEY_GET_VERSION_STRING)
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| fingerprint::parse_ascii_text(&data))
                 .and_then(|s| fingerprint::parse_dotted_version(&s));
             let serial = self
-                .transmit_full(&fingerprint::NITROKEY_GET_SERIAL)
+                .transmit_full_raw(&fingerprint::NITROKEY_GET_SERIAL)
                 .ok()
                 .filter(|(_, sw)| *sw == piv::SW_OK)
                 .and_then(|(data, _)| keyroost_piv::parse_serial(&data).ok());
@@ -1800,26 +2019,18 @@ impl PivSession {
     /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
     /// and which slots hold a certificate. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
-        // Fingerprint resolution (which also resolves `version` — see
-        // `Self::applet_fingerprint`'s doc) runs first: some identities' own
-        // probes supply a real serial number, and when one does, the Yubico
-        // GET SERIAL extension below is skipped entirely — a card that
-        // answers it with a fake value (observed: a Nitrokey) never gets the
-        // chance to overwrite the real one.
+        // Fingerprint resolution (which also resolves `version` and
+        // `serial` — see `Self::applet_fingerprint`'s doc) runs first and is
+        // fully cached in `identity`: a card's serial can't change while the
+        // physical card stays the same, so there's nothing left to resolve
+        // here — no live GET SERIAL round trip on a repeat call.
         let AppletFingerprintResult {
             fingerprint: applet_fingerprint,
             name: applet_name,
             version,
             version_firmware,
-            serial: fingerprint_serial,
+            serial,
         } = self.applet_fingerprint();
-        let serial = resolve_serial(
-            applet_fingerprint,
-            version.as_deref(),
-            version_firmware.as_deref(),
-            fingerprint_serial,
-            || self.serial(),
-        );
         let pin_retries = self.pin_retries();
         // Best-effort: a transport hiccup reading the CHUID shouldn't fail
         // the whole status snapshot, any more than an unsupported GET
@@ -1879,33 +2090,36 @@ impl PivSession {
     /// The saving over calling `status()` and then `slot_key_algorithm` +
     /// `read_certificate` + `slot_policy` per slot is that each slot here
     /// costs exactly **one GET METADATA and one [`Self::read_certificate`]**
-    /// (plus an ATTEST only as the pre-5.3-firmware policy fallback): that one
-    /// certificate read feeds occupancy, the Subject DN, and the algorithm's
-    /// step-3 fallback together, and the GET METADATA feeds both the algorithm
-    /// and the policy. Calling the methods separately re-reads the certificate
-    /// two or three times and GET METADATA twice, because [`PivSession`] holds
-    /// no read cache.
+    /// on a session seeing this slot for the first time (plus an ATTEST only
+    /// as the pre-5.3-firmware policy fallback): that one certificate read
+    /// feeds occupancy, the Subject DN, and the algorithm's step-3 fallback
+    /// together, and the GET METADATA feeds both the algorithm and the
+    /// policy — calling the methods separately would otherwise re-read the
+    /// certificate two or three times and GET METADATA twice.
+    ///
+    /// On a *later* call — another slot method reusing what this one just
+    /// resolved, a tab reselect, or a whole new session on the same card via
+    /// [`Self::open_cached`] — even that one read each may not happen at
+    /// all: [`Self::read_certificate`]/[`Self::cached_slot_key`]/
+    /// [`Self::slot_policy`] each check [`CertCache`]/[`PubkeyCache`]/
+    /// [`PolicyCache`] first, so a slot whose key and certificate haven't
+    /// changed since costs no APDU here whatsoever.
     ///
     /// Algorithm and policy fall back exactly as [`Self::slot_key_algorithm`]
     /// and [`Self::slot_policy`] do (they share the resolvers), so a caller
     /// that generated a key in this session should [`Self::remember_pubkey`]
     /// it first to have that key named for a slot with no certificate yet.
     pub fn status_detailed(&mut self) -> Result<PivStatusDetailed, TransportError> {
-        // See the identical ordering (and why) in `status`.
+        // See the identical reasoning in `status`: `serial` is already
+        // fully resolved as part of `identity`, cached, no live GET SERIAL
+        // round trip here.
         let AppletFingerprintResult {
             fingerprint: applet_fingerprint,
             name: applet_name,
             version,
             version_firmware,
-            serial: fingerprint_serial,
+            serial,
         } = self.applet_fingerprint();
-        let serial = resolve_serial(
-            applet_fingerprint,
-            version.as_deref(),
-            version_firmware.as_deref(),
-            fingerprint_serial,
-            || self.serial(),
-        );
         let pin_retries = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
 
@@ -1916,11 +2130,13 @@ impl PivSession {
             // Subject DN, and the algorithm's cert fallback all come off this.
             let cert = self.cert_object(slot)?;
             let cert_der = cert.as_ref().ok().and_then(Option::as_deref);
-            // The slot's one GET METADATA — shared by algorithm and policy.
-            let meta = self.metadata(slot.key_ref());
-
+            // The slot's one GET METADATA — `cached_slot_key` shares it with
+            // `slot_policy` below (its own resolution goes through
+            // `cached_slot_key` too, so a slot needing both facts never
+            // costs the round trip twice).
             let algorithm = self
-                .algorithm_without_cert(slot, meta.as_ref())
+                .cached_slot_key(slot)
+                .map(|(alg, _)| alg)
                 .or_else(|| self.hid_crescendo_slot_algorithm(slot))
                 .or_else(|| {
                     cert_der
@@ -1929,7 +2145,7 @@ impl PivSession {
             let subject = cert_der
                 .and_then(|der| piv::x509_parse::parse_subject_dn(der).ok())
                 .map(|dn| dn.to_string());
-            let policy = self.resolve_policy(slot, meta.as_ref());
+            let policy = self.slot_policy(slot);
 
             slots.push(slot_occupancy(
                 slot,
@@ -1971,9 +2187,16 @@ impl PivSession {
 
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
     /// Widened to `u128` — see [`keyroost_piv::parse_serial`] for why the
-    /// reply isn't always the standard 4-byte `u32`. Not called at all when
-    /// [`Self::applet_fingerprint`] already produced a serial of its own —
-    /// see the call sites in [`Self::status`]/[`Self::status_detailed`].
+    /// reply isn't always the standard 4-byte `u32`. Called at most once per
+    /// lineage, from [`Self::applet_fingerprint`]'s `YubiKey` and generic
+    /// catch-all arms only — every fingerprint with its own dedicated serial
+    /// probe (Token2, Thetis, Nitrokey, HID Crescendo) never calls this at
+    /// all. Resolving it during fingerprinting rather than lazily in
+    /// [`Self::status`]/[`Self::status_detailed`] means it rides along in
+    /// `identity`'s own unconditional cache — safe, because a card's serial
+    /// cannot change while the physical card stays the same, exactly like
+    /// the rest of `identity` — instead of needing a cache of its own that
+    /// every status read would otherwise have to check.
     fn serial(&mut self) -> Option<u128> {
         let (data, sw) = self.transmit_full(&piv::get_serial()).ok()?;
         if sw != piv::SW_OK {
@@ -1982,17 +2205,34 @@ impl PivSession {
         piv::parse_serial(&data).ok()
     }
 
-    /// Remaining PIN tries via a no-op VERIFY. `63 Cx` → `Some(x)`, `6983`
-    /// (blocked) → `Some(0)`, `9000` (already verified) / anything else → `None`.
+    /// Remaining PIN tries via a no-op VERIFY (consumes no try itself — the
+    /// query the card answers is distinct from an actual PIN presentation).
+    /// `63 Cx` → `Some(x)`, `6983` (blocked) → `Some(0)`, `9000` (already
+    /// verified) / anything else → `None`.
+    ///
+    /// Cached in [`PivSessionState::pin_retries_cache`] for the rest of this
+    /// lineage once a real status word comes back — a transport-level
+    /// failure (the early `?` below) is never cached, same as every other
+    /// cache here. [`Self::verify_pin`]/[`Self::change_pin`]/
+    /// [`Self::unblock_pin`]/[`Self::set_pin_retries`] each invalidate this
+    /// on the way out, since each is the one thing that can actually move
+    /// the counter this method itself never touches.
     fn pin_retries(&mut self) -> Option<u8> {
-        let (_, sw) = self.transmit_full(&piv::verify_pin_status()).ok()?;
-        if let Some(n) = crate::sw_tries_remaining(sw) {
+        if let Some(cached) = self.state.pin_retries_cache {
+            return cached;
+        }
+        let Ok((_, sw)) = self.transmit_full(&piv::verify_pin_status()) else {
+            return None;
+        };
+        let retries = if let Some(n) = crate::sw_tries_remaining(sw) {
             Some(n)
         } else if sw == 0x6983 {
             Some(0)
         } else {
             None
-        }
+        };
+        self.state.pin_retries_cache = Some(retries);
+        retries
     }
 
     /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] plus
@@ -2129,13 +2369,19 @@ impl PivSession {
     /// Runs [`clear_metadata_if_quirky`] over the parsed reply before
     /// returning it — see that function's doc for what it strips and why.
     /// This is the sole place that needs to know about either check: every
-    /// caller of [`Self::metadata`] — [`Self::slot_key`]/
-    /// [`metadata_key_material`], [`Self::algorithm_without_cert`],
-    /// [`Self::resolve_policy`], [`Self::reported_management_key_algorithm`],
-    /// [`Self::status_detailed`] — already treats a missing algorithm/public
-    /// key as "fall back to another source", which is exactly the right
-    /// behavior on a device where GET METADATA can't be trusted, or isn't
-    /// there at all.
+    /// caller — direct, or through [`Self::resolve_slot_from_device`]'s
+    /// decode — already treats a missing algorithm/public key as "fall back
+    /// to another source", which is exactly the right behavior on a device
+    /// where GET METADATA can't be trusted, or isn't there at all.
+    ///
+    /// Always a live round trip, deliberately uncached here: a PIN/PUK/
+    /// management-key reference's `retries`/`is_default` answer can change
+    /// on essentially every VERIFY/CHANGE REFERENCE DATA/SET MANAGEMENT KEY
+    /// call, so this crate never caches *this* method's raw result — a
+    /// caller with an actual [`Slot`] in hand decodes and caches the *final*
+    /// facts it actually needs ([`Self::resolve_slot_from_device`] for
+    /// algorithm/key/policy) rather than the reply itself; see that
+    /// method's doc for why.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
         if self.extension_gate(keyroost_piv::compat::PivExtension::GetMetadata)
             == keyroost_piv::compat::FeatureGate::Unsupported
@@ -2148,6 +2394,93 @@ impl PivSession {
         }
         let md = piv::parse_metadata(&data).ok()?;
         Some(clear_metadata_if_quirky(&self.quirks(), md))
+    }
+
+    /// One live [`Self::metadata`]`(slot.key_ref())` read, decoded straight
+    /// into the *final* facts a caller actually wants — never kept around as
+    /// an intermediate [`Metadata`] value:
+    ///
+    /// * whenever the reply carries a `policy` tag, decodes and writes
+    ///   [`PolicyCache`] directly — sharing this one round trip with
+    ///   whatever else needed it, so a slot wanting both algorithm/key *and*
+    ///   policy (`status_detailed`'s per-slot loop) never pays for it twice.
+    ///   Deliberately never writes a *negative* answer there: an absent tag
+    ///   means "try the ATTEST fallback next", a decision [`Self::slot_policy`]
+    ///   — not this method — gets to make once it's tried that too;
+    /// * returns the decoded `(algorithm, key)` when the reply names both
+    ///   (via [`metadata_key_material`]), `None` otherwise. Callers write
+    ///   that into [`PubkeyCache`] however fits their own read policy — see
+    ///   [`Self::cached_slot_key`] (cache-preferring) and
+    ///   [`Self::confirmed_slot_key`] (always re-confirms live).
+    ///
+    /// Never itself consults or writes `pubkey_cache`/`policy_cache`'s
+    /// "already resolved" state — that's each caller's own job, precisely
+    /// so [`Self::slot_key_status_algorithm`] can use this same decode path
+    /// for its algorithm-only reply without going anywhere near
+    /// `pubkey_cache` at all (see that method's doc for why it must not).
+    fn resolve_slot_from_device(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+        let key_ref = slot.key_ref();
+        let md = self.metadata(key_ref);
+        if let Some((pin, touch)) = md.as_ref().and_then(|m| m.policy) {
+            if let (Some(pin), Some(touch)) = (PinPolicy::from_id(pin), TouchPolicy::from_id(touch))
+            {
+                self.state.policy_cache.remember(key_ref, Some((pin, touch)));
+            }
+        }
+        md.as_ref()
+            .and_then(|m| metadata_key_material(m, |id| self.key_alg_from_apdu_id(id)))
+            .and_then(|(alg, raw)| public_key_from_metadata(raw).ok().map(|key| (alg, key)))
+    }
+
+    /// `slot`'s algorithm + public key from [`PubkeyCache`] if this lineage
+    /// has already resolved it (by either provenance — see that type's
+    /// doc), else one live [`Self::resolve_slot_from_device`] read, cached
+    /// for next time either way (including a confirmed-empty slot, so a
+    /// slot that's genuinely empty — the common case — doesn't cost another
+    /// APDU on the next tab reselect). Backs the display/status paths that
+    /// call repeatedly and can tolerate a value that's a moment stale:
+    /// [`Self::status_detailed`], [`Self::slot_key_algorithm`],
+    /// [`Self::slot_has_key`]. [`Self::confirmed_slot_key`] is the
+    /// always-fresh counterpart for the two callers that can't.
+    fn cached_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+        let key_ref = slot.key_ref();
+        if let Some(resolved) = self.state.pubkey_cache.get(key_ref) {
+            return resolved.cloned();
+        }
+        let resolved = self.resolve_slot_from_device(slot);
+        self.state.pubkey_cache.remember(key_ref, resolved.clone());
+        resolved
+    }
+
+    /// `slot`'s algorithm + public key, always re-confirmed live against the
+    /// device first — bypassing whatever [`PubkeyCache`] already holds —
+    /// and preferring what the device reports whenever it reports anything.
+    /// Backs [`Self::slot_key`], the shared source [`Self::generate_csr`]/
+    /// [`Self::self_signed_certificate`] use: both mint an SPKI that then
+    /// gets signed by the card's *actual* current private key, so trusting a
+    /// stale cached value here wouldn't just show outdated info — it would
+    /// produce a certificate whose declared public key doesn't match what
+    /// signed it. Worth the extra APDU on an operation already doing a PIN
+    /// verify and a signature.
+    ///
+    /// A device that answers nothing new proves nothing about whether an
+    /// existing entry — self-known via [`Self::remember_pubkey`], or a
+    /// previous confirmation — is still right, so that case falls back to
+    /// whatever's already cached instead of erasing it: a metadata-less
+    /// card's silence is *expected*, not a "this key is gone" signal.
+    fn confirmed_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+        let key_ref = slot.key_ref();
+        match self.resolve_slot_from_device(slot) {
+            Some(kv) => {
+                self.state.pubkey_cache.remember(key_ref, Some(kv.clone()));
+                Some(kv)
+            }
+            None => self
+                .state
+                .pubkey_cache
+                .get(key_ref)
+                .and_then(|cached| cached.cloned()),
+        }
     }
 
     /// The raw response body of a HID Crescendo GET PIV PROPERTIES read for
@@ -2554,7 +2887,7 @@ impl PivSession {
 
         let result: Result<(), TransportError> = (|| {
             let (_, sw) =
-                self.transmit_full(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
+                self.transmit_full_raw(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
             ok_or_apdu("piv aca select", sw)?;
             self.aca_xauth_unlock(key)
         })();
@@ -2578,7 +2911,7 @@ impl PivSession {
     fn aca_xauth_unlock(&mut self, key: &[u8]) -> Result<(), TransportError> {
         use keyroost_piv::fingerprint;
 
-        let (challenge, sw) = self.transmit_full(&fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE)?;
+        let (challenge, sw) = self.transmit_full_raw(&fingerprint::HID_CRESCENDO_ACA_GET_CHALLENGE)?;
         ok_or_apdu("piv aca get challenge", sw)?;
         let alg = fingerprint::hid_crescendo_xauth_key_alg(challenge.len())
             .ok_or(TransportError::PivBadKeyLength)?;
@@ -2590,7 +2923,7 @@ impl PivSession {
         let apdu = Zeroizing::new(fingerprint::hid_crescendo_aca_external_authenticate(
             &cryptogram,
         ));
-        let (_, sw) = self.transmit_full(&apdu)?;
+        let (_, sw) = self.transmit_full_raw(&apdu)?;
         if sw != piv::SW_OK {
             // Per HID's documentation, `SW = 6A 88` ("XAUTH 1 key has
             // not been initialized"), `SW = 69 85` ("Get Challenge not
@@ -2614,10 +2947,17 @@ impl PivSession {
     /// typed error on anything else rather than pad/truncate, so an unchecked
     /// over-length PIN can never silently verify (and store) something other
     /// than what the user typed, and no retry counter is consumed.
+    ///
+    /// Invalidates [`PivSessionState::pin_retries_cache`] once the card has
+    /// actually answered — success resets the counter, a wrong PIN
+    /// decrements it, so either way a cached count from before this call is
+    /// stale. Left untouched on a transport-level failure (the early `?`
+    /// below): nothing reached the card, so nothing changed.
     pub fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
         let apdu =
             Zeroizing::new(piv::verify_pin(pin).map_err(|_| TransportError::PivBadPinLength)?);
         let (_, sw) = self.transmit_full(&apdu)?;
+        self.state.pin_retries_cache = None;
         map_pin_sw(sw)
     }
 
@@ -2637,7 +2977,7 @@ impl PivSession {
             piv::verify_pin_at(keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_REF, pin)
                 .map_err(|_| TransportError::PivBadPinLength)?,
         );
-        let (_, sw) = self.transmit_full(&apdu)?;
+        let (_, sw) = self.transmit_full_raw(&apdu)?;
         map_pin_sw(sw)
     }
 
@@ -2688,13 +3028,16 @@ impl PivSession {
     }
 
     /// Change the PIV PIN. A wrong `old` PIN consumes a try and reports the
-    /// remaining count. Both PINs must be 6–8 bytes.
+    /// remaining count. Both PINs must be 6–8 bytes. Invalidates
+    /// [`PivSessionState::pin_retries_cache`] the same way, and for the same
+    /// reason, [`Self::verify_pin`] does.
     pub fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
             piv::change_reference(piv::PIN_REF_APPLICATION, old, new)
                 .map_err(|_| TransportError::PivBadPinLength)?,
         );
         let (_, sw) = self.transmit_full(&apdu)?;
+        self.state.pin_retries_cache = None;
         map_pin_sw(sw)
     }
 
@@ -2710,20 +3053,31 @@ impl PivSession {
     }
 
     /// Unblock a blocked PIN using the PUK, setting a new PIN. A wrong PUK
-    /// consumes a try and reports the remaining count. Both must be 6–8 bytes.
+    /// consumes a try and reports the remaining count; a successful unblock
+    /// resets the *PIN's* counter too (it's the PUK's own counter that isn't
+    /// tracked here — see [`PivSessionState::pin_retries_cache`]'s doc for
+    /// why this crate never caches that one). Both must be 6–8 bytes.
+    /// Invalidates [`PivSessionState::pin_retries_cache`] the same way, and
+    /// for the same reason, [`Self::verify_pin`] does.
     pub fn unblock_pin(&mut self, puk: &[u8], new_pin: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
             piv::unblock_pin(puk, new_pin).map_err(|_| TransportError::PivBadPinLength)?,
         );
         let (_, sw) = self.transmit_full(&apdu)?;
+        self.state.pin_retries_cache = None;
         map_pin_sw(sw)
     }
 
     /// Set the PIN and PUK retry counts (resetting both to their defaults).
-    /// Requires prior management-key auth **and** a verified PIN.
+    /// Requires prior management-key auth **and** a verified PIN. Invalidates
+    /// [`PivSessionState::pin_retries_cache`]: this resets the PIN counter to
+    /// its (possibly new) default, same as a successful [`Self::verify_pin`]
+    /// would, just without presenting a PIN to do it.
     pub fn set_pin_retries(&mut self, pin_tries: u8, puk_tries: u8) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&piv::set_pin_retries(pin_tries, puk_tries))?;
-        ok_or_write("piv set pin retries", sw)
+        ok_or_write("piv set pin retries", sw)?;
+        self.state.pin_retries_cache = None;
+        Ok(())
     }
 
     /// Replace the card-management key with `(alg, key)`. Requires prior
@@ -2838,7 +3192,7 @@ impl PivSession {
 
         let result: Result<(), TransportError> = (|| {
             let (_, sw) =
-                self.transmit_full(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
+                self.transmit_full_raw(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
             ok_or_apdu("piv aca select", sw)?;
 
             match current {
@@ -2855,7 +3209,7 @@ impl PivSession {
                     fingerprint::hid_crescendo_aca_put_xauth_key_remove()
                 }
             });
-            let (_, sw) = self.transmit_full(&apdu)?;
+            let (_, sw) = self.transmit_full_raw(&apdu)?;
             ok_or_write("piv aca put xauth key", sw)
         })();
 
@@ -2938,7 +3292,7 @@ impl PivSession {
 
         let result: Result<FactoryResetOutcome, TransportError> = (|| {
             let (_, sw) =
-                self.transmit_full(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
+                self.transmit_full_raw(&piv::select_by_aid(&fingerprint::HID_CRESCENDO_ACA_AID))?;
             ok_or_apdu("piv aca select", sw)?;
 
             match pre_reset_mgmt_auth {
@@ -2946,7 +3300,7 @@ impl PivSession {
                 CurrentMgmtAuth::Key(current_key) => self.aca_xauth_unlock(current_key)?,
             }
 
-            let (_, sw) = self.transmit_full(&fingerprint::HID_CRESCENDO_ACA_RESET_CARD)?;
+            let (_, sw) = self.transmit_full_raw(&fingerprint::HID_CRESCENDO_ACA_RESET_CARD)?;
             ok_or_write("piv aca reset card", sw)?;
 
             // Wiped. Everything from here on is the factory-XAUTH-key
@@ -2981,7 +3335,7 @@ impl PivSession {
                 keyroost_piv::MgmtAlg::TripleDes,
                 restore_key,
             ) {
-                Some(apdu) => match self.transmit_full(&apdu) {
+                Some(apdu) => match self.transmit_full_raw(&apdu) {
                     Ok((_, sw)) if sw == piv::SW_OK => FactoryResetOutcome::WipedGlobal,
                     Ok((_, sw)) => {
                         trace::line(self.debug, || {
@@ -3027,17 +3381,20 @@ impl PivSession {
     /// method's doc comment for why this deliberately doesn't do that on its
     /// own.
     ///
-    /// Also seeds [`PolicyCache`] — not with `pin_policy`/`touch_policy`
-    /// themselves (a request, not a result: this instruction's response is
-    /// the public key blob alone, no policy confirmation, and a card is
-    /// free to translate a requested policy into something else on its own
-    /// terms — e.g. a `Default` axis becomes *some* concrete native default
-    /// only the card knows, but nothing rules out a card normalizing even
-    /// an explicit request to a value of its own choosing either), but with
-    /// whatever [`Self::slot_policy`] reads back afterward — a real GET
-    /// METADATA, falling back to ATTEST, exactly like any other resolution.
-    /// Best-effort: a failed read here just leaves the slot uncached, same
-    /// as any other [`Self::slot_policy`] miss.
+    /// Also evicts any [`PolicyCache`] entry already cached for `slot` — it
+    /// describes the *old* key, if this slot held one — before reseeding it
+    /// with whatever [`Self::slot_policy`] reads back afterward: not with
+    /// `pin_policy`/`touch_policy` themselves (a request, not a result: this
+    /// instruction's response is the public key blob alone, no policy
+    /// confirmation, and a card is free to translate a requested policy into
+    /// something else on its own terms — e.g. a `Default` axis becomes *some*
+    /// concrete native default only the card knows, but nothing rules out a
+    /// card normalizing even an explicit request to a value of its own
+    /// choosing either), but with the real GET METADATA/ATTEST resolution,
+    /// exactly like any other [`Self::slot_policy`] call. That method always
+    /// leaves the slot resolved one way or another, including "neither
+    /// channel names a policy", so this never leaves a slot uncached even on
+    /// a card with no policy-reporting channel at all.
     pub fn generate_key(
         &mut self,
         slot: Slot,
@@ -3053,22 +3410,49 @@ impl PivSession {
         // The new key just overwrote whatever was in `slot`; any existing
         // certificate now names a public key that no longer matches it.
         self.clear_certificate(slot)?;
+        // Whatever policy was cached for `slot` before this call describes
+        // the *old* key, not this one. Evict before `slot_policy` below
+        // reads it back, so that read sees the card's actual answer for the
+        // new key instead of a stale cached one for the old.
+        self.state.policy_cache.evict(slot.key_ref());
+        // Likewise evict `pubkey_cache` — and do it *before* `slot_policy`
+        // below, not just before returning. Whatever this slot resolved to
+        // before (an old key here already, or a confirmed-empty `None` for
+        // a slot that just got its first key) is exactly the kind of
+        // "already resolved" entry `cached_slot_key` trusts without a device
+        // round trip. `slot_policy`'s GET METADATA step goes through
+        // `cached_slot_key`, so a stale entry here — not just a stale
+        // `policy_cache` entry — makes it skip the live metadata read (and
+        // its policy tag) entirely, forcing every generate onto the ATTEST
+        // fallback, and on firmware/quirks where that fallback comes up
+        // empty, permanently caching "no policy" for a slot GET METADATA
+        // could have answered correctly. This is the common case, not an
+        // edge one: a slot's key/policy is typically already resolved (an
+        // earlier status read, or an old key being regenerated) by the time
+        // `generate_key` runs on it.
+        self.state.pubkey_cache.evict(slot.key_ref());
+        // `slot_policy` reads (and caches) the policy the card actually
+        // ended up applying — the *request* above is not trustworthy enough
+        // to cache directly, so this doesn't try to shortcut from
+        // `pin_policy`/`touch_policy`.
+        let _ = self.slot_policy(slot);
+        // Seed (or, on firmware with GET METADATA, re-confirm) the new
+        // key's material from GENERATE's own response — the one source
+        // that's authoritative even when the metadata read `slot_policy`
+        // just did above found nothing (pre-5.3 firmware), where
+        // `cached_slot_key` would otherwise have left this slot cached as
+        // `None`.
         self.state
             .pubkey_cache
-            .remember(slot.key_ref(), alg, key.clone());
-        // `slot_policy` reads (and, on a successful ATTEST fallback,
-        // caches) the policy the card actually ended up applying — the
-        // *request* above is not trustworthy enough to cache directly, so
-        // this doesn't try to shortcut from `pin_policy`/`touch_policy`.
-        let _ = self.slot_policy(slot);
+            .remember(slot.key_ref(), Some((alg, key.clone())));
         Ok(key)
     }
 
-    /// Seed this session's in-memory key cache for `slot` with `(alg, key)`
-    /// directly, without a card round-trip — the same cache
-    /// [`Self::generate_key`] populates, and the same one [`Self::slot_key`] /
-    /// [`Self::slot_key_algorithm`] fall back to when GET METADATA doesn't
-    /// cover the slot.
+    /// Seed this session's key-material cache for `slot` with `(alg, key)`
+    /// directly, without a card round-trip — the same [`PubkeyCache`]
+    /// [`Self::generate_key`] populates, and the same one [`Self::slot_key`]/
+    /// [`Self::slot_key_algorithm`] read when the device hasn't (yet, or
+    /// ever) reported anything better.
     ///
     /// This is the deliberately-explicit replacement for what used to be an
     /// automatic on-disk cache: `PivSession` itself keeps no persistence
@@ -3081,12 +3465,16 @@ impl PivSession {
     /// wherever the user chose to put it — and call this before the call that
     /// needs it (`generate_csr`, `self_signed_certificate`, or checking
     /// `slot_key_algorithm` for display). Not verified against the card in
-    /// any way: what's remembered here is exactly what's trusted later, so a
-    /// caller handing over the wrong slot's key gets a CSR/self-signed
-    /// certificate whose SPKI doesn't match the private key that actually
-    /// signed it.
+    /// any way when written — but [`Self::slot_key`] (via
+    /// [`Self::confirmed_slot_key`]) always re-confirms live before trusting
+    /// it for a signing operation, so a caller handing over the wrong slot's
+    /// key gets caught there whenever the device has any channel to check
+    /// against; only a genuinely metadata-less card leaves this exactly as
+    /// trustworthy as whoever called this.
     pub fn remember_pubkey(&mut self, slot: Slot, alg: KeyAlg, key: PublicKey) {
-        self.state.pubkey_cache.remember(slot.key_ref(), alg, key);
+        self.state
+            .pubkey_cache
+            .remember(slot.key_ref(), Some((alg, key)));
     }
 
     /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
@@ -3181,7 +3569,13 @@ impl PivSession {
                 }
             }
         };
-        cert_write_result(slot, der.len(), sw)
+        cert_write_result(slot, der.len(), sw)?;
+        // Written; no need to read it back — this is exactly what
+        // `Self::read_certificate` would resolve to now.
+        self.state
+            .cert_cache
+            .remember(slot.key_ref(), Ok(Some(der.to_vec())));
+        Ok(())
     }
 
     /// [`Self::import_certificate`]'s pre-flight key check — see that
@@ -3230,15 +3624,23 @@ impl PivSession {
     /// `metadata_key_material`) for any Yubico-compatible fingerprint, or HID
     /// Crescendo's own GET PIV PROPERTIES read
     /// ([`Self::hid_crescendo_slot_algorithm`]) for that family. Deliberately
-    /// *not* [`Self::slot_key_algorithm`]: this never falls back to the
-    /// session-local pubkey cache (not device-reported — a caller of
-    /// [`Self::reject_certificate_key_mismatch`] already tried that, via
-    /// [`Self::slot_key`], before reaching here) nor to the slot's existing
-    /// certificate (not independent evidence — it's exactly the object about
-    /// to be overwritten, and may itself be stale). A caller can trust a
-    /// `Some` here as much as `GetSlotKeyStatus`'s own gate for this
-    /// fingerprint — check that gate too before treating a `None` as
-    /// "confirmed empty" rather than merely "this channel came up empty".
+    /// *not* [`Self::slot_key_algorithm`], and deliberately calling
+    /// [`Self::metadata`] directly rather than going through [`PubkeyCache`]
+    /// (via [`Self::cached_slot_key`]/[`Self::confirmed_slot_key`]) at all:
+    /// this must never fall back to — or get confused with — the
+    /// self-known slice of that cache (not device-reported — a caller of
+    /// [`Self::reject_certificate_key_mismatch`] already tried the full
+    /// cache, via [`Self::slot_key`], before reaching here, precisely
+    /// because *that* check needs an independent, never-self-vouched
+    /// corroborating source) nor to the slot's existing certificate (not
+    /// independent evidence — it's exactly the object about to be
+    /// overwritten, and may itself be stale). A caller can trust a `Some`
+    /// here as much as `GetSlotKeyStatus`'s own gate for this fingerprint —
+    /// check that gate too before treating a `None` as "confirmed empty"
+    /// rather than merely "this channel came up empty". Uncached: this path
+    /// is reached only when the primary check already failed, rare enough
+    /// that a live round trip here is cheap insurance rather than a hot-path
+    /// cost.
     fn slot_key_status_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
         let alg_id = self.metadata(slot.key_ref()).and_then(|m| m.algorithm);
         alg_id
@@ -3261,6 +3663,11 @@ impl PivSession {
     /// the standard fix, not a workaround specific to any one vendor's card.
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
+    ///
+    /// Invalidates [`PivSessionState::chuid_cache`] back to "unresolved" on
+    /// success, so the next [`Self::read_chuid`] — this session or, via
+    /// `open_cached`, a later one on the same card — sees the value just
+    /// written instead of whatever was cached before it.
     pub fn new_chuid(
         &mut self,
         guid: &[u8; 16],
@@ -3268,7 +3675,9 @@ impl PivSession {
     ) -> Result<(), TransportError> {
         let value = piv::encode_chuid(guid, expiration);
         let (_, sw) = self.transmit_full(&piv::put_data(&piv::OBJECT_CHUID, &value))?;
-        ok_or_write("piv new chuid", sw)
+        ok_or_write("piv new chuid", sw)?;
+        self.state.chuid_cache = None;
+        Ok(())
     }
 
     /// Read the card's CHUID: FASC-N, GUID, and expiration date (the
@@ -3276,13 +3685,24 @@ impl PivSession {
     /// [`keyroost_piv::parse_chuid`]). `None` when the object is empty/absent
     /// or doesn't parse as a CHUID. No PIN required — CHUID is a public data
     /// object, like a certificate.
+    ///
+    /// Cached in [`PivSessionState::chuid_cache`] for the rest of this
+    /// lineage — [`Self::new_chuid`] is the only thing that invalidates it.
+    /// A transport- or parse-level failure (either `?` below) is never
+    /// cached, same as every other cache here.
     pub fn read_chuid(&mut self) -> Result<Option<keyroost_piv::Chuid>, TransportError> {
+        if let Some(cached) = self.state.chuid_cache.clone() {
+            return Ok(cached);
+        }
         let (data, sw) = self.transmit_full(&piv::get_data(&piv::OBJECT_CHUID))?;
         if sw != piv::SW_OK {
+            self.state.chuid_cache = Some(None);
             return Ok(None);
         }
         let inner = piv::unwrap_data_object(&data).map_err(TransportError::PivParse)?;
-        Ok(piv::parse_chuid(inner))
+        let chuid = piv::parse_chuid(inner);
+        self.state.chuid_cache = Some(chuid.clone());
+        Ok(chuid)
     }
 
     /// Clear `slot`'s certificate object (standard PIV; universal across
@@ -3292,7 +3712,10 @@ impl PivSession {
     /// [`authenticate_management`]: PivSession::authenticate_management
     pub fn clear_certificate(&mut self, slot: Slot) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&piv::clear_certificate(slot))?;
-        ok_or_write("piv clear certificate", sw)
+        ok_or_write("piv clear certificate", sw)?;
+        // Cleared; no need to read it back to know it's gone now.
+        self.state.cert_cache.remember(slot.key_ref(), Ok(None));
+        Ok(())
     }
 
     /// Delete `slot`'s private key. Permanently erases the key material; the
@@ -3418,6 +3841,11 @@ impl PivSession {
     /// object: no PIN, and a malformed body is reported as absent rather than
     /// erroring the call (a real card doesn't produce one; `slot_status` and
     /// `status_detailed` derive occupancy straight from this).
+    ///
+    /// A thin wrapper over [`Self::cert_object`] — see that method's doc for
+    /// the caching behaviour — that turns an unreadable certificate into
+    /// [`TransportError::PivCertUnreadable`] instead of the tri-state
+    /// `Result` [`Self::cert_object`] returns.
     pub fn read_certificate(&mut self, slot: Slot) -> Result<Option<Vec<u8>>, TransportError> {
         self.cert_object(slot)?
             .map_err(|reason| TransportError::PivCertUnreadable { slot, reason })
@@ -3427,15 +3855,28 @@ impl PivSession {
     /// `Result` is the card exchange, the inner one whether a certificate
     /// that is there can be read. Status views use this directly so one
     /// unreadable slot is reported, not fatal to the whole snapshot.
+    ///
+    /// Cached in [`CertCache`] for the rest of this lineage — see that
+    /// type's doc for the full invalidation lifecycle. A transport-level
+    /// failure (the `?` below) is never cached, same as every other cache
+    /// here: only an actual answer from the card, `9000` or not, counts as
+    /// resolved.
     fn cert_object(
         &mut self,
         slot: Slot,
     ) -> Result<Result<Option<Vec<u8>>, CertUnreadable>, TransportError> {
-        let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
-        if sw != piv::SW_OK {
-            return Ok(Ok(None));
+        let key_ref = slot.key_ref();
+        if let Some(cached) = self.state.cert_cache.get(key_ref) {
+            return Ok(cached);
         }
-        Ok(cert_object_der(&data))
+        let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
+        let cert = if sw == piv::SW_OK {
+            cert_object_der(&data)
+        } else {
+            Ok(None)
+        };
+        self.state.cert_cache.remember(key_ref, cert.clone());
+        Ok(cert)
     }
 
     /// Yubico ATTEST: the self-signed attestation certificate for `slot`'s key
@@ -3446,7 +3887,7 @@ impl PivSession {
     /// anything, same reasoning as [`Self::metadata`]'s
     /// [`GetMetadata`](keyroost_piv::compat::PivExtension::GetMetadata)
     /// check — so a caller doesn't pay for a guaranteed-refused round trip
-    /// (and [`Self::resolve_policy`]'s ATTEST fallback, which every one of
+    /// (and [`Self::slot_policy`]'s ATTEST fallback, which every one of
     /// this fingerprint's slots hits since GET METADATA never names a
     /// policy either, doesn't send four of them per status read). The
     /// synthetic `SW = 6D 00` this returns without any card I/O matches
@@ -3472,76 +3913,76 @@ impl PivSession {
 
     /// Read `slot`'s PIN/touch policy for display:
     ///
-    /// 1. GET METADATA, tried unconditionally — cards that don't support it
-    ///    (pre-5.3 firmware, or non-Yubico PIV) simply answer with something
-    ///    other than `9000`/no policy, which falls through to step 2.
-    /// 2. This session's [`PolicyCache`] — `generate_key`'s own arguments,
-    ///    or an earlier successful step 3 resolution, this session or an
-    ///    earlier one carried in via [`Self::open_cached`]. Skips a real
-    ///    APDU round trip for a value that's fixed for the life of the
-    ///    slot's current key.
+    /// 1. [`PolicyCache`] — already resolved this lineage, by either of the
+    ///    two channels below, this session or an earlier one carried in via
+    ///    [`Self::open_cached`]. Skips both remaining steps for a value
+    ///    that's fixed for the life of the slot's current key.
+    /// 2. GET METADATA's own `policy` field, via [`Self::cached_slot_key`] —
+    ///    shares that method's one live round trip (and its own
+    ///    [`PubkeyCache`] cache check) rather than issuing a second GET
+    ///    METADATA, so a slot [`Self::status_detailed`] just resolved the
+    ///    algorithm for costs nothing extra here.
     /// 3. The ATTEST certificate's Yubico key-policy extension
     ///    (`1.3.6.1.4.1.41482.3.8`) — GET METADATA predates policy reporting,
     ///    but ATTEST itself has existed since 4.3. ATTEST is itself a Yubico
     ///    vendor instruction, so a non-Yubico PIV card refuses it too; that
     ///    refusal is handled the same as everything else here, not specially.
-    ///    A successful resolution here is cached for step 2's benefit next
-    ///    time.
+    ///
+    /// Whatever step 2 or 3 settles on — including "neither channel names
+    /// one" — is written to [`PolicyCache`] before returning, so a slot that
+    /// genuinely has no reportable policy doesn't pay for both APDUs again
+    /// on the next call.
     ///
     /// `None` throughout means "not available for display", not a wire
     /// error — this is an informational read, not a precondition for a write,
     /// so every failure mode (missing extension, unparsable metadata, ATTEST
     /// itself being unsupported) collapses to the same answer.
     pub fn slot_policy(&mut self, slot: Slot) -> Option<(PinPolicy, TouchPolicy)> {
-        let meta = self.metadata(slot.key_ref());
-        self.resolve_policy(slot, meta.as_ref())
-    }
-
-    /// [`Self::slot_policy`]'s resolution from a GET METADATA reply the
-    /// caller already has: its `policy` bytes, else this session's
-    /// [`PolicyCache`], else the ATTEST certificate's key-policy extension
-    /// (cached for next time on success). Split out so
-    /// [`Self::status_detailed`] shares the exact same order without a
-    /// second GET METADATA.
-    fn resolve_policy(
-        &mut self,
-        slot: Slot,
-        meta: Option<&Metadata>,
-    ) -> Option<(PinPolicy, TouchPolicy)> {
-        if let Some((pin, touch)) = meta.and_then(|m| m.policy) {
-            return Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?));
+        let key_ref = slot.key_ref();
+        if let Some(resolved) = self.state.policy_cache.get(key_ref) {
+            return resolved;
         }
-        if let Some(policy) = self.state.policy_cache.get(slot.key_ref()) {
-            return Some(policy);
+        // `cached_slot_key` writes `policy_cache` directly whenever its own
+        // GET METADATA reply carries a policy tag — check again after it,
+        // rather than inspecting its return value, since that's the key
+        // material, not the policy.
+        self.cached_slot_key(slot);
+        if let Some(resolved) = self.state.policy_cache.get(key_ref) {
+            return resolved;
         }
-        // Non-Yubico PIV cards refuse this vendor instruction outright
-        // (a status word, not `9000`) — `.ok()?` turns that refusal
-        // into the same "no policy available" `None` as every other
-        // failure mode here.
-        let cert = self.attest(slot).ok()?;
-        let (pin, touch) = keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
+        // Non-Yubico PIV cards refuse this vendor instruction outright (a
+        // status word, not `9000`) — folded into the same `None` as every
+        // other failure mode here via `.ok()` / `.flatten()`.
+        let policy = self
+            .attest(slot)
             .ok()
-            .flatten()?;
-        let policy = (PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?);
-        self.state.policy_cache.remember(slot.key_ref(), policy);
-        Some(policy)
+            .and_then(|cert| {
+                keyroost_piv::x509_parse::parse_key_policy_extension(&cert)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|(pin, touch)| Some((PinPolicy::from_id(pin)?, TouchPolicy::from_id(touch)?)));
+        self.state.policy_cache.remember(key_ref, policy);
+        policy
     }
 
     /// Read `slot`'s key algorithm for display, compatible with any PIV
     /// token — not just a YubiKey new enough for GET METADATA (5.3+):
     ///
-    /// 1. GET METADATA. When it names an algorithm, that's authoritative —
-    ///    return it.
-    /// 2. This session's in-memory key cache (populated by
-    ///    [`Self::generate_key`], or seeded explicitly via
-    ///    [`Self::remember_pubkey`]). This is what makes a freshly generated key
-    ///    show up immediately on metadata-less firmware: there's no
-    ///    certificate yet for step 3 to read (self-sign/import hasn't run),
-    ///    and GET METADATA's silence on such firmware doesn't mean "empty" —
-    ///    it means "doesn't exist", so without this step a slot that was
-    ///    *just* populated would still display as empty. A caller reading
-    ///    status in a fresh session has to `remember_pubkey` first if it wants
-    ///    this step to see anything.
+    /// 1. [`Self::cached_slot_key`] — GET METADATA's algorithm when it names
+    ///    one (authoritative), else this session's self-known key cache
+    ///    (populated by [`Self::generate_key`], or seeded explicitly via
+    ///    [`Self::remember_pubkey`]) — either way, [`PubkeyCache`]. This is
+    ///    what makes a freshly generated key show up immediately on
+    ///    metadata-less firmware: there's no certificate yet for step 3 to
+    ///    read (self-sign/import hasn't run), and GET METADATA's silence on
+    ///    such firmware doesn't mean "empty" — it means "doesn't exist", so
+    ///    without this step a slot that was *just* populated would still
+    ///    display as empty. A caller reading status in a fresh session has
+    ///    to `remember_pubkey` first if it wants this step to see anything.
+    /// 2. HID Crescendo C2300's live substitute for GET METADATA, which that
+    ///    fingerprint never answers at all — see
+    ///    [`Self::hid_crescendo_slot_algorithm`]'s doc.
     /// 3. Otherwise, fall back to the slot's certificate (a standard PIV data
     ///    object every card serves) and parse the algorithm out of its
     ///    SubjectPublicKeyInfo directly.
@@ -3549,37 +3990,19 @@ impl PivSession {
     /// Unlike [`Self::slot_key`] — which this does *not* replace — this never
     /// needs the actual public key bytes, only the algorithm, so the
     /// certificate fallback is enough; `slot_key`'s callers (CSR/self-sign)
-    /// need the raw key material GET METADATA carries and stay
-    /// metadata-only.
+    /// need the raw key material and always re-confirm it live instead of
+    /// trusting this cache (see [`Self::confirmed_slot_key`]).
     pub fn slot_key_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
-        let meta = self.metadata(slot.key_ref());
-        // Steps 1–2 need no card read beyond the GET METADATA just done.
-        if let Some(alg) = self.algorithm_without_cert(slot, meta.as_ref()) {
+        if let Some((alg, _)) = self.cached_slot_key(slot) {
             return Some(alg);
         }
-        // HID Crescendo C2300's live substitute for GET METADATA, which this
-        // fingerprint never answers — see
-        // `Self::hid_crescendo_slot_algorithm`'s doc. A no-op (`None`)
-        // on every other fingerprint.
         if let Some(alg) = self.hid_crescendo_slot_algorithm(slot) {
             return Some(alg);
         }
-        // Step 3: the slot certificate's SubjectPublicKeyInfo.
         self.read_certificate(slot)
             .ok()
             .flatten()
             .and_then(|der| piv::x509_parse::parse_key_algorithm(&der).ok().flatten())
-    }
-
-    /// The first two of [`Self::slot_key_algorithm`]'s three steps — GET
-    /// METADATA's `algorithm` (from a reply the caller already has), then
-    /// this session's generated-key cache — i.e. everything that needs no
-    /// certificate read. [`Self::status_detailed`] appends the same step-3
-    /// certificate fallback with a cert it already holds.
-    fn algorithm_without_cert(&mut self, slot: Slot, meta: Option<&Metadata>) -> Option<KeyAlg> {
-        meta.and_then(|m| m.algorithm)
-            .and_then(|id| self.key_alg_from_apdu_id(id))
-            .or_else(|| self.state.pubkey_cache.get(slot.key_ref()).map(|(alg, _)| *alg))
     }
 
     /// Ask `slot`'s private key to sign a *prepared* block via GENERAL
@@ -3701,26 +4124,23 @@ impl PivSession {
             .map_err(TransportError::PivParse)
     }
 
-    /// The algorithm and public key of the key stored in `slot`: from GET
-    /// METADATA (firmware 5.3+) when the card actually names both, else from
-    /// this session's in-memory key cache. That cache is populated only by a
-    /// prior [`Self::generate_key`] on `slot` in *this* session, or by a caller
-    /// explicitly carrying the key material forward via [`Self::remember_pubkey`]
-    /// — that's what lets CSR/self-sign work right after generation on cards
-    /// that don't support GET METADATA (older YubiKeys, non-Yubico PIV
-    /// tokens): the card refuses to name the key material any other way, so
-    /// the cache is the only source left once GENERATE ASYMMETRIC has already
-    /// told us what it made, and this crate keeps no on-disk or
-    /// cross-process copy of that on its own (see [`Self::remember_pubkey`]).
-    ///
-    /// GET METADATA answering `SW_OK` is not by itself treated as authoritative
-    /// — some implementations (Nitrokey's `piv-authenticator`) accept the
-    /// instruction but reply with an empty body for slots they haven't wired
-    /// reporting up for yet, rather than failing it outright. That's
-    /// functionally identical to "no GET METADATA support" for our purposes,
-    /// so `metadata_key_material` is the single gate for "does this reply
-    /// actually name the key", and only a `Some` from it short-circuits the
-    /// cache fallback below.
+    /// The algorithm and public key of the key stored in `slot`, via
+    /// [`Self::confirmed_slot_key`]: always re-confirmed live against GET
+    /// METADATA first (firmware 5.3+, when the card actually names both
+    /// algorithm and public key — [`metadata_key_material`] is the gate for
+    /// "does this reply actually name the key", since some implementations,
+    /// e.g. Nitrokey's `piv-authenticator`, answer `SW_OK` with an empty body
+    /// for slots they haven't wired reporting up for yet, functionally
+    /// identical to "no GET METADATA support" here), falling back to
+    /// whatever [`PubkeyCache`] already holds only when the device answers
+    /// nothing new — self-known, from a prior [`Self::generate_key`] on
+    /// `slot` in *this* session, or a caller explicitly carrying key
+    /// material forward via [`Self::remember_pubkey`]. That's what lets
+    /// CSR/self-sign work right after generation on cards that don't
+    /// support GET METADATA (older YubiKeys, non-Yubico PIV tokens): the
+    /// card refuses to name the key material any other way, and this crate
+    /// keeps no on-disk or cross-process copy of it on its own (see
+    /// [`Self::remember_pubkey`]).
     ///
     /// Called by [`Self::generate_csr`]/[`Self::self_signed_certificate`]
     /// *before* they verify the PIN — GET METADATA is an unauthenticated
@@ -3737,18 +4157,7 @@ impl PivSession {
     /// handed to it via `remember_pubkey`), or a cached entry was invalidated
     /// by a later delete/move/reset.
     pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
-        let key_ref = slot.key_ref();
-        if let Some(md) = self.metadata(key_ref) {
-            if let Some((alg, raw)) = metadata_key_material(&md, |id| self.key_alg_from_apdu_id(id))
-            {
-                let key = public_key_from_metadata(raw).map_err(TransportError::PivParse)?;
-                return Ok((alg, key));
-            }
-        }
-        if let Some(cached) = self.state.pubkey_cache.get(key_ref).cloned() {
-            return Ok(cached);
-        }
-        Err(TransportError::MalformedResponse(
+        self.confirmed_slot_key(slot).ok_or(TransportError::MalformedResponse(
             "slot has no key, or GET METADATA doesn't name this slot's key and \
              the key material wasn't handed to this session — run `piv generate-key` \
              on this slot in this same session, or pass its previously saved \
@@ -3840,11 +4249,18 @@ impl PivSession {
         ok_or_write("piv move key", sw)?;
         // The key itself relocated, not just its reference — carry both
         // cached entries along with it rather than dropping them, so a
-        // subsequent CSR/self-sign, or policy display, at `dest` still
-        // works on metadata-less firmware without paying to re-resolve
-        // either.
-        self.state.pubkey_cache.migrate(src.key_ref(), dest.key_ref());
-        self.state.policy_cache.migrate(src.key_ref(), dest.key_ref());
+        // subsequent CSR/self-sign or policy display at `dest` still works
+        // (or, on metadata-full firmware, still skips the round trip)
+        // without paying to re-resolve either. `cert_cache` is deliberately
+        // *not* migrated here — MOVE KEY never touches the certificate
+        // object, which stays exactly where it was at `src` (see this
+        // method's own doc).
+        self.state
+            .pubkey_cache
+            .migrate(src.key_ref(), dest.key_ref());
+        self.state
+            .policy_cache
+            .migrate(src.key_ref(), dest.key_ref());
         Ok(())
     }
 
@@ -3853,28 +4269,28 @@ impl PivSession {
     /// the on-demand occupancy check (not part of [`status`]'s snapshot, which
     /// stays 4 GET DATA calls rather than 24 by never touching retired slots).
     ///
-    /// Derives occupancy from [`metadata`], which folds a transient/comms
-    /// error into the same `None` as a genuinely empty slot, so a rare
-    /// transient failure here is reported as an empty slot; the card's own
-    /// refusal to write over an occupied destination is the backstop.
+    /// Derives occupancy from [`Self::cached_slot_key`] — cache-preferring,
+    /// same as `status_detailed`'s own use, since this backs a UI dimming
+    /// check as often as it backs [`Self::move_key`]'s destination-occupied
+    /// precondition — which folds a transient/comms error into the same
+    /// `None` as a genuinely empty slot, so a rare transient failure here is
+    /// reported as an empty slot; the card's own refusal to write over an
+    /// occupied destination is the backstop.
     ///
-    /// A `Some` from [`metadata`] is *not* by itself "occupied": some
-    /// implementations (Nitrokey's `piv-authenticator`, and PivApplet as seen
-    /// on a Token2 fingerprint trace) answer `SW_OK` for every retired key
-    /// reference whether or not a key was ever generated there, with an empty
-    /// or key-less body for the ones that weren't. That reply is
+    /// A GET METADATA reply naming *something* is not by itself "occupied":
+    /// some implementations (Nitrokey's `piv-authenticator`, and PivApplet as
+    /// seen on a Token2 fingerprint trace) answer `SW_OK` for every retired
+    /// key reference whether or not a key was ever generated there, with an
+    /// empty or key-less body for the ones that weren't. That reply is
     /// indistinguishable from "no key" and would otherwise mark every retired
-    /// slot present — so this gates on [`metadata_key_material`], the same
-    /// "does this reply actually name the key" check [`Self::slot_key`] uses,
-    /// rather than on the GET METADATA status word alone.
+    /// slot present — so [`Self::resolve_slot_from_device`] gates on
+    /// [`metadata_key_material`], the same "does this reply actually name the
+    /// key" check [`Self::slot_key`] uses, rather than on the GET METADATA
+    /// status word alone.
     ///
     /// [`status`]: PivSession::status
-    /// [`metadata`]: PivSession::metadata
     pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
-        let Some(md) = self.metadata(slot.key_ref()) else {
-            return Ok(false);
-        };
-        Ok(metadata_key_material(&md, |id| self.key_alg_from_apdu_id(id)).is_some())
+        Ok(self.cached_slot_key(slot).is_some())
     }
 
     /// Reset the PIV application to factory defaults. Always sends the bare
@@ -4471,9 +4887,30 @@ impl PivSession {
         ))
     }
 
-    /// Transmit one APDU and reassemble a response the card splits across `61xx`
-    /// continuations (GET RESPONSE), returning `(payload, sw)`.
+    /// Transmit one APDU and reassemble a response the card splits across
+    /// `61xx` continuations (GET RESPONSE), returning `(payload, sw)`.
+    /// Lazily issues a real SELECT PIV first via [`Self::ensure_selected`] if
+    /// this connection hasn't sent one yet — every genuine PIV command in
+    /// this file reaches the card through here. Anything that needs to talk
+    /// to a *different* applet (an AID-hopping fingerprint probe, HID
+    /// Crescendo's ACA sequences, SELECT PIV itself) calls
+    /// [`Self::transmit_full_raw`] instead, bypassing this gate — see that
+    /// method's doc for why going through this one there would be wrong, not
+    /// just redundant.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
+        self.ensure_selected()?;
+        self.transmit_full_raw(apdu)
+    }
+
+    /// The actual APDU transmission [`Self::transmit_full`] wraps with a
+    /// lazy SELECT. Call this directly only when `apdu` itself selects an
+    /// applet (PIV or otherwise) or is addressed to an applet other than PIV
+    /// that the caller has already explicitly SELECTed — every such spot in
+    /// this file unconditionally re-SELECTs PIV before returning, per its
+    /// own doc. Reaching this for a genuine PIV command would skip
+    /// [`Self::transmit_full`]'s lazy-select guarantee and could send it to
+    /// whatever applet happens to be selected instead of PIV.
+    fn transmit_full_raw(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
         let cmd_sensitive = piv_cmd_sensitive(apdu);
         // GENERAL AUTHENTICATE responses today are only ciphertext (witness /
         // encrypted challenge), but the same INS in signing/decrypt mode
@@ -5140,37 +5577,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_serial_skips_bcd_decode_and_the_yubico_round_trip_when_a_fingerprint_probe_answers()
-    {
-        use keyroost_piv::fingerprint::AppletFingerprint;
-
-        // A fingerprint probe (Token2 and Thetis's OTP-applet GET_INFO, HID
-        // Crescendo's CPLC read) already supplied the full, correct serial:
-        // it wins outright, unprocessed — even though Token2 carries
-        // `InsF8SerialIsBcd`, this value must not be BCD-decoded a second
-        // time. The `yubico_serial` closure panics if called at all, proving
-        // the GET SERIAL round trip is skipped entirely.
-        assert_eq!(
-            resolve_serial(AppletFingerprint::Token2, None, None, Some(0x1234_5678), || {
-                panic!("yubico GET SERIAL must not be issued when a fingerprint probe answered")
-            }),
-            Some(0x1234_5678)
-        );
-        // No fingerprint-probe serial: falls back to the raw Yubico GET
-        // SERIAL reply, BCD-decoded because Token2 carries the quirk —
-        // exactly `decode_serial_if_bcd`'s own behaviour.
-        assert_eq!(
-            resolve_serial(AppletFingerprint::Token2, None, None, None, || Some(0x1234_5678)),
-            Some(12_345_678)
-        );
-        // Neither source has a serial: still `None`.
-        assert_eq!(
-            resolve_serial(AppletFingerprint::Token2, None, None, None, || None),
-            None
-        );
-    }
-
-    #[test]
     fn clear_metadata_if_quirky_strips_algorithm_and_public_key_together() {
         use keyroost_piv::compat::PivQuirk;
 
@@ -5557,14 +5963,15 @@ mod tests {
         assert_eq!(pick_mgmt_alg(&[], 20), None);
     }
 
-    // --- pubkey-cache invalidation semantics ---------------------------------
+    // --- pubkey-cache transitions ---------------------------------------
     //
     // The session methods that drive these transitions need a live card, so
     // what gets pinned here is the PubkeyCache transition each of them is a
-    // one-line caller of. What these defend: on metadata-less firmware the
-    // cache is the ONLY source for CSR/self-sign key material, so a stale
-    // entry silently produces a certificate whose SPKI doesn't match the
-    // private key on the card.
+    // one-line caller of. What these defend: whether the entry came from a
+    // self-known write or a device-reported one, a stale entry silently
+    // produces a certificate whose SPKI doesn't match the private key on the
+    // card, and a confirmed-empty slot must not cost another APDU on the
+    // next read (the common case — most slots are empty on any real device).
 
     fn ecc(byte: u8) -> PublicKey {
         PublicKey::Ecc {
@@ -5580,106 +5987,107 @@ mod tests {
     }
 
     #[test]
-    fn pubkey_cache_starts_empty_and_remember_seeds_exactly_one_slot() {
+    fn pubkey_cache_starts_empty_and_get_distinguishes_unasked_from_empty() {
         // A fresh open() has nothing to fall back to — there is deliberately
         // no on-disk or cross-process persistence.
         let mut cache = PubkeyCache::default();
         assert!(cache.0.is_empty());
-        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
-        assert_eq!(cache.0.len(), 1);
-        assert_eq!(cache.get(0x9A), Some(&(KeyAlg::EccP256, ecc(1))));
-        // Seeding 9A says nothing about any other slot.
-        assert_eq!(cache.get(0x9C), None);
+        // Never asked about 0x9A at all.
+        assert_eq!(cache.get(0x9A), None);
+        // Asked (a live GET METADATA decode), and the card names neither
+        // algorithm nor public key for this slot — a real answer, distinct
+        // from "never asked", so the next read skips the APDU.
+        cache.remember(0x9A, None);
+        assert_eq!(cache.get(0x9A), Some(None));
     }
 
     #[test]
-    fn remember_replaces_the_slots_previous_entry() {
+    fn pubkey_remember_replaces_the_slots_previous_entry() {
         // generate_key over an occupied slot mints a new keypair: the old
         // cached pubkey must not survive to describe the new private key.
         let mut cache = PubkeyCache::default();
-        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
-        cache.remember(0x9A, KeyAlg::Rsa2048, rsa(2));
+        cache.remember(0x9A, Some((KeyAlg::EccP256, ecc(1))));
+        cache.remember(0x9A, Some((KeyAlg::Rsa2048, rsa(2))));
         assert_eq!(cache.0.len(), 1);
-        assert_eq!(cache.get(0x9A), Some(&(KeyAlg::Rsa2048, rsa(2))));
+        assert_eq!(cache.get(0x9A), Some(Some(&(KeyAlg::Rsa2048, rsa(2)))));
     }
 
     #[test]
-    fn evict_forgets_only_the_deleted_slot() {
+    fn pubkey_evict_forgets_only_the_deleted_slot() {
         let mut cache = PubkeyCache::default();
-        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
-        cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
+        cache.remember(0x9A, Some((KeyAlg::EccP256, ecc(1))));
+        cache.remember(0x9C, Some((KeyAlg::EccP384, ecc(2))));
         cache.evict(0x9A);
-        // The deleted slot's key material is gone from the card; a bystander
-        // slot's entry is still good.
+        // Evicted back to "never asked", not to "asked, empty" — the next
+        // read must issue a real APDU, not trust a synthesized empty answer.
+        // The deleted slot's key material is gone from the card either way;
+        // a bystander slot's entry is still good.
         assert_eq!(cache.get(0x9A), None);
-        assert_eq!(cache.get(0x9C), Some(&(KeyAlg::EccP384, ecc(2))));
+        assert_eq!(cache.get(0x9C), Some(Some(&(KeyAlg::EccP384, ecc(2)))));
         // Deleting a slot this session never cached is a quiet no-op.
         cache.evict(0x82);
         assert_eq!(cache.0.len(), 1);
     }
 
     #[test]
-    fn migrate_carries_the_entry_and_leaves_nothing_at_src() {
+    fn pubkey_migrate_carries_the_entry_and_leaves_nothing_at_src() {
         let mut cache = PubkeyCache::default();
-        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
-        cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
+        cache.remember(0x9A, Some((KeyAlg::EccP256, ecc(1))));
+        cache.remember(0x9C, Some((KeyAlg::EccP384, ecc(2))));
         cache.migrate(0x9A, 0x82);
         // The key relocated: its entry follows it to dest — that's what keeps
         // CSR/self-sign working at dest on metadata-less firmware — and src
         // no longer holds anything to describe.
         assert_eq!(cache.get(0x9A), None);
-        assert_eq!(cache.get(0x82), Some(&(KeyAlg::EccP256, ecc(1))));
+        assert_eq!(cache.get(0x82), Some(Some(&(KeyAlg::EccP256, ecc(1)))));
         // A bystander slot is untouched.
-        assert_eq!(cache.get(0x9C), Some(&(KeyAlg::EccP384, ecc(2))));
+        assert_eq!(cache.get(0x9C), Some(Some(&(KeyAlg::EccP384, ecc(2)))));
     }
 
     #[test]
-    fn migrate_of_an_uncached_src_changes_nothing() {
+    fn pubkey_migrate_of_an_uncached_src_changes_nothing() {
         // Moving a key this session never generated: there is nothing to
         // carry, and crucially nothing gets invented at dest.
         let mut cache = PubkeyCache::default();
-        cache.remember(0x9C, KeyAlg::EccP384, ecc(2));
+        cache.remember(0x9C, Some((KeyAlg::EccP384, ecc(2))));
         cache.migrate(0x9A, 0x82);
         assert_eq!(cache.get(0x82), None);
-        assert_eq!(cache.get(0x9C), Some(&(KeyAlg::EccP384, ecc(2))));
+        assert_eq!(cache.get(0x9C), Some(Some(&(KeyAlg::EccP384, ecc(2)))));
         assert_eq!(cache.0.len(), 1);
     }
 
     #[test]
-    fn migrate_replaces_a_stale_dest_entry() {
+    fn pubkey_migrate_replaces_a_stale_dest_entry() {
         // The card refuses MOVE KEY into an occupied slot, so any dest entry
         // present here is stale by definition (e.g. remember_pubkey of a slot
         // that was later emptied out-of-session) — the key that actually
         // arrived must win.
         let mut cache = PubkeyCache::default();
-        cache.remember(0x9A, KeyAlg::EccP256, ecc(1));
-        cache.remember(0x82, KeyAlg::EccP384, ecc(9));
+        cache.remember(0x9A, Some((KeyAlg::EccP256, ecc(1))));
+        cache.remember(0x82, Some((KeyAlg::EccP384, ecc(9))));
         cache.migrate(0x9A, 0x82);
-        assert_eq!(cache.get(0x82), Some(&(KeyAlg::EccP256, ecc(1))));
+        assert_eq!(cache.get(0x82), Some(Some(&(KeyAlg::EccP256, ecc(1)))));
         assert_eq!(cache.get(0x9A), None);
         assert_eq!(cache.0.len(), 1);
     }
 
     #[test]
-    fn default_starts_empty() {
+    fn pubkey_cache_default_starts_empty() {
         assert!(PubkeyCache::default().0.is_empty());
     }
 
     // --- policy cache transitions — mirrors the pubkey cache tests above,
-    // same lifecycle, different value shape -------------------------------
+    // same lifecycle and "never asked" vs. "asked, got nothing" distinction,
+    // different value shape -----------------------------------------------
 
     #[test]
-    fn policy_cache_starts_empty_and_remember_seeds_exactly_one_slot() {
+    fn policy_cache_starts_empty_and_get_distinguishes_unasked_from_empty() {
         let mut cache = PolicyCache::default();
         assert!(cache.0.is_empty());
-        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
-        assert_eq!(cache.0.len(), 1);
-        assert_eq!(
-            cache.get(0x9A),
-            Some((PinPolicy::Once, TouchPolicy::Always))
-        );
-        // Seeding 9A says nothing about any other slot.
-        assert_eq!(cache.get(0x9C), None);
+        assert_eq!(cache.get(0x9A), None);
+        // Resolved: neither GET METADATA nor ATTEST names a policy.
+        cache.remember(0x9A, None);
+        assert_eq!(cache.get(0x9A), Some(None));
     }
 
     #[test]
@@ -5687,25 +6095,25 @@ mod tests {
         // A regenerate mints a new keypair with a (possibly different)
         // policy: the old cached policy must not survive to describe it.
         let mut cache = PolicyCache::default();
-        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
-        cache.remember(0x9A, (PinPolicy::Never, TouchPolicy::Cached));
+        cache.remember(0x9A, Some((PinPolicy::Once, TouchPolicy::Always)));
+        cache.remember(0x9A, Some((PinPolicy::Never, TouchPolicy::Cached)));
         assert_eq!(cache.0.len(), 1);
         assert_eq!(
             cache.get(0x9A),
-            Some((PinPolicy::Never, TouchPolicy::Cached))
+            Some(Some((PinPolicy::Never, TouchPolicy::Cached)))
         );
     }
 
     #[test]
     fn policy_evict_forgets_only_the_deleted_slot() {
         let mut cache = PolicyCache::default();
-        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
-        cache.remember(0x9C, (PinPolicy::Always, TouchPolicy::Never));
+        cache.remember(0x9A, Some((PinPolicy::Once, TouchPolicy::Always)));
+        cache.remember(0x9C, Some((PinPolicy::Always, TouchPolicy::Never)));
         cache.evict(0x9A);
         assert_eq!(cache.get(0x9A), None);
         assert_eq!(
             cache.get(0x9C),
-            Some((PinPolicy::Always, TouchPolicy::Never))
+            Some(Some((PinPolicy::Always, TouchPolicy::Never)))
         );
         // Deleting a slot this session never cached is a quiet no-op.
         cache.evict(0x82);
@@ -5715,29 +6123,29 @@ mod tests {
     #[test]
     fn policy_migrate_carries_the_entry_and_leaves_nothing_at_src() {
         let mut cache = PolicyCache::default();
-        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
-        cache.remember(0x9C, (PinPolicy::Always, TouchPolicy::Never));
+        cache.remember(0x9A, Some((PinPolicy::Once, TouchPolicy::Always)));
+        cache.remember(0x9C, Some((PinPolicy::Always, TouchPolicy::Never)));
         cache.migrate(0x9A, 0x82);
         assert_eq!(cache.get(0x9A), None);
         assert_eq!(
             cache.get(0x82),
-            Some((PinPolicy::Once, TouchPolicy::Always))
+            Some(Some((PinPolicy::Once, TouchPolicy::Always)))
         );
         assert_eq!(
             cache.get(0x9C),
-            Some((PinPolicy::Always, TouchPolicy::Never))
+            Some(Some((PinPolicy::Always, TouchPolicy::Never)))
         );
     }
 
     #[test]
     fn policy_migrate_of_an_uncached_src_changes_nothing() {
         let mut cache = PolicyCache::default();
-        cache.remember(0x9C, (PinPolicy::Always, TouchPolicy::Never));
+        cache.remember(0x9C, Some((PinPolicy::Always, TouchPolicy::Never)));
         cache.migrate(0x9A, 0x82);
         assert_eq!(cache.get(0x82), None);
         assert_eq!(
             cache.get(0x9C),
-            Some((PinPolicy::Always, TouchPolicy::Never))
+            Some(Some((PinPolicy::Always, TouchPolicy::Never)))
         );
         assert_eq!(cache.0.len(), 1);
     }
@@ -5745,12 +6153,12 @@ mod tests {
     #[test]
     fn policy_migrate_replaces_a_stale_dest_entry() {
         let mut cache = PolicyCache::default();
-        cache.remember(0x9A, (PinPolicy::Once, TouchPolicy::Always));
-        cache.remember(0x82, (PinPolicy::Always, TouchPolicy::Never));
+        cache.remember(0x9A, Some((PinPolicy::Once, TouchPolicy::Always)));
+        cache.remember(0x82, Some((PinPolicy::Always, TouchPolicy::Never)));
         cache.migrate(0x9A, 0x82);
         assert_eq!(
             cache.get(0x82),
-            Some((PinPolicy::Once, TouchPolicy::Always))
+            Some(Some((PinPolicy::Once, TouchPolicy::Always)))
         );
         assert_eq!(cache.get(0x9A), None);
         assert_eq!(cache.0.len(), 1);
@@ -5759,6 +6167,36 @@ mod tests {
     #[test]
     fn policy_cache_default_starts_empty() {
         assert!(PolicyCache::default().0.is_empty());
+    }
+
+    // --- certificate cache transitions — same "never asked" vs. "asked,
+    // empty" shape as the metadata cache above, but never touched by
+    // move_key/delete_key: neither relocates or erases a certificate object. -
+
+    #[test]
+    fn cert_cache_starts_empty_and_get_distinguishes_unasked_from_empty() {
+        let mut cache = CertCache::default();
+        assert!(cache.0.is_empty());
+        assert_eq!(cache.get(0x9A), None);
+        // clear_certificate's write: asked (or just cleared), no certificate.
+        cache.remember(0x9A, Ok(None));
+        assert_eq!(cache.get(0x9A), Some(Ok(None)));
+    }
+
+    #[test]
+    fn cert_remember_replaces_the_slots_previous_entry() {
+        // import_certificate over an occupied slot: the old DER must not
+        // survive to be handed back as this slot's current certificate.
+        let mut cache = CertCache::default();
+        cache.remember(0x9A, Ok(Some(vec![0x01])));
+        cache.remember(0x9A, Ok(Some(vec![0x02])));
+        assert_eq!(cache.0.len(), 1);
+        assert_eq!(cache.get(0x9A), Some(Ok(Some(vec![0x02]))));
+    }
+
+    #[test]
+    fn cert_cache_default_starts_empty() {
+        assert!(CertCache::default().0.is_empty());
     }
 
     // --- metadata-vs-cache fallback gate ---------------------------------
@@ -6477,11 +6915,10 @@ mod open_cached_validity_rules {
 
     #[test]
     fn reuse_requires_every_check_to_agree() {
-        assert!(piv_session_cache_reusable(true, true, true));
-        assert!(!piv_session_cache_reusable(false, true, true));
-        assert!(!piv_session_cache_reusable(true, false, true));
-        assert!(!piv_session_cache_reusable(true, true, false));
-        assert!(!piv_session_cache_reusable(false, false, false));
+        assert!(piv_session_cache_reusable(true, true));
+        assert!(!piv_session_cache_reusable(false, true));
+        assert!(!piv_session_cache_reusable(true, false));
+        assert!(!piv_session_cache_reusable(false, false));
     }
 }
 

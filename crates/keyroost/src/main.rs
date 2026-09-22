@@ -7690,7 +7690,11 @@ impl App {
     /// read trusts `piv_session_state` at all — see [`PivCache`]. Callers
     /// that always want [`PivCache::Reuse`] (everyone but the Refresh
     /// button) can go through [`Self::load_piv_status`] instead, which
-    /// fixes it for them.
+    /// fixes it for them. The activity log line itself distinguishes the two
+    /// outcomes a `Reuse` read can have: "PIV status read (N slots)" when
+    /// [`keyroost_transport::PivSession::touched_card`] says a live APDU
+    /// actually reached the card, "PIV status cache validated" when every
+    /// value came out of the reused state with none.
     fn load_piv_status_with_cache(&mut self, kind: LogKind, cache: PivCache) {
         self.piv.error = None;
         let Some(reader) = self.selected_oath_reader() else {
@@ -7720,21 +7724,32 @@ impl App {
             }
             .map(|mut s| {
                 let detailed = s.status_detailed();
-                (detailed, s.state())
+                // Read before `state()` so it reflects this call's own
+                // status_detailed() and nothing after — whether *any* of it
+                // needed a live APDU, or every value came out of the state
+                // `open_cached` carried in with no card round trip at all.
+                let touched_card = s.touched_card();
+                (detailed, s.state(), touched_card)
             });
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok((Ok(detailed), state)) => {
+                    Ok((Ok(detailed), state, touched_card)) => {
                         app.store_piv_session_state(for_device.clone(), state);
                         let keyroost_transport::PivStatusDetailed { status, slots, .. } = detailed;
-                        app.log_kind(
-                            Severity::Ok,
-                            kind,
-                            format!("PIV status read ({} slots)", slots.len()),
-                        );
+                        // `touched_card` false means every field above came
+                        // out of the cache `open_cached` reused, with no
+                        // live APDU at all — say so distinctly from an
+                        // actual read, rather than implying this round trip
+                        // hit the card when it didn't.
+                        let message = if touched_card {
+                            format!("PIV status read ({} slots)", slots.len())
+                        } else {
+                            "PIV status cache validated".to_string()
+                        };
+                        app.log_kind(Severity::Ok, kind, message);
                         app.piv.slot_keys = slots
                             .iter()
                             .map(|d| (d.slot, d.algorithm, d.subject.clone()))
@@ -7743,7 +7758,7 @@ impl App {
                         app.piv.status = Some(status);
                         app.piv.loaded = true;
                     }
-                    Ok((Err(e), state)) => {
+                    Ok((Err(e), state, _touched_card)) => {
                         app.store_piv_session_state(for_device.clone(), state);
                         app.log_kind(Severity::Err, kind, format!("PIV status read: {e}"));
                         app.piv.error = Some(e.to_string());
