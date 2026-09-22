@@ -1478,8 +1478,10 @@ fn run_card_reset_step(
                 ResetMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
                 ResetMgmtAuth::Pin(pin) => keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes()),
             });
-            let mut s = keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
-            Ok(match s.factory_reset(current) {
+            keyroost_transport::PivSession::with_transaction(
+                name,
+                |s| -> Result<StepOutcome, TransportError> {
+                    Ok(match s.factory_reset(current) {
                 Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
                 // The device-wide mechanism ran cleanly -- more than just PIV
                 // was wiped, so the report should say so rather than naming
@@ -1507,6 +1509,9 @@ fn run_card_reset_step(
                 ) => StepOutcome::Skipped(e.to_string()),
                 Err(e) => StepOutcome::Failed(piv_factory_reset_message(e)),
             })
+                },
+            )
+            .map_err(|e: TransportError| e.to_string())
         })()
         .unwrap_or_else(StepOutcome::Failed);
     }
@@ -2608,13 +2613,13 @@ struct App {
     /// scratch every single action (sessions are opened fresh per action,
     /// never kept alive across them). Every PIV action reads its device's
     /// entry (or an empty default, the first time) before spawning its job,
-    /// hands it to `PivSession::open_cached`, and — once the job's session is
+    /// hands it to `PivSession::with_cached_transaction`, and — once the job's session is
     /// done with whatever it went on to do — stores `PivSession::state()`
     /// back here, so the *next* action on the same device gets to skip
     /// re-probing identity, and the public-key cache (bridging "generate" to
     /// a later "sign a CSR with it" on cards without GET METADATA) survives
     /// switching to another device's tab and back, which it did not before
-    /// this map existed. `open_cached`'s own validation (PC/SC presence
+    /// this map existed. `with_cached_transaction`'s own validation (PC/SC presence
     /// bookkeeping, ATR, raw SELECT response) is what makes trusting a
     /// carried-over entry safe even though the physical card in a reader can
     /// change between two actions — see that method's doc. Keyed by
@@ -3145,9 +3150,9 @@ enum LogKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PivCache {
     /// Reuse this device's `piv_session_state` entry via
-    /// [`keyroost_transport::PivSession::open_cached`] — the default for
+    /// [`keyroost_transport::PivSession::with_cached_transaction`] — the default for
     /// every unprompted read (first tab view, the re-read every write
-    /// triggers): `open_cached`'s own checks already vouch for it, so
+    /// triggers): `with_cached_transaction`'s own checks already vouch for it, so
     /// there's no reason to distrust it just because nothing asked to.
     Reuse,
     /// Ignore whatever's cached and open via a plain
@@ -5716,23 +5721,26 @@ impl App {
         let for_device = dev.id;
         self.spawn_job("Checking PIV reset support\u{2026}", move || {
             let (preview, needs_reset_mgmt_auth, default_mgmt_key, reset_long_running) =
-                match keyroost_transport::PivSession::open(&reader) {
-                    Ok(mut s) => {
-                        // One fingerprint serves all four checks — see
-                        // `PivSession::preview_factory_reset`/
-                        // `global_reset_available`/`default_management_key`/
-                        // `quirks`'s docs.
-                        let preview = FactoryResetPivPreview::Resolved(s.preview_factory_reset());
-                        (
-                            preview,
-                            s.global_reset_available(),
-                            s.default_management_key(),
-                            s.quirks()
-                                .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning),
-                        )
-                    }
-                    Err(_) => (FactoryResetPivPreview::CheckFailed, false, None, false),
-                };
+                keyroost_transport::PivSession::with_transaction(&reader, |s| {
+                    // One fingerprint serves all four checks — see
+                    // `PivSession::preview_factory_reset`/
+                    // `global_reset_available`/`default_management_key`/
+                    // `quirks`'s docs.
+                    let preview = FactoryResetPivPreview::Resolved(s.preview_factory_reset());
+                    Ok::<_, TransportError>((
+                        preview,
+                        s.global_reset_available(),
+                        s.default_management_key(),
+                        s.quirks()
+                            .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning),
+                    ))
+                })
+                .unwrap_or((
+                    FactoryResetPivPreview::CheckFailed,
+                    false,
+                    None,
+                    false,
+                ));
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(Some(&for_device), app.selected_device.as_ref()) {
                     return;
@@ -7061,7 +7069,7 @@ enum PivMgmtAuth {
 /// single call site every management-gated PIV job in this module runs
 /// through, so the two authorization paths stay in sync.
 fn piv_authenticate(
-    s: &mut keyroost_transport::PivSession,
+    s: &mut keyroost_transport::PivSession<'_>,
     auth: &PivMgmtAuth,
 ) -> Result<(), TransportError> {
     match auth {
@@ -7613,7 +7621,7 @@ impl App {
     /// The selected device's cached [`keyroost_transport::PivSessionState`]
     /// (an empty, freshly-`Default`ed one the first time this device's PIV
     /// tab does anything), cloned for a background job to move into its
-    /// `PivSession::open_cached` call — cloned rather than borrowed because
+    /// `PivSession::with_cached_transaction` call — cloned rather than borrowed because
     /// the job runs off-thread and can't hold a reference into `App`. Every
     /// PIV action calls this before `spawn_piv_job` and passes the result
     /// through; see the `piv_session_state` field's doc for the full round
@@ -7651,7 +7659,7 @@ impl App {
     /// [`keyroost_transport::PivSessionState`] into the plain
     /// `Result<PivStatus, TransportError>` [`Self::apply_piv_write`] expects,
     /// storing the state for `device` along the way (a no-op on `Err`: a
-    /// job whose `PivSession::open_cached` failed outright, or that never
+    /// job whose `PivSession::with_cached_transaction` failed outright, or that never
     /// got as far as producing a final state, has nothing to store). Shared
     /// by every simple PIN/PUK/management-key/retries write, which
     /// otherwise all repeat this same split.
@@ -7659,7 +7667,10 @@ impl App {
         &mut self,
         device: Option<DeviceId>,
         result: Result<
-            (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
+            (
+                keyroost_transport::PivStatus,
+                keyroost_transport::PivSessionState,
+            ),
             TransportError,
         >,
     ) -> Result<keyroost_transport::PivStatus, TransportError> {
@@ -7712,25 +7723,31 @@ impl App {
             // pane-side with `slot_key_algorithm` + `read_certificate` +
             // `slot_policy` per slot re-read the certificate two or three
             // times and GET METADATA twice (`PivSession` keeps no read cache).
-            // `open_cached` carries forward whatever keys generated earlier
+            // `with_cached_transaction` carries forward whatever keys generated earlier
             // this app run were already cached — including across a device
             // switch and back — so there's no need to reseed `remember_pubkey`
-            // per slot the way a plain `open` would have required;
+            // per slot the way a plain `with_transaction` would have required;
             // `PivCache::Bypass` forgoes that on purpose — see this
             // method's doc.
             let result = match cached_state {
-                Some(cached) => keyroost_transport::PivSession::open_cached(&reader, cached),
-                None => keyroost_transport::PivSession::open(&reader),
-            }
-            .map(|mut s| {
-                let detailed = s.status_detailed();
-                // Read before `state()` so it reflects this call's own
-                // status_detailed() and nothing after — whether *any* of it
-                // needed a live APDU, or every value came out of the state
-                // `open_cached` carried in with no card round trip at all.
-                let touched_card = s.touched_card();
-                (detailed, s.state(), touched_card)
-            });
+                Some(cached) => {
+                    keyroost_transport::PivSession::with_cached_transaction(&reader, cached, |s| {
+                        let detailed = s.status_detailed();
+                        // Read before `state()` so it reflects this call's
+                        // own status_detailed() and nothing after — whether
+                        // *any* of it needed a live APDU, or every value came
+                        // out of the state `with_cached_transaction` carried
+                        // in with no card round trip at all.
+                        let touched_card = s.touched_card();
+                        Ok::<_, TransportError>((detailed, s.state(), touched_card))
+                    })
+                }
+                None => keyroost_transport::PivSession::with_transaction(&reader, |s| {
+                    let detailed = s.status_detailed();
+                    let touched_card = s.touched_card();
+                    Ok::<_, TransportError>((detailed, s.state(), touched_card))
+                }),
+            };
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
@@ -7740,7 +7757,7 @@ impl App {
                         app.store_piv_session_state(for_device.clone(), state);
                         let keyroost_transport::PivStatusDetailed { status, slots, .. } = detailed;
                         // `touched_card` false means every field above came
-                        // out of the cache `open_cached` reused, with no
+                        // out of the cache `with_cached_transaction` reused, with no
                         // live APDU at all — say so distinctly from an
                         // actual read, rather than implying this round trip
                         // hit the card when it didn't.
@@ -7847,15 +7864,12 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Changing PIV PIN\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                s.change_pin(old.as_bytes(), new.as_bytes())?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    s.change_pin(old.as_bytes(), new.as_bytes())?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.pin_old);
                 wipe(&mut app.piv.pin_new);
@@ -7881,15 +7895,12 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Changing PUK\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                s.change_puk(old.as_bytes(), new.as_bytes())?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    s.change_puk(old.as_bytes(), new.as_bytes())?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.puk_old);
                 wipe(&mut app.piv.puk_new);
@@ -7913,15 +7924,12 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Unblocking PIN\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.unblock_puk);
                 wipe(&mut app.piv.unblock_new_pin);
@@ -8007,17 +8015,14 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Setting PIV retry counts\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                s.verify_pin(pin.as_bytes())?;
-                s.set_pin_retries(pin_tries, puk_tries)?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.verify_pin(pin.as_bytes())?;
+                    s.set_pin_retries(pin_tries, puk_tries)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 wipe(&mut app.piv.retries_pin_auth);
@@ -8050,20 +8055,16 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Generating key\u{2026} (touch if it blinks)", move || {
-            let result = (|| -> Result<
-                (
-                    keyroost_piv::PublicKey,
-                    keyroost_transport::PivStatus,
-                    keyroost_transport::PivSessionState,
-                ),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
-                let status = s.status()?;
-                Ok((pubkey, status, s.state()))
-            })();
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &name,
+                cached_state,
+                |s| -> Result<_, TransportError> {
+                    piv_authenticate(s, &mgmt)?;
+                    let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
+                    let status = s.status()?;
+                    Ok((pubkey, status, s.state()))
+                },
+            );
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 match result {
@@ -8142,7 +8143,7 @@ impl App {
         let path = self.piv.cert_path.trim().to_owned();
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
-        // `open_cached` restores the whole cached pubkey map (every slot, not
+        // `with_cached_transaction` restores the whole cached pubkey map (every slot, not
         // just this one) as part of resolving the session — see
         // `load_piv_status`/`piv_self_sign`'s docs for why a key generated
         // earlier this app run, including one that overwrote an older key
@@ -8163,11 +8164,16 @@ impl App {
                 })?;
                 let der = cert_bytes_to_der(&bytes)
                     .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                s.import_certificate(slot, &der)?;
-                let status = s.status()?;
-                Ok((status, s.state()))
+                keyroost_transport::PivSession::with_cached_transaction(
+                    &name,
+                    cached_state,
+                    |s| {
+                        piv_authenticate(s, &mgmt)?;
+                        s.import_certificate(slot, &der)?;
+                        let status = s.status()?;
+                        Ok((status, s.state()))
+                    },
+                )
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
@@ -8198,16 +8204,13 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Deleting certificate\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                s.clear_certificate(slot)?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.clear_certificate(slot)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 let result = app.store_and_unwrap_piv_write(for_device, result);
@@ -8270,16 +8273,13 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Writing a new CHUID\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                s.new_chuid(&guid, &expiration)?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.new_chuid(&guid, &expiration)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 let result = app.store_and_unwrap_piv_write(for_device, result);
@@ -8310,19 +8310,16 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Deleting key\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                s.delete_key(slot)?;
-                // `delete_key` already evicted this slot from the session's
-                // own pubkey cache — nothing left to do here beyond storing
-                // the updated state back.
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.delete_key(slot)?;
+                    // `delete_key` already evicted this slot from the
+                    // session's own pubkey cache — nothing left to do here
+                    // beyond storing the updated state back.
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 let result = app.store_and_unwrap_piv_write(for_device, result);
@@ -8355,20 +8352,17 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Moving key\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &mgmt)?;
-                // The key itself relocated, not just its reference —
-                // `move_key` already carries a cached entry along with it in
-                // the session's own pubkey cache, same as
-                // `PivSession::move_key`'s in-session cache always has.
-                s.move_key(src, dest)?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    // The key itself relocated, not just its reference —
+                    // `move_key` already carries a cached entry along with it
+                    // in the session's own pubkey cache, same as
+                    // `PivSession::move_key`'s in-session cache always has.
+                    s.move_key(src, dest)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 let result = app.store_and_unwrap_piv_write(for_device, result);
@@ -8408,14 +8402,17 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Reading retired slots\u{2026}", move || {
-            let result =
-                keyroost_transport::PivSession::open_cached(&reader, cached_state).map(|mut s| {
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &reader,
+                cached_state,
+                |s| {
                     let occupancy: Vec<_> = keyroost_piv::Slot::retired_all()
                         .into_iter()
                         .map(|slot| (slot, s.slot_has_key(slot).unwrap_or(false)))
                         .collect();
-                    (occupancy, s.state())
-                });
+                    Ok::<_, TransportError>((occupancy, s.state()))
+                },
+            );
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
@@ -8592,7 +8589,7 @@ impl App {
         };
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
-        // `open_cached` restores whatever the session's pubkey cache already
+        // `with_cached_transaction` restores whatever the session's pubkey cache already
         // knew — including a key generated earlier this app run, on cards
         // where the freshly-opened session otherwise has no other way to
         // learn it (see `load_piv_status`'s doc).
@@ -8600,23 +8597,23 @@ impl App {
         self.spawn_piv_job(
             "Creating self-signed certificate\u{2026} (touch if it blinks)",
             move || {
-                let result = (|| -> Result<
-                    (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                    TransportError,
-                > {
-                    let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                    piv_authenticate(&mut s, &mgmt)?;
-                    let now = unix_now();
-                    s.self_signed_certificate(
-                        slot,
-                        &subject,
-                        i64::from(now),
-                        keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
-                        pin.as_bytes(),
-                    )?;
-                    let status = s.status()?;
-                    Ok((status, s.state()))
-                })();
+                let result = keyroost_transport::PivSession::with_cached_transaction(
+                    &name,
+                    cached_state,
+                    |s| {
+                        piv_authenticate(s, &mgmt)?;
+                        let now = unix_now();
+                        s.self_signed_certificate(
+                            slot,
+                            &subject,
+                            i64::from(now),
+                            keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
+                            pin.as_bytes(),
+                        )?;
+                        let status = s.status()?;
+                        Ok((status, s.state()))
+                    },
+                );
                 Box::new(move |app: &mut App| {
                     wipe(&mut app.piv.sign_pin);
                     wipe(&mut app.piv.mgmt_key_input);
@@ -8649,21 +8646,24 @@ impl App {
         let slot = self.piv.selected_slot.to_slot();
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
-        // See `piv_self_sign`: `open_cached` restores whatever the session's
+        // See `piv_self_sign`: `with_cached_transaction` restores whatever the session's
         // pubkey cache already knew, including a key generated earlier this
         // app run.
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job(
             "Signing certificate request\u{2026} (touch if it blinks)",
             move || {
-                let result = (|| -> Result<keyroost_transport::PivSessionState, TransportError> {
-                    let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                    let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
-                    std::fs::write(&path, pem.as_bytes()).map_err(|_| {
-                        TransportError::MalformedResponse("cannot write destination file")
-                    })?;
-                    Ok(s.state())
-                })();
+                let result = keyroost_transport::PivSession::with_cached_transaction(
+                    &name,
+                    cached_state,
+                    |s| -> Result<_, TransportError> {
+                        let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
+                        std::fs::write(&path, pem.as_bytes()).map_err(|_| {
+                            TransportError::MalformedResponse("cannot write destination file")
+                        })?;
+                        Ok(s.state())
+                    },
+                );
                 Box::new(move |app: &mut App| {
                     wipe(&mut app.piv.sign_pin);
                     match result {
@@ -8701,18 +8701,21 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Exporting certificate\u{2026}", move || {
-            let result = (|| -> Result<(usize, keyroost_transport::PivSessionState), TransportError> {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                let der = s
-                    .read_certificate(slot)?
-                    .ok_or(TransportError::MalformedResponse(
-                        "slot holds no certificate",
-                    ))?;
-                std::fs::write(&path, &der).map_err(|_| {
-                    TransportError::MalformedResponse("cannot write destination file")
-                })?;
-                Ok((der.len(), s.state()))
-            })();
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &name,
+                cached_state,
+                |s| -> Result<_, TransportError> {
+                    let der =
+                        s.read_certificate(slot)?
+                            .ok_or(TransportError::MalformedResponse(
+                                "slot holds no certificate",
+                            ))?;
+                    std::fs::write(&path, &der).map_err(|_| {
+                        TransportError::MalformedResponse("cannot write destination file")
+                    })?;
+                    Ok((der.len(), s.state()))
+                },
+            );
             Box::new(move |app: &mut App| match result {
                 Ok((n, state)) => {
                     app.store_piv_session_state(for_device, state);
@@ -8773,33 +8776,31 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         self.spawn_piv_job("Changing management key\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                piv_authenticate(&mut s, &old)?;
-                // A HID Crescendo unit whose management key isn't a real PIV
-                // object runs its own self-contained unlock right before PUT
-                // XAUTH KEY (see `set_management_key`'s doc) rather than
-                // relying on the `piv_authenticate` call above still being in
-                // force — `current` carries the same credential again for
-                // that path; every other device ignores it.
-                let current = match &old {
-                    PivMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
-                    PivMgmtAuth::Pin(pin) => {
-                        keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &old)?;
+                    // A HID Crescendo unit whose management key isn't a real
+                    // PIV object runs its own self-contained unlock right
+                    // before PUT XAUTH KEY (see `set_management_key`'s doc)
+                    // rather than relying on the `piv_authenticate` call
+                    // above still being in force — `current` carries the
+                    // same credential again for that path; every other
+                    // device ignores it.
+                    let current = match &old {
+                        PivMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                        PivMgmtAuth::Pin(pin) => {
+                            keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+                        }
+                    };
+                    match &new {
+                        Some((new_alg, new_key)) => {
+                            s.set_management_key(current, *new_alg, new_key, false)?;
+                        }
+                        None => s.delete_management_key_hid_crescendo(current)?,
                     }
-                };
-                match &new {
-                    Some((new_alg, new_key)) => {
-                        s.set_management_key(current, *new_alg, new_key, false)?;
-                    }
-                    None => s.delete_management_key_hid_crescendo(current)?,
-                }
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 wipe(&mut app.piv.new_mgmt_key_input);
@@ -8824,26 +8825,24 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
         let queued = self.spawn_piv_job("Resetting PIV applet\u{2026}", move || {
-            let result = (|| -> Result<
-                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open_cached(&name, cached_state)?;
-                // The PIV pane's "Reset applet" card collects no
-                // management-key/PIN credential of its own (unlike the
-                // Overview tab's whole-device factory reset) — nothing to
-                // pass here today; see `force_reset_if_known_supported`'s
-                // doc for why the parameter exists regardless.
-                //
-                // `force_reset_if_known_supported`/`reset` already rebuild
-                // this session's state from nothing internally (see
-                // `PivSession::refresh`'s doc) — wipes every slot, nothing
-                // cached survives it — so `s.state()` below is already the
-                // post-reset state; there's nothing left to clear by hand.
-                s.force_reset_if_known_supported(None)?;
-                let status = s.status()?;
-                Ok((status, s.state()))
-            })();
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    // The PIV pane's "Reset applet" card collects no
+                    // management-key/PIN credential of its own (unlike the
+                    // Overview tab's whole-device factory reset) — nothing to
+                    // pass here today; see `force_reset_if_known_supported`'s
+                    // doc for why the parameter exists regardless.
+                    //
+                    // `force_reset_if_known_supported`/`reset` already
+                    // rebuild this session's state from nothing internally
+                    // (see `PivSession::refresh`'s doc) — wipes every slot,
+                    // nothing cached survives it — so `s.state()` below is
+                    // already the post-reset state; there's nothing left to
+                    // clear by hand.
+                    s.force_reset_if_known_supported(None)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(
@@ -9180,53 +9179,63 @@ fn run_piv_self_test(
     ),
     String,
 > {
-    let mut s =
-        keyroost_transport::PivSession::open_cached(reader, cached).map_err(|e| e.to_string())?;
-    // Verify against the slot CERTIFICATE's public key on purpose: the cert is
-    // what other PIV software consumes, so a pass proves the cert matches the
-    // slot's key material. A compressed cert is inflated on read (#147/#148).
-    let cert = s
-        .read_certificate(slot)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
-    let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
-        .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+    // The session itself can only report `TransportError` (from
+    // `with_cached_transaction`'s own connect/SELECT machinery) — flattened
+    // to `String` right at the end, via the outer `map_err`/`and_then`
+    // below. Everything this closure does on its own (no certificate, an
+    // unusable algorithm, a rejected PIN) keeps building its `String`
+    // exactly as before, one level in, via `inner`.
+    keyroost_transport::PivSession::with_cached_transaction(reader, cached, |s| {
+        let inner = (|| -> Result<_, String> {
+            // Verify against the slot CERTIFICATE's public key on purpose: the
+            // cert is what other PIV software consumes, so a pass proves the
+            // cert matches the slot's key material. A compressed cert is
+            // inflated on read (#147/#148).
+            let cert = s
+                .read_certificate(slot)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
+            let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+                .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
 
-    if !keyroost_pivtest::SelfTest::all()
-        .into_iter()
-        .any(|op| keyroost_pivtest::supports(op, alg))
-    {
-        return Err(format!("no self-test applies to a {} key", alg.label()));
-    }
+            if !keyroost_pivtest::SelfTest::all()
+                .into_iter()
+                .any(|op| keyroost_pivtest::supports(op, alg))
+            {
+                return Err(format!("no self-test applies to a {} key", alg.label()));
+            }
 
-    // Verify once up front so a wrong PIN fails the whole run (one retry, not
-    // one per op). PIN-per-use slots (9C) drop the verified state after each
-    // GENERAL AUTHENTICATE, so the per-op closure re-verifies before every
-    // op after the first that actually runs.
-    let has_pin = !pin.is_empty();
-    if has_pin {
-        s.verify_pin(pin).map_err(|e| e.to_string())?;
-    }
-    let mut ran = 0usize;
-    let results = keyroost_pivtest::run(
-        alg,
-        &pubkey,
-        |op, input| -> Result<Vec<u8>, String> {
-            if has_pin && ran > 0 {
+            // Verify once up front so a wrong PIN fails the whole run (one
+            // retry, not one per op). PIN-per-use slots (9C) drop the
+            // verified state after each GENERAL AUTHENTICATE, so the per-op
+            // closure re-verifies before every op after the first that
+            // actually runs.
+            let has_pin = !pin.is_empty();
+            if has_pin {
                 s.verify_pin(pin).map_err(|e| e.to_string())?;
             }
-            ran += 1;
-            if op.is_key_agreement() {
-                s.key_agree(slot, alg, input)
-            } else if op == keyroost_pivtest::SelfTest::Decrypt {
-                s.decrypt(slot, alg, input)
-            } else {
-                s.sign(slot, alg, input)
-            }
-            .map_err(|e| e.to_string())
-        },
-    );
-    Ok((results, s.state()))
+            let mut ran = 0usize;
+            let results =
+                keyroost_pivtest::run(alg, &pubkey, |op, input| -> Result<Vec<u8>, String> {
+                    if has_pin && ran > 0 {
+                        s.verify_pin(pin).map_err(|e| e.to_string())?;
+                    }
+                    ran += 1;
+                    if op.is_key_agreement() {
+                        s.key_agree(slot, alg, input)
+                    } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                        s.decrypt(slot, alg, input)
+                    } else {
+                        s.sign(slot, alg, input)
+                    }
+                    .map_err(|e| e.to_string())
+                });
+            Ok((results, s.state()))
+        })();
+        Ok::<_, TransportError>(inner)
+    })
+    .map_err(|e| e.to_string())
+    .and_then(|inner| inner)
 }
 
 /// Slots a key may be moved to: every standard + retired slot that is empty
@@ -16694,7 +16703,9 @@ impl App {
                     .as_ref()
                     .and_then(|id| self.piv_session_state.get(id))
                     .and_then(|state| state.cached_pubkey(self.piv.selected_slot.to_slot()))
-                    .and_then(|(alg, key)| keyroost_piv::spki::subject_public_key_info(key, alg).ok())
+                    .and_then(|(alg, key)| {
+                        keyroost_piv::spki::subject_public_key_info(key, alg).ok()
+                    })
                     .map(|der| keyroost_piv::spki::to_pem(&der));
                 if let Some(pem) = &gen_pubkey_pem {
                     ui.add_space(6.0);
@@ -16752,13 +16763,12 @@ impl App {
                                 open_self_sign = true;
                             }
                         } else {
-                            theme::button_disabled(ui, p, "Self-signed \u{2192} slot").on_hover_text(
-                                if selected_has_key {
+                            theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
+                                .on_hover_text(if selected_has_key {
                                     cant_sign_hint
                                 } else {
                                     no_slot_key_hint
-                                },
-                            );
+                                });
                         }
                         ui.add_space(8.0);
                         if selected_has_key && sel_key_can_sign {
