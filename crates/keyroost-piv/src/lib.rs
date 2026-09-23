@@ -61,6 +61,10 @@ pub const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
 pub const SW_AUTH_BLOCKED: u16 = 0x6983;
 /// Reference data (key/PIN) not found.
 pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
+/// Wrong length (e.g. a PUT DATA whose object is longer than the card takes).
+pub const SW_WRONG_LENGTH: u16 = 0x6700;
+/// Not enough memory space in the file (the card has no room for the object).
+pub const SW_NOT_ENOUGH_MEMORY: u16 = 0x6A84;
 
 /// PIN reference (P2) for the PIV application PIN.
 pub const PIN_REF_APPLICATION: u8 = 0x80;
@@ -1082,9 +1086,11 @@ pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
 /// `0x70` value at all.
 ///
 /// keyroost writes uncompressed certs (`encode_certificate` sets CertInfo 0),
-/// but YubiKey stores attestation and imported certs gzip-compressed, so a
-/// cert read back may carry the compressed bytes with the flag set; the caller
-/// inflates them (the byte layer stays free of a decompressor). See
+/// but a PIV certificate object may hold the certificate gzip-compressed
+/// (CertInfo `0x01`, SP 800-73-4 Part 1 Appendix A); the tool that writes the
+/// object chooses this, and tools such as ykman do so on request. A cert read
+/// back may therefore carry the compressed bytes with the flag set; the caller
+/// inflates them (the byte layer stays free of a decompressor). See also
 /// [Yubico's encoded-certificate format](https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html).
 #[must_use]
 pub fn cert_object_parts(inner: &[u8]) -> Option<(&[u8], bool)> {
@@ -2135,7 +2141,7 @@ mod tests {
             cert_object_parts(&unc),
             Some((&[0xAB, 0xCD, 0xEF][..], false))
         );
-        // Gzip-compressed (YubiKey): CertInfo bit 0 set. The 0x70 value here
+        // Gzip-compressed: CertInfo bit 0 set. The 0x70 value here
         // stands in for the gzip stream; the flag is what matters.
         let gz = [0x70, 0x02, 0x1F, 0x8B, 0x71, 0x01, 0x01, 0xFE, 0x00];
         assert_eq!(cert_object_parts(&gz), Some((&[0x1F, 0x8B][..], true)));

@@ -9,6 +9,7 @@
 //! PIN/PUK change and unblock, set-pin-retries, set-management-key, key
 //! generation, certificate import/export, and applet reset.
 
+use crate::gzip::gunzip_capped;
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
@@ -157,12 +158,49 @@ pub struct PivStatus {
 #[derive(Debug, Clone)]
 pub struct PivSlotStatus {
     pub slot: piv::Slot,
-    /// True when GET DATA returned a certificate object for the slot.
+    /// True when GET DATA returned a certificate object for the slot —
+    /// including one that cannot be read (see [`Self::cert_unreadable`]).
     pub cert_present: bool,
     /// Length in bytes of the certificate's DER encoding, as read from the
     /// card, when present. This is the DER itself — the card's own `0x53`
     /// object framing (the `70`/`71`/`FE` TLVs wrapping it) is not counted.
+    /// `0` when the certificate is unreadable.
     pub cert_len: usize,
+    /// `Some` when the slot holds a certificate that cannot be read, and why.
+    /// The slot is not empty: writing a new certificate replaces it.
+    pub cert_unreadable: Option<CertUnreadable>,
+}
+
+/// Why a slot's certificate object holds a certificate that cannot be read.
+/// Both cases are a certificate flagged gzip-compressed (CertInfo `71 01 01`,
+/// as the tool that wrote the object may choose) whose compressed data won't
+/// inflate.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertUnreadable {
+    /// Not a gzip stream, or its compressed data is corrupt or cut off.
+    Damaged,
+    /// It inflates past the 64 KiB host ceiling on a certificate's size.
+    TooLarge,
+}
+
+impl CertUnreadable {
+    /// A stable machine-readable token (`damaged` / `too_large`).
+    pub fn code(self) -> &'static str {
+        match self {
+            CertUnreadable::Damaged => "damaged",
+            CertUnreadable::TooLarge => "too_large",
+        }
+    }
+}
+
+impl std::fmt::Display for CertUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CertUnreadable::Damaged => "its compressed data is damaged",
+            CertUnreadable::TooLarge => "it decompresses to more than 64 KiB",
+        })
+    }
 }
 
 /// [`PivStatus`] plus the per-slot key/certificate detail a status pane
@@ -476,23 +514,26 @@ impl PivSession {
         for slot in piv::Slot::all() {
             // The slot's one certificate read — its occupancy fields, its
             // Subject DN, and the algorithm's cert fallback all come off this.
-            let cert = self.read_certificate(slot)?;
+            let cert = self.cert_object(slot)?;
+            let cert_der = cert.as_ref().ok().and_then(Option::as_deref);
             // The slot's one GET METADATA — shared by algorithm and policy.
             let meta = self.metadata(slot.key_ref());
 
             let algorithm = self
                 .algorithm_without_cert(slot, meta.as_ref())
                 .or_else(|| {
-                    cert.as_deref()
+                    cert_der
                         .and_then(|der| piv::x509_parse::parse_key_algorithm(der).ok().flatten())
                 });
-            let subject = cert
-                .as_deref()
+            let subject = cert_der
                 .and_then(|der| piv::x509_parse::parse_subject_dn(der).ok())
                 .map(|dn| dn.to_string());
             let policy = self.resolve_policy(slot, meta.as_ref());
 
-            slots.push(slot_occupancy(slot, cert.as_deref()));
+            slots.push(slot_occupancy(
+                slot,
+                cert.as_ref().map(Option::as_deref).map_err(|e| *e),
+            ));
             detail.push(PivSlotDetail {
                 slot,
                 algorithm,
@@ -856,7 +897,12 @@ impl PivSession {
     ///
     /// Tries a single extended-length PUT DATA first; a cert big enough to
     /// need one (any real X.509 cert typically is) that gets rejected falls
-    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why.
+    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why. The
+    /// fallback also runs when the extended APDU fails at the PC/SC layer
+    /// before any status word comes back (seen with certificates of a few
+    /// KB). A card that refuses the certificate's length or has no room for
+    /// it yields [`TransportError::PivCertTooLarge`] /
+    /// [`TransportError::PivCardFull`].
     pub fn import_certificate(&mut self, slot: Slot, der: &[u8]) -> Result<(), TransportError> {
         let value = piv::encode_certificate(der);
         let tag = slot.cert_object_tag();
@@ -868,30 +914,45 @@ impl PivSession {
                     self.chain_reason()
                 )
             });
-            self.transmit_chain(
+            chained_cert_sw(self.transmit_chain(
                 "piv import certificate",
                 &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
-            )?
-            .1
+            ))?
         } else {
-            let (_, sw) = self.transmit_full(&apdu)?;
-            if sw == piv::SW_OK || !uses_extended_length(&apdu) {
-                sw
-            } else {
-                trace::line(self.debug, || {
-                    format!(
-                        "! piv import certificate: extended length rejected (SW={sw:04X}); \
-                         retrying with command chaining"
-                    )
-                });
-                self.transmit_chain(
+            let extended = uses_extended_length(&apdu);
+            let direct = self.transmit_full(&apdu);
+            if retry_chained_after(&direct, extended) {
+                if let Err(e) = &direct {
+                    trace::line(self.debug, || {
+                        format!(
+                            "! piv import certificate: extended length failed at the PC/SC \
+                             layer ({e}); retrying with command chaining"
+                        )
+                    });
+                }
+                chained_cert_sw(self.transmit_chain(
                     "piv import certificate",
                     &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
-                )?
-                .1
+                ))?
+            } else {
+                let (_, sw) = direct?;
+                if sw == piv::SW_OK || !extended {
+                    sw
+                } else {
+                    trace::line(self.debug, || {
+                        format!(
+                            "! piv import certificate: extended length rejected (SW={sw:04X}); \
+                             retrying with command chaining"
+                        )
+                    });
+                    chained_cert_sw(self.transmit_chain(
+                        "piv import certificate",
+                        &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+                    ))?
+                }
             }
         };
-        ok_or_write("piv import certificate", sw)
+        cert_write_result(slot, der.len(), sw)
     }
 
     /// Write a CHUID (Card Holder Unique Identifier) to the card: `guid` is
@@ -974,9 +1035,21 @@ impl PivSession {
     /// erroring the call (a real card doesn't produce one; `slot_status` and
     /// `status_detailed` derive occupancy straight from this).
     pub fn read_certificate(&mut self, slot: Slot) -> Result<Option<Vec<u8>>, TransportError> {
+        self.cert_object(slot)?
+            .map_err(|reason| TransportError::PivCertUnreadable { slot, reason })
+    }
+
+    /// One GET DATA of `slot`'s certificate object, decoded: the outer
+    /// `Result` is the card exchange, the inner one whether a certificate
+    /// that is there can be read. Status views use this directly so one
+    /// unreadable slot is reported, not fatal to the whole snapshot.
+    fn cert_object(
+        &mut self,
+        slot: Slot,
+    ) -> Result<Result<Option<Vec<u8>>, CertUnreadable>, TransportError> {
         let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
         if sw != piv::SW_OK {
-            return Ok(None);
+            return Ok(Ok(None));
         }
         Ok(cert_object_der(&data))
     }
@@ -1483,8 +1556,11 @@ impl PivSession {
 
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
     fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
-        let cert = self.read_certificate(slot)?;
-        Ok(slot_occupancy(slot, cert.as_deref()))
+        let cert = self.cert_object(slot)?;
+        Ok(slot_occupancy(
+            slot,
+            cert.as_ref().map(Option::as_deref).map_err(|e| *e),
+        ))
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
@@ -1555,6 +1631,49 @@ impl PivSession {
             }
         }
         Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+    }
+}
+
+/// Whether a direct (single-APDU) certificate PUT DATA that came back as
+/// `result` should be retried with command chaining *because of a PC/SC-layer
+/// failure*: only a [`TransportError::Pcsc`] error on an extended-length APDU
+/// qualifies. Some reader/card paths fail an extended APDU of a few KB below
+/// the card, before any status word; chaining sends short APDUs instead. A
+/// status word (success or not) is left to the SW-driven fallback, and every
+/// other error propagates.
+fn retry_chained_after(result: &Result<(Vec<u8>, u16), TransportError>, extended: bool) -> bool {
+    extended && matches!(result, Err(TransportError::Pcsc(_)))
+}
+
+/// The status word a chained certificate PUT DATA ended on. `transmit_chain`
+/// reports an intermediate chunk's non-`9000` as a generic
+/// [`TransportError::Apdu`]; a `6700` or `6A84` there is handed back as a
+/// status word instead, so [`cert_write_result`] names it the same way as on
+/// the final chunk. Every other error propagates unchanged.
+fn chained_cert_sw(result: Result<(Vec<u8>, u16), TransportError>) -> Result<u16, TransportError> {
+    match result {
+        Ok((_, sw)) => Ok(sw),
+        Err(TransportError::Apdu { sw1, sw2, .. })
+            if matches!(
+                u16::from_be_bytes([sw1, sw2]),
+                piv::SW_WRONG_LENGTH | piv::SW_NOT_ENOUGH_MEMORY
+            ) =>
+        {
+            Ok(u16::from_be_bytes([sw1, sw2]))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Map the final status word of a certificate PUT DATA: `6700` (wrong
+/// length) → [`TransportError::PivCertTooLarge`] with the DER length,
+/// `6A84` (not enough memory) → [`TransportError::PivCardFull`], anything
+/// else as any PIV write ([`ok_or_write`]).
+fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
+    match sw {
+        piv::SW_WRONG_LENGTH => Err(TransportError::PivCertTooLarge { slot, len }),
+        piv::SW_NOT_ENOUGH_MEMORY => Err(TransportError::PivCardFull { slot }),
+        _ => ok_or_write("piv import certificate", sw),
     }
 }
 
@@ -1728,72 +1847,46 @@ fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
 /// answers a deleted slot this way instead of `6A82`), a `0x53` object with
 /// no `0x70`, or a body that isn't a `0x53` data template at all (not
 /// expected from a real card, and degraded rather than errored — this feeds
-/// read-only status calls). Pure, so the byte cases stay unit-tested.
-fn cert_object_der(body: &[u8]) -> Option<Vec<u8>> {
-    let inner = piv::unwrap_data_object(body).ok()?;
-    let (der, gzip) = piv::cert_object_parts(inner)?;
+/// read-only status calls). `Err` when there IS a certificate, flagged
+/// compressed, that won't inflate — reported as unreadable, never as empty.
+/// Pure, so the byte cases stay unit-tested.
+fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
+    let Some((der, gzip)) = piv::unwrap_data_object(body)
+        .ok()
+        .and_then(piv::cert_object_parts)
+    else {
+        return Ok(None);
+    };
     if gzip {
-        // YubiKey stores the cert gzip-compressed (CertInfo bit 0). Inflate it
-        // before anyone parses it as DER. A stream that won't inflate, or one
-        // that blows the size cap, degrades to "no cert" — the same way a
-        // malformed body already does — rather than handing garbage downstream.
-        gunzip_capped(der)
+        // The object holds the cert gzip-compressed (CertInfo bit 0, which
+        // the writing tool chose). Inflate it before anyone parses it as DER;
+        // never hand the compressed bytes on.
+        gunzip_capped(der).map(Some)
     } else {
-        Some(der.to_vec())
+        Ok(Some(der.to_vec()))
     }
 }
 
-/// Host ceiling on an inflated PIV certificate. Real certs are a few KB; the
-/// card's own object is small. This just bounds a hostile/broken gzip stream
-/// so the decompressor cannot be made to allocate without limit.
-const MAX_CERT_DECOMPRESSED: usize = 64 * 1024;
-
-/// Inflate a gzip (RFC 1952) stream, capped at [`MAX_CERT_DECOMPRESSED`].
-/// `None` on a non-gzip or malformed header, an unparseable DEFLATE body, or
-/// output past the cap. The gzip trailer (CRC32 + ISIZE) is trimmed; the CRC
-/// is not verified — a wrong cert fails its own signature check downstream,
-/// so the CRC adds nothing here.
-fn gunzip_capped(data: &[u8]) -> Option<Vec<u8>> {
-    // Fixed header: magic(2) CM(1) FLG(1) MTIME(4) XFL(1) OS(1) = 10 bytes,
-    // plus the 8-byte trailer, so a valid stream is at least 18 bytes.
-    if data.len() < 18 || data[0] != 0x1F || data[1] != 0x8B || data[2] != 0x08 {
-        return None;
-    }
-    let flg = data[3];
-    let mut pos = 10usize;
-    if flg & 0x04 != 0 {
-        // FEXTRA: 2-byte little-endian length, then that many bytes.
-        let xlen = u16::from_le_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
-        pos = pos.checked_add(2)?.checked_add(xlen)?;
-    }
-    if flg & 0x08 != 0 {
-        // FNAME: zero-terminated.
-        let rel = data.get(pos..)?.iter().position(|&b| b == 0)?;
-        pos = pos.checked_add(rel)?.checked_add(1)?;
-    }
-    if flg & 0x10 != 0 {
-        // FCOMMENT: zero-terminated.
-        let rel = data.get(pos..)?.iter().position(|&b| b == 0)?;
-        pos = pos.checked_add(rel)?.checked_add(1)?;
-    }
-    if flg & 0x02 != 0 {
-        // FHCRC: 2 bytes.
-        pos = pos.checked_add(2)?;
-    }
-    let end = data.len().checked_sub(8)?; // trim CRC32 + ISIZE trailer
-    let deflate = data.get(pos..end)?;
-    miniz_oxide::inflate::decompress_to_vec_with_limit(deflate, MAX_CERT_DECOMPRESSED).ok()
-}
-
-/// A slot's [`PivSlotStatus`] from the certificate DER
-/// [`PivSession::read_certificate`] returned for it: present (with its byte
-/// length) when non-empty, absent otherwise.
-fn slot_occupancy(slot: piv::Slot, cert_der: Option<&[u8]>) -> PivSlotStatus {
-    let len = cert_der.map_or(0, <[u8]>::len);
-    PivSlotStatus {
-        slot,
-        cert_present: len > 0,
-        cert_len: len,
+/// A slot's [`PivSlotStatus`] from its decoded certificate object: present
+/// (with its DER byte length) when non-empty, present-but-unreadable when a
+/// certificate is there that won't decode, absent otherwise.
+fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) -> PivSlotStatus {
+    match cert {
+        Err(reason) => PivSlotStatus {
+            slot,
+            cert_present: true,
+            cert_len: 0,
+            cert_unreadable: Some(reason),
+        },
+        Ok(der) => {
+            let len = der.map_or(0, <[u8]>::len);
+            PivSlotStatus {
+                slot,
+                cert_present: len > 0,
+                cert_len: len,
+                cert_unreadable: None,
+            }
+        }
     }
 }
 
@@ -1932,6 +2025,7 @@ fn block_crypt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gzip::MAX_CERT_DECOMPRESSED;
 
     #[test]
     fn describe_apdu_names_the_command() {
@@ -2236,7 +2330,7 @@ mod tests {
     #[test]
     fn cert_object_der_empty_template_is_none() {
         // `53 00`: object present, zero-length value — the Nitrokey case.
-        assert_eq!(cert_object_der(&[0x53, 0x00]), None);
+        assert_eq!(cert_object_der(&[0x53, 0x00]), Ok(None));
     }
 
     #[test]
@@ -2245,27 +2339,30 @@ mod tests {
         // CertInfo absent so it reads as uncompressed and passes through.
         assert_eq!(
             cert_object_der(&[0x53, 0x03, 0x70, 0x01, 0xAB]),
-            Some(vec![0xAB])
+            Ok(Some(vec![0xAB]))
         );
     }
 
-    /// gzip-wrap `payload` the way a YubiKey would (minimal RFC 1952 header,
-    /// raw-DEFLATE body, dummy CRC/ISIZE trailer — the reader trims and does
-    /// not verify the trailer).
+    /// gzip-wrap `payload` (minimal RFC 1952 header, raw-DEFLATE body, and
+    /// the real CRC32 + ISIZE trailer the reader verifies).
     fn gzip(payload: &[u8]) -> Vec<u8> {
         let mut v = vec![0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xFF];
         v.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(payload, 6));
-        v.extend_from_slice(&[0u8; 8]); // CRC32 + ISIZE, unread
+        v.extend_from_slice(&crate::gzip::crc32(payload).to_le_bytes());
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         v
     }
 
     #[test]
     fn gunzip_capped_round_trips() {
         let der = b"\x30\x82\x01\x0a hello certificate bytes";
-        assert_eq!(gunzip_capped(&gzip(der)).as_deref(), Some(&der[..]));
-        // Not gzip -> None, no panic.
-        assert_eq!(gunzip_capped(b"\x30\x03\x01\x01\xff"), None);
-        assert_eq!(gunzip_capped(&[]), None);
+        assert_eq!(gunzip_capped(&gzip(der)).as_deref(), Ok(&der[..]));
+        // Not gzip -> Damaged, no panic.
+        assert_eq!(
+            gunzip_capped(b"\x30\x03\x01\x01\xff"),
+            Err(CertUnreadable::Damaged)
+        );
+        assert_eq!(gunzip_capped(&[]), Err(CertUnreadable::Damaged));
     }
 
     #[test]
@@ -2281,28 +2378,181 @@ mod tests {
         inner.extend_from_slice(&[0x71, 0x01, 0x01, 0xFE, 0x00]);
         let mut obj = vec![0x53, inner.len() as u8];
         obj.extend_from_slice(&inner);
-        assert_eq!(cert_object_der(&obj).as_deref(), Some(&der[..]));
+        assert_eq!(cert_object_der(&obj), Ok(Some(der.to_vec())));
+    }
+
+    /// `53 { 70 <payload> 71 01 01 FE 00 }` — a cert object flagged
+    /// gzip-compressed, with long-form lengths so large payloads fit.
+    fn compressed_cert_object(payload: &[u8]) -> Vec<u8> {
+        fn tlv(tag: u8, val: &[u8]) -> Vec<u8> {
+            let n = val.len();
+            let mut v = vec![tag];
+            match n {
+                0..=0x7F => v.push(n as u8),
+                0x80..=0xFF => v.extend_from_slice(&[0x81, n as u8]),
+                _ => v.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8]),
+            }
+            v.extend_from_slice(val);
+            v
+        }
+        let mut inner = tlv(0x70, payload);
+        inner.extend_from_slice(&[0x71, 0x01, 0x01, 0xFE, 0x00]);
+        tlv(0x53, &inner)
+    }
+
+    // A slot whose certificate is flagged compressed but will not inflate
+    // holds *something* — it must read as unreadable, never as empty, so
+    // `piv status` doesn't invite overwriting it and `export-cert` doesn't
+    // report "no certificate" (#147 follow-up; seen on a YubiKey 5.7).
+
+    #[test]
+    fn cert_object_der_flagged_compressed_but_not_gzip_is_damaged() {
+        let obj = compressed_cert_object(b"\x30\x82\x01\x0a plain DER, wrongly flagged");
+        assert_eq!(cert_object_der(&obj), Err(CertUnreadable::Damaged));
+    }
+
+    #[test]
+    fn cert_object_der_invalid_deflate_body_is_damaged() {
+        // A gzip header, then a DEFLATE block of reserved type (BTYPE = 11),
+        // which no decoder accepts, then the 8-byte trailer.
+        let mut gz = vec![0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xFF];
+        gz.extend_from_slice(&[0x07, 0x00, 0x00]);
+        gz.extend_from_slice(&[0u8; 8]);
+        let obj = compressed_cert_object(&gz);
+        assert_eq!(cert_object_der(&obj), Err(CertUnreadable::Damaged));
+    }
+
+    #[test]
+    fn cert_object_der_truncated_gzip_is_damaged() {
+        let der: Vec<u8> = (0..400u32).map(|i| (i * 7 % 251) as u8).collect();
+        let gz = gzip(&der);
+        let obj = compressed_cert_object(&gz[..gz.len() / 2]);
+        assert_eq!(cert_object_der(&obj), Err(CertUnreadable::Damaged));
+    }
+
+    #[test]
+    fn cert_object_der_over_the_inflate_cap_is_too_large() {
+        let obj = compressed_cert_object(&gzip(&vec![0u8; MAX_CERT_DECOMPRESSED + 1]));
+        assert_eq!(cert_object_der(&obj), Err(CertUnreadable::TooLarge));
+    }
+
+    #[test]
+    fn cert_object_der_exactly_at_the_inflate_cap_is_read() {
+        let der = vec![0u8; MAX_CERT_DECOMPRESSED];
+        let obj = compressed_cert_object(&gzip(&der));
+        assert_eq!(cert_object_der(&obj), Ok(Some(der)));
+    }
+
+    #[test]
+    fn slot_occupancy_marks_an_unreadable_cert_present_not_empty() {
+        let occ = slot_occupancy(piv::Slot::KeyManagement, Err(CertUnreadable::Damaged));
+        assert!(occ.cert_present);
+        assert_eq!(occ.cert_len, 0);
+        assert_eq!(occ.cert_unreadable, Some(CertUnreadable::Damaged));
+        let ok = slot_occupancy(piv::Slot::KeyManagement, Ok(Some(&[0xAB][..])));
+        assert_eq!(ok.cert_unreadable, None);
+    }
+
+    #[test]
+    fn unreadable_cert_error_names_the_slot_and_the_reason() {
+        let e = TransportError::PivCertUnreadable {
+            slot: piv::Slot::KeyManagement,
+            reason: CertUnreadable::Damaged,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains(&piv::Slot::KeyManagement.label()), "{msg}");
+        assert!(msg.contains("compressed data is damaged"), "{msg}");
+        let e = TransportError::PivCertUnreadable {
+            slot: piv::Slot::KeyManagement,
+            reason: CertUnreadable::TooLarge,
+        };
+        assert!(e.to_string().contains("64 KiB"), "{e}");
+    }
+
+    #[test]
+    fn a_pcsc_failure_of_an_extended_apdu_retries_chained() {
+        let pcsc = Err(TransportError::Pcsc(pcsc::Error::NotTransacted));
+        assert!(retry_chained_after(&pcsc, true));
+        // A short APDU has nothing to gain from chaining.
+        assert!(!retry_chained_after(&pcsc, false));
+        // Any other error propagates.
+        assert!(!retry_chained_after(
+            &Err(TransportError::HostRngFailed),
+            true
+        ));
+        // A status word, success or not, is the SW-driven fallback's call.
+        assert!(!retry_chained_after(&Ok((Vec::new(), piv::SW_OK)), true));
+        assert!(!retry_chained_after(&Ok((Vec::new(), 0x6700)), true));
+    }
+
+    #[test]
+    fn cert_write_status_names_too_large_and_card_full() {
+        let slot = piv::Slot::Signature;
+        assert!(matches!(
+            cert_write_result(slot, 3087, piv::SW_WRONG_LENGTH),
+            Err(TransportError::PivCertTooLarge { len: 3087, .. })
+        ));
+        assert!(matches!(
+            cert_write_result(slot, 3087, piv::SW_NOT_ENOUGH_MEMORY),
+            Err(TransportError::PivCardFull { .. })
+        ));
+        assert!(cert_write_result(slot, 10, piv::SW_OK).is_ok());
+        assert!(matches!(
+            cert_write_result(slot, 10, piv::SW_SECURITY_NOT_SATISFIED),
+            Err(TransportError::PivSecurityNotSatisfied)
+        ));
+    }
+
+    #[test]
+    fn a_mid_chain_length_or_memory_refusal_reaches_the_cert_mapping() {
+        let apdu = |sw1, sw2| {
+            Err(TransportError::Apdu {
+                label: "piv import certificate",
+                sw1,
+                sw2,
+            })
+        };
+        assert_eq!(chained_cert_sw(apdu(0x67, 0x00)).ok(), Some(0x6700));
+        assert_eq!(chained_cert_sw(apdu(0x6A, 0x84)).ok(), Some(0x6A84));
+        assert_eq!(chained_cert_sw(Ok((Vec::new(), 0x9000))).ok(), Some(0x9000));
+        // Other intermediate refusals keep their generic error.
+        assert!(matches!(
+            chained_cert_sw(apdu(0x69, 0x82)),
+            Err(TransportError::Apdu { sw1: 0x69, .. })
+        ));
+    }
+
+    #[test]
+    fn too_large_and_card_full_errors_name_the_slot_and_size() {
+        let slot = piv::Slot::Signature;
+        let msg = TransportError::PivCertTooLarge { slot, len: 3087 }.to_string();
+        assert!(msg.contains(&slot.label()), "{msg}");
+        assert!(msg.contains("3087 bytes"), "{msg}");
+        assert!(msg.contains("too large"), "{msg}");
+        let msg = TransportError::PivCardFull { slot }.to_string();
+        assert!(msg.contains(&slot.label()), "{msg}");
+        assert!(msg.contains("no room left"), "{msg}");
     }
 
     #[test]
     fn cert_object_der_template_without_70_is_none() {
         // `53 02 71 00`: a `0x53` object carrying only a cert-info `71` TLV.
-        assert_eq!(cert_object_der(&[0x53, 0x02, 0x71, 0x00]), None);
+        assert_eq!(cert_object_der(&[0x53, 0x02, 0x71, 0x00]), Ok(None));
     }
 
     #[test]
     fn cert_object_der_unparseable_body_is_none_not_a_panic() {
         // Not a `0x53` template at all — shouldn't happen on a real card, but
         // a read-only status call must degrade gracefully, not panic or error.
-        assert_eq!(cert_object_der(&[0xFF, 0x00]), None);
+        assert_eq!(cert_object_der(&[0xFF, 0x00]), Ok(None));
     }
 
     #[test]
     fn slot_occupancy_reads_present_only_for_a_non_empty_cert() {
         let slot = piv::Slot::Authentication;
-        assert!(!slot_occupancy(slot, None).cert_present);
-        assert!(!slot_occupancy(slot, Some(&[])).cert_present);
-        let occ = slot_occupancy(slot, Some(&[0xAB, 0xCD]));
+        assert!(!slot_occupancy(slot, Ok(None)).cert_present);
+        assert!(!slot_occupancy(slot, Ok(Some(&[]))).cert_present);
+        let occ = slot_occupancy(slot, Ok(Some(&[0xAB, 0xCD])));
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, 2);
     }
@@ -2331,8 +2581,11 @@ mod tests {
         body.extend_from_slice(&inner);
 
         let cert_der = cert_object_der(&body);
-        assert_eq!(cert_der.as_deref(), Some(&der[..]));
-        let occ = slot_occupancy(piv::Slot::Authentication, cert_der.as_deref());
+        assert_eq!(cert_der, Ok(Some(der.to_vec())));
+        let occ = slot_occupancy(
+            piv::Slot::Authentication,
+            cert_der.as_ref().map(Option::as_deref).map_err(|e| *e),
+        );
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, der.len());
     }
@@ -2348,8 +2601,11 @@ mod tests {
         body.extend_from_slice(&inner);
 
         let cert_der = cert_object_der(&body);
-        assert_eq!(cert_der.as_deref(), Some(&der[..]));
-        let occ = slot_occupancy(piv::Slot::Authentication, cert_der.as_deref());
+        assert_eq!(cert_der, Ok(Some(der.to_vec())));
+        let occ = slot_occupancy(
+            piv::Slot::Authentication,
+            cert_der.as_ref().map(Option::as_deref).map_err(|e| *e),
+        );
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, der.len());
     }

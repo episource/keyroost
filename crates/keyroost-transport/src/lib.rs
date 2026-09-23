@@ -41,9 +41,12 @@ pub use token2prog::Token2ProgSession;
 mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
+mod gzip;
+
 mod piv;
 pub use piv::{
-    random_chuid_guid, PivSession, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
+    random_chuid_guid, CertUnreadable, PivSession, PivSlotDetail, PivSlotStatus, PivStatus,
+    PivStatusDetailed,
 };
 
 mod token2otp;
@@ -148,6 +151,21 @@ pub enum TransportError {
     /// A PIV MOVE KEY refused because the destination slot already holds a key
     /// (GET METADATA pre-check, ahead of the card's own refusal).
     PivDestinationOccupied(keyroost_piv::Slot),
+    /// The slot holds a certificate, flagged compressed, that cannot be read
+    /// (see [`CertUnreadable`]). Distinct from "no certificate": the slot is
+    /// occupied, and writing a new certificate replaces it.
+    PivCertUnreadable {
+        slot: keyroost_piv::Slot,
+        reason: CertUnreadable,
+    },
+    /// A certificate import the card refused as too long (`SW 6700` to the
+    /// PUT DATA of the slot's certificate object). `len` is the DER length.
+    PivCertTooLarge {
+        slot: keyroost_piv::Slot,
+        len: usize,
+    },
+    /// A certificate import the card refused for lack of memory (`SW 6A84`).
+    PivCardFull { slot: keyroost_piv::Slot },
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
@@ -303,6 +321,24 @@ impl fmt::Display for TransportError {
             TransportError::PivDestinationOccupied(slot) => write!(
                 f,
                 "slot {} already holds a key — delete it first or pick an empty slot",
+                slot.label()
+            ),
+            TransportError::PivCertUnreadable { slot, reason } => write!(
+                f,
+                "{} holds a certificate that cannot be read: {} (importing a new \
+                 certificate replaces it; deleting the certificate clears it)",
+                slot.label(),
+                reason
+            ),
+            TransportError::PivCertTooLarge { slot, len } => write!(
+                f,
+                "the certificate ({} bytes) is too large for {}: the card refused its length",
+                len,
+                slot.label()
+            ),
+            TransportError::PivCardFull { slot } => write!(
+                f,
+                "the card has no room left to store a certificate in {}",
                 slot.label()
             ),
             TransportError::HostRngFailed => {
