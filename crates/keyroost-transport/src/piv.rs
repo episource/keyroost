@@ -135,7 +135,7 @@ pub struct PivStatus {
     /// trace back to anything in OpenFIPS201's own source), so a reply here
     /// means "answers this Yubico extension," not "is a YubiKey." `None` if
     /// the card doesn't answer it, or answers empty. Feature gates (e.g.
-    /// [`move_key_supported`]) compare this directly as a byte slice rather
+    /// `move_key_supported`) compare this directly as a byte slice rather
     /// than requiring an exact 3-byte shape. See
     /// [`keyroost_piv::format_version_bytes`] for display formatting.
     pub version: Option<Vec<u8>>,
@@ -559,24 +559,12 @@ impl PivSession {
     /// The card-management (9B) key's algorithm *as the card reports it* via
     /// GET METADATA, or `None` when the card doesn't answer the extension
     /// (pre-5.3 YubiKey firmware, and non-Yubico applets that stub it out).
-    /// Unlike [`Self::management_key_algorithm`] this makes no assumption about
-    /// what an absent answer means — see [`Self::resolve_management_key_algorithm`].
+    /// It makes no assumption about what an absent answer means — see
+    /// [`Self::resolve_management_key_algorithm`].
     pub fn reported_management_key_algorithm(&mut self) -> Option<MgmtAlg> {
         self.metadata(piv::KEY_REF_MANAGEMENT)
             .and_then(|m| m.algorithm)
             .and_then(MgmtAlg::from_id)
-    }
-
-    /// The card-management (9B) key's algorithm, from GET METADATA. Defaults to
-    /// [`MgmtAlg::TripleDes`] when the card doesn't report it (pre-5.3 firmware,
-    /// where 3DES was the only option).
-    ///
-    /// Prefer [`Self::resolve_management_key_algorithm`] when a key of known
-    /// length is in hand: it disambiguates cards without GET METADATA instead
-    /// of blindly assuming 3DES.
-    pub fn management_key_algorithm(&mut self) -> MgmtAlg {
-        self.reported_management_key_algorithm()
-            .unwrap_or(MgmtAlg::TripleDes)
     }
 
     /// Decide which algorithm to run management-key authentication under, given
@@ -666,7 +654,7 @@ impl PivSession {
     /// Authenticate to the card-management key via the GENERAL AUTHENTICATE
     /// witness/challenge round. Required before key generation, certificate
     /// import, set-management-key, and set-pin-retries. `alg` must match the
-    /// card's stored management-key algorithm (see [`Self::management_key_algorithm`]).
+    /// card's stored management-key algorithm (see [`Self::resolve_management_key_algorithm`]).
     pub fn authenticate_management(
         &mut self,
         alg: MgmtAlg,
@@ -1227,7 +1215,7 @@ impl PivSession {
     /// instruction but reply with an empty body for slots they haven't wired
     /// reporting up for yet, rather than failing it outright. That's
     /// functionally identical to "no GET METADATA support" for our purposes,
-    /// so [`metadata_key_material`] is the single gate for "does this reply
+    /// so `metadata_key_material` is the single gate for "does this reply
     /// actually name the key", and only a `Some` from it short-circuits the
     /// cache fallback below.
     ///
