@@ -300,13 +300,23 @@ impl Slot {
 pub const OBJECT_CHUID: [u8; 3] = [0x5F, 0xC1, 0x02];
 
 /// "Printed Information" data-object tag (`5F C1 09`). Yubico overloads this
-/// same object as its PIN-protected-data container on devices that carry
-/// [`compat::PivQuirk::PinManagementAuthProtected9BKey`], storing tag `0x88`
+/// same object as its PIN-protected-data container, storing tag `0x88`
 /// wrapping subtag `0x89` (the plaintext management key) inside it — see
 /// [`parse_pin_protected_management_key`]. The two uses don't collide in
 /// practice: a card doing PIN-protected management-key storage has no
 /// separate use for the standard "printed information" text.
 pub const OBJECT_PIN_PROTECTED_DATA: [u8; 3] = [0x5F, 0xC1, 0x09];
+
+/// Yubico "Admin Data" object (`5F FF 00`) — vendor metadata carrying, among
+/// other things, a tag-`0x81` flags byte inside a tag-`0x80` container. Bit
+/// `0x02` of that byte is the one this crate cares about: it marks whether
+/// the management key is currently stored PIN-protected in
+/// [`OBJECT_PIN_PROTECTED_DATA`] (`ykman`'s "PIN-protected management key"/
+/// `--protect` bookkeeping). See
+/// <https://docs.yubico.com/yesdk/users-manual/application-piv/piv-objects.html>
+/// (`53 05 / 80 03 / 81 01 / 02` is that SDK's own worked example of setting
+/// this exact bit) and [`set_admin_data_pin_protected_flag`].
+pub const OBJECT_ADMIN_DATA: [u8; 3] = [0x5F, 0xFF, 0x00];
 
 /// Management-key (9B) cipher algorithm. The card stores one of these; auth
 /// uses a witness/challenge round whose block size this dictates.
@@ -744,6 +754,7 @@ pub fn data_object_name(tag: &[u8]) -> Option<String> {
         [0x5F, 0xC1, 0x22] => "Biometric Information Templates Group Template",
         [0x5F, 0xC1, 0x23] => "Secure Messaging Certificate Signer",
         [0x5F, 0xC1, 0x24] => "Pairing Code Reference Data Container",
+        [0x5F, 0xFF, 0x00] => "Yubico Admin Data",
         [0x5F, 0xFF, 0x01] => "Yubico PIV Attestation Certificate",
         [0x5F, 0xFF, 0x10] => "Yubico MSCMAP",
         [0xFF, 0xFF, 0x7F] => "HID Crescendo C2300 GET PIV PROPERTIES",
@@ -1780,8 +1791,8 @@ pub fn unwrap_data_object(buf: &[u8]) -> Result<&[u8], ParseError> {
 /// Extract the management key from a GET DATA response on
 /// [`OBJECT_PIN_PROTECTED_DATA`]: strip the outer `0x53` template (same as
 /// [`unwrap_data_object`]), then find tag `0x88` and, inside it, subtag
-/// `0x89` — the scheme [`compat::PivQuirk::PinManagementAuthProtected9BKey`]
-/// documents. `None` on any parse failure *or* on a well-formed reply that
+/// `0x89` — the scheme [`compat::PivExtension::PinManagementAuth`]'s own doc
+/// describes. `None` on any parse failure *or* on a well-formed reply that
 /// simply carries no tag 88 / subtag 89: a card can legitimately answer this
 /// way when PIN management auth has never been set up, which callers must
 /// tell apart from "the read itself failed" only by the fact that this
@@ -1794,6 +1805,141 @@ pub fn parse_pin_protected_management_key(buf: &[u8]) -> Option<Zeroizing<Vec<u8
     let tag88 = find_tlv(inner, 0x88)?;
     let key = find_tlv(tag88, 0x89)?;
     Some(Zeroizing::new(key.to_vec()))
+}
+
+/// Build the inner bytes (nested `88`/`89`, everything [`put_data`] wraps in
+/// its own outer `0x53`) to write [`OBJECT_PIN_PROTECTED_DATA`] as Yubico's
+/// PIN-protected management-key container — the write-side counterpart of
+/// [`parse_pin_protected_management_key`]. Per
+/// <https://docs.yubico.com/yesdk/users-manual/application-piv/pin-only.html>,
+/// this object carries nothing else when used this way (see
+/// [`OBJECT_PIN_PROTECTED_DATA`]'s own doc for why that's safe to assume), so
+/// unlike [`set_admin_data_pin_protected_flag`] this always replaces the
+/// object wholesale rather than patching around existing content.
+#[must_use]
+pub fn build_pin_protected_management_key(key: &[u8]) -> Vec<u8> {
+    let mut tag89 = Vec::with_capacity(key.len() + 2);
+    push_tlv(&mut tag89, &[0x89], key);
+    let mut tag88 = Vec::with_capacity(tag89.len() + 2);
+    push_tlv(&mut tag88, &[0x88], &tag89);
+    tag88
+}
+
+/// Top-level-only BER-TLV span finder: like [`find_tlv`], but returns the
+/// matched entry's `(tlv_start, value_start, value_end)` offsets into `buf`
+/// instead of just the value slice, so a caller can splice a replacement in
+/// while copying every other byte through unchanged. `None` on a parse
+/// failure or no match, same non-distinction [`find_tlv`] itself makes.
+fn tlv_span(buf: &[u8], tag: u8) -> Option<(usize, usize, usize)> {
+    let mut i = 0;
+    while i < buf.len() {
+        let t = buf[i];
+        let (len, header) = read_ber_len(buf.get(i + 1..)?).ok()?;
+        let vstart = i + 1 + header;
+        let vend = vstart.checked_add(len)?;
+        if vend > buf.len() {
+            return None;
+        }
+        if t == tag {
+            return Some((i, vstart, vend));
+        }
+        i = vend;
+    }
+    None
+}
+
+/// Bit `0x02` of Admin Data's tag-`0x81` flags byte — see
+/// [`OBJECT_ADMIN_DATA`]'s doc.
+const ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY: u8 = 0x02;
+
+/// Set or clear the PIN-protected-management-key bit (`0x02`) in Admin
+/// Data's tag-`0x81` flags byte, inside its tag-`0x80` container, leaving
+/// every other byte untouched: other bits of that same flags byte (e.g.
+/// `ykman`'s own PUK-blocked bit, `0x01`), any other subtag of `0x80` (salt
+/// `0x82`, PIN-last-updated timestamp `0x83`), and any top-level tag
+/// sibling to `0x80`. See [`OBJECT_ADMIN_DATA`]'s doc for the object and
+/// bit this operates on.
+///
+/// `existing` is [`unwrap_data_object`]'s output for a prior GET DATA on
+/// [`OBJECT_ADMIN_DATA`] — the object's content with the outer `0x53`
+/// template already stripped — or `&[]` for a device that has never written
+/// this object.
+///
+/// Returns the new inner content to [`put_data`] back (re-wrapping in `0x53`
+/// is [`put_data`]'s own job, not this function's), or `None` when there is
+/// nothing to write:
+///
+/// - `set = true` always returns `Some`, synthesizing the `0x80`/`0x81`
+///   nesting from scratch when `existing` doesn't already carry it.
+/// - `set = false` returns `None` when the `0x80`/`0x81` nesting is entirely
+///   absent — nothing was ever configured, so there is nothing to clear and
+///   the object must be left alone, not created just to write a `0`.
+///
+/// A malformed `existing` (or an unexpected tag-`0x81` value length — SP
+/// 800-73's own example is a single byte) is treated the same as "not
+/// found": `None` for `set = false`, and for `set = true` the unparseable
+/// tail is left in place while a fresh `0x80`/`0x81` is appended — this can
+/// duplicate a tag-`0x80` a genuinely malformed reply already had, but never
+/// silently drops or corrupts bytes this function couldn't make sense of.
+#[must_use]
+pub fn set_admin_data_pin_protected_flag(existing: &[u8], set: bool) -> Option<Vec<u8>> {
+    let Some((c_start, cv_start, cv_end)) = tlv_span(existing, 0x80) else {
+        if !set {
+            return None; // never configured; leave it alone
+        }
+        let mut container = Vec::with_capacity(3);
+        push_tlv(
+            &mut container,
+            &[0x81],
+            &[ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY],
+        );
+        let mut inner = existing.to_vec();
+        push_tlv(&mut inner, &[0x80], &container);
+        return Some(inner);
+    };
+    let container = &existing[cv_start..cv_end];
+    let new_container = match tlv_span(container, 0x81) {
+        Some((f_start, fv_start, fv_end)) => {
+            let value = container.get(fv_start..fv_end)?;
+            let &[current] = value else {
+                // Unexpected length for a field SP 800-73's own example
+                // always shows as one byte — leave the container as-is
+                // rather than guess at a multi-byte flags encoding this
+                // crate has never observed.
+                return None;
+            };
+            if !set && current & ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY == 0 {
+                return None; // already clear; nothing to write back
+            }
+            let updated = if set {
+                current | ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY
+            } else {
+                current & !ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY
+            };
+            let mut rebuilt = Vec::with_capacity(container.len());
+            rebuilt.extend_from_slice(&container[..f_start]);
+            push_tlv(&mut rebuilt, &[0x81], &[updated]);
+            rebuilt.extend_from_slice(&container[fv_end..]);
+            rebuilt
+        }
+        None => {
+            if !set {
+                return None; // tag 0x81 absent; nothing to clear
+            }
+            let mut rebuilt = container.to_vec();
+            push_tlv(
+                &mut rebuilt,
+                &[0x81],
+                &[ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY],
+            );
+            rebuilt
+        }
+    };
+    let mut inner = Vec::with_capacity(existing.len() + 3);
+    inner.extend_from_slice(&existing[..c_start]);
+    push_tlv(&mut inner, &[0x80], &new_container);
+    inner.extend_from_slice(&existing[cv_end..]);
+    Some(inner)
 }
 
 /// Format a Yubico `GET VERSION` reply for display — tolerant of any
@@ -2260,6 +2406,84 @@ mod tests {
 
         // Not even a 53 template.
         assert!(parse_pin_protected_management_key(&[0x70, 0x01, 0x00]).is_none());
+    }
+
+    #[test]
+    fn build_pin_protected_management_key_round_trips_with_parse() {
+        let key = [0x11u8; 24];
+        let inner = build_pin_protected_management_key(&key);
+        let mut buf = vec![0x53];
+        push_ber_len(&mut buf, inner.len());
+        buf.extend_from_slice(&inner);
+        assert_eq!(
+            &parse_pin_protected_management_key(&buf).unwrap()[..],
+            &key[..]
+        );
+    }
+
+    #[test]
+    fn admin_data_flag_set_matches_sdk_worked_example() {
+        // The Yubico SDK docs' own example of `AdminData.PinProtected = true`
+        // on a previously-empty object: `53 05 / 80 03 / 81 01 / 02`.
+        let inner = set_admin_data_pin_protected_flag(&[], true).unwrap();
+        assert_eq!(inner, vec![0x80, 0x03, 0x81, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn admin_data_flag_clear_on_never_configured_is_a_no_op() {
+        assert!(set_admin_data_pin_protected_flag(&[], false).is_none());
+        // A container with unrelated subtags but no 0x81 flags byte at all —
+        // still nothing to clear.
+        let inner = [0x80, 0x03, 0x82, 0x01, 0xAA];
+        assert!(set_admin_data_pin_protected_flag(&inner, false).is_none());
+    }
+
+    #[test]
+    fn admin_data_flag_clear_preserves_other_bits_and_siblings() {
+        // Flags byte 0x03 = PIN-protected (0x02) *and* PUK-blocked (0x01,
+        // ykman's own bit) both set, plus an unrelated salt subtag (0x82)
+        // and a top-level sibling tag (0x99) that must survive untouched.
+        let inner = [
+            0x80, 0x06, 0x81, 0x01, 0x03, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F,
+        ];
+        let updated = set_admin_data_pin_protected_flag(&inner, false).unwrap();
+        assert_eq!(
+            updated,
+            vec![0x80, 0x06, 0x81, 0x01, 0x01, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F]
+        );
+    }
+
+    #[test]
+    fn admin_data_flag_set_preserves_other_bits_and_siblings() {
+        // Only PUK-blocked (0x01) set going in; setting PIN-protected must
+        // OR it in (-> 0x03), not clobber it, and siblings still survive.
+        let inner = [
+            0x80, 0x06, 0x81, 0x01, 0x01, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F,
+        ];
+        let updated = set_admin_data_pin_protected_flag(&inner, true).unwrap();
+        assert_eq!(
+            updated,
+            vec![0x80, 0x06, 0x81, 0x01, 0x03, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F]
+        );
+    }
+
+    #[test]
+    fn admin_data_flag_clear_already_clear_is_a_no_op() {
+        let inner = [0x80, 0x03, 0x81, 0x01, 0x01]; // only PUK-blocked set
+        assert!(set_admin_data_pin_protected_flag(&inner, false).is_none());
+    }
+
+    #[test]
+    fn admin_data_flag_set_synthesizes_container_alongside_existing_siblings() {
+        // A top-level sibling tag already present, but no 0x80 container at
+        // all yet — the fresh 80/81 pair is appended after it, sibling
+        // untouched.
+        let inner = [0x99, 0x01, 0x7F];
+        let updated = set_admin_data_pin_protected_flag(&inner, true).unwrap();
+        assert_eq!(
+            updated,
+            vec![0x99, 0x01, 0x7F, 0x80, 0x03, 0x81, 0x01, 0x02]
+        );
     }
 
     #[test]
