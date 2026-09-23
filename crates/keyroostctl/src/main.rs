@@ -939,32 +939,66 @@ enum PivCmd {
     /// third-party device: refused on a device known to be incompatible
     /// unless `--force`, runs with a warning on an unverified one, silent on a
     /// known-good one.
+    ///
+    /// On every device except HID Crescendo (which unlocks management
+    /// directly off the PIN, with no key material to store), this also
+    /// maintains Yubico's PIN-protected management-key storage, enabling it
+    /// with `--allow-pin-unlock` or disabling it without — gated on
+    /// `PivExtension::PinManagementAuth`: silent on a known-good device, a
+    /// warning on an unverified one. On a device known unable to support it,
+    /// `--allow-pin-unlock` is refused unless `--force`; left unset, the
+    /// maintenance step is silently skipped instead — a plain key rotation on
+    /// such a device isn't blocked just because pin-unlock, which it never
+    /// asked to touch, is confirmed absent.
     ChangeManagementKey {
-        #[arg(long, value_name = "SUBSTR")]
+        // Explicit `display_order` on every field here (10.. up, one per
+        // field, matching declaration order): clap-derive's implicit order
+        // is an auto-incrementing counter that starts fresh at 0 in *each*
+        // derive invocation, including the top-level `Cli` struct's own
+        // `global = true` args (`--list-readers`/`--debug`/`--device`/
+        // `--json`, implicitly 0..3). Left implicit, this variant's own
+        // fields also start at 0, so `--help` interleaved the two structs'
+        // args by tied order number instead of keeping this command's own
+        // args — the `--old-mgmt-key-*` trio in particular — together.
+        #[arg(long, value_name = "SUBSTR", display_order = 10)]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"])]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"], display_order = 11)]
         old_mgmt_key_env: Option<String>,
-        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_default"])]
+        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_default"], display_order = 12)]
         old_mgmt_key_stdin: bool,
         /// Authenticate with this device's well-known factory-default
         /// management key, if one is known; fails with a clear error if it
         /// isn't. Only applies to the OLD (current) key — there's no
         /// equivalent for NEW, since installing a known-weak key on purpose
         /// isn't what this convenience is for.
-        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_stdin"])]
+        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_stdin"], display_order = 13)]
         old_mgmt_key_default: bool,
-        #[arg(long, value_name = "VAR", conflicts_with = "new_mgmt_key_stdin")]
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with = "new_mgmt_key_stdin",
+            display_order = 14
+        )]
         new_mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, display_order = 15)]
         new_mgmt_key_stdin: bool,
         /// Algorithm of the NEW management key.
-        #[arg(long, value_enum, default_value = "aes192")]
+        #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
         new_algorithm: CliPivMgmtAlg,
         /// Require a physical touch for every future management-key auth.
-        #[arg(long)]
+        #[arg(long, display_order = 17)]
         touch: bool,
+        /// Store the new management key PIN-protected, so it can later be
+        /// unlocked with the PIN alone instead of the raw key. Omit to
+        /// instead clear any existing PIN-protected storage of the old key —
+        /// except on a device confirmed unable to support this at all, where
+        /// omitting it is a no-op rather than an attempted clear. Ignored on
+        /// HID Crescendo, which already unlocks management off the PIN with
+        /// no key material of its own to store.
+        #[arg(long, display_order = 18)]
+        allow_pin_unlock: bool,
         /// Run even on a device known to be incompatible (the operation will likely fail).
-        #[arg(long)]
+        #[arg(long, display_order = 19)]
         force: bool,
     },
     /// Generate a new key pair in a slot and print its public key (PEM). Needs
@@ -7179,6 +7213,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             new_mgmt_key_stdin,
             new_algorithm,
             touch,
+            allow_pin_unlock,
             force,
         } => {
             let new = read_mgmt_key(
@@ -7215,6 +7250,47 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         keyroost_piv::compat::PivExtension::SetManagementKey,
                         *force,
                     )?;
+                    let pin_unlock_gate =
+                        s.feature_gate(keyroost_piv::compat::PivExtension::PinManagementAuth);
+                    // Whether to run the PIN-protected-storage maintenance step
+                    // below (2a/2b) at all, alongside the key change:
+                    // - `Supported`: always.
+                    // - `Unverified`: always, with a warning — support was never
+                    //   confirmed either way, so a caller who didn't even ask
+                    //   still gets best-effort maintenance rather than being
+                    //   blocked, but is told it isn't confirmed here.
+                    // - `Unsupported`: only if `--allow-pin-unlock` was actually
+                    //   given — that's a deliberate request for a feature
+                    //   confirmed absent, gated like any other extension (error
+                    //   unless `--force`). Left unset (the common case — most
+                    //   invocations of this command are a plain key rotation
+                    //   that never touches pin-unlock at all), a confirmed-absent
+                    //   device is silently skipped: no error, no warning, just
+                    //   the ordinary management-key change. Irrelevant on HID
+                    //   Crescendo in practice (it resolves this extension
+                    //   `Supported` unconditionally), which is also the
+                    //   fingerprint `set_management_key_pin_protected` skips the
+                    //   maintenance step for entirely regardless of this flag.
+                    let maintain_pin_unlock = match pin_unlock_gate {
+                        keyroost_piv::compat::FeatureGate::Supported => true,
+                        keyroost_piv::compat::FeatureGate::Unverified => {
+                            eprintln!(
+                                "warning: {} {}",
+                                keyroost_piv::compat::PivExtension::PinManagementAuth.requirement(),
+                                keyroost_piv::compat::FeatureGate::UNVERIFIED_SUFFIX
+                            );
+                            true
+                        }
+                        keyroost_piv::compat::FeatureGate::Unsupported if *allow_pin_unlock => {
+                            guard_piv_feature(
+                                s,
+                                keyroost_piv::compat::PivExtension::PinManagementAuth,
+                                *force,
+                            )?;
+                            true
+                        }
+                        keyroost_piv::compat::FeatureGate::Unsupported => false,
+                    };
                     authenticate_piv(s, &old)?;
                     // A HID Crescendo unit whose management key isn't a real PIV
                     // object runs its own self-contained unlock right before PUT
@@ -7222,17 +7298,71 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // on `authenticate_piv`'s auth above still being in force —
                     // `current` carries the same key again for that path; every
                     // other device ignores it.
-                    s.set_management_key(
-                        keyroost_transport::CurrentMgmtAuth::Key(&old),
-                        new_alg,
-                        &new,
-                        *touch,
-                    )?;
+                    let current = keyroost_transport::CurrentMgmtAuth::Key(&old);
+                    let maintenance = if maintain_pin_unlock {
+                        s.set_management_key_pin_protected(
+                            current,
+                            new_alg,
+                            &new,
+                            *touch,
+                            *allow_pin_unlock,
+                        )?
+                    } else {
+                        s.set_management_key(current, new_alg, &new, *touch)?;
+                        keyroost_transport::PinProtectMaintenance::NotApplicable
+                    };
                     println!(
                         "Management key changed to {}{}.",
                         new_alg.label(),
                         if *touch { " (touch required)" } else { "" }
                     );
+                    match maintenance {
+                        keyroost_transport::PinProtectMaintenance::NotApplicable => {}
+                        keyroost_transport::PinProtectMaintenance::Ran {
+                            printed_data: Ok(()),
+                        } => {
+                            println!(
+                                "{}",
+                                if *allow_pin_unlock {
+                                    "PIN-protected management-key storage enabled: the PIN \
+                                     alone now unlocks management on this device."
+                                } else {
+                                    "PIN-protected management-key storage disabled (if it \
+                                     was set)."
+                                }
+                            );
+                        }
+                        keyroost_transport::PinProtectMaintenance::Ran {
+                            printed_data: Err(e),
+                        } => {
+                            let action = if *allow_pin_unlock {
+                                "enable"
+                            } else {
+                                "disable"
+                            };
+                            // `Supported` means this device is confirmed to support
+                            // the write, so a failure here is a real problem — every
+                            // other gate value (`Unverified`, or `Unsupported`
+                            // overridden by `--force`) means it was never confirmed
+                            // to work here at all, so the same failure is expected
+                            // background noise (see `PinProtectMaintenance`'s doc).
+                            if matches!(
+                                pin_unlock_gate,
+                                keyroost_piv::compat::FeatureGate::Supported
+                            ) {
+                                return Err(format!(
+                                    "management key changed, but failed to {action} \
+                                     PIN-protected management-key storage: {e}"
+                                )
+                                .into());
+                            }
+                            eprintln!(
+                                "warning: management key changed, but could not {action} \
+                                 PIN-protected management-key storage ({e}) — support for \
+                                 this is unverified on this device, so this may be expected."
+                            );
+                        }
+                    }
                     Ok(())
                 },
             )?;

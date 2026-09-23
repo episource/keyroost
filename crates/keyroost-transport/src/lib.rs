@@ -46,8 +46,8 @@ mod gzip;
 mod piv;
 pub use piv::{
     random_chuid_guid, CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan,
-    PivResetPreview, PivSession, PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus,
-    PivStatusDetailed,
+    PinProtectMaintenance, PivResetPreview, PivSession, PivSessionState, PivSlotDetail,
+    PivSlotStatus, PivStatus, PivStatusDetailed,
 };
 
 mod token2otp;
@@ -120,12 +120,11 @@ pub enum TransportError {
     /// did not verify, i.e. the supplied management key is wrong).
     PivManagementAuthFailed,
     /// [`PivSession::authenticate_management_via_pin`]'s PIN VERIFY
-    /// succeeded, but this device carries
-    /// [`keyroost_piv::compat::PivQuirk::PinManagementAuthProtected9BKey`]
-    /// and its PIN-protected-data read came back with no management key —
-    /// either the read itself failed, or it succeeded with no tag `0x88` /
-    /// subtag `0x89` inside. Either way, PIN-based management auth simply
-    /// hasn't been set up on this card yet.
+    /// succeeded, but — on every fingerprint except HID Crescendo, which
+    /// this error can't occur for — its PIN-protected-data read came back
+    /// with no management key: either the read itself failed, or it
+    /// succeeded with no tag `0x88` / subtag `0x89` inside. Either way,
+    /// PIN-based management auth simply hasn't been set up on this card yet.
     PivPinProtectedKeyNotSet,
     /// [`PivSession::delete_management_key_hid_crescendo`] was called on a
     /// device that isn't a HID Crescendo unit with no real `0x9B` slot

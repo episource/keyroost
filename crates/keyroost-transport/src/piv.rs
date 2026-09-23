@@ -350,6 +350,37 @@ pub enum CurrentMgmtAuth<'a> {
     Pin(&'a [u8]),
 }
 
+/// [`PivSession::set_management_key_pin_protected`]'s outcome.
+#[derive(Debug)]
+pub enum PinProtectMaintenance {
+    /// The device is HID Crescendo, which unlocks management directly off
+    /// the PIN with no key material of its own to store — the whole
+    /// maintenance step was skipped, not attempted and failed.
+    NotApplicable,
+    /// The maintenance step ran. The Admin Data bookkeeping bit
+    /// (`keyroost_piv::OBJECT_ADMIN_DATA`) is always best-effort — see
+    /// [`PivSession::update_admin_data_pin_protected_flag`]'s doc — and
+    /// never surfaces here; `printed_data` is the outcome of the
+    /// substantive write/clear against
+    /// `keyroost_piv::OBJECT_PIN_PROTECTED_DATA`, the object
+    /// [`PivSession::authenticate_management_via_pin`] actually reads back.
+    ///
+    /// A caller deciding how to react to `printed_data` being `Err` should
+    /// weigh it against
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`]'s gate for
+    /// this device: at `Supported`, PIN-protected storage is confirmed to
+    /// work here, so a failure is a real problem worth erroring on; at
+    /// anything less certain (`Unverified`, or `Unsupported` overridden by
+    /// `keyroostctl`'s `--force`), this device was never confirmed to
+    /// support the write at all, so a failure is expected background noise
+    /// — worth a warning, not an error, especially since
+    /// [`PivSession::set_management_key`] has already succeeded by this
+    /// point regardless.
+    Ran {
+        printed_data: Result<(), TransportError>,
+    },
+}
+
 /// What [`PivSession::factory_reset`] does for the PIV-only path, resolved
 /// purely from this applet's [`keyroost_piv::compat::PivExtension::Reset`]
 /// gate and [`keyroost_piv::compat::PivQuirk`]s — see
@@ -3052,15 +3083,30 @@ impl<'tx> PivSession<'tx> {
     /// Unlock PIV management via
     /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`] instead of
     /// the standard `0x9B` management-key round: [`Self::verify_pin`], then —
-    /// only if this fingerprint carries
-    /// [`keyroost_piv::compat::PivQuirk::PinManagementAuthProtected9BKey`] —
-    /// read the PIN-protected management key
+    /// on every fingerprint except HID Crescendo, the one family confirmed
+    /// to unlock management directly off PIN VERIFY alone — read the
+    /// PIN-protected management key
     /// ([`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`],
     /// [`keyroost_piv::parse_pin_protected_management_key`]) and run
     /// [`Self::authenticate_management`] with it, exactly as if the user had
-    /// typed that key directly. A device without the quirk needs nothing
-    /// past the PIN VERIFY — management is unlocked directly, the same way
-    /// HID Crescendo does it.
+    /// typed that key directly.
+    ///
+    /// Branches on [`Self::fingerprint`] directly — HID Crescendo or not —
+    /// rather than on a *version*-scoped confirmation of which specific
+    /// applet build actually needs the indirect read: a device whose
+    /// version this crate couldn't read, or hasn't seen before, or any
+    /// non-YubiKey fingerprint
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`] still
+    /// resolves `Unverified` or `Supported` for should still get the
+    /// indirect read attempted, not silently skipped as if it were a
+    /// *confirmed* direct-unlock device — this method would otherwise
+    /// return `Ok` without ever authenticating management on exactly the
+    /// devices `Unverified` exists to let a caller still try. The read
+    /// below is cheap and fails cleanly
+    /// ([`TransportError::PivPinProtectedKeyNotSet`]) on a card that
+    /// genuinely has nothing stored there, so attempting it on everything
+    /// but a *confirmed*-direct fingerprint is the safe direction to default
+    /// toward.
     ///
     /// Callers should check
     /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`] via
@@ -3071,17 +3117,40 @@ impl<'tx> PivSession<'tx> {
     /// MOVE KEY/DELETE KEY.
     ///
     /// Errors: whatever [`Self::verify_pin`] returns for a wrong/blocked PIN;
-    /// [`TransportError::PivPinProtectedKeyNotSet`] if the quirk applies and
-    /// no management key comes back from the read (the read failed, or
-    /// succeeded with no tag `0x88` / subtag `0x89` — PIN management auth was
-    /// never set up on this card); otherwise whatever
-    /// [`Self::authenticate_management`] returns for the retrieved key.
+    /// on every non-HID-Crescendo fingerprint,
+    /// [`TransportError::PivPinProtectedKeyNotSet`] if no management key
+    /// comes back from the read (the read failed, or succeeded with no tag
+    /// `0x88` / subtag `0x89` — PIN management auth was never set up on this
+    /// card); otherwise whatever [`Self::authenticate_management`] returns
+    /// for the retrieved key.
+    ///
+    /// Deliberately does **not** consult Yubico Admin Data's tag-`0x81`
+    /// PIN-protected bookkeeping bit
+    /// ([`keyroost_piv::set_admin_data_pin_protected_flag`],
+    /// [`keyroost_piv::OBJECT_ADMIN_DATA`]) to decide whether to attempt the
+    /// read above — that bit is `ykman`'s own bookkeeping for *its* UI, not
+    /// an access condition the card enforces, and a caller here (the "Use
+    /// PIN" checkbox/flag) decides on its own whether to try this path,
+    /// independent of whatever that bit currently says. This is intentional:
+    /// it means a management key that's still sitting in
+    /// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] can always be recovered
+    /// via the PIN, even if the bit was never set, got cleared, or otherwise
+    /// drifted out of sync with the object it's meant to describe — see
+    /// [`Self::set_management_key_pin_protected`] for the write side that
+    /// normally keeps the two in step.
     pub fn authenticate_management_via_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
+        // Resolved *before* the VERIFY below, not after: `self.fingerprint()`
+        // re-SELECTs PIV when identity isn't already cached (same reasoning
+        // `keyroostctl`'s own management-key flows gate on fingerprint before
+        // authenticating for), which would otherwise risk dropping the PIN's
+        // just-established security status before the GET DATA below gets to
+        // rely on it.
+        let is_hid_crescendo = matches!(
+            self.fingerprint(),
+            keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
+        );
         self.verify_pin(pin)?;
-        if !self
-            .quirks()
-            .contains(&keyroost_piv::compat::PivQuirk::PinManagementAuthProtected9BKey)
-        {
+        if is_hid_crescendo {
             return Ok(());
         }
         let (data, sw) =
@@ -3214,6 +3283,171 @@ impl<'tx> PivSession<'tx> {
             return Err(TransportError::PivManagementKeyDeleteUnsupported);
         }
         self.hid_crescendo_aca_put_xauth_key_op(current, HidCrescendoXauthKeyOp::Delete)
+    }
+
+    /// Read Yubico Admin Data ([`keyroost_piv::OBJECT_ADMIN_DATA`]) with the
+    /// outer `0x53` template stripped, or an empty `Vec` if GET DATA fails —
+    /// the object is created lazily by Yubico's own tooling on first write,
+    /// so "not found" here just means "never configured", not a transport
+    /// error. Only a genuine transport failure (the `?` below) propagates.
+    fn read_admin_data_inner(&mut self) -> Result<Vec<u8>, TransportError> {
+        let (data, sw) = self.transmit_full(&piv::get_data(&keyroost_piv::OBJECT_ADMIN_DATA))?;
+        if sw != piv::SW_OK {
+            return Ok(Vec::new());
+        }
+        Ok(keyroost_piv::unwrap_data_object(&data)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default())
+    }
+
+    /// Set or clear the PIN-protected-management-key bit in Admin Data — see
+    /// [`keyroost_piv::set_admin_data_pin_protected_flag`] for exactly what
+    /// changes and what's preserved (every other bit of the same flags
+    /// byte, every other subtag, every other top-level object byte). A true
+    /// no-op — nothing sent to the card — when `set = false` and the bit
+    /// was never configured, per that function's own contract.
+    ///
+    /// Best-effort on the write: Admin Data (`keyroost_piv::OBJECT_ADMIN_DATA`)
+    /// is a Yubico proprietary extension, not something SP 800-73-4 obligates
+    /// every PIV implementation to carry — a PUT DATA rejection (any `SW !=
+    /// 9000`) is traced and treated as "this device doesn't have this
+    /// object," not propagated as an error. The bit is bookkeeping for
+    /// `ykman`-style UIs; [`Self::authenticate_management_via_pin`] never
+    /// reads it back (see that method's own doc), so a caller here — via
+    /// [`Self::set_management_key_pin_protected`] — still has the
+    /// substantive [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] write left to
+    /// run regardless of whether this one lands. Only a genuine transport
+    /// failure (the `?`s below, before a status word is even in hand)
+    /// propagates.
+    fn update_admin_data_pin_protected_flag(&mut self, set: bool) -> Result<(), TransportError> {
+        let existing = self.read_admin_data_inner()?;
+        let Some(patched) = keyroost_piv::set_admin_data_pin_protected_flag(&existing, set) else {
+            return Ok(());
+        };
+        let apdu = piv::put_data(&keyroost_piv::OBJECT_ADMIN_DATA, &patched);
+        let (_, sw) = self.transmit_full(&apdu)?;
+        if sw != piv::SW_OK {
+            trace::line(self.traced, || {
+                format!(
+                    "piv put admin data: rejected (SW {sw:04X}) — treating as \
+                     unsupported on this device, not an error"
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// Store `key` in Yubico's PIN-protected management-key object
+    /// ([`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`]) — the write-side
+    /// counterpart of what [`Self::authenticate_management_via_pin`] reads
+    /// back after a bare PIN VERIFY. Requires the same management-key auth
+    /// [`Self::set_management_key`] does.
+    fn write_pin_protected_management_key(&mut self, key: &[u8]) -> Result<(), TransportError> {
+        let inner = keyroost_piv::build_pin_protected_management_key(key);
+        let apdu = Zeroizing::new(piv::put_data(
+            &keyroost_piv::OBJECT_PIN_PROTECTED_DATA,
+            &inner,
+        ));
+        let (_, sw) = self.transmit_full(&apdu)?;
+        ok_or_write("piv put pin-protected management key", sw)
+    }
+
+    /// Erase Yubico's PIN-protected management-key object
+    /// ([`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`]) — [`Self::write_pin_protected_management_key`]'s
+    /// undo, written back with a zero-length value, the same "PUT DATA with
+    /// an empty `0x53`" convention [`keyroost_piv::clear_certificate`]
+    /// already uses to wipe an optional PIV data object. Unconditional: run
+    /// whether or not anything was actually stored there — an empty PUT
+    /// DATA against an object that was already empty is a harmless no-op on
+    /// the card.
+    fn clear_pin_protected_management_key(&mut self) -> Result<(), TransportError> {
+        let apdu = piv::put_data(&keyroost_piv::OBJECT_PIN_PROTECTED_DATA, &[]);
+        let (_, sw) = self.transmit_full(&apdu)?;
+        ok_or_write("piv clear pin-protected management key", sw)
+    }
+
+    /// [`Self::set_management_key`], plus — on every fingerprint except HID
+    /// Crescendo, which already unlocks management off a bare PIN VERIFY
+    /// with no key material to store (see
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`]'s doc) —
+    /// maintaining Yubico's PIN-protected management-key storage (`ykman
+    /// piv access change-management-key --protect`'s equivalent):
+    ///
+    /// - `allow_pin_unlock = false`: best-effort clear the Admin Data
+    ///   PIN-protected bit ([`Self::update_admin_data_pin_protected_flag`]);
+    ///   left alone if it was never configured. Then erase
+    ///   [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] itself
+    ///   ([`Self::clear_pin_protected_management_key`]) — a key this
+    ///   caller is deliberately marking as no longer PIN-unlockable
+    ///   shouldn't keep sitting recoverable-via-PIN on the card.
+    /// - `allow_pin_unlock = true`: set the bit, then
+    ///   [`Self::write_pin_protected_management_key`] with the new `key`,
+    ///   so [`Self::authenticate_management_via_pin`] can retrieve it after
+    ///   a bare PIN VERIFY.
+    ///
+    /// [`Self::authenticate_management_via_pin`] never reads the Admin Data
+    /// bit back — see that method's own doc for why — so it's
+    /// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`]'s own content, not the
+    /// bit, that actually decides whether the PIN can unlock management.
+    /// Both branches above try to keep the two in step, but
+    /// [`Self::update_admin_data_pin_protected_flag`] is best-effort — a
+    /// device with no Admin Data object at all (see that method's own doc)
+    /// simply keeps whatever it never had, while
+    /// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] itself still gets
+    /// written/cleared either way — so this is a "try to stay in step, but
+    /// the actual behavior is governed by the object that matters" contract,
+    /// not a guarantee. A caller that only wants the bookkeeping bit changed
+    /// without touching the stored key either way has no method here for
+    /// that — this one always attempts both together.
+    ///
+    /// `current`/`alg`/`key`/`require_touch` are exactly
+    /// [`Self::set_management_key`]'s own parameters, threaded through
+    /// unchanged — including to the HID Crescendo XAUTH path, which runs its
+    /// own self-contained unlock from `current` rather than relying on prior
+    /// auth still being in force (see [`Self::set_management_key`]'s doc).
+    ///
+    /// This method itself doesn't gate `allow_pin_unlock` on
+    /// [`keyroost_piv::compat::PivExtension::PinManagementAuth`] — callers
+    /// (`keyroostctl`, the GUI) each already resolve that gate to drive
+    /// their own UI/CLI messaging (a disabled checkbox, a `--force`
+    /// requirement) and are expected to have decided whether to call this
+    /// at all — with `allow_pin_unlock` true *or* false — before reaching
+    /// here, rather than relying on this method to refuse anything.
+    ///
+    /// Returns a [`PinProtectMaintenance`] describing whether the
+    /// maintenance step ran at all, and — if it did — how the substantive
+    /// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] write/clear went; see
+    /// that type's own doc for how a caller should weigh a failure there
+    /// against [`keyroost_piv::compat::PivExtension::PinManagementAuth`]'s
+    /// gate. This method itself doesn't make that call — it always returns
+    /// the outcome rather than turning a failed write into an `Err` here,
+    /// since only the caller knows whether this device's gate makes that
+    /// failure expected or alarming.
+    pub fn set_management_key_pin_protected(
+        &mut self,
+        current: CurrentMgmtAuth<'_>,
+        alg: MgmtAlg,
+        key: &[u8],
+        require_touch: bool,
+        allow_pin_unlock: bool,
+    ) -> Result<PinProtectMaintenance, TransportError> {
+        self.set_management_key(current, alg, key, require_touch)?;
+        // `self.fingerprint()` is a cached read at this point — the same
+        // call inside `set_management_key` above already resolved and
+        // cached session identity, so this doesn't re-SELECT and drop the
+        // management-key authentication the writes below still need.
+        if let keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_) = self.fingerprint() {
+            return Ok(PinProtectMaintenance::NotApplicable);
+        }
+        // Best-effort regardless of outcome (see its own doc) — never
+        // propagated as the reason the overall maintenance step failed.
+        self.update_admin_data_pin_protected_flag(allow_pin_unlock)?;
+        let printed_data = if allow_pin_unlock {
+            self.write_pin_protected_management_key(key)
+        } else {
+            self.clear_pin_protected_management_key()
+        };
+        Ok(PinProtectMaintenance::Ran { printed_data })
     }
 
     /// The vendor fallback [`Self::set_management_key`]/

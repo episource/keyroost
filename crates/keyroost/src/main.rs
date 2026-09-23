@@ -2116,6 +2116,16 @@ struct PivState {
     /// New management key (hex) + algorithm for a management-key rotation.
     new_mgmt_key_input: String,
     new_mgmt_alg: PivMgmtAlgSel,
+    /// "Allow PIN unlock" checkbox in the management-key rotation dialog —
+    /// whether the new key should also be stored PIN-protected (Yubico's
+    /// `PivExtension::PinManagementAuth`; see
+    /// `keyroost_transport::PivSession::set_management_key_pin_protected`).
+    /// Reset to `false` per dialog open, same as `new_mgmt_key_input`; the
+    /// row rendering this forces it to (effectively) `true` and disables
+    /// editing on HID Crescendo, which unlocks management off the PIN
+    /// already, with nothing to toggle — see the "Management key" row's own
+    /// comment.
+    new_mgmt_allow_pin_unlock: bool,
     /// Certificate creation: subject (bare name or full DN), validity, the PIN
     /// that authorizes the on-card signature, and the CSR destination.
     cert_subject: String,
@@ -2220,6 +2230,7 @@ impl Default for PivState {
             export_path: String::new(),
             new_mgmt_key_input: String::new(),
             new_mgmt_alg: PivMgmtAlgSel::default(),
+            new_mgmt_allow_pin_unlock: false,
             cert_subject: String::new(),
             cert_valid_years: 1,
             cert_valid_months: 0,
@@ -8772,6 +8783,52 @@ impl App {
             }
             None => None,
         };
+        // Whether to also maintain PIN-protected management-key storage
+        // (`set_management_key_pin_protected`'s steps 2a/2b) alongside the
+        // key change itself, gated on `PivExtension::PinManagementAuth` the
+        // same way the checkbox row above is — the GUI has no `--force`
+        // override the way `keyroostctl` does, so a device known unable to
+        // support it stays on plain `set_management_key`, leaving Admin
+        // Data / the PIN-protected object untouched either way. HID
+        // Crescendo resolves this `Supported` unconditionally, so it always
+        // takes the maintenance path — its own no-op lives inside
+        // `set_management_key_pin_protected` itself, not here.
+        //
+        // `pin_unlock_gate` is kept (not just the derived `maintain_pin_unlock`
+        // bool) because the worker closure below needs it again, at a finer
+        // grain, to decide whether a `PinProtectMaintenance::Ran` write
+        // failure is a real error (`Supported`) or expected background noise
+        // worth a warning instead (`Unverified` — the only other value
+        // reachable here, since `Unsupported` already means
+        // `maintain_pin_unlock` is false).
+        let pin_unlock_gate = {
+            use keyroost_piv::compat::PivExtension;
+            let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+                (
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
+            );
+            keyroost_piv::compat::resolve(
+                PivExtension::PinManagementAuth,
+                piv_fp,
+                piv_ver,
+                piv_fw_ver,
+            )
+        };
+        let maintain_pin_unlock = !matches!(
+            pin_unlock_gate,
+            keyroost_piv::compat::FeatureGate::Unsupported
+        );
+        let allow_pin_unlock = self.piv.new_mgmt_allow_pin_unlock;
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
         let cached_state = self.piv_cached_piv_session_state();
@@ -8792,24 +8849,86 @@ impl App {
                             keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
                         }
                     };
+                    let mut pin_unlock_warning = None;
                     match &new {
+                        Some((new_alg, new_key)) if maintain_pin_unlock => {
+                            match s.set_management_key_pin_protected(
+                                current,
+                                *new_alg,
+                                new_key,
+                                false,
+                                allow_pin_unlock,
+                            )? {
+                                keyroost_transport::PinProtectMaintenance::NotApplicable
+                                | keyroost_transport::PinProtectMaintenance::Ran {
+                                    printed_data: Ok(()),
+                                } => {}
+                                keyroost_transport::PinProtectMaintenance::Ran {
+                                    printed_data: Err(e),
+                                } => {
+                                    // `Supported` is a confirmed device — a
+                                    // failure there is real and still fails
+                                    // the whole job, same as before this
+                                    // outcome existed. Anything less certain
+                                    // (only `Unverified` reaches here, per
+                                    // `maintain_pin_unlock`'s own doc above)
+                                    // was never confirmed to support this
+                                    // write at all, so it's downgraded to a
+                                    // warning the apply closure logs instead.
+                                    if pin_unlock_gate == keyroost_piv::compat::FeatureGate::Supported {
+                                        return Err(e);
+                                    }
+                                    let action = if allow_pin_unlock { "enable" } else { "disable" };
+                                    pin_unlock_warning = Some(format!(
+                                        "Could not {action} PIN-protected management-key \
+                                         storage ({e}) — support for this is unverified on \
+                                         this device, so this may be expected."
+                                    ));
+                                }
+                            }
+                        }
                         Some((new_alg, new_key)) => {
                             s.set_management_key(current, *new_alg, new_key, false)?;
                         }
                         None => s.delete_management_key_hid_crescendo(current)?,
                     }
                     let status = s.status()?;
-                    Ok((status, s.state()))
+                    Ok((status, s.state(), pin_unlock_warning))
                 });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 wipe(&mut app.piv.new_mgmt_key_input);
+                let (result, pin_unlock_warning) = match result {
+                    Ok((status, state, warning)) => (Ok((status, state)), warning),
+                    Err(e) => (Err(e), None),
+                };
+                // Reflects what actually happened, not just what was asked
+                // for: a `pin_unlock_warning` means the PIN-protected-storage
+                // write itself failed (downgraded to a warning, logged
+                // separately below) even though the management key change
+                // succeeded — the status line must not then go on to claim
+                // that write also succeeded.
                 let notice = match &new {
-                    Some((new_alg, _)) => format!("Management key changed to {}.", new_alg.label()),
+                    Some((new_alg, _)) => {
+                        let base = format!("Management key changed to {}.", new_alg.label());
+                        if !maintain_pin_unlock || pin_unlock_warning.is_some() {
+                            base
+                        } else if allow_pin_unlock {
+                            format!("{base} PIN-protected management-key storage enabled.")
+                        } else {
+                            format!("{base} PIN-protected management-key storage disabled (if it was set).")
+                        }
+                    }
                     None => "Management key deleted.".to_string(),
                 };
                 let result = app.store_and_unwrap_piv_write(for_device, result);
+                let succeeded = result.is_ok();
                 Self::apply_piv_write(app, result, notice);
+                if succeeded {
+                    if let Some(w) = pin_unlock_warning {
+                        app.log(Severity::Warn, w);
+                    }
+                }
                 Self::apply_piv_cred_result(app);
             })
         });
@@ -14162,22 +14281,26 @@ impl App {
     /// they're about to authorize with before committing to it.
     ///
     /// When this device's fingerprint resolves
-    /// `keyroost_piv::compat::PivExtension::PinManagementAuth` to `Supported`,
-    /// a second "Use PIN" toggle appears alongside it. Both toggles are pure
-    /// views onto — and setters of — the single `PivState::mgmt_auth_mode`
-    /// (see that type's doc for why): checking either sets the mode to that
-    /// variant; unchecking either always returns to `PivMgmtAuthMode::Manual`,
-    /// never leaves the other toggle's variant standing. With "Use PIN" on,
-    /// the hex field either turns into a PIN entry (label "PIN", hint "PIN")
-    /// — or, for a flow with a dedicated PIN field of its own
-    /// (`PivCredKind::shares_pin_field`), disappears entirely, since that
-    /// field's PIN is reused for management auth too (there is only one PIV
-    /// application PIN).
+    /// `keyroost_piv::compat::PivExtension::PinManagementAuth` to `Supported`
+    /// *or* `Unverified`, a second "Use PIN" toggle appears alongside it —
+    /// with a warning-triangle marker next to it for `Unverified`, same as
+    /// every other gated control in this pane, so the user can still try it
+    /// but knows it hasn't been confirmed on this specific device.
+    /// `Unsupported` hides the toggle entirely, same as before. Both toggles
+    /// are pure views onto — and setters of — the single
+    /// `PivState::mgmt_auth_mode` (see that type's doc for why): checking
+    /// either sets the mode to that variant; unchecking either always
+    /// returns to `PivMgmtAuthMode::Manual`, never leaves the other toggle's
+    /// variant standing. With "Use PIN" on, the hex field either turns into
+    /// a PIN entry (label "PIN", hint "PIN") — or, for a flow with a
+    /// dedicated PIN field of its own (`PivCredKind::shares_pin_field`),
+    /// disappears entirely, since that field's PIN is reused for management
+    /// auth too (there is only one PIV application PIN).
     fn piv_modal_mgmt_field(&mut self, ui: &mut egui::Ui, p: &Palette, kind: PivCredKind) {
         if !kind.needs_mgmt_key() {
             return;
         }
-        let pin_auth_available = {
+        let pin_auth_gate = {
             let (fp, ver, fw) = self.piv.status.as_ref().map_or(
                 (
                     keyroost_piv::fingerprint::AppletFingerprint::Generic,
@@ -14197,8 +14320,12 @@ impl App {
                 fp,
                 ver,
                 fw,
-            ) == keyroost_piv::compat::FeatureGate::Supported
+            )
         };
+        let pin_auth_available = !matches!(
+            pin_auth_gate,
+            keyroost_piv::compat::FeatureGate::Unsupported
+        );
         if !pin_auth_available && self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
             // Keeps state sane if a device switch mid-modal drops support out
             // from under an already-checked toggle.
@@ -14225,9 +14352,20 @@ impl App {
                 self.piv.mgmt_auth_mode =
                     piv_mgmt_mode_after_toggle(is_default, PivMgmtAuthMode::Default);
             }
-            let mut is_pin = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin;
-            if pin_auth_available && ui.checkbox(&mut is_pin, "Use PIN").changed() {
-                self.piv.mgmt_auth_mode = piv_mgmt_mode_after_toggle(is_pin, PivMgmtAuthMode::Pin);
+            if pin_auth_available {
+                let mut is_pin = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin;
+                if ui.checkbox(&mut is_pin, "Use PIN").changed() {
+                    self.piv.mgmt_auth_mode =
+                        piv_mgmt_mode_after_toggle(is_pin, PivMgmtAuthMode::Pin);
+                }
+                if matches!(pin_auth_gate, keyroost_piv::compat::FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(format!(
+                        "{} {}",
+                        keyroost_piv::compat::PivExtension::PinManagementAuth.requirement(),
+                        keyroost_piv::compat::FeatureGate::UNVERIFIED_SUFFIX
+                    ));
+                }
             }
         });
         if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
@@ -14237,19 +14375,23 @@ impl App {
         if use_pin && kind.shares_pin_field() {
             return;
         }
-        // Match the New CHUID dialog's GUID row so the two fields line
-        // up — same field width *and* same label-column width ("GUID"
-        // is short enough to fit the shared 96px label box, but
-        // "Management key" isn't, so both rows need the wider,
-        // measured column or their inputs start at different x).
+        // Match the New CHUID dialog's GUID row (and, for `ChangeMgmtKey`,
+        // that same modal's own "New key" row below this one) so the fields
+        // line up — same label-column width ("GUID" and "New key" are both
+        // short enough to fit the shared 96px label box, but "Management
+        // key" isn't, so every row sharing a column with it needs the
+        // wider, measured width or their inputs start at different x). Field
+        // width stays each row's own — only the label column needs to match.
         // Every other flow keeps the narrower defaults.
-        let (label_w, width) = if kind == PivCredKind::NewChuid {
-            (
-                chuid_label_width(ui.ctx()),
-                chuid_guid_field_width(ui.ctx()),
-            )
+        let label_w = if matches!(kind, PivCredKind::NewChuid | PivCredKind::ChangeMgmtKey) {
+            chuid_label_width(ui.ctx())
         } else {
-            (96.0, 300.0)
+            96.0
+        };
+        let width = if kind == PivCredKind::NewChuid {
+            chuid_guid_field_width(ui.ctx())
+        } else {
+            300.0
         };
         let (label, hint) = if use_pin {
             ("PIN", "PIN")
@@ -14647,6 +14789,24 @@ impl App {
                         }
                         PivCredKind::ChangeMgmtKey => {
                             self.piv_modal_mgmt_field(ui, p, kind);
+                            // Shared with `piv_modal_mgmt_field`'s own
+                            // "Management key"/"PIN" row above (see its
+                            // comment) so this row's field, and the "Allow
+                            // Pin Unlock" checkbox below it, all start at the
+                            // same x.
+                            let label_w = chuid_label_width(ui.ctx());
+                            // Same `add_sized`/empty-`Label` call
+                            // `secret_field`'s own label column uses, so the
+                            // "Allow PIN unlock" row below reserves exactly
+                            // the same width before its first real widget —
+                            // matching that, rather than a plain
+                            // `ui.add_space(label_w)`, is what actually
+                            // guarantees the same left edge (egui's
+                            // horizontal-layout item spacing then applies
+                            // identically on both rows).
+                            let label_spacer = |ui: &mut egui::Ui| {
+                                ui.add_sized([label_w, 22.0], egui::Label::new(""));
+                            };
                             match self.piv.new_mgmt_alg.to_alg() {
                                 Some(alg) => {
                                     let new_key_hint = format!("hex ({} chars)", alg.key_len() * 2);
@@ -14656,16 +14816,114 @@ impl App {
                                         "New key",
                                         &mut self.piv.new_mgmt_key_input,
                                         &new_key_hint,
-                                        96.0,
+                                        label_w,
                                         300.0,
                                     );
+                                    // "Allow PIN unlock": whether the new key
+                                    // is also stored PIN-protected (Yubico's
+                                    // `PivExtension::PinManagementAuth`) —
+                                    // gated the same three-way way the
+                                    // GenerateKey modal's own PIN/touch
+                                    // policy rows are, resolved locally here
+                                    // since this modal doesn't share the
+                                    // status card's gate locals. HID
+                                    // Crescendo unlocks management off the
+                                    // PIN already, with no key material to
+                                    // store — forced on and disabled there
+                                    // instead of gated, same "nothing to
+                                    // toggle" treatment
+                                    // `set_management_key_pin_protected`
+                                    // itself gives that fingerprint (it skips
+                                    // the maintenance step outright).
+                                    use keyroost_piv::compat::{FeatureGate, PivExtension};
+                                    let is_hid_crescendo = self.piv.status.as_ref().is_some_and(|s| {
+                                        matches!(
+                                            s.applet_fingerprint,
+                                            keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
+                                        )
+                                    });
+                                    ui.add_space(4.0);
+                                    if is_hid_crescendo {
+                                        self.piv.new_mgmt_allow_pin_unlock = true;
+                                        ui.horizontal(|ui| {
+                                            label_spacer(ui);
+                                            ui.add_enabled_ui(false, |ui| {
+                                                ui.checkbox(
+                                                    &mut self.piv.new_mgmt_allow_pin_unlock,
+                                                    "Allow PIN unlock",
+                                                );
+                                            });
+                                        });
+                                    } else {
+                                        let (piv_fp, piv_ver, piv_fw_ver) =
+                                            self.piv.status.as_ref().map_or(
+                                                (
+                                                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                                                    None,
+                                                    None,
+                                                ),
+                                                |s| {
+                                                    (
+                                                        s.applet_fingerprint,
+                                                        s.version.as_deref(),
+                                                        s.version_firmware.as_deref(),
+                                                    )
+                                                },
+                                            );
+                                        let pin_unlock_gate = keyroost_piv::compat::resolve(
+                                            PivExtension::PinManagementAuth,
+                                            piv_fp,
+                                            piv_ver,
+                                            piv_fw_ver,
+                                        );
+                                        let pin_unlock_blocked_hint = format!(
+                                            "{} {}",
+                                            PivExtension::PinManagementAuth.requirement(),
+                                            FeatureGate::INCOMPATIBLE_SUFFIX
+                                        );
+                                        ui.horizontal(|ui| {
+                                            label_spacer(ui);
+                                            ui.add_enabled_ui(
+                                                !matches!(
+                                                    pin_unlock_gate,
+                                                    FeatureGate::Unsupported
+                                                ),
+                                                |ui| {
+                                                    ui.checkbox(
+                                                        &mut self.piv.new_mgmt_allow_pin_unlock,
+                                                        "Allow PIN unlock",
+                                                    );
+                                                },
+                                            )
+                                            .response
+                                            .on_disabled_hover_text(
+                                                pin_unlock_blocked_hint.as_str(),
+                                            );
+                                            if matches!(pin_unlock_gate, FeatureGate::Unverified) {
+                                                ui.add_space(4.0);
+                                                theme::warn_marker(ui, p).on_hover_text(
+                                                    format!(
+                                                        "{} {}",
+                                                        PivExtension::PinManagementAuth
+                                                            .requirement(),
+                                                        FeatureGate::UNVERIFIED_SUFFIX
+                                                    )
+                                                    .as_str(),
+                                                );
+                                            }
+                                        });
+                                    }
                                     card_note(
                                         ui,
                                         p,
                                         if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
-                                            "Enter the PIN, then the new key."
+                                            "Enter the PIN, then the new key. Select \"Allow \
+                                             PIN Unlock\" to also unlock management with the \
+                                             PIN, in addition to the management key."
                                         } else {
-                                            "Enter the current key, then the new key."
+                                            "Enter the current key, then the new key. Select \
+                                             \"Allow PIN unlock\" to also unlock management \
+                                             with the PIN, in addition to the management key."
                                         },
                                     );
                                 }
@@ -14945,6 +15203,7 @@ impl App {
         wipe(&mut self.piv.sign_pin);
         wipe(&mut self.piv.retries_pin_auth);
         self.piv.mgmt_auth_mode = PivMgmtAuthMode::default();
+        self.piv.new_mgmt_allow_pin_unlock = false;
         self.piv.move_dest = None;
         self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
         self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
