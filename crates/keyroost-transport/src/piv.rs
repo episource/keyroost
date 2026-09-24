@@ -1085,6 +1085,19 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     Ok(guid)
 }
 
+/// A fresh, random management key sized for `alg` — host-side only, no card
+/// I/O. For a "Generate Random & Copy" action in the "Change management key"
+/// flow; the caller still has to write it via
+/// [`PivSession::set_management_key`] (or
+/// [`PivSession::set_management_key_pin_protected`]) like any other new key
+/// the user typed by hand. Wipe-on-drop like every other key-bearing buffer
+/// in this crate.
+pub fn random_management_key(alg: MgmtAlg) -> Result<zeroize::Zeroizing<Vec<u8>>, TransportError> {
+    let mut key = zeroize::Zeroizing::new(vec![0u8; alg.key_len()]);
+    getrandom::getrandom(&mut key).map_err(|_| TransportError::HostRngFailed)?;
+    Ok(key)
+}
+
 /// Run [`crate::decode_bcd_serial`] over `serial`, but only when
 /// [`keyroost_piv::compat::resolve_quirks`] finds
 /// [`keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd`] active for

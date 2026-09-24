@@ -45,9 +45,9 @@ mod gzip;
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome, FactoryResetPlan,
-    PinProtectMaintenance, PivResetPreview, PivSession, PivSessionState, PivSlotDetail,
-    PivSlotStatus, PivStatus, PivStatusDetailed,
+    random_chuid_guid, random_management_key, CertUnreadable, CurrentMgmtAuth,
+    FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance, PivResetPreview, PivSession,
+    PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
 };
 
 /// Fuzzing-only entry points for the compressed-certificate reader. Not

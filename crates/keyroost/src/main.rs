@@ -5940,15 +5940,22 @@ impl App {
             // never AES-256, unlike the standard PIV 0x9B round.
             ("Management key", "hex (16/32/48 chars)")
         };
-        secret_field(
+        let mut reset_mgmt_rev = self
+            .secret_reveal
+            .get("reset-mgmt-auth")
+            .copied()
+            .unwrap_or(false);
+        piv_secret_field(
             ui,
             p,
             label,
             &mut self.reset_mgmt_auth_input,
+            &mut reset_mgmt_rev,
             hint,
             96.0,
             300.0,
         );
+        self.secret_reveal.insert("reset-mgmt-auth", reset_mgmt_rev);
     }
 
     /// Resolve the credential the user entered for the factory reset's
@@ -8245,6 +8252,30 @@ impl App {
         }
     }
 
+    /// "Change management key"'s "Generate random key & Copy" link: fill `New
+    /// key` with a fresh random key sized for `alg` and copy it to the
+    /// clipboard. Host-side only (no card I/O); the field's prior contents
+    /// are wiped, not just overwritten, same discipline as every other
+    /// secret-bearing field this app clears. Auto-clears the clipboard after
+    /// 45s like the OTP-code copy path, so the generated key doesn't sit in
+    /// clipboard-manager history forever. Leaves the field as-is on the
+    /// vanishingly rare RNG failure rather than blanking a value the user
+    /// may already be editing. Reveals the field (same `secret_reveal` toggle
+    /// its own eye icon uses) — the value just landed on the clipboard in
+    /// plain text anyway, so hiding it in the field buys nothing and only
+    /// stops the user checking what they generated.
+    fn piv_generate_random_mgmt_key(&mut self, ctx: &egui::Context, alg: keyroost_piv::MgmtAlg) {
+        let Ok(key) = keyroost_transport::random_management_key(alg) else {
+            return;
+        };
+        let hex = hex_lower(&key);
+        wipe(&mut self.piv.new_mgmt_key_input);
+        self.piv.new_mgmt_key_input.push_str(&hex);
+        ctx.copy_text(hex.clone());
+        self.clipboard_clear_at = Some((hex, now_secs_f64() + 45.0));
+        self.secret_reveal.insert("piv-new-mgmt-key", true);
+    }
+
     /// Write a CHUID — the GUID from `chuid_guid` (a fresh random default,
     /// or whatever the user overwrote it with). Management-key authorized;
     /// applet-wide, not tied to any slot. Mirrors `piv_import_cert`'s shape:
@@ -9484,6 +9515,123 @@ fn secret_field(
     ui.add_space(4.0);
 }
 
+/// Masked secret input with a reveal ("eye") toggle painted *inside* the
+/// field itself, at its right edge, instead of beside it. A widened right
+/// text margin keeps typed characters clear of the icon; the widget's outer
+/// `desired_width` is untouched, so this drops into a spot already sized for
+/// a plain masked `TextEdit` without changing that size — unlike
+/// [`secret_edit`], which adds a separate icon column next to the field.
+/// `revealed` is read for the initial mask state and flipped in place when
+/// the eye is clicked. Used only by the PIV pane and the factory-reset
+/// dialog (see [`piv_pin_field`]/[`piv_secret_field`]); every other secret
+/// field in the app still uses [`secret_edit`] or a plain mask.
+fn inline_secret_edit(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    buf: &mut String,
+    revealed: &mut bool,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    let mut edit = egui::TextEdit::singleline(buf)
+        .desired_width(width)
+        .margin(egui::Margin {
+            left: 4,
+            right: 30,
+            top: 2,
+            bottom: 2,
+        });
+    if !*revealed {
+        edit = edit.password(true);
+    }
+    if !hint.is_empty() {
+        edit = edit.hint_text(hint);
+    }
+    let resp = ui.add(edit);
+    // Eye toggle painted over the field's own right edge. This claims no
+    // extra layout space of its own — it only paints/interacts within the
+    // rect the TextEdit above already occupies.
+    let center = egui::pos2(resp.rect.right() - 13.0, resp.rect.center().y);
+    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(20.0, resp.rect.height()));
+    let ir = ui.interact(icon_rect, resp.id.with("reveal"), egui::Sense::click());
+    let col = if ir.hovered() { p.txt } else { p.txt2 };
+    paint_eye_icon(ui, center, col);
+    if !*revealed {
+        // Slash across the eye to signal the hidden state.
+        ui.painter().line_segment(
+            [
+                egui::pos2(center.x - 6.0, center.y + 4.0),
+                egui::pos2(center.x + 6.0, center.y - 4.0),
+            ],
+            egui::Stroke::new(1.1, col),
+        );
+    }
+    if ir.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if ir.clicked() {
+        *revealed = !*revealed;
+    }
+    let _ = ir.on_hover_text(if *revealed { "Hide" } else { "Show" });
+    guard_secret_field(ui.ctx(), &resp);
+    resp
+}
+
+/// Like [`pin_field`], but the value can be revealed via [`inline_secret_edit`]'s
+/// in-field eye toggle, and the label column width is a caller-supplied
+/// `label_w` rather than a hardcoded 96px — needed for the rows (`SelfSign`,
+/// `SetRetries`) that share a column with a "Management key" row (see
+/// [`label_text_width`]). PIV-pane/factory-reset-dialog only — see that
+/// function's doc for why this isn't just a flag on `pin_field`.
+fn piv_pin_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    buf: &mut String,
+    revealed: &mut bool,
+    label_w: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [label_w, 22.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            ),
+        );
+        inline_secret_edit(ui, p, buf, revealed, "", 200.0);
+    });
+    ui.add_space(4.0);
+}
+
+/// Like [`secret_field`], but with [`piv_pin_field`]'s inline reveal toggle.
+/// Same scope note: PIV pane and factory-reset dialog only.
+#[allow(clippy::too_many_arguments)]
+fn piv_secret_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    buf: &mut String,
+    revealed: &mut bool,
+    hint: &str,
+    label_w: f32,
+    w: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [label_w, 22.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            ),
+        );
+        inline_secret_edit(ui, p, buf, revealed, hint, w);
+    });
+    ui.add_space(4.0);
+}
+
 /// Fine-print note inside a management card.
 fn card_note(ui: &mut egui::Ui, p: &Palette, t: &str) {
     ui.label(
@@ -9620,26 +9768,30 @@ fn chuid_guid_field_width(ctx: &egui::Context) -> f32 {
     w + 24.0
 }
 
-/// Label-column width for the New CHUID dialog's rows: the rendered width of
-/// "Management key" (the longest of the three row labels there — "GUID" and
-/// "Valid for" both fit inside it) plus a little padding. Every other
-/// dialog's `secret_field`/`text_field` label sits in a fixed 96px column,
-/// which is too narrow for "Management key" specifically — it overflowed
-/// into the field next to it, which then started at a different x than the
-/// GUID row's input did. Measured for the same reason
-/// [`chuid_guid_field_width`] is: correct regardless of font metrics.
-fn chuid_label_width(ctx: &egui::Context) -> f32 {
+/// Font-measured width (+ padding) of a label text — the general form behind
+/// [`chuid_label_width`]. A fixed-guess label column (the app's usual 96px)
+/// is only ever wide enough for the labels someone happened to test with;
+/// when a dialog shows two rows sharing a label column and one label is
+/// longer than the guess, that row's label overflows into the field next to
+/// it, which then starts at a different x than the other row's field.
+/// Measuring the actual longest label at the current font/zoom — the same
+/// reason [`chuid_guid_field_width`] measures rather than guesses — avoids
+/// that regardless of font metrics.
+fn label_text_width(ctx: &egui::Context, text: &str) -> f32 {
     let w = ctx
-        .fonts_mut(|f| {
-            f.layout_no_wrap(
-                "Management key".to_owned(),
-                theme::f_reg(13.0),
-                egui::Color32::WHITE,
-            )
-        })
+        .fonts_mut(|f| f.layout_no_wrap(text.to_owned(), theme::f_reg(13.0), egui::Color32::WHITE))
         .size()
         .x;
     w + 8.0
+}
+
+/// Label-column width for the New CHUID dialog's rows, and for any other
+/// dialog with a row sharing a column with a "Management key"/PIN row (see
+/// `App::piv_modal_mgmt_field`'s label_w for callers): the rendered width of
+/// "Management key" (the longest of the New CHUID dialog's three row labels
+/// there — "GUID" and "Valid for" both fit inside it) plus a little padding.
+fn chuid_label_width(ctx: &egui::Context) -> f32 {
+    label_text_width(ctx, "Management key")
 }
 
 /// `ui.selectable_value`'s own row, but sized the same whether or not the
@@ -14375,15 +14527,24 @@ impl App {
         if use_pin && kind.shares_pin_field() {
             return;
         }
-        // Match the New CHUID dialog's GUID row (and, for `ChangeMgmtKey`,
-        // that same modal's own "New key" row below this one) so the fields
-        // line up — same label-column width ("GUID" and "New key" are both
-        // short enough to fit the shared 96px label box, but "Management
-        // key" isn't, so every row sharing a column with it needs the
-        // wider, measured width or their inputs start at different x). Field
-        // width stays each row's own — only the label column needs to match.
-        // Every other flow keeps the narrower defaults.
-        let label_w = if matches!(kind, PivCredKind::NewChuid | PivCredKind::ChangeMgmtKey) {
+        // Match whichever row shares a label column with this one, so the
+        // fields line up: the New CHUID dialog's GUID row (and, for
+        // `ChangeMgmtKey`, that same modal's own "New key" row below this
+        // one), or — for `SelfSign`/`SetRetries` — the dedicated PIN row
+        // below this one. "GUID"/"New key"/"PIN" are all short enough to fit
+        // the shared 96px label box, but "Management key" isn't, so every
+        // row sharing a column with it needs the wider, measured width or
+        // their inputs start at different x. Field width stays each row's
+        // own — only the label column needs to match. Every other flow
+        // (nothing else visible to misalign against) keeps the narrower
+        // default.
+        let label_w = if matches!(
+            kind,
+            PivCredKind::NewChuid
+                | PivCredKind::ChangeMgmtKey
+                | PivCredKind::SelfSign
+                | PivCredKind::SetRetries
+        ) {
             chuid_label_width(ui.ctx())
         } else {
             96.0
@@ -14398,15 +14559,23 @@ impl App {
         } else {
             ("Management key", "hex (48/32/64 chars)")
         };
-        secret_field(
+        let mut mgmt_key_rev = self
+            .secret_reveal
+            .get("piv-mgmt-key-input")
+            .copied()
+            .unwrap_or(false);
+        piv_secret_field(
             ui,
             p,
             label,
             &mut self.piv.mgmt_key_input,
+            &mut mgmt_key_rev,
             hint,
             label_w,
             width,
         );
+        self.secret_reveal
+            .insert("piv-mgmt-key-input", mgmt_key_rev);
     }
 
     /// PIV credential-entry modal: drives the PIN/PUK flows (Change PIN / Change
@@ -14521,20 +14690,132 @@ impl App {
                     // user can retry without losing the dialog).
                     match kind {
                         PivCredKind::ChangePin => {
-                            pin_field(ui, p, "Current PIN", &mut self.piv.pin_old);
-                            pin_field(ui, p, "New PIN", &mut self.piv.pin_new);
-                            pin_field(ui, p, "Confirm new PIN", &mut self.piv.pin_confirm);
+                            let mut old_rev = self
+                                .secret_reveal
+                                .get("piv-pin-old")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut new_rev = self
+                                .secret_reveal
+                                .get("piv-pin-new")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut confirm_rev = self
+                                .secret_reveal
+                                .get("piv-pin-confirm")
+                                .copied()
+                                .unwrap_or(false);
+                            // Sized to "Confirm new PIN", the widest of this
+                            // dialog's three labels, so all three fields'
+                            // left edges line up (see `label_text_width`).
+                            let label_w = label_text_width(ui.ctx(), "Confirm new PIN");
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Current PIN",
+                                &mut self.piv.pin_old,
+                                &mut old_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "New PIN",
+                                &mut self.piv.pin_new,
+                                &mut new_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Confirm new PIN",
+                                &mut self.piv.pin_confirm,
+                                &mut confirm_rev,
+                                label_w,
+                            );
+                            self.secret_reveal.insert("piv-pin-old", old_rev);
+                            self.secret_reveal.insert("piv-pin-new", new_rev);
+                            self.secret_reveal.insert("piv-pin-confirm", confirm_rev);
                             card_note(ui, p, "6\u{2013}8 characters.");
                         }
                         PivCredKind::ChangePuk => {
-                            pin_field(ui, p, "Current PUK", &mut self.piv.puk_old);
-                            pin_field(ui, p, "New PUK", &mut self.piv.puk_new);
-                            pin_field(ui, p, "Confirm new PUK", &mut self.piv.puk_confirm);
+                            let mut old_rev = self
+                                .secret_reveal
+                                .get("piv-puk-old")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut new_rev = self
+                                .secret_reveal
+                                .get("piv-puk-new")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut confirm_rev = self
+                                .secret_reveal
+                                .get("piv-puk-confirm")
+                                .copied()
+                                .unwrap_or(false);
+                            // Sized to "Confirm new PUK" — same rationale as
+                            // `ChangePin` above.
+                            let label_w = label_text_width(ui.ctx(), "Confirm new PUK");
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Current PUK",
+                                &mut self.piv.puk_old,
+                                &mut old_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "New PUK",
+                                &mut self.piv.puk_new,
+                                &mut new_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Confirm new PUK",
+                                &mut self.piv.puk_confirm,
+                                &mut confirm_rev,
+                                label_w,
+                            );
+                            self.secret_reveal.insert("piv-puk-old", old_rev);
+                            self.secret_reveal.insert("piv-puk-new", new_rev);
+                            self.secret_reveal.insert("piv-puk-confirm", confirm_rev);
                             card_note(ui, p, "8 characters.");
                         }
                         PivCredKind::UnblockPin => {
-                            pin_field(ui, p, "PUK", &mut self.piv.unblock_puk);
-                            pin_field(ui, p, "New PIN", &mut self.piv.unblock_new_pin);
+                            let mut puk_rev = self
+                                .secret_reveal
+                                .get("piv-unblock-puk")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut new_pin_rev = self
+                                .secret_reveal
+                                .get("piv-unblock-new-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PUK",
+                                &mut self.piv.unblock_puk,
+                                &mut puk_rev,
+                                96.0,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "New PIN",
+                                &mut self.piv.unblock_new_pin,
+                                &mut new_pin_rev,
+                                96.0,
+                            );
+                            self.secret_reveal.insert("piv-unblock-puk", puk_rev);
+                            self.secret_reveal
+                                .insert("piv-unblock-new-pin", new_pin_rev);
                             card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
                         }
                         // Management-key-gated flows: only the *secrets* live here;
@@ -14739,7 +15020,23 @@ impl App {
                         }
                         PivCredKind::SelfSign => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            let mut sign_pin_rev = self
+                                .secret_reveal
+                                .get("piv-sign-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            // Matches `piv_modal_mgmt_field`'s own label
+                            // column above, so the two fields' left edges
+                            // line up.
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PIN",
+                                &mut self.piv.sign_pin,
+                                &mut sign_pin_rev,
+                                chuid_label_width(ui.ctx()),
+                            );
+                            self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
                             card_note(
                                 ui,
                                 p,
@@ -14754,11 +15051,37 @@ impl App {
                         }
                         PivCredKind::RequestCsr => {
                             card_note(ui, p, &format!("Saving to {}", self.piv.csr_path));
-                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            let mut sign_pin_rev = self
+                                .secret_reveal
+                                .get("piv-sign-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PIN",
+                                &mut self.piv.sign_pin,
+                                &mut sign_pin_rev,
+                                96.0,
+                            );
+                            self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
                             card_note(ui, p, "The PIN authorizes the on-card signature.");
                         }
                         PivCredKind::SelfTest => {
-                            pin_field(ui, p, "PIN (optional)", &mut self.piv.sign_pin);
+                            let mut sign_pin_rev = self
+                                .secret_reveal
+                                .get("piv-sign-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PIN (optional)",
+                                &mut self.piv.sign_pin,
+                                &mut sign_pin_rev,
+                                96.0,
+                            );
+                            self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
                             card_note(
                                 ui,
                                 p,
@@ -14774,7 +15097,24 @@ impl App {
                         }
                         PivCredKind::SetRetries => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            pin_field(ui, p, "Current PIN", &mut self.piv.retries_pin_auth);
+                            let mut retries_pin_rev = self
+                                .secret_reveal
+                                .get("piv-retries-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            // Matches `piv_modal_mgmt_field`'s own label
+                            // column above, so the two fields' left edges
+                            // line up.
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Current PIN",
+                                &mut self.piv.retries_pin_auth,
+                                &mut retries_pin_rev,
+                                chuid_label_width(ui.ctx()),
+                            );
+                            self.secret_reveal
+                                .insert("piv-retries-pin", retries_pin_rev);
                             card_note(
                                 ui,
                                 p,
@@ -14791,34 +15131,66 @@ impl App {
                             self.piv_modal_mgmt_field(ui, p, kind);
                             // Shared with `piv_modal_mgmt_field`'s own
                             // "Management key"/"PIN" row above (see its
-                            // comment) so this row's field, and the "Allow
-                            // Pin Unlock" checkbox below it, all start at the
-                            // same x.
+                            // comment) so this row's field starts at the same
+                            // x. The "Generate random key & Copy" link and "Allow
+                            // PIN unlock" checkbox below it are centered
+                            // instead, not lined up under this column — see
+                            // their own comments.
                             let label_w = chuid_label_width(ui.ctx());
-                            // Same `add_sized`/empty-`Label` call
-                            // `secret_field`'s own label column uses, so the
-                            // "Allow PIN unlock" row below reserves exactly
-                            // the same width before its first real widget —
-                            // matching that, rather than a plain
-                            // `ui.add_space(label_w)`, is what actually
-                            // guarantees the same left edge (egui's
-                            // horizontal-layout item spacing then applies
-                            // identically on both rows).
-                            let label_spacer = |ui: &mut egui::Ui| {
-                                ui.add_sized([label_w, 22.0], egui::Label::new(""));
-                            };
                             match self.piv.new_mgmt_alg.to_alg() {
                                 Some(alg) => {
                                     let new_key_hint = format!("hex ({} chars)", alg.key_len() * 2);
-                                    secret_field(
+                                    let mut new_key_rev = self
+                                        .secret_reveal
+                                        .get("piv-new-mgmt-key")
+                                        .copied()
+                                        .unwrap_or(false);
+                                    piv_secret_field(
                                         ui,
                                         p,
                                         "New key",
                                         &mut self.piv.new_mgmt_key_input,
+                                        &mut new_key_rev,
                                         &new_key_hint,
                                         label_w,
                                         300.0,
                                     );
+                                    self.secret_reveal.insert("piv-new-mgmt-key", new_key_rev);
+                                    ui.add_space(2.0);
+                                    // Centered rather than lined up under the
+                                    // label column like the rows above/below
+                                    // it — this link and the "Allow PIN
+                                    // unlock" checkbox beneath it read as a
+                                    // pair of standalone actions, not a
+                                    // labeled field, so they share the
+                                    // modal's horizontal center instead.
+                                    ui.vertical_centered(|ui| {
+                                        // Plain accent-colored `Label` +
+                                        // `Sense::click()`, not `ui.link()` —
+                                        // same pattern as the zoom "Reset"
+                                        // link above: a pointing-hand cursor
+                                        // on hover, but no underline.
+                                        if ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(
+                                                        "Generate random key & Copy",
+                                                    )
+                                                    .font(theme::f_sb(13.0))
+                                                    .color(p.accent),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .on_hover_text(
+                                                "Fill in a fresh random key of the selected \
+                                                 length and copy it to the clipboard.",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.piv_generate_random_mgmt_key(ui.ctx(), alg);
+                                        }
+                                    });
                                     // "Allow PIN unlock": whether the new key
                                     // is also stored PIN-protected (Yubico's
                                     // `PivExtension::PinManagementAuth`) —
@@ -14843,10 +15215,12 @@ impl App {
                                         )
                                     });
                                     ui.add_space(4.0);
+                                    // Centered under the link above, not under
+                                    // the field label column — see that row's
+                                    // comment.
                                     if is_hid_crescendo {
                                         self.piv.new_mgmt_allow_pin_unlock = true;
-                                        ui.horizontal(|ui| {
-                                            label_spacer(ui);
+                                        ui.vertical_centered(|ui| {
                                             ui.add_enabled_ui(false, |ui| {
                                                 ui.checkbox(
                                                     &mut self.piv.new_mgmt_allow_pin_unlock,
@@ -14881,36 +15255,71 @@ impl App {
                                             PivExtension::PinManagementAuth.requirement(),
                                             FeatureGate::INCOMPATIBLE_SUFFIX
                                         );
+                                        // `ui.vertical_centered` only centers
+                                        // a row correctly when the row is a
+                                        // single widget claiming its own
+                                        // natural size — `ui.horizontal`
+                                        // always pre-claims the *full*
+                                        // available width up front (so
+                                        // multi-widget centering has nothing
+                                        // left to center), which is exactly
+                                        // why the checkbox-alone branches
+                                        // above and below this one center
+                                        // fine while this one (checkbox +
+                                        // conditional warning icon, two
+                                        // widgets on one line) didn't. Measure
+                                        // the row's actual rendered width and
+                                        // pad it into the middle by hand
+                                        // instead; the padding is one frame
+                                        // stale right after the icon
+                                        // appears/disappears, which is
+                                        // imperceptible for a row that only
+                                        // changes on a device switch.
+                                        let row_w_id =
+                                            egui::Id::new("piv-allow-pin-unlock-row-width");
+                                        let last_row_w =
+                                            ui.data(|d| d.get_temp::<f32>(row_w_id)).unwrap_or(0.0);
                                         ui.horizontal(|ui| {
-                                            label_spacer(ui);
-                                            ui.add_enabled_ui(
-                                                !matches!(
-                                                    pin_unlock_gate,
-                                                    FeatureGate::Unsupported
-                                                ),
-                                                |ui| {
-                                                    ui.checkbox(
-                                                        &mut self.piv.new_mgmt_allow_pin_unlock,
-                                                        "Allow PIN unlock",
-                                                    );
-                                                },
-                                            )
-                                            .response
-                                            .on_disabled_hover_text(
-                                                pin_unlock_blocked_hint.as_str(),
+                                            ui.add_space(
+                                                ((ui.available_width() - last_row_w) / 2.0)
+                                                    .max(0.0),
                                             );
-                                            if matches!(pin_unlock_gate, FeatureGate::Unverified) {
-                                                ui.add_space(4.0);
-                                                theme::warn_marker(ui, p).on_hover_text(
-                                                    format!(
-                                                        "{} {}",
-                                                        PivExtension::PinManagementAuth
-                                                            .requirement(),
-                                                        FeatureGate::UNVERIFIED_SUFFIX
-                                                    )
-                                                    .as_str(),
+                                            let row = ui.horizontal(|ui| {
+                                                ui.add_enabled_ui(
+                                                    !matches!(
+                                                        pin_unlock_gate,
+                                                        FeatureGate::Unsupported
+                                                    ),
+                                                    |ui| {
+                                                        ui.checkbox(
+                                                            &mut self.piv.new_mgmt_allow_pin_unlock,
+                                                            "Allow PIN unlock",
+                                                        );
+                                                    },
+                                                )
+                                                .response
+                                                .on_disabled_hover_text(
+                                                    pin_unlock_blocked_hint.as_str(),
                                                 );
-                                            }
+                                                if matches!(
+                                                    pin_unlock_gate,
+                                                    FeatureGate::Unverified
+                                                ) {
+                                                    ui.add_space(4.0);
+                                                    theme::warn_marker(ui, p).on_hover_text(
+                                                        format!(
+                                                            "{} {}",
+                                                            PivExtension::PinManagementAuth
+                                                                .requirement(),
+                                                            FeatureGate::UNVERIFIED_SUFFIX
+                                                        )
+                                                        .as_str(),
+                                                    );
+                                                }
+                                            });
+                                            ui.data_mut(|d| {
+                                                d.insert_temp(row_w_id, row.response.rect.width())
+                                            });
                                         });
                                     }
                                     card_note(
