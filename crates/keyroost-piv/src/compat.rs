@@ -2799,10 +2799,30 @@ const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// explicit [`PivExtension::ResetGlobal`] entry, and why
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins that same entry instead of getting one of its own.
+///
+/// [`PivExtension::SetManagementKey`]/[`PivExtension::SetPinPukRetries`]/
+/// [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] join the same row,
+/// same universal `[]` [`Verdict::KnownUnsupportedSince`]: IDPrime doesn't
+/// mimic any of Yubico's vendor-extension APDUs these four represent — it's
+/// built on its own applet with its own proprietary commands for
+/// key/PIN/PUK/management-key administration instead — so keyroost has no
+/// working mechanism for any of them on this fingerprint, independent of
+/// whatever the device itself can do, the same reasoning
+/// [`FEITIAN_APPLET_VERDICTS`]'s doc uses for its own identical row.
+/// [`PivExtension::Reset`] joins the row too, on the same reasoning as
+/// [`PivExtension::ResetGlobal`] right beside it: IDPrime hasn't been
+/// observed to accept Yubico's `INS 0xFB` RESET either, PIV-scoped or
+/// otherwise, so keyroost has no working reset mechanism for this
+/// fingerprint at all yet.
 const IDPRIME_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
     extensions: &[
         PivExtension::ResetGlobal,
+        PivExtension::Reset,
         PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        PivExtension::SetManagementKey,
+        PivExtension::SetPinPukRetries,
+        PivExtension::MoveKey,
+        PivExtension::DeleteKey,
     ],
     verdicts: &[VersionVerdict {
         version: &[],
@@ -3048,24 +3068,67 @@ const OPENFIPS201_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry. Distinct from
 /// [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`] above, which additionally carries
-/// MOVE KEY/DELETE KEY data this generic OpenFIPS201 fingerprint has none of.
+/// MOVE KEY/DELETE KEY data of its own — that sub-fingerprint rejects them
+/// outright rather than lacking the mechanism keyroost would need to reach
+/// them at all, see that const's own doc.
 ///
 /// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] also get
 /// an explicit [`Verdict::KnownUnsupportedSince`] row at the universal `[]`
 /// version: upstream OpenFIPS201 has not been observed to mimic any Yubico
 /// extension, the same standing-vendor-pattern reasoning
-/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc uses.
+/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc uses. [`PivExtension::Reset`]
+/// joins that same row too — unlike [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`]'s
+/// own `Reset` row, this generic OpenFIPS201 fingerprint hasn't been observed
+/// to accept Yubico's `INS 0xFB` RESET either, so keyroost has no working
+/// reset mechanism for it at all yet, PIV-scoped or otherwise.
+/// [`PivExtension::SetManagementKey`]/[`PivExtension::SetPinPukRetries`]/
+/// [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] join that same row
+/// on the same reasoning: upstream OpenFIPS201
+/// (<https://github.com/makinako/OpenFIPS201>) ships its own commands for
+/// key/PIN/PUK/management-key administration rather than mimicking any of
+/// these four Yubico vendor-extension APDUs, none of which keyroost has
+/// implemented for this fingerprint. This leaves the
+/// [`PivExtension::ManagementKeyAlgorithm`] row below (which real algorithms
+/// a management-key *change* could use) effectively unreachable in practice
+/// — a caller checks [`PivExtension::SetManagementKey`] first, per that
+/// extension's own doc — but it's kept rather than removed: it's still an
+/// accurate statement about what the applet itself accepts, keyroost just
+/// has no mechanism to reach that code path on this fingerprint yet.
+///
+/// Deliberately no [`PivExtension::SlotKeyAlgorithm`] rows: upstream
+/// OpenFIPS201 (<https://github.com/makinako/OpenFIPS201>) documents a
+/// different supported-algorithm set per release line (v1, v1.10, v2, …),
+/// but keyroost has no way to read *which* line a given unit is running —
+/// this fingerprint carries no applet- or firmware-version identification at
+/// all yet, unlike [`OpenFips201Variant::SwissbitIShield2`], whose GET
+/// VERSION reply this table's sibling const keys its own
+/// [`PivExtension::SlotKeyAlgorithm`] rows to. Seeding a version-gated
+/// verdict here regardless would silently assume every `Generic` unit is one
+/// specific release line, which is exactly the kind of inferred-not-observed
+/// claim this module's known-support tables exist to avoid — see this
+/// module's own doc and `resolve`'s "no data at all" fallback to
+/// [`FeatureGate::Unverified`]. Every [`KeyAlg`] on this fingerprint
+/// therefore resolves [`FeatureGate::Unverified`] until a real version
+/// signal is found.
 const OPENFIPS201_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)` joins
     // this row: no standard PIV equivalent on this fingerprint — the
     // management key is mandatory, never removable — same universal `[]`
-    // `Verdict::KnownUnsupportedSince`.
+    // `Verdict::KnownUnsupportedSince`. `PivExtension::Reset`/
+    // `PivExtension::SetManagementKey`/`PivExtension::SetPinPukRetries`/
+    // `PivExtension::MoveKey`/`PivExtension::DeleteKey` join it too — see
+    // this const's own doc.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
+            PivExtension::Reset,
             PivExtension::SlotPinPolicy,
             PivExtension::SlotTouchPolicy,
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+            PivExtension::SetManagementKey,
+            PivExtension::SetPinPukRetries,
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -4017,9 +4080,14 @@ mod tests {
     }
 
     #[test]
-    fn swissbit_ishield2_other_openfips201_variant_is_unverified() {
-        // The row is keyed to the SwissbitIShield2 sub-fingerprint
-        // specifically — the generic OpenFIPS201 variant carries no data.
+    fn swissbit_ishield2_other_openfips201_variant_is_known_unsupported_since() {
+        // The row above is keyed to the SwissbitIShield2 sub-fingerprint
+        // specifically — its `[1, 4, 1, 0]` floor doesn't leak to the
+        // generic OpenFIPS201 variant. That variant doesn't resolve
+        // `Unverified` here any more either, though: it now carries its own,
+        // separate `Verdict::KnownUnsupportedSince` row for both extensions
+        // — see `OPENFIPS201_GENERIC_APPLET_VERDICTS`'s doc and
+        // `idprime_and_openfips201_generic_yubico_extensions_are_known_unsupported_since`.
         for ext in [PivExtension::MoveKey, PivExtension::DeleteKey] {
             assert_eq!(
                 resolve(
@@ -4028,7 +4096,7 @@ mod tests {
                     Some(&[1, 4, 1, 0]),
                     None,
                 ),
-                FeatureGate::Unverified
+                FeatureGate::Unsupported
             );
         }
     }
@@ -4247,12 +4315,15 @@ mod tests {
             // `hid_crescendo_move_key_is_known_unsupported_since_regardless_of_version` —
             // unlike either `UTrust` variant, which now also carries one —
             // see `utrust_generic_and_gov_yubico_extensions_are_known_unsupported`
-            // — and unlike `Feitian`, which now also carries one — see
-            // `feitian_yubico_extensions_are_known_unsupported_at_v0`.
+            // — unlike `Feitian`, which now also carries one — see
+            // `feitian_yubico_extensions_are_known_unsupported_at_v0` — and
+            // unlike `IdPrime`/`OpenFips201::Generic`, which now also each
+            // carry one — see
+            // `idprime_and_openfips201_generic_yubico_extensions_are_known_unsupported_since`.
             assert_eq!(
                 resolve(
                     PivExtension::MoveKey,
-                    AppletFingerprint::IdPrime,
+                    AppletFingerprint::AuthentrendATKey,
                     version,
                     version,
                 ),
@@ -6374,6 +6445,50 @@ mod tests {
         }
     }
 
+    // --- IdPrime / OpenFIPS201::Generic: Reset/SetManagementKey/-----------
+    // --- SetPinPukRetries/MoveKey/DeleteKey are KnownUnsupportedSince — ----
+    // --- neither vendor mimics these Yubico vendor-extension APDUs; each --
+    // --- ships its own proprietary commands instead, none implemented in --
+    // --- keyroost yet (Reset: not even the widely-mimicked `INS 0xFB`) ----
+
+    #[test]
+    fn idprime_and_openfips201_generic_yubico_extensions_are_known_unsupported_since() {
+        // See `IDPRIME_APPLET_VERDICTS`'s/`OPENFIPS201_GENERIC_APPLET_VERDICTS`'s
+        // own docs. `Verdict::KnownUnsupportedSince` at the universal `[]`
+        // version: unlike the Feitian/UTrust rows above (plain
+        // `Verdict::KnownUnsupported`), this doesn't soften to `Unverified`
+        // for a version newer than anything on the row — every *reported*
+        // version matches it, same shape as
+        // `hid_crescendo_move_key_is_known_unsupported_since_regardless_of_version`.
+        for fp in [
+            AppletFingerprint::IdPrime,
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+        ] {
+            for ext in [
+                PivExtension::Reset,
+                PivExtension::SetManagementKey,
+                PivExtension::SetPinPukRetries,
+                PivExtension::MoveKey,
+                PivExtension::DeleteKey,
+            ] {
+                for version in [&[0][..], &[9, 9, 9][..]] {
+                    assert_eq!(
+                        resolve(ext, fp, Some(version), None),
+                        FeatureGate::Unsupported,
+                        "{fp:?} {ext:?} at {version:?}"
+                    );
+                }
+                // Neither axis reported at all: `resolve` substitutes the
+                // universal `[]` sentinel on both, matching the same row.
+                assert_eq!(
+                    resolve(ext, fp, None, None),
+                    FeatureGate::Unsupported,
+                    "{fp:?} {ext:?} with no reported version"
+                );
+            }
+        }
+    }
+
     // --- PIV SET_MANAGEMENT_KEY: YubiKey/HID Crescendo always, Token2/Thetis
     // --- at 5.112.0, Arekinath from v4, SwissbitIShield2 from v1, Trussed
     // --- Nitrokey from firmware 1.8 -----------------------------------------
@@ -6556,22 +6671,26 @@ mod tests {
 
     #[test]
     fn set_management_key_data_does_not_leak_to_other_fingerprints() {
-        // None of these carry a `SetManagementKey` row, proving the seeded
-        // fingerprints above don't leak their verdict elsewhere. Feitian and
-        // both UTrust variants don't belong in this list any more — each now
-        // has its own genuine `KnownUnsupported` SetManagementKey row, see
+        // `AppletFingerprint::Generic` carries no `SetManagementKey` row,
+        // proving the seeded fingerprints above don't leak their verdict
+        // elsewhere. Feitian and both UTrust variants don't belong in this
+        // list any more — each now has its own genuine `KnownUnsupported`
+        // SetManagementKey row, see
         // `feitian_yubico_extensions_are_known_unsupported_at_v0` and
         // `utrust_generic_and_gov_yubico_extensions_are_known_unsupported`.
-        for fp in [
-            AppletFingerprint::Generic,
-            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
-        ] {
-            assert_eq!(
-                resolve(PivExtension::SetManagementKey, fp, None, None),
-                FeatureGate::Unverified,
-                "{fp:?}"
-            );
-        }
+        // `IdPrime`/`OpenFips201::Generic` don't belong here either any
+        // more — each now has its own genuine `KnownUnsupportedSince` row,
+        // see
+        // `idprime_and_openfips201_generic_yubico_extensions_are_known_unsupported_since`.
+        assert_eq!(
+            resolve(
+                PivExtension::SetManagementKey,
+                AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            FeatureGate::Unverified
+        );
     }
 
     // --- Trussed Nitrokey firmware-axis table: SetManagementKey/Reset/
@@ -6664,17 +6783,23 @@ mod tests {
         // `Generic` (no more specific fingerprint matched) seeds no
         // `SlotKeyAlgorithm` row, so every algorithm resolves unverified —
         // the same "no data" default every other extension gets.
-        for alg in KeyAlg::ALL {
-            assert_eq!(
-                resolve(
-                    PivExtension::SlotKeyAlgorithm(alg),
-                    AppletFingerprint::Generic,
-                    None,
-                    None
-                ),
-                FeatureGate::Unverified,
-                "{alg:?}"
-            );
+        // `OpenFips201::Generic` deliberately carries none either, even
+        // though upstream OpenFIPS201 documents a different algorithm set
+        // per release line (v1/v1.10/v2/…): this fingerprint has no way to
+        // read which line a given unit is running, so a version-gated
+        // verdict here would assume a release line no evidence actually
+        // pins it to — see `OPENFIPS201_GENERIC_APPLET_VERDICTS`'s own doc.
+        for fp in [
+            AppletFingerprint::Generic,
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+        ] {
+            for alg in KeyAlg::ALL {
+                assert_eq!(
+                    resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                    FeatureGate::Unverified,
+                    "{fp:?} {alg:?}"
+                );
+            }
         }
     }
 
