@@ -2690,16 +2690,92 @@ const AUTHENTREND_ATKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 /// explicit [`PivExtension::ResetGlobal`] entry, and why
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins that same entry instead of getting one of its own.
-const AUTHENTREND_ATKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[
-        PivExtension::ResetGlobal,
-        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
-    ],
-    verdicts: &[VersionVerdict {
-        version: &[],
-        verdict: Verdict::KnownUnsupportedSince,
-    }],
-}];
+///
+/// The [`PivExtension::SetPinPukRetries`]/[`PivExtension::SetManagementKey`]/
+/// [`PivExtension::DeleteKey`]/[`PivExtension::MoveKey`]/
+/// [`PivExtension::GetMetadata`]/[`PivExtension::PinManagementAuth`]/
+/// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`]/
+/// [`PivExtension::Reset`] row below, and the [`PivExtension::SlotKeyAlgorithm`]
+/// rows after it, are hardware-observed on a live applet v6.0.1 unit: applet
+/// v6 mimics the YubiKey PIV extension set close to completely — every one
+/// of those nine extensions is accepted, and [`crate::KeyAlg::Rsa1024`]/
+/// [`crate::KeyAlg::Rsa2048`]/[`crate::KeyAlg::EccP256`]/
+/// [`crate::KeyAlg::EccP384`] are all accepted as a slot key algorithm.
+/// [`MgmtAlgChoice::TripleDes`]/[`MgmtAlgChoice::Aes128`]/
+/// [`MgmtAlgChoice::Aes192`]/[`MgmtAlgChoice::Aes256`] join the same row too:
+/// all four are accepted as the management key's algorithm on the same unit
+/// — distinct from [`MgmtAlgChoice::Delete`] right above, which stays its
+/// own separate [`Verdict::KnownUnsupportedSince`] row regardless (the
+/// management key is mandatory on this fingerprint, never removable, same
+/// as every other non-HID-Crescendo one). Every extension and algorithm on
+/// this row gets a [`Verdict::KnownSupported`] verdict keyed to `[6]`, not
+/// the exact tested version `[6, 0, 1]`: only one v6.0.1 unit was actually
+/// probed, but the whole v6 lineup is assumed to share this support, so the
+/// verdict is deliberately floored at the major version rather than the
+/// precise build — a deviation, spelled out here rather than left implicit,
+/// from this module's usual "key the verdict to exactly what was tested"
+/// discipline. Per [`Verdict::KnownSupported`]'s own no-regression-forward
+/// assumption, no claim is made about any version before `[6]`.
+/// [`crate::KeyAlg::Rsa3072`]/[`crate::KeyAlg::Rsa4096`]/
+/// [`crate::KeyAlg::EccP521`]/[`crate::KeyAlg::Ed25519`]/
+/// [`crate::KeyAlg::X25519`] were rejected on the same unit, so they instead
+/// get a [`Verdict::KnownUnsupported`] row at the exact tested version,
+/// `[6, 0, 1]` — kept there rather than widened to `[6]` the same way,
+/// since nothing here assumes the rest of the v6 lineup shares an
+/// *absence*: the ordinary "observed absence" verdict, not
+/// [`Verdict::KnownUnsupportedSince`], so a later applet version is left
+/// free to soften back to [`FeatureGate::Unverified`] rather than being
+/// asserted unsupported forever.
+const AUTHENTREND_ATKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SetPinPukRetries,
+            PivExtension::SetManagementKey,
+            PivExtension::DeleteKey,
+            PivExtension::MoveKey,
+            PivExtension::GetMetadata,
+            PivExtension::PinManagementAuth,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::Reset,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[6],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[6, 0, 1],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+];
 
 /// See [`YUBIKEY_FIRMWARE_VERDICTS`]'s doc — empty.
 const AUTHENTREND_ATKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
@@ -4305,8 +4381,8 @@ mod tests {
                 ),
                 FeatureGate::Unverified
             );
-            // A second, real fingerprint that genuinely carries no MoveKey
-            // row in any per-fingerprint applet-axis table at all — unlike
+            // A second fingerprint that resolves `Unverified` here too, for
+            // a different reason than "no row at all" — unlike
             // `AppletFingerprint::Token2`, whose row's single
             // known-unsupported verdict extends backward to resolve
             // `Unsupported` for these same low versions; see
@@ -4320,6 +4396,15 @@ mod tests {
             // unlike `IdPrime`/`OpenFips201::Generic`, which now also each
             // carry one — see
             // `idprime_and_openfips201_generic_yubico_extensions_are_known_unsupported_since`.
+            // `AuthentrendATKey` itself now carries a `MoveKey` row too —
+            // `Verdict::KnownSupported` floored at `[6]` (the whole v6
+            // lineup is assumed to share this support, not just the exact
+            // v6.0.1 unit actually tested) — but every version here
+            // (`None`, `[5, 7, 4]`, `[1, 0]`) is below that floor, and
+            // `Verdict::KnownSupported` says nothing about versions before
+            // it, so all three still resolve `Unverified`; see
+            // `authentrend_atkey_yubico_extension_set_is_known_supported_at_v6`
+            // for the floor-and-above case.
             assert_eq!(
                 resolve(
                     PivExtension::MoveKey,
@@ -6327,8 +6412,17 @@ mod tests {
             FeatureGate::Unverified
         );
         // AuthentrendATKey has a `ResetGlobal` row in
-        // `AUTHENTREND_ATKEY_APPLET_VERDICTS` but no row at all for
-        // SetPinPukRetries — proves that data doesn't leak across tables.
+        // `AUTHENTREND_ATKEY_APPLET_VERDICTS`, and now a genuine
+        // `KnownSupported` SetPinPukRetries row of its own too — but that
+        // row is floored at `[6]` (the whole v6 lineup is assumed to share
+        // support hardware-observed on one v6.0.1 unit, not just that exact
+        // build), and says nothing about versions before it. Querying at
+        // `[0]`, well below that floor, still falls off the row entirely
+        // and resolves `Unverified` — proving the `ResetGlobal` row's own
+        // `KnownUnsupportedSince` verdict (which *would* apply at `[0]`)
+        // doesn't leak across to this extension. See
+        // `authentrend_atkey_yubico_extension_set_is_known_supported_at_v6`
+        // for the floor-and-above case.
         // (Neither Thetis nor Token2 demonstrate this themselves any more:
         // both now have their own genuine `KnownSupported` row here at the
         // same version — see
@@ -6800,6 +6894,96 @@ mod tests {
                     "{fp:?} {alg:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn authentrend_atkey_yubico_extension_set_is_known_supported_at_v6() {
+        // Hardware-observed on a live applet v6.0.1 unit, but the
+        // `Verdict::KnownSupported` row is deliberately floored at `[6]`
+        // rather than the exact tested build: the whole v6 lineup is
+        // assumed to share this support — see `AUTHENTREND_ATKEY_APPLET_VERDICTS`'s
+        // own doc. Every one of the nine plain extensions, RSA-1024/2048 and
+        // ECC P-256/P-384 as slot key algorithms, and all four real
+        // `MgmtAlgChoice` values as the management key's algorithm, resolves
+        // `Supported` at `[6]` itself and at every version at or above it
+        // (`[6, 0, 0]` included, despite predating the actual tested build,
+        // and `[6, 0, 1]`/`[6, 1, 0]`/`[7]`), per `Verdict::KnownSupported`'s
+        // forward no-regression assumption — but *not* below `[6]`, since
+        // that verdict says nothing about versions before it.
+        let fp = AppletFingerprint::AuthentrendATKey;
+        let extensions = [
+            PivExtension::SetPinPukRetries,
+            PivExtension::SetManagementKey,
+            PivExtension::DeleteKey,
+            PivExtension::MoveKey,
+            PivExtension::GetMetadata,
+            PivExtension::PinManagementAuth,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::Reset,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+        ];
+        for ext in extensions {
+            for version in [
+                &[6][..],
+                &[6, 0, 0][..],
+                &[6, 0, 1][..],
+                &[6, 1, 0][..],
+                &[7][..],
+            ] {
+                assert_eq!(
+                    resolve(ext, fp, Some(version), None),
+                    FeatureGate::Supported,
+                    "{ext:?} at {version:?}"
+                );
+            }
+            assert_eq!(
+                resolve(ext, fp, Some(&[5, 9, 9]), None),
+                FeatureGate::Unverified,
+                "{ext:?} below v6"
+            );
+        }
+        // RSA-3072/4096, ECC P-521, and Ed25519/X25519 were rejected on the
+        // same unit — kept at the exact tested version, `[6, 0, 1]`, rather
+        // than widened to `[6]` the same way: nothing here assumes the rest
+        // of the v6 lineup shares an *absence*. `Verdict::KnownUnsupported`,
+        // not `...Since`: it extends backward to every earlier untested
+        // version (assumed to lack it too) but softens back to `Unverified`
+        // for any version newer than the row, rather than being asserted
+        // unsupported forever — see `AUTHENTREND_ATKEY_APPLET_VERDICTS`'s
+        // own doc for why.
+        for alg in [
+            KeyAlg::Rsa3072,
+            KeyAlg::Rsa4096,
+            KeyAlg::EccP521,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            for version in [&[0][..], &[6, 0, 0][..], &[6, 0, 1][..]] {
+                assert_eq!(
+                    resolve(PivExtension::SlotKeyAlgorithm(alg), fp, Some(version), None),
+                    FeatureGate::Unsupported,
+                    "{alg:?} at {version:?}"
+                );
+            }
+            assert_eq!(
+                resolve(
+                    PivExtension::SlotKeyAlgorithm(alg),
+                    fp,
+                    Some(&[6, 1, 0]),
+                    None
+                ),
+                FeatureGate::Unverified,
+                "{alg:?} above 6.0.1"
+            );
         }
     }
 
