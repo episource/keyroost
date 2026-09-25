@@ -2294,8 +2294,14 @@ impl PivSlotSel {
 /// not an algorithm at all — HID Crescendo's ACA-only "management key" (see
 /// [`keyroost_transport::CurrentMgmtAuth`]'s doc) can be deleted outright
 /// instead of replaced, unlike a standard PIV management key, which is
-/// mandatory; [`piv_mgmtalg_combo`] only ever offers it alongside
-/// [`Self::HID_CRESCENDO_OPTIONS`], never in [`Self::ALL`].
+/// mandatory — but it's still always offered, last, in [`Self::ALL`], on
+/// every device, not only HID Crescendo: which options are actually
+/// *selectable* on the live device is a per-choice
+/// `keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm` gate,
+/// resolved where the combo is drawn (see `cap_piv`) and rendered as a
+/// disabled entry rather than an omitted one — same split between "offered
+/// set" and "live gate" that `KeyAlg`/`piv_keyalg_combo` already use for the
+/// slot key-algorithm picker.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PivMgmtAlgSel {
     #[default]
@@ -2318,6 +2324,20 @@ impl PivMgmtAlgSel {
             PivMgmtAlgSel::Delete => None,
         }
     }
+    /// This choice as a `keyroost_piv::compat::MgmtAlgChoice` — the argument
+    /// [`keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm`] gates on.
+    /// A 1:1 mapping (unlike [`Self::to_alg`], `MgmtAlgChoice` has its own
+    /// [`Self::Delete`]-equivalent variant, so this never returns `Option`).
+    fn to_choice(self) -> keyroost_piv::compat::MgmtAlgChoice {
+        use keyroost_piv::compat::MgmtAlgChoice;
+        match self {
+            PivMgmtAlgSel::Aes192 => MgmtAlgChoice::Aes192,
+            PivMgmtAlgSel::Aes128 => MgmtAlgChoice::Aes128,
+            PivMgmtAlgSel::Aes256 => MgmtAlgChoice::Aes256,
+            PivMgmtAlgSel::TripleDes => MgmtAlgChoice::TripleDes,
+            PivMgmtAlgSel::Delete => MgmtAlgChoice::Delete,
+        }
+    }
     fn label(self) -> &'static str {
         match self {
             PivMgmtAlgSel::Delete => "Delete",
@@ -2327,20 +2347,32 @@ impl PivMgmtAlgSel {
                 .label(),
         }
     }
-    /// Every algorithm a standard PIV device's management key can rotate to.
-    const ALL: [PivMgmtAlgSel; 4] = [
+    /// Every candidate for the management-key algorithm combo, in menu order
+    /// — alphabetical by [`Self::label`] (`"3DES"`, `"AES-128"`, `"AES-192"`,
+    /// `"AES-256"`), with [`Self::Delete`] last: it isn't a real algorithm
+    /// name to sort alongside the rest (see this type's own doc), and
+    /// `"Delete"` happens to sort after all four anyway. Offered identically
+    /// on every device, standard PIV or HID Crescendo alike: which entries
+    /// actually resolve selectable there is a live
+    /// `keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm` gate per
+    /// candidate (see this type's own doc), not a difference in which
+    /// candidates are listed. A standard device's mandatory management key
+    /// has no delete mechanism keyroost implements, so `Delete` renders
+    /// disabled there; HID Crescendo's ACA XAUTH key can be removed outright
+    /// ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]),
+    /// so it's selectable there — same "list every candidate, gate each one
+    /// live" shape `keyroost_piv::KeyAlg::ALL`/[`piv_keyalg_combo`] already
+    /// use for the slot key-algorithm picker.
+    ///
+    /// Note `Self::ALL[0]` (`TripleDes`) is *not* [`Self::default`] (`Aes192`)
+    /// — unlike before this was alphabetized, the two are no longer the same
+    /// entry; see [`piv_mgmtalg_unsupported_fallback`]'s doc for where that
+    /// used to matter.
+    const ALL: [PivMgmtAlgSel; 5] = [
+        PivMgmtAlgSel::TripleDes,
+        PivMgmtAlgSel::Aes128,
         PivMgmtAlgSel::Aes192,
-        PivMgmtAlgSel::Aes128,
         PivMgmtAlgSel::Aes256,
-        PivMgmtAlgSel::TripleDes,
-    ];
-    /// The combo's options for a HID Crescendo device: only the two
-    /// algorithms ACA XAUTH actually supports
-    /// ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key`]'s own
-    /// restriction), plus [`Self::Delete`] at the end.
-    const HID_CRESCENDO_OPTIONS: [PivMgmtAlgSel; 3] = [
-        PivMgmtAlgSel::TripleDes,
-        PivMgmtAlgSel::Aes128,
         PivMgmtAlgSel::Delete,
     ];
 }
@@ -9824,6 +9856,20 @@ fn stable_selectable_value<'a, T: PartialEq>(
     resp
 }
 
+/// Opacity for a gated (disabled) row in the PIV algorithm/policy combos —
+/// [`piv_keyalg_combo`] and [`piv_mgmtalg_combo`] gate entries today;
+/// `piv_policy_combo` sets it too even though every `PivPolicyOption` quirk
+/// currently filters `options` instead of disabling a value in place (see
+/// its `show_ui` closure) — so this is ready the day one does. The
+/// move-destination combo is the one PIV dropdown left out: it only ever
+/// offers an already-filtered, all-enabled slot list. egui's own default
+/// (`Visuals::disabled_alpha`, 0.5) reads as barely-lighter-than-enabled at
+/// this popup's font size, so a gated row and a pickable one are too close
+/// in weight to tell apart at a glance; this app sets it lower, scoped to
+/// just these popups' own `Ui` (see each `show_ui` closure), so it doesn't
+/// touch other disabled widgets in the app.
+const PIV_COMBO_DISABLED_ALPHA: f32 = 0.32;
+
 /// A PIV key-algorithm picker combo, listing every `keyroost_piv::KeyAlg`
 /// variant. `gate_of` resolves each candidate's
 /// `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm` gate on the live
@@ -9842,6 +9888,13 @@ fn piv_keyalg_combo(
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
+            // `disabled_alpha`'s egui default (0.5) leaves a gated row only
+            // faintly lighter than an enabled one at this popup's font size —
+            // see PIV_COMBO_DISABLED_ALPHA. Set on this popup's own `Ui`
+            // (built fresh from the ambient style per `Palette::apply`'s
+            // `ScrollStyle` comment above), so it reaches every row below
+            // without touching disabled widgets elsewhere in the app.
+            ui.style_mut().visuals.disabled_alpha = PIV_COMBO_DISABLED_ALPHA;
             for opt in keyroost_piv::KeyAlg::ALL {
                 let enabled = gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported;
                 ui.add_enabled_ui(enabled, |ui| {
@@ -9849,6 +9902,30 @@ fn piv_keyalg_combo(
                 });
             }
         });
+}
+
+/// If `sel` gates `Unsupported` under `gate_of`, snap it to the first
+/// candidate in `keyroost_piv::KeyAlg::ALL` that doesn't — the slot
+/// key-algorithm counterpart of [`piv_mgmtalg_unsupported_fallback`], same
+/// reasoning: `fallback` (the caller's usual "widely-supported default", e.g.
+/// `KeyAlg::EccP256`) is itself just one candidate and could be the very
+/// entry gating `Unsupported` on some fingerprint, so it isn't returned
+/// unconditionally — only once every algorithm in `ALL` gates `Unsupported`
+/// and there's nothing better left to pick. Factored out of `cap_piv` so this
+/// fallback rule is unit-testable without an egui context.
+#[must_use]
+fn piv_keyalg_unsupported_fallback(
+    sel: keyroost_piv::KeyAlg,
+    fallback: keyroost_piv::KeyAlg,
+    gate_of: impl Fn(keyroost_piv::KeyAlg) -> keyroost_piv::compat::FeatureGate,
+) -> keyroost_piv::KeyAlg {
+    if gate_of(sel) != keyroost_piv::compat::FeatureGate::Unsupported {
+        return sel;
+    }
+    keyroost_piv::KeyAlg::ALL
+        .into_iter()
+        .find(|&alg| gate_of(alg) != keyroost_piv::compat::FeatureGate::Unsupported)
+        .unwrap_or(fallback)
 }
 
 /// An OpenPGP key-algorithm picker combo, restricted to `choices` (the card's
@@ -9930,6 +10007,12 @@ fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
+            // No option is ever gated disabled today — quirk-excluded values
+            // are dropped from `options` outright rather than shown dimmed —
+            // but set the same dimming as the two combos above in case a
+            // future quirk gates a policy value in place instead of
+            // filtering it out (see `PIV_COMBO_DISABLED_ALPHA`).
+            ui.style_mut().visuals.disabled_alpha = PIV_COMBO_DISABLED_ALPHA;
             for &opt in options {
                 stable_selectable_value(ui, sel, opt, opt.label());
             }
@@ -9950,25 +10033,103 @@ fn piv_mgmtalg_clamp(sel: &mut PivMgmtAlgSel, options: &[PivMgmtAlgSel]) {
     }
 }
 
-/// A PIV management-key-algorithm picker combo.
-/// `options` is the offered set — [`PivMgmtAlgSel::ALL`] for a standard
-/// device, [`PivMgmtAlgSel::HID_CRESCENDO_OPTIONS`] for a HID Crescendo one
-/// (see that type's doc). If `*sel` isn't among `options` (e.g. it was left
-/// on an algorithm the previously-selected device offered but this one
-/// doesn't), it snaps to `options[0]` before drawing — see
-/// [`piv_mgmtalg_clamp`].
+/// If `sel` gates `Unsupported` under `gate_of`, snap it to the first offered
+/// option that doesn't — used so the management-key algorithm combo never
+/// preselects a disabled entry. Deliberately not "snap to `options[0]`"
+/// outright, the way [`piv_mgmtalg_clamp`] does for an *unoffered* selection:
+/// `options[0]` (`TripleDes` on [`PivMgmtAlgSel::ALL`] today, now that it's
+/// alphabetized — this reasoning predates that and originally named `Aes192`,
+/// which was both `options[0]` *and* the type's `#[default]` at the time) can
+/// itself be the very entry gating `Unsupported` — a HID Crescendo device's
+/// XAUTH key never accepts AES-192, for instance — so falling back to it
+/// again would leave the combo showing a disabled selection instead of fixing
+/// anything. Falls back to `options[0]` only when
+/// every offered option gates `Unsupported`, and leaves `sel` alone
+/// (including when it isn't `Unsupported` to begin with) if `options` is
+/// empty — there's nothing to snap to either way. Factored out of `cap_piv`
+/// so this fallback rule is unit-testable without an egui context, the same
+/// reason [`piv_mgmtalg_clamp`] is its own function.
+#[must_use]
+fn piv_mgmtalg_unsupported_fallback(
+    sel: PivMgmtAlgSel,
+    options: &[PivMgmtAlgSel],
+    gate_of: impl Fn(PivMgmtAlgSel) -> keyroost_piv::compat::FeatureGate,
+) -> PivMgmtAlgSel {
+    if gate_of(sel) != keyroost_piv::compat::FeatureGate::Unsupported {
+        return sel;
+    }
+    options
+        .iter()
+        .copied()
+        .find(|&opt| gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported)
+        .or_else(|| options.first().copied())
+        .unwrap_or(sel)
+}
+
+/// The management-key algorithm combo's per-algorithm "unverified" warning
+/// list — every offered algorithm gating [`keyroost_piv::compat::FeatureGate::Unverified`],
+/// *unless* `extension_gate`
+/// (`keyroost_piv::compat::PivExtension::SetManagementKey`'s own gate, not a
+/// per-algorithm one) is already
+/// [`keyroost_piv::compat::FeatureGate::Unsupported`] — in which case this is
+/// always empty. When the whole extension is unsupported, the "Change
+/// management key…" button and the algorithm combo are already disabled with
+/// their own blocked-hint tooltip (see `cap_piv`'s "Management key" row); a
+/// caller can't pick an algorithm for a change it can't make at all, so
+/// calling out individually "unverified" algorithms on top of that would be
+/// misleading noise rather than useful information. Factored out of `cap_piv`
+/// so this suppression rule is unit-testable without an egui context, the
+/// same reason [`piv_mgmtalg_unsupported_fallback`] is its own function.
+#[must_use]
+fn piv_mgmtalg_unverified_labels(
+    extension_gate: keyroost_piv::compat::FeatureGate,
+    options: &[PivMgmtAlgSel],
+    gate_of: impl Fn(PivMgmtAlgSel) -> keyroost_piv::compat::FeatureGate,
+) -> Vec<&'static str> {
+    if extension_gate == keyroost_piv::compat::FeatureGate::Unsupported {
+        return Vec::new();
+    }
+    options
+        .iter()
+        .copied()
+        .filter(|&opt| gate_of(opt) == keyroost_piv::compat::FeatureGate::Unverified)
+        .map(PivMgmtAlgSel::label)
+        .collect()
+}
+
+/// A PIV management-key-algorithm picker combo. `options` is the offered set
+/// — [`PivMgmtAlgSel::ALL`] at every call site today, the same five entries
+/// on every device (see that type's doc); kept as a parameter rather than
+/// hard-coded so the clamp/fallback logic below stays generically testable.
+/// If `*sel` isn't among `options`, it snaps to `options[0]` before drawing —
+/// see [`piv_mgmtalg_clamp`].
+///
+/// `gate_of` resolves each candidate's
+/// `keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm` gate on the
+/// live device, same shape and same treatment as [`piv_keyalg_combo`]'s own
+/// `gate_of`: an entry gating `Unsupported` renders disabled (dimmed, not
+/// removed — the combo's shape stays the same as gates change); `Unverified`
+/// entries stay enabled and are instead called out together in a note above
+/// the combo (see `cap_piv`).
 fn piv_mgmtalg_combo(
     ui: &mut egui::Ui,
     id: &str,
     sel: &mut PivMgmtAlgSel,
     options: &[PivMgmtAlgSel],
+    gate_of: impl Fn(PivMgmtAlgSel) -> keyroost_piv::compat::FeatureGate,
 ) {
     piv_mgmtalg_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
+            // See `piv_keyalg_combo`'s matching line: bump the dimming for
+            // gated rows in this popup only.
+            ui.style_mut().visuals.disabled_alpha = PIV_COMBO_DISABLED_ALPHA;
             for &opt in options {
-                stable_selectable_value(ui, sel, opt, opt.label());
+                let enabled = gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported;
+                ui.add_enabled_ui(enabled, |ui| {
+                    stable_selectable_value(ui, sel, opt, opt.label());
+                });
             }
         });
 }
@@ -16528,6 +16689,34 @@ impl App {
             PivExtension::SetManagementKey.requirement(),
             FeatureGate::INCOMPATIBLE_SUFFIX
         );
+        // Per-algorithm gates for the "Management key" row's algorithm
+        // combo, below — same shape as `keyalg_gates` (the slot
+        // key-algorithm combo's own gate table, built further down in this
+        // function): resolved eagerly here (an owned array, not a closure
+        // over `retries_piv_fp`/`retries_piv_ver`/`retries_piv_fw_ver`) for
+        // the same borrow-lifetime reason `keyalg_gates`'s own doc gives. Not
+        // every algorithm is universally implemented, standardized or not,
+        // and `Delete` is a real HID-Crescendo-only capability rather than
+        // always-unsupported filler — see
+        // `PivExtension::ManagementKeyAlgorithm`'s own doc.
+        let mgmtalg_gates: [(PivMgmtAlgSel, FeatureGate); PivMgmtAlgSel::ALL.len()] =
+            PivMgmtAlgSel::ALL.map(|alg| {
+                (
+                    alg,
+                    keyroost_piv::compat::resolve(
+                        PivExtension::ManagementKeyAlgorithm(alg.to_choice()),
+                        retries_piv_fp,
+                        retries_piv_ver,
+                        retries_piv_fw_ver,
+                    ),
+                )
+            });
+        let mgmtalg_gate = move |alg: PivMgmtAlgSel| {
+            mgmtalg_gates
+                .iter()
+                .find_map(|&(a, gate)| (a == alg).then_some(gate))
+                .unwrap_or(FeatureGate::Unverified)
+        };
         // Unsupported doesn't just dim the DragValues below -- with no way
         // to submit them, a count the user dragged in before this device
         // turned out incompatible (or left over from a previous, compatible
@@ -16767,6 +16956,40 @@ impl App {
                 // Management key: label + help left, algorithm combo and change
                 // button right-aligned.
                 ui.add_space(10.0);
+                // Every candidate is offered on every device — including
+                // `PivMgmtAlgSel::Delete`, HID Crescendo's "remove the
+                // management key outright" choice, which renders disabled
+                // rather than omitted on a device that can't do that — see
+                // `PivMgmtAlgSel::ALL`'s own doc. Each option is gated
+                // individually by `mgmtalg_gate` below, the same "list every
+                // candidate, gate each one live" shape the Generate key
+                // card's algorithm combo already uses.
+                let mgmt_alg_options = &PivMgmtAlgSel::ALL[..];
+                // Same "don't leave a selection the combo can no longer
+                // offer" treatment as the Generate key card's algorithm
+                // combo: a prior selection that's since become
+                // known-unsupported (e.g. after switching devices) falls back
+                // to the first offered option that's actually selectable —
+                // see `piv_mgmtalg_unsupported_fallback`'s own doc for why
+                // that isn't simply `mgmt_alg_options[0]`.
+                self.piv.new_mgmt_alg = piv_mgmtalg_unsupported_fallback(
+                    self.piv.new_mgmt_alg,
+                    mgmt_alg_options,
+                    mgmtalg_gate,
+                );
+                // Same `Unsupported`-only gate the "Change management key…"
+                // button and the combo below both use, so button, combo, and
+                // this per-algorithm warning all dim/suppress together — see
+                // `piv_mgmtalg_unverified_labels`'s own doc for why the
+                // warning specifically goes empty rather than merely
+                // disabled.
+                let mgmt_key_unsupported = matches!(change_mgmt_key_gate, FeatureGate::Unsupported);
+                let mgmt_alg_unverified =
+                    piv_mgmtalg_unverified_labels(change_mgmt_key_gate, mgmt_alg_options, mgmtalg_gate);
+                let mgmt_alg_unverified_hint = format!(
+                    "Unverified on this device: {}. May not be supported.",
+                    mgmt_alg_unverified.join(", ")
+                );
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Management key")
@@ -16775,10 +16998,23 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "piv-admin");
-                    if matches!(change_mgmt_key_gate, FeatureGate::Unverified) {
+                    let extension_unverified = matches!(change_mgmt_key_gate, FeatureGate::Unverified);
+                    if extension_unverified || !mgmt_alg_unverified.is_empty() {
                         ui.add_space(4.0);
-                        theme::warn_marker(ui, p)
-                            .on_hover_text(change_mgmt_key_unverified_hint.as_str());
+                        // Both hints can apply at once (whether the
+                        // management key can be changed at all, and which
+                        // algorithms an actual change could use) — combined
+                        // into one tooltip rather than two markers, same as
+                        // this row's other pairs of caveats.
+                        let combined_hint = match (extension_unverified, mgmt_alg_unverified.is_empty()) {
+                            (true, false) => {
+                                format!("{change_mgmt_key_unverified_hint} {mgmt_alg_unverified_hint}")
+                            }
+                            (true, true) => change_mgmt_key_unverified_hint.clone(),
+                            (false, false) => mgmt_alg_unverified_hint.clone(),
+                            (false, true) => unreachable!("guarded by the `if` above"),
+                        };
+                        theme::warn_marker(ui, p).on_hover_text(combined_hint.as_str());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if matches!(change_mgmt_key_gate, FeatureGate::Unsupported) {
@@ -16790,32 +17026,18 @@ impl App {
                             open_change_mgmt = true;
                         }
                         ui.add_space(8.0);
-                        // HID Crescendo's ACA-only management key only ever
-                        // takes TDES/AES-128, plus the HID-specific "Delete"
-                        // choice — see `PivMgmtAlgSel`'s doc.
-                        let is_hid_crescendo = self.piv.status.as_ref().is_some_and(|s| {
-                            matches!(
-                                s.applet_fingerprint,
-                                keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
-                            )
-                        });
-                        let mgmt_alg_options = if is_hid_crescendo {
-                            &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS[..]
-                        } else {
-                            &PivMgmtAlgSel::ALL[..]
-                        };
-                        // There's nothing to pick an algorithm *for* once the
-                        // device is known unable to accept a new management key
-                        // at all — same `Unsupported`-only gate the "Change
-                        // management key…" button above already uses, so the two
-                        // controls dim together.
-                        let mgmt_key_unsupported = matches!(change_mgmt_key_gate, FeatureGate::Unsupported);
+                        // `mgmt_key_unsupported` (computed above, alongside
+                        // `mgmt_alg_unverified`) is the same `Unsupported`-only
+                        // gate the "Change management key…" button above
+                        // already uses, so button, combo, and the
+                        // per-algorithm warning all dim/suppress together.
                         ui.add_enabled_ui(!mgmt_key_unsupported, |ui| {
                             piv_mgmtalg_combo(
                                 ui,
                                 "piv-new-mgmt-alg",
                                 &mut self.piv.new_mgmt_alg,
                                 mgmt_alg_options,
+                                mgmtalg_gate,
                             );
                         })
                         .response
@@ -17322,11 +17544,16 @@ impl App {
                 // offer" treatment as the PIN/touch policy combos in the
                 // Generate Key modal: a prior selection that's since become
                 // known-unsupported (e.g. after switching readers) falls back
-                // to the widely-supported default rather than staying
-                // selected-but-disabled.
-                if keyalg_gate(self.piv.gen_alg) == FeatureGate::Unsupported {
-                    self.piv.gen_alg = keyroost_piv::KeyAlg::EccP256;
-                }
+                // to the first selectable algorithm rather than staying
+                // selected-but-disabled — see
+                // `piv_keyalg_unsupported_fallback`'s own doc for why
+                // `EccP256` is only a fallback-of-last-resort here, not
+                // returned unconditionally.
+                self.piv.gen_alg = piv_keyalg_unsupported_fallback(
+                    self.piv.gen_alg,
+                    keyroost_piv::KeyAlg::EccP256,
+                    keyalg_gate,
+                );
                 let unverified_algs: Vec<&str> = keyroost_piv::KeyAlg::ALL
                     .into_iter()
                     .filter(|&alg| keyalg_gate(alg) == FeatureGate::Unverified)
@@ -21053,11 +21280,15 @@ mod tests {
 
     /// `PivMgmtAlgSel::Delete` maps to no algorithm at all — the "delete the
     /// management key outright" choice HID Crescendo's own combo offers,
-    /// distinct from every real `MgmtAlg`.
+    /// distinct from every real `MgmtAlg`. `to_choice()`, unlike `to_alg()`,
+    /// is total: `MgmtAlgChoice` has its own `Delete`-equivalent variant, so
+    /// every `PivMgmtAlgSel` (including `Delete` itself) round-trips.
     #[test]
     fn piv_mgmt_alg_sel_delete_has_no_algorithm() {
+        use keyroost_piv::compat::MgmtAlgChoice;
         assert_eq!(PivMgmtAlgSel::Delete.to_alg(), None);
         assert_eq!(PivMgmtAlgSel::Delete.label(), "Delete");
+        assert_eq!(PivMgmtAlgSel::Delete.to_choice(), MgmtAlgChoice::Delete);
         for alg in [
             PivMgmtAlgSel::Aes192,
             PivMgmtAlgSel::Aes128,
@@ -21065,23 +21296,41 @@ mod tests {
             PivMgmtAlgSel::TripleDes,
         ] {
             assert!(alg.to_alg().is_some());
+            assert_ne!(alg.to_choice(), MgmtAlgChoice::Delete);
         }
     }
 
-    /// The HID Crescendo combo offers exactly TDES/AES-128 (the only two
-    /// algorithms ACA XAUTH supports) plus `Delete` at the end; the standard
-    /// combo offers every algorithm and never `Delete`.
+    /// The management-key combo offers every algorithm plus `Delete` last, on
+    /// every device — `Delete` isn't trimmed off the list for a standard
+    /// device the way it used to be; it's still offered there, just gated
+    /// disabled live (via `PivExtension::ManagementKeyAlgorithm`) since a
+    /// standard device's management key can't be removed outright.
     #[test]
-    fn hid_crescendo_mgmt_alg_options_are_tdes_aes128_then_delete() {
+    fn piv_mgmtalg_all_lists_delete_last() {
         assert_eq!(
-            PivMgmtAlgSel::HID_CRESCENDO_OPTIONS,
+            PivMgmtAlgSel::ALL,
             [
                 PivMgmtAlgSel::TripleDes,
                 PivMgmtAlgSel::Aes128,
+                PivMgmtAlgSel::Aes192,
+                PivMgmtAlgSel::Aes256,
                 PivMgmtAlgSel::Delete,
             ]
         );
-        assert!(!PivMgmtAlgSel::ALL.contains(&PivMgmtAlgSel::Delete));
+        assert_eq!(PivMgmtAlgSel::ALL.last(), Some(&PivMgmtAlgSel::Delete));
+    }
+
+    /// The Generate key card's initial selection (`App::piv`'s `new_mgmt_alg`
+    /// field seeds from [`PivMgmtAlgSel::default`]) stays `Aes192` — a
+    /// widely-supported starting point — independent of [`PivMgmtAlgSel::ALL`]'s
+    /// own order. The two used to coincide (`Aes192` was `ALL[0]` too, before
+    /// `ALL` was alphabetized to `TripleDes` first); this pins the `#[default]`
+    /// attribute itself so a future reshuffle of `ALL` can't silently drag the
+    /// default combo selection along with it.
+    #[test]
+    fn piv_mgmtalg_default_stays_aes192_despite_the_alphabetized_all_order() {
+        assert_eq!(PivMgmtAlgSel::default(), PivMgmtAlgSel::Aes192);
+        assert_ne!(PivMgmtAlgSel::ALL[0], PivMgmtAlgSel::default());
     }
 
     /// `piv_mgmtalg_clamp` snaps a selection the given options don't offer
@@ -21089,19 +21338,211 @@ mod tests {
     /// alone.
     #[test]
     fn piv_mgmtalg_clamp_snaps_an_unoffered_selection_to_the_first_option() {
-        let mut sel = PivMgmtAlgSel::Aes256;
-        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS);
-        assert_eq!(sel, PivMgmtAlgSel::TripleDes);
-
         // Already valid: left alone.
         let mut sel = PivMgmtAlgSel::Delete;
-        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::HID_CRESCENDO_OPTIONS);
+        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::ALL);
         assert_eq!(sel, PivMgmtAlgSel::Delete);
 
-        // Switching back to the standard list clamps `Delete` away too.
+        // A narrower list that excludes `Delete` (e.g. a hypothetical future
+        // device the combo restricts further) clamps it away to that list's
+        // first entry.
+        let without_delete = [
+            PivMgmtAlgSel::TripleDes,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Aes192,
+            PivMgmtAlgSel::Aes256,
+        ];
         let mut sel = PivMgmtAlgSel::Delete;
-        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::ALL);
-        assert_eq!(sel, PivMgmtAlgSel::Aes192);
+        piv_mgmtalg_clamp(&mut sel, &without_delete);
+        assert_eq!(sel, PivMgmtAlgSel::TripleDes);
+    }
+
+    /// `piv_mgmtalg_unsupported_fallback` snaps a selection gating
+    /// `Unsupported` to the first *selectable* offered option — not
+    /// `options[0]` unconditionally, since `options[0]` (`TripleDes` on the
+    /// alphabetized `ALL`) can itself be the disabled entry. A regression
+    /// test for exactly that bug: the combo used to preselect `options[0]`
+    /// even when it was disabled, because the old fallback snapped straight
+    /// back to it without checking whether *it* was selectable too.
+    #[test]
+    fn piv_mgmtalg_unsupported_fallback_skips_a_disabled_first_option() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // TripleDes (`options[0]`) is disabled; Aes128 is the next option in
+        // `ALL`'s order (`[TripleDes, Aes128, Aes192, Aes256]`) and is
+        // selectable, so it's the fallback.
+        let gate = |alg: PivMgmtAlgSel| match alg {
+            PivMgmtAlgSel::TripleDes => FeatureGate::Unsupported,
+            _ => FeatureGate::Supported,
+        };
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(PivMgmtAlgSel::TripleDes, &PivMgmtAlgSel::ALL, gate),
+            PivMgmtAlgSel::Aes128
+        );
+
+        // A selection that isn't `Unsupported` is left alone, even if a
+        // *different* option would also be selectable.
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(PivMgmtAlgSel::Aes128, &PivMgmtAlgSel::ALL, gate),
+            PivMgmtAlgSel::Aes128
+        );
+
+        // Every option disabled: nothing better to select, so it falls back
+        // to `options[0]` rather than panicking or leaving `sel` disabled
+        // forever with no path back to a selectable state.
+        let all_unsupported = |_: PivMgmtAlgSel| FeatureGate::Unsupported;
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(
+                PivMgmtAlgSel::TripleDes,
+                &PivMgmtAlgSel::ALL,
+                all_unsupported
+            ),
+            PivMgmtAlgSel::TripleDes
+        );
+
+        // Empty options: no-op regardless of gate.
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(PivMgmtAlgSel::TripleDes, &[], gate),
+            PivMgmtAlgSel::TripleDes
+        );
+    }
+
+    /// `piv_mgmtalg_unverified_labels` suppresses the per-algorithm
+    /// "unverified" warning entirely once `SetManagementKey` itself gates
+    /// `Unsupported` — there's nothing to warn about picking an algorithm for
+    /// a change that can't be made at all, and the disabled button/combo
+    /// already carry their own blocked-hint tooltip.
+    #[test]
+    fn piv_mgmtalg_unverified_labels_are_suppressed_when_the_extension_is_unsupported() {
+        use keyroost_piv::compat::FeatureGate;
+
+        let all_unverified = |_: PivMgmtAlgSel| FeatureGate::Unverified;
+        // Extension unsupported: empty, regardless of what the per-algorithm
+        // gates would otherwise report.
+        assert!(piv_mgmtalg_unverified_labels(
+            FeatureGate::Unsupported,
+            &PivMgmtAlgSel::ALL,
+            all_unverified
+        )
+        .is_empty());
+
+        // Extension merely unverified, or fully supported: the per-algorithm
+        // list still comes through normally.
+        assert_eq!(
+            piv_mgmtalg_unverified_labels(
+                FeatureGate::Unverified,
+                &PivMgmtAlgSel::ALL,
+                all_unverified
+            )
+            .len(),
+            PivMgmtAlgSel::ALL.len()
+        );
+        assert_eq!(
+            piv_mgmtalg_unverified_labels(
+                FeatureGate::Supported,
+                &PivMgmtAlgSel::ALL,
+                all_unverified
+            )
+            .len(),
+            PivMgmtAlgSel::ALL.len()
+        );
+
+        // Extension supported, but no option is individually unverified:
+        // empty for an unrelated reason (nothing to report), not the
+        // suppression rule.
+        assert!(
+            piv_mgmtalg_unverified_labels(FeatureGate::Supported, &PivMgmtAlgSel::ALL, |_| {
+                FeatureGate::Supported
+            })
+            .is_empty()
+        );
+    }
+
+    /// `piv_keyalg_unsupported_fallback` — the slot key-algorithm counterpart
+    /// of `piv_mgmtalg_unsupported_fallback` — snaps a selection gating
+    /// `Unsupported` to the first selectable algorithm in `KeyAlg::ALL`
+    /// rather than unconditionally returning `fallback`: the caller's usual
+    /// "widely-supported default" (`EccP256` at the one call site in
+    /// `cap_piv`) is just another candidate and could itself be the disabled
+    /// entry on some fingerprint.
+    #[test]
+    fn piv_keyalg_unsupported_fallback_skips_a_disabled_fallback_algorithm() {
+        use keyroost_piv::compat::FeatureGate;
+        use keyroost_piv::KeyAlg;
+
+        // `EccP256` (the usual `fallback` argument) is itself disabled here;
+        // `Rsa1024` is the first selectable algorithm in `ALL`'s order.
+        let gate = |alg: KeyAlg| match alg {
+            KeyAlg::EccP256 => FeatureGate::Unsupported,
+            _ => FeatureGate::Supported,
+        };
+        assert_eq!(
+            piv_keyalg_unsupported_fallback(KeyAlg::EccP256, KeyAlg::EccP256, gate),
+            KeyAlg::Rsa1024
+        );
+
+        // A selection that isn't `Unsupported` is left alone.
+        assert_eq!(
+            piv_keyalg_unsupported_fallback(KeyAlg::Rsa2048, KeyAlg::EccP256, gate),
+            KeyAlg::Rsa2048
+        );
+
+        // Every algorithm disabled: falls back to `fallback` outright —
+        // nothing better to select.
+        assert_eq!(
+            piv_keyalg_unsupported_fallback(KeyAlg::EccP256, KeyAlg::EccP256, |_| {
+                FeatureGate::Unsupported
+            }),
+            KeyAlg::EccP256
+        );
+    }
+
+    /// `PivMgmtAlgSel::to_choice()` feeds `PivExtension::ManagementKeyAlgorithm`
+    /// correctly end to end: a HID Crescendo device gates 3DES/AES-128/Delete
+    /// `Supported` and AES-192/AES-256 `Unsupported`, while a YubiKey gates
+    /// every real algorithm `Supported` and `Delete` `Unsupported` — the same
+    /// verdicts `keyroost_piv::compat`'s own tests confirm directly against
+    /// `MgmtAlgChoice`, exercised here through the GUI-side selector instead.
+    #[test]
+    fn piv_mgmtalg_sel_to_choice_resolves_the_expected_gate_per_fingerprint() {
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
+        use keyroost_piv::fingerprint::{AppletFingerprint, HidCrescendoVariant};
+
+        let gate = |fp: AppletFingerprint, sel: PivMgmtAlgSel| {
+            keyroost_piv::compat::resolve(
+                PivExtension::ManagementKeyAlgorithm(sel.to_choice()),
+                fp,
+                None,
+                None,
+            )
+        };
+        let hid = AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300);
+        for sel in [
+            PivMgmtAlgSel::TripleDes,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Delete,
+        ] {
+            assert_eq!(gate(hid, sel), FeatureGate::Supported, "{sel:?}");
+        }
+        for sel in [PivMgmtAlgSel::Aes192, PivMgmtAlgSel::Aes256] {
+            assert_eq!(gate(hid, sel), FeatureGate::Unsupported, "{sel:?}");
+        }
+        for sel in [
+            PivMgmtAlgSel::Aes192,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Aes256,
+            PivMgmtAlgSel::TripleDes,
+        ] {
+            assert_eq!(
+                gate(AppletFingerprint::YubiKey, sel),
+                FeatureGate::Supported,
+                "{sel:?}"
+            );
+        }
+        assert_eq!(
+            gate(AppletFingerprint::YubiKey, PivMgmtAlgSel::Delete),
+            FeatureGate::Unsupported
+        );
     }
 
     /// `piv_policy_clamp` — the PIN/touch policy counterpart of
