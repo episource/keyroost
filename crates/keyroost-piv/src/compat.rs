@@ -56,6 +56,69 @@ use crate::fingerprint::{
 };
 use crate::KeyAlg;
 
+/// One offerable choice in a management-key algorithm picker — every
+/// [`crate::MgmtAlg`] variant, plus [`Self::Delete`] for a device (HID
+/// Crescendo) that can remove its management key outright instead of only
+/// ever replacing it. A sibling of [`crate::MgmtAlg`] rather than an added
+/// variant on it: "Delete" isn't a cipher, so it has no sensible
+/// [`crate::MgmtAlg::id`]/[`crate::MgmtAlg::block_size`]/
+/// [`crate::MgmtAlg::key_len`], and every one of those methods (plus every
+/// real-crypto caller across `keyroost-transport`) would otherwise need an
+/// arm for a case that can't occur there — the same reason `keyroost`'s own
+/// GUI-side `PivMgmtAlgSel` selector keeps `Delete` as a sibling choice
+/// rather than folding it into `crate::MgmtAlg`, converting to
+/// `Option<crate::MgmtAlg>` (`None` for `Delete`) the same way this type's
+/// [`Self::to_mgmt_alg`] does. Exists purely as [`PivExtension::ManagementKeyAlgorithm`]'s
+/// argument, so [`resolve`] can gate each choice in a management-key picker
+/// the same way [`PivExtension::SlotKeyAlgorithm`] already gates each
+/// [`crate::KeyAlg`] in a slot's key-algorithm picker.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MgmtAlgChoice {
+    /// [`crate::MgmtAlg::TripleDes`].
+    TripleDes,
+    /// [`crate::MgmtAlg::Aes128`].
+    Aes128,
+    /// [`crate::MgmtAlg::Aes192`].
+    Aes192,
+    /// [`crate::MgmtAlg::Aes256`].
+    Aes256,
+    /// Remove the management key outright rather than replace it — no
+    /// corresponding [`crate::MgmtAlg`] variant, since it isn't a real
+    /// cipher. HID Crescendo's own PUT XAUTH KEY "remove" form
+    /// ([`crate::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]) is
+    /// the only mechanism keyroost implements for this today.
+    Delete,
+}
+
+impl MgmtAlgChoice {
+    /// The real [`crate::MgmtAlg`] this choice names, or `None` for
+    /// [`Self::Delete`], which names no algorithm at all.
+    #[must_use]
+    pub const fn to_mgmt_alg(self) -> Option<crate::MgmtAlg> {
+        match self {
+            MgmtAlgChoice::TripleDes => Some(crate::MgmtAlg::TripleDes),
+            MgmtAlgChoice::Aes128 => Some(crate::MgmtAlg::Aes128),
+            MgmtAlgChoice::Aes192 => Some(crate::MgmtAlg::Aes192),
+            MgmtAlgChoice::Aes256 => Some(crate::MgmtAlg::Aes256),
+            MgmtAlgChoice::Delete => None,
+        }
+    }
+
+    /// Short human label — [`crate::MgmtAlg::label`] for every real algorithm,
+    /// `"Delete"` for [`Self::Delete`].
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            MgmtAlgChoice::Delete => "Delete",
+            MgmtAlgChoice::TripleDes => crate::MgmtAlg::TripleDes.label(),
+            MgmtAlgChoice::Aes128 => crate::MgmtAlg::Aes128.label(),
+            MgmtAlgChoice::Aes192 => crate::MgmtAlg::Aes192.label(),
+            MgmtAlgChoice::Aes256 => crate::MgmtAlg::Aes256.label(),
+        }
+    }
+}
+
 /// One of the non-standard, vendor-extension PIV commands keyroost exposes —
 /// nothing in SP 800-73-4 defines it, so support varies by applet and is
 /// gated by device fingerprint through [`resolve`]. Not limited to commands a
@@ -256,6 +319,24 @@ pub enum PivExtension {
     /// known-support tables are. See [`slot_key_algorithm_apdu_id_override`]'s
     /// own doc for both cases.
     SlotKeyAlgorithm(KeyAlg),
+    /// Whether a given [`MgmtAlgChoice`] can be set as the management key's
+    /// algorithm on this device — the management-key counterpart of
+    /// [`Self::SlotKeyAlgorithm`], same plain payload-free-per-value shape:
+    /// [`resolve`] gates it through the same per-fingerprint known-support
+    /// tables and version-matching rule, surfaced to a UI's management-key
+    /// algorithm picker the same way [`Self::SlotKeyAlgorithm`] is surfaced to
+    /// a slot's key-algorithm picker. Distinct from [`Self::SetManagementKey`]:
+    /// that extension gates *whether the management key can be changed at
+    /// all*; this one gates *which algorithm a change can use*, so a device
+    /// can resolve [`FeatureGate::Supported`] on [`Self::SetManagementKey`]
+    /// while still disabling individual algorithms here (e.g. HID Crescendo's
+    /// XAUTH key rejects AES-192/AES-256 outright even though it accepts a
+    /// replacement key in general). [`MgmtAlgChoice::Delete`] is a value like
+    /// any other here, not a special case at the [`resolve`] layer — every
+    /// fingerprint but [`AppletFingerprint::HidCrescendo`] resolves it
+    /// [`FeatureGate::Unsupported`], since only HID Crescendo's XAUTH key can
+    /// be removed outright rather than only ever replaced.
+    ManagementKeyAlgorithm(MgmtAlgChoice),
 }
 
 impl PivExtension {
@@ -328,6 +409,17 @@ impl PivExtension {
             PivExtension::SlotKeyAlgorithm(alg) => {
                 format!(
                     "Generating a {} key needs a compatible device.",
+                    alg.label()
+                )
+            }
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete) => {
+                "Deleting the management key outright needs a compatible third-party device \
+                 (e.g. HID Crescendo)."
+                    .to_string()
+            }
+            PivExtension::ManagementKeyAlgorithm(alg) => {
+                format!(
+                    "Using a {} management key needs a compatible device.",
                     alg.label()
                 )
             }
@@ -1134,6 +1226,11 @@ const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Aes192,Aes256})` joins this row: every YubiKey firmware generation
+    // observed accepts all four as the management key's algorithm too, same
+    // universal `[]` `Verdict::KnownSupported` as RESET/SET PIN RETRIES/SET
+    // MANAGEMENT KEY.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::Reset,
@@ -1143,16 +1240,25 @@ const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)` joins
+    // this row: no standard PIV equivalent, since YubiKey's management key
+    // is mandatory and never removable, same universal `[]`
+    // `Verdict::KnownUnsupportedSince` as RESET GLOBAL/ECC P-521.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1319,10 +1425,32 @@ const TOKEN2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm` — 3DES/AES-128/AES-192/AES-256
+    // are all accepted as the management key's algorithm: one
+    // `Verdict::KnownSupported` row at the universal `[]` version (this
+    // fingerprint's own RESET/SET PIN RETRIES row above sits at a specific
+    // `[5, 112, 0]` version instead, so it isn't the same row to join).
+    // `MgmtAlgChoice::Delete` has no standard PIV equivalent on this
+    // fingerprint — the management key is mandatory, never removable — so it
+    // joins the RESET GLOBAL/ECC P-521 row below instead, which already
+    // carries that same universal `[]` `Verdict::KnownUnsupportedSince`.
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1440,18 +1568,27 @@ const SWISSBIT_ISHIELD2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownUnsupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)` joins
+    // this row: no standard PIV equivalent on this fingerprint — the
+    // management key is mandatory, never removable — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Aes192,Aes256})` joins this row: all four are accepted as the
+    // management key's algorithm too, same universal `[]`
+    // `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::Reset,
@@ -1459,6 +1596,10 @@ const SWISSBIT_ISHIELD2_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1612,10 +1753,32 @@ const THETIS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm` — 3DES/AES-128/AES-192/AES-256
+    // are all accepted as the management key's algorithm: one
+    // `Verdict::KnownSupported` row at the universal `[]` version (this
+    // fingerprint's own RESET/SET PIN RETRIES row above sits at a specific
+    // `[5, 112, 0]` version instead, so it isn't the same row to join).
+    // `MgmtAlgChoice::Delete` has no standard PIV equivalent on this
+    // fingerprint — the management key is mandatory, never removable — so it
+    // joins the RESET GLOBAL/ECC P-521 row below instead, which already
+    // carries that same universal `[]` `Verdict::KnownUnsupportedSince`.
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1754,6 +1917,10 @@ const AREKINATH_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             },
         ],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)` joins
+    // this row: no standard PIV equivalent on this fingerprint — the
+    // management key is mandatory, never removable — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
@@ -1762,6 +1929,7 @@ const AREKINATH_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1775,12 +1943,20 @@ const AREKINATH_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Aes192,Aes256})` joins this row: all four are accepted as the
+    // management key's algorithm too, same universal `[]`
+    // `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1874,6 +2050,10 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             },
         ],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)` joins
+    // this row: no standard PIV equivalent on this fingerprint — the
+    // management key is mandatory, never removable — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::ResetGlobal,
@@ -1882,6 +2062,7 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -1895,12 +2076,20 @@ const AREKINATH_SWISSBIT_ISHIELD1_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Aes192,Aes256})` joins this row: all four are accepted as the
+    // management key's algorithm too, same universal `[]`
+    // `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -2107,6 +2296,12 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   C2300's doesn't), so there's no single list to extend to an
 ///   unclassified unit.
 const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{Aes192,Aes256})`
+    // joins this row: HID Crescendo's ACA XAUTH key rejects both outright —
+    // they're outside XAUTH's closed algorithm set (see the
+    // `PivExtension::SlotKeyAlgorithm` rows already here for the same
+    // closed-enumeration reasoning) — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::MoveKey,
@@ -2122,12 +2317,20 @@ const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Delete})` joins this row: HID Crescendo's ACA XAUTH key accepts 3DES or
+    // AES-128 (`hid_crescendo_aca_put_xauth_key`'s own restriction), and —
+    // unlike every other fingerprint — can be removed outright via
+    // `MgmtAlgChoice::Delete` (`hid_crescendo_aca_put_xauth_key_remove`), same
+    // universal `[]` `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::DeleteKey,
@@ -2138,6 +2341,9 @@ const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -2239,6 +2445,12 @@ const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   not [`crate::KeyAlg::id`]'s `0x16` — a separate axis from this
 ///   known-support gate.
 const HID_CRESCENDO_C4000_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{Aes192,Aes256})`
+    // joins this row: HID Crescendo's ACA XAUTH key rejects both outright —
+    // they're outside XAUTH's closed algorithm set (see the
+    // `PivExtension::SlotKeyAlgorithm` rows already here for the same
+    // closed-enumeration reasoning) — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::MoveKey,
@@ -2252,12 +2464,20 @@ const HID_CRESCENDO_C4000_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Delete})` joins this row: HID Crescendo's ACA XAUTH key accepts 3DES or
+    // AES-128 (`hid_crescendo_aca_put_xauth_key`'s own restriction), and —
+    // unlike every other fingerprint — can be removed outright via
+    // `MgmtAlgChoice::Delete` (`hid_crescendo_aca_put_xauth_key_remove`), same
+    // universal `[]` `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::DeleteKey,
@@ -2270,6 +2490,9 @@ const HID_CRESCENDO_C4000_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -2334,6 +2557,12 @@ const HID_CRESCENDO_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::Merg
 ///   *wire-byte* answer still applies to `Generic`, though — see its doc for
 ///   why that's a different axis this reasoning doesn't touch).
 const HID_CRESCENDO_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{Aes192,Aes256})`
+    // joins this row: HID Crescendo's ACA XAUTH key rejects both outright —
+    // they're outside XAUTH's closed algorithm set, the same
+    // closed-enumeration reasoning [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s
+    // own `PivExtension::SlotKeyAlgorithm` rows use — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::MoveKey,
@@ -2341,16 +2570,27 @@ const HID_CRESCENDO_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SetPinPukRetries,
             PivExtension::SlotPinPolicy,
             PivExtension::SlotTouchPolicy,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes128,
+    // Delete})` joins this row: HID Crescendo's ACA XAUTH key accepts 3DES or
+    // AES-128 (`hid_crescendo_aca_put_xauth_key`'s own restriction), and —
+    // unlike every other fingerprint — can be removed outright via
+    // `MgmtAlgChoice::Delete` (`hid_crescendo_aca_put_xauth_key_remove`), same
+    // universal `[]` `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::GetSlotKeyStatus,
             PivExtension::SetManagementKey,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -2381,14 +2621,16 @@ const HID_CRESCENDO_GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// [`AppletFingerprint::Generic`]'s applet-axis known-support table — a
-/// single [`PivExtension::ResetGlobal`] entry, [`Verdict::KnownUnsupportedSince`]
-/// at the universal `[]` version. Every non-HID-Crescendo fingerprint's table
-/// carries this same entry — deliberately explicit rather than left absent
-/// (which would resolve [`FeatureGate::Unverified`], same as any fingerprint
-/// with no entry for this extension): `PivSession::factory_reset` checks
-/// this gate *first*, ahead of [`PivExtension::Reset`]'s own shape — an
-/// `Unverified` default here would make a *non*-HID-Crescendo device with a
-/// genuinely working [`PivExtension::Reset`] path (e.g. the PIN/PUK-burn
+/// single entry pairing [`PivExtension::ResetGlobal`] with
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm),
+/// both [`Verdict::KnownUnsupportedSince`] at the universal `[]` version.
+/// Every non-HID-Crescendo fingerprint's table carries this same
+/// [`PivExtension::ResetGlobal`] entry — deliberately explicit rather than
+/// left absent (which would resolve [`FeatureGate::Unverified`], same as any
+/// fingerprint with no entry for this extension): `PivSession::factory_reset`
+/// checks this gate *first*, ahead of [`PivExtension::Reset`]'s own shape —
+/// an `Unverified` default here would make a *non*-HID-Crescendo device with
+/// a genuinely working [`PivExtension::Reset`] path (e.g. the PIN/PUK-burn
 /// convention) attempt HID's ACA RESET CARD mechanism first instead, fail
 /// (there's no such applet on that card), and never fall through to the
 /// mechanism that would have worked. An explicit
@@ -2399,13 +2641,25 @@ const GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// both `ArekinathPivApplet` tables above each also carry their own explicit
 /// [`PivExtension::ResetGlobal`] entry instead of being left absent, and why
 /// [`AUTHENTREND_ATKEY_APPLET_VERDICTS`], [`IDPRIME_APPLET_VERDICTS`],
-/// [`TRUSSED_NITROKEY_APPLET_VERDICTS`], [`OPENFIPS201_GENERIC_APPLET_VERDICTS`],
-/// [`UTRUST_GENERIC_APPLET_VERDICTS`], and [`UTRUST_GOV_APPLET_VERDICTS`]
-/// below are each a single-entry table with exactly this same row.
-/// [`FEITIAN_APPLET_VERDICTS`] carries this same row too, alongside further
-/// rows of its own now — see its doc.
+/// [`TRUSSED_NITROKEY_APPLET_VERDICTS`], [`UTRUST_GENERIC_APPLET_VERDICTS`],
+/// and [`UTRUST_GOV_APPLET_VERDICTS`] below are each a single-entry table
+/// with exactly this same row. [`FEITIAN_APPLET_VERDICTS`] and
+/// [`OPENFIPS201_GENERIC_APPLET_VERDICTS`] each carry this same row too,
+/// alongside further rows of their own now — see their own docs.
+///
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins the [`PivExtension::ResetGlobal`] row rather than getting an entry
+/// of its own: no standard PIV equivalent on this fingerprint — the
+/// management key is mandatory, never removable — so it resolves the same
+/// way. No entry for the four real algorithms: keyroost has no known-support
+/// data for this fingerprint's management-key algorithm, so each resolves
+/// [`FeatureGate::Unverified`] rather than being asserted one way or the
+/// other.
 const GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[PivExtension::ResetGlobal],
+    extensions: &[
+        PivExtension::ResetGlobal,
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+    ],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2433,9 +2687,14 @@ const AUTHENTREND_ATKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 
 /// Authentrend's ATkey's applet-axis known-support table — see
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
-/// explicit [`PivExtension::ResetGlobal`] entry.
+/// explicit [`PivExtension::ResetGlobal`] entry, and why
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins that same entry instead of getting one of its own.
 const AUTHENTREND_ATKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[PivExtension::ResetGlobal],
+    extensions: &[
+        PivExtension::ResetGlobal,
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+    ],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2485,9 +2744,16 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// same hardware-observed [`Verdict::KnownUnsupported`] group at applet
 /// version `[0]`: the live unit's GENERATE ASYMMETRIC KEYPAIR rejects both
 /// the `0xAA` and `0xAB` tags.
+///
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins the [`PivExtension::ResetGlobal`] row instead of getting an entry of
+/// its own — see [`GENERIC_APPLET_VERDICTS`]'s doc for why.
 const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
-        extensions: &[PivExtension::ResetGlobal],
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
@@ -2530,9 +2796,14 @@ const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Gemalto/Thales IDPrime's applet-axis known-support table — see
 /// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
-/// explicit [`PivExtension::ResetGlobal`] entry.
+/// explicit [`PivExtension::ResetGlobal`] entry, and why
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins that same entry instead of getting one of its own.
 const IDPRIME_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[PivExtension::ResetGlobal],
+    extensions: &[
+        PivExtension::ResetGlobal,
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+    ],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2586,8 +2857,17 @@ const TRUSSED_NITROKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRela
 /// [`TRUSSED_NITROKEY_FIRMWARE_VERDICTS`] keys its rows to, and why this
 /// fingerprint is the one exception noted on that const's own doc rather
 /// than following [`YUBIKEY_FIRMWARE_VERDICTS`]'s "always empty" norm.
+///
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins the [`PivExtension::ResetGlobal`] row below instead of getting an
+/// entry of its own — see [`GENERIC_APPLET_VERDICTS`]'s doc for why. The four
+/// real algorithms are instead gated on the firmware axis, in
+/// [`TRUSSED_NITROKEY_FIRMWARE_VERDICTS`] — see its own doc.
 const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[PivExtension::ResetGlobal],
+    extensions: &[
+        PivExtension::ResetGlobal,
+        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+    ],
     verdicts: &[VersionVerdict {
         version: &[],
         verdict: Verdict::KnownUnsupportedSince,
@@ -2687,6 +2967,12 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             verdict: Verdict::KnownSupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{Aes128,Aes192})`
+    // joins this row: both are rejected on firmware 1.8.3 (the newest
+    // tested) and, per `Verdict::KnownUnsupported`'s backward-extension
+    // rule, assumed rejected on every earlier version too — a firmware newer
+    // than 1.8.3 softens to `FeatureGate::Unverified` rather than staying
+    // `Unsupported`, since a later release may have added them.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::SetPinPukRetries,
@@ -2695,17 +2981,24 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::Attest,
             PivExtension::SlotPinPolicy,
             PivExtension::SlotTouchPolicy,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
         ],
         verdicts: &[VersionVerdict {
             version: &[1, 8, 3],
             verdict: Verdict::KnownUnsupported,
         }],
     },
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{TripleDes,Aes256})`
+    // joins this row: both have been supported at every firmware generation
+    // keyroost has evidence for, same universal `[]` `Verdict::KnownSupported`.
     ExtensionVerdicts {
         extensions: &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -2762,17 +3055,41 @@ const OPENFIPS201_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 /// version: upstream OpenFIPS201 has not been observed to mimic any Yubico
 /// extension, the same standing-vendor-pattern reasoning
 /// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc uses.
-const OPENFIPS201_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[
-        PivExtension::ResetGlobal,
-        PivExtension::SlotPinPolicy,
-        PivExtension::SlotTouchPolicy,
-    ],
-    verdicts: &[VersionVerdict {
-        version: &[],
-        verdict: Verdict::KnownUnsupportedSince,
-    }],
-}];
+const OPENFIPS201_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)` joins
+    // this row: no standard PIV equivalent on this fingerprint — the
+    // management key is mandatory, never removable — same universal `[]`
+    // `Verdict::KnownUnsupportedSince`.
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    // `PivExtension::ManagementKeyAlgorithm` — 3DES/AES-128/AES-192/AES-256
+    // are all accepted as the management key's algorithm: one
+    // `Verdict::KnownSupported` row at the universal `[]` version. No other
+    // row in this table shares that exact verdict, so this stays a
+    // standalone entry rather than joining one.
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::TripleDes),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+];
 
 /// See [`YUBIKEY_FIRMWARE_VERDICTS`]'s doc — empty.
 const OPENFIPS201_GENERIC_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
@@ -2793,7 +3110,9 @@ const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxe
 /// Identiv/Hirsch's uTrust Generic (the general-purpose FIDO2 Security Keys
 /// line — [`UTrustVariant::Generic`])'s applet-axis known-support table —
 /// see [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
-/// explicit [`PivExtension::ResetGlobal`] entry.
+/// explicit [`PivExtension::ResetGlobal`] entry, and why
+/// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins that same entry instead of getting one of its own.
 ///
 /// The [`PivExtension::DeleteKey`]/[`PivExtension::MoveKey`]/
 /// [`PivExtension::SetPinPukRetries`]/[`PivExtension::Reset`]/
@@ -2822,7 +3141,10 @@ const UTRUST_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         }],
     },
     ExtensionVerdicts {
-        extensions: &[PivExtension::ResetGlobal],
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
@@ -2853,7 +3175,9 @@ const UTRUST_GOV_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// its doc) — reserved for when it can be told apart from
 /// [`UTrustVariant::Generic`] on the wire — but it still carries the same
 /// universal [`PivExtension::ResetGlobal`] entry every non-HID-Crescendo
-/// fingerprint gets; see [`GENERIC_APPLET_VERDICTS`]'s doc for why.
+/// fingerprint gets; see [`GENERIC_APPLET_VERDICTS`]'s doc for why, and for
+/// why [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
+/// joins that same entry instead of getting one of its own.
 ///
 /// The [`PivExtension::DeleteKey`]/[`PivExtension::MoveKey`]/
 /// [`PivExtension::SetPinPukRetries`]/[`PivExtension::Reset`]/
@@ -2888,7 +3212,10 @@ const UTRUST_GOV_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         }],
     },
     ExtensionVerdicts {
-        extensions: &[PivExtension::ResetGlobal],
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+        ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
@@ -6828,5 +7155,186 @@ mod tests {
             ),
             0x15
         );
+    }
+
+    // --- ManagementKeyAlgorithm / MgmtAlgChoice ---------------------------
+
+    #[test]
+    fn mgmt_alg_choice_to_mgmt_alg_is_none_only_for_delete() {
+        assert_eq!(
+            MgmtAlgChoice::TripleDes.to_mgmt_alg(),
+            Some(crate::MgmtAlg::TripleDes)
+        );
+        assert_eq!(
+            MgmtAlgChoice::Aes128.to_mgmt_alg(),
+            Some(crate::MgmtAlg::Aes128)
+        );
+        assert_eq!(
+            MgmtAlgChoice::Aes192.to_mgmt_alg(),
+            Some(crate::MgmtAlg::Aes192)
+        );
+        assert_eq!(
+            MgmtAlgChoice::Aes256.to_mgmt_alg(),
+            Some(crate::MgmtAlg::Aes256)
+        );
+        assert_eq!(MgmtAlgChoice::Delete.to_mgmt_alg(), None);
+        assert_eq!(MgmtAlgChoice::Delete.label(), "Delete");
+        assert_eq!(
+            MgmtAlgChoice::Aes192.label(),
+            crate::MgmtAlg::Aes192.label()
+        );
+    }
+
+    #[test]
+    fn yubikey_token2_thetis_arekinath_openfips201_support_every_real_mgmt_alg() {
+        // Every fingerprint seeded with `Verdict::KnownSupported` for the four
+        // real `MgmtAlgChoice` variants at the universal `[]` version —
+        // reported version shouldn't matter for any of them.
+        for fp in [
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::Token2,
+            AppletFingerprint::Thetis,
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::Generic),
+            AppletFingerprint::ArekinathPivApplet(ArekinathVariant::SwissbitIShield1),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+            AppletFingerprint::OpenFips201(OpenFips201Variant::SwissbitIShield2),
+        ] {
+            for alg in [
+                MgmtAlgChoice::TripleDes,
+                MgmtAlgChoice::Aes128,
+                MgmtAlgChoice::Aes192,
+                MgmtAlgChoice::Aes256,
+            ] {
+                assert_eq!(
+                    resolve(
+                        PivExtension::ManagementKeyAlgorithm(alg),
+                        fp,
+                        Some(&[9, 9, 9]),
+                        None
+                    ),
+                    FeatureGate::Supported,
+                    "{fp:?} {alg:?}"
+                );
+            }
+            // `Delete` has no standard PIV equivalent on any of these.
+            assert_eq!(
+                resolve(
+                    PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+                    fp,
+                    Some(&[9, 9, 9]),
+                    None
+                ),
+                FeatureGate::Unsupported,
+                "{fp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_supports_only_tdes_aes128_and_delete() {
+        for fp in [
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::Generic),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+        ] {
+            for alg in [
+                MgmtAlgChoice::TripleDes,
+                MgmtAlgChoice::Aes128,
+                MgmtAlgChoice::Delete,
+            ] {
+                assert_eq!(
+                    resolve(PivExtension::ManagementKeyAlgorithm(alg), fp, None, None),
+                    FeatureGate::Supported,
+                    "{fp:?} {alg:?}"
+                );
+            }
+            for alg in [MgmtAlgChoice::Aes192, MgmtAlgChoice::Aes256] {
+                assert_eq!(
+                    resolve(PivExtension::ManagementKeyAlgorithm(alg), fp, None, None),
+                    FeatureGate::Unsupported,
+                    "{fp:?} {alg:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_fingerprint_has_no_mgmt_alg_data_except_delete() {
+        // No known-support data for the four real algorithms — each resolves
+        // Unverified rather than being asserted one way or the other — but
+        // `Delete` still resolves Unsupported, since the "every fingerprint
+        // except HidCrescendo" rule doesn't exempt the fallback fingerprint.
+        for alg in [
+            MgmtAlgChoice::TripleDes,
+            MgmtAlgChoice::Aes128,
+            MgmtAlgChoice::Aes192,
+            MgmtAlgChoice::Aes256,
+        ] {
+            assert_eq!(
+                resolve(
+                    PivExtension::ManagementKeyAlgorithm(alg),
+                    AppletFingerprint::Generic,
+                    None,
+                    None
+                ),
+                FeatureGate::Unverified,
+                "{alg:?}"
+            );
+        }
+        assert_eq!(
+            resolve(
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+                AppletFingerprint::Generic,
+                None,
+                None
+            ),
+            FeatureGate::Unsupported
+        );
+    }
+
+    #[test]
+    fn nitrokey_firmware_axis_gates_mgmt_alg_by_firmware_1_8_3() {
+        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        // 3DES/AES-256 supported at any reported firmware.
+        for alg in [MgmtAlgChoice::TripleDes, MgmtAlgChoice::Aes256] {
+            assert_eq!(
+                resolve(
+                    PivExtension::ManagementKeyAlgorithm(alg),
+                    fp,
+                    None,
+                    Some(&[1, 2, 0])
+                ),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        // AES-128/AES-192 known-unsupported up to and including 1.8.3 —
+        // extended backward to an earlier firmware too.
+        for alg in [MgmtAlgChoice::Aes128, MgmtAlgChoice::Aes192] {
+            for fw in [&[1u8, 8, 3][..], &[1, 2, 0][..]] {
+                assert_eq!(
+                    resolve(
+                        PivExtension::ManagementKeyAlgorithm(alg),
+                        fp,
+                        None,
+                        Some(fw)
+                    ),
+                    FeatureGate::Unsupported,
+                    "{alg:?} {fw:?}"
+                );
+            }
+            // A firmware newer than every verdict on the row softens to
+            // Unverified rather than staying Unsupported.
+            assert_eq!(
+                resolve(
+                    PivExtension::ManagementKeyAlgorithm(alg),
+                    fp,
+                    None,
+                    Some(&[1, 9, 0])
+                ),
+                FeatureGate::Unverified,
+                "{alg:?}"
+            );
+        }
     }
 }
