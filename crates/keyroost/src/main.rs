@@ -21787,9 +21787,14 @@ mod tests {
     /// default management key" checkbox on.
     #[test]
     fn piv_default_mgmt_key_none_for_an_unseeded_fingerprint() {
+        // IdPrime no longer fits this test — it now carries its own seeded
+        // default (`keyroost_piv::compat::IDPRIME_APPLET_QUIRKS`) — so this
+        // uses OpenFips201::Generic instead, which still has none.
         assert_eq!(
             piv_default_mgmt_key(
-                keyroost_piv::fingerprint::AppletFingerprint::IdPrime,
+                keyroost_piv::fingerprint::AppletFingerprint::OpenFips201(
+                    keyroost_piv::fingerprint::OpenFips201Variant::Generic
+                ),
                 Some(&[0]),
                 None
             ),
@@ -21932,8 +21937,12 @@ mod tests {
         assert!(app.piv_current_mgmt_key().is_err());
 
         // A live status, but for a fingerprint with no seeded default.
+        // IdPrime no longer fits here either — see
+        // `piv_default_mgmt_key_none_for_an_unseeded_fingerprint`.
         app.piv.status = Some(piv_status_with(
-            keyroost_piv::fingerprint::AppletFingerprint::IdPrime,
+            keyroost_piv::fingerprint::AppletFingerprint::OpenFips201(
+                keyroost_piv::fingerprint::OpenFips201Variant::Generic,
+            ),
             None,
         ));
         assert!(app.piv_current_mgmt_key().is_err());

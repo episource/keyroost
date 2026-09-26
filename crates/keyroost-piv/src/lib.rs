@@ -2036,6 +2036,38 @@ pub fn parse_general_auth(buf: &[u8], inner_tag: u8) -> Result<&[u8], ParseError
     find_tlv(inner, inner_tag).ok_or(ParseError::NotAuthTemplate)
 }
 
+/// Like [`parse_general_auth`], but accepts whatever tag the response's sole
+/// inner TLV element carries instead of requiring a specific `inner_tag` —
+/// for [`compat::PivQuirk::HostChallengeResponsePermissiveTag`] devices that
+/// echo the mutual-auth step-2 response under the wrong tag (observed:
+/// IdPrime answers with `0x80`, the witness tag from step 1, where SP
+/// 800-73-4 calls for `0x82`). Only safe when the reply holds exactly one
+/// TLV element: with more than one present there's no unambiguous "this one
+/// is the answer" choice, so that case still errors as
+/// [`ParseError::NotAuthTemplate`] rather than guessing.
+pub fn parse_general_auth_permissive(buf: &[u8]) -> Result<&[u8], ParseError> {
+    if buf.first() != Some(&TAG_DYN_AUTH) {
+        return Err(ParseError::NotAuthTemplate);
+    }
+    let (len, header) = read_ber_len(&buf[1..])?;
+    let start = 1 + header;
+    let end = start.checked_add(len).ok_or(ParseError::Truncated)?;
+    let inner = buf.get(start..end).ok_or(ParseError::Truncated)?;
+    // <tag> <len> <value>, single-byte tag — same assumption every other
+    // inner-tag walker in this module makes (see `find_tlv`'s doc).
+    let len_bytes = inner.get(1..).ok_or(ParseError::NotAuthTemplate)?;
+    let (vlen, vheader) = read_ber_len(len_bytes)?;
+    let vstart = 1 + vheader;
+    let vend = vstart.checked_add(vlen).ok_or(ParseError::Truncated)?;
+    let value = inner.get(vstart..vend).ok_or(ParseError::Truncated)?;
+    if vend != inner.len() {
+        // More than one TLV element present (or trailing garbage) — no
+        // single unambiguous value to return.
+        return Err(ParseError::NotAuthTemplate);
+    }
+    Ok(value)
+}
+
 /// Parse a `0x7F49` generated-public-key template into a [`PublicKey`]. RSA
 /// carries `81` (modulus) and `82` (exponent); EC/EdDSA carry `86` (point).
 pub fn parse_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
@@ -3298,6 +3330,46 @@ mod tests {
         // wrong outer tag
         assert_eq!(
             parse_general_auth(&[0x70, 0x02, 0x80, 0x00], 0x80),
+            Err(ParseError::NotAuthTemplate)
+        );
+    }
+
+    #[test]
+    fn parse_general_auth_permissive_accepts_any_single_tag() {
+        // 7C 0A 80 08 <8-byte value> — the IdPrime shape: wrong tag (0x80,
+        // not 0x82), but exactly one TLV element, so it's accepted anyway.
+        let mut buf = vec![0x7C, 0x0A, 0x80, 0x08];
+        buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            parse_general_auth_permissive(&buf).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        // the spec-correct tag works exactly the same way
+        let mut buf82 = vec![0x7C, 0x0A, 0x82, 0x08];
+        buf82.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            parse_general_auth_permissive(&buf82).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn parse_general_auth_permissive_rejects_multiple_tags() {
+        // 7C 06 80 02 AA BB 81 00 — two TLV elements: no single unambiguous
+        // answer, so this must still fail rather than pick one.
+        let buf = [0x7C, 0x06, 0x80, 0x02, 0xAA, 0xBB, 0x81, 0x00];
+        assert_eq!(
+            parse_general_auth_permissive(&buf),
+            Err(ParseError::NotAuthTemplate)
+        );
+        // wrong outer tag, same as `parse_general_auth`
+        assert_eq!(
+            parse_general_auth_permissive(&[0x70, 0x02, 0x80, 0x00]),
+            Err(ParseError::NotAuthTemplate)
+        );
+        // empty inner template — no TLV element at all
+        assert_eq!(
+            parse_general_auth_permissive(&[0x7C, 0x00]),
             Err(ParseError::NotAuthTemplate)
         );
     }
