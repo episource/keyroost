@@ -8,8 +8,8 @@
 //! same product. This module encodes what keyroost has actually observed,
 //! keyed by [`AppletFingerprint`], as a **combined known-support table**: for each
 //! fingerprint it knows about, a list of per-version verdicts each either
-//! [`Verdict::KnownSupported`] ("extension known to be supported at this version")
-//! or [`Verdict::KnownUnsupported`] ("extension known to be unsupported at this
+//! `Verdict::KnownSupported` ("extension known to be supported at this version")
+//! or `Verdict::KnownUnsupported` ("extension known to be unsupported at this
 //! version"). There are two such lists per extension — one keyed by the PIV
 //! *applet's* own version, one by the *firmware's* — since the two can diverge
 //! (see [`crate` root docs][crate] / `PivStatus::version` vs
@@ -236,7 +236,7 @@ pub enum PivExtension {
     /// the *capability*, though, not that one specific wire mechanism: a
     /// vendor can reach the same result its own proprietary way — HID
     /// Crescendo's SDK exposes an `UpdatePINProperties` method that in
-    /// principle covers this ground (see [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s
+    /// principle covers this ground (see `HID_CRESCENDO_C4000_APPLET_VERDICTS`'s
     /// doc) — the same shape [`Self::PinManagementAuth`] already
     /// uses for a capability two vendors reach by genuinely different
     /// mechanisms (direct PIN unlock on HID Crescendo, the indirect
@@ -316,7 +316,7 @@ pub enum PivExtension {
     /// `Trussed::NitroKey`'s: its RSA-4096 byte itself changed, from `0xE1`
     /// pre-1.8.2 firmware to Yubico's own `0x16` at 1.8.2 and later, so that
     /// one entry is gated by firmware version like this variant's own
-    /// known-support tables are. See [`slot_key_algorithm_apdu_id_override`]'s
+    /// known-support tables are. See `slot_key_algorithm_apdu_id_override`'s
     /// own doc for both cases.
     SlotKeyAlgorithm(KeyAlg),
     /// Whether a given [`MgmtAlgChoice`] can be set as the management key's
@@ -430,7 +430,7 @@ impl PivExtension {
 /// A version-gated behavioral wrinkle keyroost has observed on some PIV
 /// devices — distinct from [`PivExtension`]: an extension is "supported or
 /// not", a quirk is "present and needs a workaround" regardless of support.
-/// Carried on [`VersionQuirks::quirks`] and surfaced by [`resolve_quirks`].
+/// Carried on `VersionQuirks::quirks` and surfaced by [`resolve_quirks`].
 /// Nothing in this crate acts on a resolved quirk yet — the workaround code
 /// for each one lands separately.
 #[non_exhaustive]
@@ -451,7 +451,7 @@ pub enum PivQuirk {
     /// (observed: a brand-new unit, then several key generations later) and
     /// still carry this quirk, since there's no known state a caller could
     /// use to tell "still reliable" apart from "already gone stale" — see
-    /// [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`]'s doc for the specific history
+    /// `SWISSBIT_ISHIELD2_APPLET_QUIRKS`'s doc for the specific history
     /// that ruled out a version-gated floor.
     InsF7MetadataAlgorithmInvalid,
     /// GET METADATA (`INS 0xF7`) might report a PIN/touch policy (tag `0x02`,
@@ -488,7 +488,7 @@ pub enum PivQuirk {
     /// this quirk's mechanism, but it isn't the only one: a live Token2
     /// applet at version 5.112.0 has been observed accepting `INS 0xFB`
     /// outright, with neither the PIN nor the PUK blocked and no
-    /// authenticated session either (see [`TOKEN2_APPLET_VERDICTS`]'s
+    /// authenticated session either (see `TOKEN2_APPLET_VERDICTS`'s
     /// doc) — so this quirk's absence really only
     /// answers "does RESET need management auth", not "what, if anything,
     /// RESET needs instead".
@@ -534,7 +534,7 @@ pub enum PivQuirk {
     /// [`default_9b_management_key`]) and disables that convenience entirely
     /// when it's absent — an absent entry means keyroost has no known
     /// default for this fingerprint, not that the device has none; see each
-    /// fingerprint's own applet-axis quirks const (e.g. [`YUBIKEY_APPLET_QUIRKS`])
+    /// fingerprint's own applet-axis quirks const (e.g. `YUBIKEY_APPLET_QUIRKS`)
     /// for what's actually known.
     ///
     /// Five distinct values are seeded today, each shared by every
@@ -562,18 +562,18 @@ pub enum PivQuirk {
     ///   path reads this entry back to restore XAUTH key 1 after RESET CARD,
     ///   rather than hard-coding the constant a second time.
     /// * Identiv/Hirsch uTrust Gov's own vendor-specific value (16 bytes,
-    ///   [`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]) — distinct from the
+    ///   `IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`) — distinct from the
     ///   YubiKey-mimicking value its sibling `UTrust::Generic` ships instead;
     ///   see [`UTrustVariant::Gov`]'s doc for the source. Also confirmed on
     ///   IdPrime hardware (a live unit's factory-default `0x9B` key,
     ///   algorithm AES-128 — hence the 16-byte length matching this value
-    ///   rather than [`YUBIKEY_DEFAULT_MGMT_KEY`]'s 24) — hence the constant's
+    ///   rather than `YUBIKEY_DEFAULT_MGMT_KEY`'s 24) — hence the constant's
     ///   name naming both fingerprints rather than just the one it was
     ///   originally seeded for.
     ///
     /// Most seeded values happen to be 24 bytes, but that's a fact about
     /// what's been observed so far, not a constraint this variant enforces —
-    /// [`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`] above is already only 16, and a future
+    /// `IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY` above is already only 16, and a future
     /// row for an AES-256 default must not need this type to change either.
     Default9bManagementKey(&'static [u8]),
     /// This fingerprint (at the version the entry covers) is known to take
@@ -739,7 +739,7 @@ enum Verdict {
     /// just an absence observed on one firmware, so use this instead of
     /// [`Self::KnownUnsupported`] for it — see e.g. HID Crescendo's
     /// [`PivExtension::GetMetadata`]/[`PivExtension::Attest`] rows in
-    /// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`], which apply this reasoning
+    /// `HID_CRESCENDO_C2300_APPLET_VERDICTS`, which apply this reasoning
     /// to a vendor that has never implemented *any* Yubico extension APDU
     /// and instead ships its own (ACA XAUTH in place of `GENERAL
     /// AUTHENTICATE` on `0x9B`, GET PIV PROPERTIES in place of GET
@@ -759,7 +759,7 @@ struct VersionQuirks {
 
 /// Which cross-axis merge policy [`resolve`]/[`resolve_quirks`] uses to
 /// combine a fingerprint's applet-version-axis and firmware-version-axis
-/// results into one, selected per fingerprint via [`axis_merge_mode`] rather
+/// results into one, selected per fingerprint via `axis_merge_mode` rather
 /// than hard-coded once for every fingerprint — a knob for a future
 /// fingerprint that needs a different reconciliation policy than today's
 /// uniform default, exactly as [`PivQuirk`] is a per-fingerprint knob rather
@@ -771,7 +771,7 @@ struct VersionQuirks {
 /// fingerprint reports genuinely conflicting data on both axes for the same
 /// extension. The one fingerprint with real verdict data on both axes,
 /// `Trussed(NitroKey)`, has its applet-axis and firmware-axis rows agree
-/// wherever both have an opinion (see [`TRUSSED_NITROKEY_APPLET_VERDICTS`]'s
+/// wherever both have an opinion (see `TRUSSED_NITROKEY_APPLET_VERDICTS`'s
 /// doc) — so [`Self::MergeRelaxed`] and [`Self::MergeStrict`] resolve
 /// identically for it, and [`Self::AppletWins`]/[`Self::FirmwareWins`]'s
 /// tie-break never triggers for it either, since there's no conflict to
@@ -785,19 +785,19 @@ pub enum AxisMergeMode {
     /// [`FeatureGate::Unverified`] on the other; two real but *conflicting*
     /// verdicts (one `Supported`, the other `Unsupported`) soften to
     /// `Unverified` instead of either winning outright — see
-    /// [`combine_relaxed`]. Quirks: unioned, identical to
+    /// `combine_relaxed`. Quirks: unioned, identical to
     /// [`Self::MergeStrict`] — this mode only changes verdict combination.
     MergeRelaxed,
     /// Verdicts: [`FeatureGate::Unsupported`] on either axis wins outright,
     /// even against [`FeatureGate::Supported`] on the other — see
-    /// [`combine_strict`]. Quirks: unioned, identical to
+    /// `combine_strict`. Quirks: unioned, identical to
     /// [`Self::MergeRelaxed`].
     MergeStrict,
     /// Verdicts: a real verdict wins over [`FeatureGate::Unverified`] on the
     /// other axis, same as [`Self::MergeRelaxed`] — but when *both* axes
     /// carry a real verdict and they genuinely conflict, the applet axis's
     /// own verdict wins outright instead of softening to `Unverified` — see
-    /// [`combine_preferring`]. Quirks: when both an applet version and a
+    /// `combine_preferring`. Quirks: when both an applet version and a
     /// firmware version were reported, the applet axis's quirks entry
     /// replaces the union outright (the firmware axis's entry for that
     /// version is dropped); when only one axis (or neither) reported a
@@ -838,7 +838,7 @@ const FEITIAN_DEFAULT_MGMT_KEY: &[u8] = &[
 ];
 
 /// Identiv/Hirsch uTrust Gov's own vendor-specific PIV factory-default
-/// management key — half [`YUBIKEY_DEFAULT_MGMT_KEY`]'s length (16 bytes,
+/// management key — half `YUBIKEY_DEFAULT_MGMT_KEY`'s length (16 bytes,
 /// the `0x01..=0x08` pattern repeated twice rather than three times), so
 /// `UTrust::Gov` does *not* mimic the YubiKey default the way `UTrust::Generic`
 /// does — <https://hirschsecure.atlassian.net/wiki/spaces/FIDO/pages/4395401218/PIV>.
@@ -900,13 +900,13 @@ fn applet_verdicts(
     )
 }
 
-/// Same lookup as [`applet_verdicts`], against each fingerprint's
+/// Same lookup as `applet_verdicts`, against each fingerprint's
 /// **firmware**-version table instead — e.g. [`YUBIKEY_FIRMWARE_VERDICTS`].
 /// Every one of those tables is empty except
 /// [`TRUSSED_NITROKEY_FIRMWARE_VERDICTS`] (see its own doc for the data it
 /// carries and why): no other fingerprint has firmware-version data for any
 /// extension yet (HID Crescendo's GET PIV PROPERTIES version is an *applet*
-/// version, not a firmware one — see [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s
+/// version, not a firmware one — see `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
 /// doc).
 #[must_use]
 fn firmware_verdicts(
@@ -953,7 +953,7 @@ fn firmware_verdicts(
     )
 }
 
-/// Shared lookup backing [`applet_verdicts`]/[`firmware_verdicts`]: find
+/// Shared lookup backing `applet_verdicts`/`firmware_verdicts`: find
 /// `extension`'s entry within one fingerprint's already-selected table —
 /// `extension` may be listed alongside others on the same row, per
 /// [`ExtensionVerdicts::extensions`].
@@ -971,7 +971,7 @@ fn find_verdicts(
 /// This fingerprint's active [`PivQuirk`]s, keyed by the PIV **applet's own**
 /// version. Dispatches to one const per fingerprint (see each const's own
 /// doc for its data and reasoning) and returns it outright — unlike
-/// [`applet_verdicts`]/[`firmware_verdicts`], there's no extension axis to
+/// `applet_verdicts`/`firmware_verdicts`, there's no extension axis to
 /// look up within it, since a quirk applies to the fingerprint/version as a
 /// whole (see [`PivQuirk`]'s own doc). A fingerprint with no data at all
 /// (today: [`AppletFingerprint::IdPrime`] and
@@ -1016,7 +1016,7 @@ fn applet_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
     }
 }
 
-/// Same lookup as [`applet_quirks`], against each fingerprint's **firmware**
+/// Same lookup as `applet_quirks`, against each fingerprint's **firmware**
 /// axis instead — e.g. [`YUBIKEY_FIRMWARE_QUIRKS`]. Every one of those
 /// consts is empty today: no fingerprint has firmware-version-gated quirk
 /// data yet.
@@ -1059,7 +1059,7 @@ fn firmware_quirks(fingerprint: AppletFingerprint) -> &'static [VersionQuirks] {
 
 /// `fingerprint`'s selected [`AxisMergeMode`] — dispatches to one const per
 /// fingerprint (see each const's own doc), the same shape as
-/// [`applet_quirks`]/[`firmware_quirks`] above.
+/// `applet_quirks`/`firmware_quirks` above.
 #[must_use]
 fn axis_merge_mode(fingerprint: AppletFingerprint) -> AxisMergeMode {
     match fingerprint {
@@ -1154,7 +1154,7 @@ const YUBIKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// * [`PivExtension::GetMetadata`] — shipped in firmware 5.3 (same reference:
 ///   "Only available in YubiKey 5.3"), same shape again with the
 ///   known-supported verdict at `[5, 3]` instead.
-/// * [`PivExtension::PinManagementAuth`] — [`Verdict::KnownSupported`] from
+/// * [`PivExtension::PinManagementAuth`] — `Verdict::KnownSupported` from
 ///   applet version 3 on. This is the *indirect* scheme on YubiKey: a caller
 ///   still has to read the PIN-protected management key back and run the
 ///   standard `0x9B` round with it — see [`PivExtension::PinManagementAuth`]'s
@@ -1168,30 +1168,30 @@ const YUBIKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   "All YubiKeys with the PIV application."), and SET MANAGEMENT KEY as
 ///   core key management have all been supported by every YubiKey PIV
 ///   implementation observed, exactly like the two SP 800-73-4-standardized
-///   algorithm pairs. So this is a single [`Verdict::KnownSupported`] at the
+///   algorithm pairs. So this is a single `Verdict::KnownSupported` at the
 ///   universal `[]` version, no known-unsupported floor to gate below it —
 ///   unlike the MOVE KEY/DELETE KEY/RSA-4096/Ed25519/X25519 row above, none
 ///   of these seven arrived in a specific later firmware. YubiKey carries no
-///   [`PivQuirk::ResetNeedsManagementAuth`] entry on [`YUBIKEY_APPLET_QUIRKS`]
+///   [`PivQuirk::ResetNeedsManagementAuth`] entry on `YUBIKEY_APPLET_QUIRKS`
 ///   either: "supported" for RESET here means the card accepts the
 ///   instruction, not that it accepts it unconditionally — the precondition
 ///   (PIN *and* PUK both already blocked) is exactly what that quirk's
 ///   absence signals, per its own doc.
 /// * [`PivExtension::ResetGlobal`]/[`PivExtension::SlotKeyAlgorithm`]`(`
-///   [`KeyAlg::EccP521`]`)` — share one row: [`Verdict::KnownUnsupportedSince`]
+///   [`KeyAlg::EccP521`]`)` — share one row: `Verdict::KnownUnsupportedSince`
 ///   at the universal `[]` version. RESET GLOBAL is the same verdict every
 ///   other non-HID-Crescendo fingerprint's table gives it — see e.g.
-///   [`GENERIC_APPLET_VERDICTS`]'s doc for why. ECC P-521 is the one
+///   `GENERIC_APPLET_VERDICTS`'s doc for why. ECC P-521 is the one
 ///   algorithm no YubiKey firmware generation has ever added — unlike the
 ///   5.7 trio above, there's no expectation a future firmware brings it, so
 ///   it gets the "stays unsupported" verdict rather than the two-tier shape.
 /// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] —
-///   [`Verdict::KnownSupported`] at applet major version `[4]`
+///   `Verdict::KnownSupported` at applet major version `[4]`
 ///   (<https://developers.yubico.com/PIV/Introduction/Yubico_extensions.html>),
 ///   no known-unsupported floor to gate below — like the RESET/SET PIN
 ///   RETRIES/SET MANAGEMENT KEY row above, these predate the 5.x lineage the
 ///   MOVE KEY/DELETE KEY/ATTEST/GET METADATA rows are anchored to. See
-///   [`YUBIKEY_APPLET_QUIRKS`] for the touch-policy `Cached` value's own
+///   `YUBIKEY_APPLET_QUIRKS` for the touch-policy `Cached` value's own
 ///   narrower gate at this same version.
 /// * No entry for [`PivExtension::GetSlotKeyStatus`] — falls through to
 ///   [`PivExtension::GetMetadata`]'s own verdict above, per [`resolve`]'s
@@ -1301,7 +1301,7 @@ const YUBIKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
 /// YubiKey's firmware-axis known-support verdicts — empty: YubiKey has no
 /// firmware-version data for any extension yet (HID Crescendo's GET PIV
 /// PROPERTIES version is an *applet* version — see
-/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc — not a firmware one). Every
+/// `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc — not a firmware one). Every
 /// other `_FIRMWARE_VERDICTS` const below is empty for the same reason,
 /// except [`TRUSSED_NITROKEY_FIRMWARE_VERDICTS`] — see its own doc for the
 /// data it carries.
@@ -1383,7 +1383,7 @@ const TOKEN2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`]/[`KeyAlg::Rsa3072`]/
 ///   [`KeyAlg::Rsa4096`]/[`KeyAlg::EccP256`]/[`KeyAlg::EccP384`]/
 ///   [`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` — share one row:
-///   [`Verdict::KnownSupported`] pinned to applet version 5.112.0, the only
+///   `Verdict::KnownSupported` pinned to applet version 5.112.0, the only
 ///   version keyroost has hardware evidence for — a live unit at this version
 ///   accepts `INS 0xFB`, Yubico's SET PIN RETRIES APDU, GET METADATA, Yubico's
 ///   SET MANAGEMENT KEY APDU, the `0xAA` tag on GENERATE ASYMMETRIC KEYPAIR,
@@ -1392,7 +1392,7 @@ const TOKEN2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   treats every non-HID-Crescendo fingerprint as indirect regardless), and
 ///   every [`crate::KeyAlg`] except ECC P-521 on that same GENERATE ASYMMETRIC
 ///   KEYPAIR alike. Unlike the MOVE KEY/DELETE KEY/SlotTouchPolicy row above —
-///   all three [`Verdict::KnownUnsupported`] at this same version — Token2
+///   all three `Verdict::KnownUnsupported` at this same version — Token2
 ///   mimics some Yubico extension APDUs and not others, so each extension's
 ///   verdict for this fingerprint is independent and this row's positive
 ///   result doesn't imply anything about those. No known-unsupported floor is
@@ -1409,9 +1409,9 @@ const TOKEN2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   [`PivQuirk::ResetNeedsManagementAuth`]'s own doc for why this quirk's
 ///   absence doesn't imply that convention.
 /// * [`PivExtension::ResetGlobal`]/[`PivExtension::SlotKeyAlgorithm`]`(`
-///   [`KeyAlg::EccP521`]`)` — share one row: [`Verdict::KnownUnsupportedSince`]
+///   [`KeyAlg::EccP521`]`)` — share one row: `Verdict::KnownUnsupportedSince`
 ///   at the universal `[]` version. RESET GLOBAL gets this same verdict on
-///   every fingerprint's table — see [`GENERIC_APPLET_VERDICTS`]'s doc for
+///   every fingerprint's table — see `GENERIC_APPLET_VERDICTS`'s doc for
 ///   why. ECC P-521 is the one algorithm the 5.112.0 unit above rejects on
 ///   GENERATE ASYMMETRIC KEYPAIR.
 /// * No entry for [`PivExtension::Attest`].
@@ -1516,7 +1516,7 @@ const SWISSBIT_ISHIELD2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 ///   share one row: applet version 1.4.1.0 and every earlier version have
 ///   been observed to reject all four — MOVE KEY/DELETE KEY outright,
 ///   *setting* either slot policy on GENERATE ASYMMETRIC KEYPAIR too. Same
-///   single-verdict shape as [`TOKEN2_APPLET_VERDICTS`]'s rows, just with
+///   single-verdict shape as `TOKEN2_APPLET_VERDICTS`'s rows, just with
 ///   `[1, 4, 1, 0]` as the observed/backward-extending version instead of
 ///   `[5, 112, 0]`. A version above 1.4.1.0 falls off the end of the row and
 ///   resolves [`FeatureGate::Unverified`] — the known-unsupported verdict
@@ -1526,33 +1526,33 @@ const SWISSBIT_ISHIELD2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 ///   requested — stale or synthesized, not a live reflection of on-card
 ///   state — so it's no evidence either policy extension actually works; see
 ///   [`PivQuirk::InsF7MetadataPinTouchPolicyInvalid`] (carried on
-///   [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`] below), which names exactly that and
+///   `SWISSBIT_ISHIELD2_APPLET_QUIRKS` below), which names exactly that and
 ///   is why a caller must ignore GET METADATA's tag `0x02` on this
 ///   fingerprint entirely. *Setting* either policy is treated as unsupported
 ///   regardless of what GET METADATA claims to report back.
 /// * [`PivExtension::ResetGlobal`]/[`PivExtension::SlotKeyAlgorithm`]`(`
 ///   [`KeyAlg::Rsa1024`]/[`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` — share one
-///   row: [`Verdict::KnownUnsupportedSince`] at the universal `[]` version.
+///   row: `Verdict::KnownUnsupportedSince` at the universal `[]` version.
 ///   RESET GLOBAL gets this same verdict on every fingerprint's table — see
-///   [`GENERIC_APPLET_VERDICTS`]'s doc for why. RSA-1024 and the Ed25519/
+///   `GENERIC_APPLET_VERDICTS`'s doc for why. RSA-1024 and the Ed25519/
 ///   X25519 curves are absent from both the pre- and post-1.4 algorithm lists
 ///   below — OpenFIPS201's own closed algorithm set never included them — so
 ///   they land on the same "stays unsupported" row rather than either of the
 ///   two-tier shapes those lists use, the same closed-enumeration reasoning
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s own row uses.
+///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s own row uses.
 /// * [`PivExtension::Reset`]/[`PivExtension::GetMetadata`]/
 ///   [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa2048`]/[`KeyAlg::EccP256`]/
-///   [`KeyAlg::EccP384`]`)` — share one row: [`Verdict::KnownSupported`] at
+///   [`KeyAlg::EccP384`]`)` — share one row: `Verdict::KnownSupported` at
 ///   the universal `[]` version. Both tested applet versions (1.0.0.0 and
 ///   1.4.1.0) accept RESET, answer GET METADATA, and accept RSA-2048/ECC
 ///   P-256/P-384 on GENERATE ASYMMETRIC KEYPAIR alike, so there's no
 ///   known-unsupported floor to gate below, same shape as YubiKey's own
 ///   [`PivExtension::Reset`] row. GET METADATA's half of this is orthogonal
 ///   to [`PivQuirk::InsF7MetadataAlgorithmInvalid`] (see
-///   [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`] below) — that quirk is about the
+///   `SWISSBIT_ISHIELD2_APPLET_QUIRKS` below) — that quirk is about the
 ///   *algorithm field* value being unreliable at every tested version, not
 ///   about whether GET METADATA itself is implemented.
-/// * [`PivExtension::SetManagementKey`] — [`Verdict::KnownSupported`] pinned
+/// * [`PivExtension::SetManagementKey`] — `Verdict::KnownSupported` pinned
 ///   to major version `[1]` rather than the universal `[]` sentinel the row
 ///   above uses: both tested applet versions (1.0.0.0 and 1.4.1.0) accept SET
 ///   MANAGEMENT KEY, but `[1]` orders below both under this module's
@@ -1563,13 +1563,13 @@ const SWISSBIT_ISHIELD2_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 /// * [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa3072`]/[`KeyAlg::Rsa4096`]/
 ///   [`KeyAlg::EccP521`]`)`/[`PivExtension::PinManagementAuth`]/
 ///   [`PivExtension::SetPinPukRetries`] — share one row: the same two-tier
-///   [`Verdict::KnownUnsupported`]-then-[`Verdict::KnownSupported`] shape as
+///   `Verdict::KnownUnsupported`-then-`Verdict::KnownSupported` shape as
 ///   YubiKey's MOVE KEY/DELETE KEY row in [`YUBIKEY_APPLET_VERDICTS`], just
 ///   anchored to this fingerprint's actual tested floor (`[1, 0, 0, 0]`)
 ///   instead of the universal `[]` sentinel YubiKey uses there, and rising
 ///   to `[1, 4]` (which, under this module's prefix ordering, already covers
 ///   the confirmed `1.4.1.0` unit
-///   [`slot_key_algorithm_apdu_id_override`]'s own EccP521 byte override was
+///   `slot_key_algorithm_apdu_id_override`'s own EccP521 byte override was
 ///   observed on). SET PIN RETRIES is confirmed supported from that same
 ///   `1.4` floor — not the narrower `1.4.1.0` a standalone row once pinned
 ///   it to — hence sharing this entry rather than keeping its own. A version
@@ -1720,14 +1720,14 @@ const THETIS_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`]/
 ///   [`PivExtension::SlotPinPolicy`]/[`PivExtension::PinManagementAuth`]/
 ///   [`PivExtension::SlotKeyAlgorithm`] (every [`crate::KeyAlg`] except ECC
-///   P-521) — share one row: [`Verdict::KnownSupported`] pinned to applet
+///   P-521) — share one row: `Verdict::KnownSupported` pinned to applet
 ///   version 5.112.0, the only version keyroost has hardware evidence for —
 ///   a live unit at this version accepts `INS 0xFB`, answers GET METADATA,
 ///   and accepts Yubico's SET PIN RETRIES APDU, Yubico's SET MANAGEMENT KEY
 ///   APDU, the `0xAA` tag on GENERATE ASYMMETRIC KEYPAIR, PIN VERIFY
 ///   unlocking management, and every algorithm but ECC P-521 on that same
 ///   GENERATE ASYMMETRIC KEYPAIR alike. Unlike the MOVE KEY/DELETE KEY/
-///   SlotTouchPolicy row above — all three [`Verdict::KnownUnsupported`] at
+///   SlotTouchPolicy row above — all three `Verdict::KnownUnsupported` at
 ///   this same version — this fingerprint mimics some Yubico extension APDUs
 ///   and not others, so each extension's verdict for this fingerprint is
 ///   independent and this row's positive result doesn't imply anything about
@@ -1738,9 +1738,9 @@ const THETIS_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///   [`THETIS_APPLET_QUIRKS`] either, so RESET doesn't need an authenticated
 ///   management-key session on this fingerprint.
 /// * [`PivExtension::ResetGlobal`]/[`PivExtension::SlotKeyAlgorithm`]`(`
-///   [`KeyAlg::EccP521`]`)` — share one row: [`Verdict::KnownUnsupportedSince`]
+///   [`KeyAlg::EccP521`]`)` — share one row: `Verdict::KnownUnsupportedSince`
 ///   at the universal `[]` version. RESET GLOBAL gets this same verdict on
-///   every fingerprint's table — see [`GENERIC_APPLET_VERDICTS`]'s doc for
+///   every fingerprint's table — see `GENERIC_APPLET_VERDICTS`'s doc for
 ///   why. ECC P-521 is the one algorithm the 5.112.0 unit above rejects on
 ///   GENERATE ASYMMETRIC KEYPAIR.
 const THETIS_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
@@ -1848,22 +1848,22 @@ const AREKINATH_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 ///   [`PivExtension::SlotTouchPolicy`] — share one row: this applet's own
 ///   source implements none of the three in applet version 5.4.0 or any
 ///   release before it — MOVE KEY/DELETE KEY, and no touch-policy equivalent
-///   either — a [`Verdict::KnownUnsupported`] verdict pinned to `[5, 4, 0]`,
+///   either — a `Verdict::KnownUnsupported` verdict pinned to `[5, 4, 0]`,
 ///   extended backward by [`resolve_in`]'s rule to cover every earlier
 ///   version too. A version above 5.4.0 falls off the end of the row and
 ///   resolves [`FeatureGate::Unverified`] — the known-unsupported verdict
 ///   doesn't extend forward to an untested future release.
 /// * [`PivExtension::GetMetadata`] — lands in this applet's own source at
-///   version 5.3.0: a [`Verdict::KnownUnsupported`] verdict at the
+///   version 5.3.0: a `Verdict::KnownUnsupported` verdict at the
 ///   empty-slice `[]` sentinel (every version before 5.3.0) and a
-///   [`Verdict::KnownSupported`] verdict at `[5, 3, 0]` covering that
+///   `Verdict::KnownSupported` verdict at `[5, 3, 0]` covering that
 ///   version and every later one, assumed not to have regressed. As on
 ///   YubiKey's row, the `[]` sentinel is load-bearing — the verdict above it
 ///   is known-supported, which says nothing about the versions before it.
 /// * [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`]/
 ///   [`PivExtension::PinManagementAuth`] — share one row: same shape as
-///   [`PivExtension::GetMetadata`] above, a [`Verdict::KnownUnsupported`]
-///   verdict at `[]` and a [`Verdict::KnownSupported`] verdict at `[5]` — the
+///   [`PivExtension::GetMetadata`] above, a `Verdict::KnownUnsupported`
+///   verdict at `[]` and a `Verdict::KnownSupported` verdict at `[5]` — the
 ///   major version, not a specific `5.0.0` patch release, since PIN
 ///   VERIFY-based management unlock is confirmed at major version 5 without
 ///   pinning it to the same `5.0.0` floor RESET/SET PIN RETRIES themselves
@@ -1877,14 +1877,14 @@ const AREKINATH_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 /// * [`PivExtension::ResetGlobal`]/[`PivExtension::SlotKeyAlgorithm`]`(`
 ///   [`KeyAlg::Rsa3072`]/[`KeyAlg::Rsa4096`]/[`KeyAlg::EccP521`]/
 ///   [`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` — share one row:
-///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version. RESET
+///   `Verdict::KnownUnsupportedSince` at the universal `[]` version. RESET
 ///   GLOBAL gets this same verdict on every fingerprint's table — see
-///   [`GENERIC_APPLET_VERDICTS`]'s doc for why. The five algorithms are ones
+///   `GENERIC_APPLET_VERDICTS`'s doc for why. The five algorithms are ones
 ///   this applet's own source has never implemented, at any release, so
 ///   there's nothing to gate by version on either side — unlike the two-tier
 ///   rows above, this is a flat "always unsupported" verdict.
 /// * [`PivExtension::SetManagementKey`]/[`PivExtension::SlotPinPolicy`] —
-///   share one row: [`Verdict::KnownSupported`] pinned to major version
+///   share one row: `Verdict::KnownSupported` pinned to major version
 ///   `[4]`, predating the 5.x lineage every other row above is anchored to.
 ///   SET MANAGEMENT KEY is core key management this applet's own source has
 ///   supported since its major version 4 releases; PIN policy on GENERATE
@@ -1895,7 +1895,7 @@ const AREKINATH_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 ///   [`KeyAlg::EccP256`]/[`KeyAlg::EccP384`]`)` — RSA-1024/2048 and ECC
 ///   P-256/P-384 (the same four YubiKey supports below its own 5.7 cutover —
 ///   see [`YUBIKEY_APPLET_VERDICTS`]'s row) have never varied by version
-///   either: [`Verdict::KnownSupported`] at the universal `[]` version,
+///   either: `Verdict::KnownSupported` at the universal `[]` version,
 ///   distinct from the row above's `[4]` pin — this applet's algorithm
 ///   support predates even its earliest major-version-4 release, so there's
 ///   nothing to gate by version at all.
@@ -2157,15 +2157,15 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 
 /// HID Crescendo C2300's applet-axis known-support table. Each bullet below
 /// still walks its extension's own reasoning individually, even though every
-/// extension that lands on [`Verdict::KnownUnsupportedSince`] shares one row
+/// extension that lands on `Verdict::KnownUnsupportedSince` shares one row
 /// in the table below, and separately every extension that lands on
-/// [`Verdict::KnownSupported`] shares the other — the two verdicts happen to
+/// `Verdict::KnownSupported` shares the other — the two verdicts happen to
 /// coincide across several otherwise-independent claims, not because they're
 /// the same claim. [`PivExtension::SlotKeyAlgorithm`]'s own per-algorithm
 /// verdicts (see its bullet below) happen to coincide with these same two
 /// rows too, and are folded into them for exactly the same reason:
 ///
-/// * [`PivExtension::DeleteKey`] — [`Verdict::KnownSupported`] at the
+/// * [`PivExtension::DeleteKey`] — `Verdict::KnownSupported` at the
 ///   universal `[]` version: `keyroost_transport::PivSession::delete_key`
 ///   implements HID's own INJECT PKI KEY (`INS 0xD8`) removal form for this
 ///   family (`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`),
@@ -2185,7 +2185,7 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   attempts something sensible for it (see that method's doc); this table
 ///   only decides what the *UI* shows ahead of time, not what the transport
 ///   layer is willing to try.
-/// * [`PivExtension::MoveKey`] — [`Verdict::KnownUnsupportedSince`] at the
+/// * [`PivExtension::MoveKey`] — `Verdict::KnownUnsupportedSince` at the
 ///   universal `[]` version, on a standing-pattern reasoning shared with
 ///   [`PivExtension::Attest`]/[`PivExtension::GetMetadata`]/
 ///   [`PivExtension::Reset`]/[`PivExtension::SetPinPukRetries`] below: this
@@ -2204,7 +2204,7 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   onto [`PivExtension::DeleteKey`] above — DELETE KEY turned out to have
 ///   the opposite answer on this family: HID's own INJECT PKI KEY
 ///   (`INS 0xD8`), sent with a zero-length key-data field, is a genuine,
-///   documented alternative, so that row carries [`Verdict::KnownSupported`]
+///   documented alternative, so that row carries `Verdict::KnownSupported`
 ///   instead of leaving the family unlisted. The absence-vs-presence split
 ///   between the two rows is deliberate, not an oversight: MOVE (relocate a
 ///   key between slots) and DELETE (remove one in place) aren't the same
@@ -2212,7 +2212,7 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   under one opcode — HID's proprietary API has no obligation to bundle
 ///   them the same way, and evidently doesn't.
 /// * [`PivExtension::Attest`]/[`PivExtension::GetMetadata`] —
-///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version for
+///   `Verdict::KnownUnsupportedSince` at the universal `[]` version for
 ///   both, same standing-pattern reasoning as [`PivExtension::MoveKey`]
 ///   above (this GET PIV PROPERTIES read is itself the proprietary
 ///   alternative standing in for GET METADATA): a live unit reporting
@@ -2224,16 +2224,16 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   (`SW = 6D 00`, "instruction not supported"), but the standing pattern
 ///   is what justifies the universal `[]` version rather than pinning just
 ///   `3.0.3.6` (or, generalized, `3.0.3.<any>`) the way an ordinary
-///   [`Verdict::KnownUnsupported`] would. See
-///   [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc for C4000's own version
+///   `Verdict::KnownUnsupported` would. See
+///   `HID_CRESCENDO_C4000_APPLET_VERDICTS`'s doc for C4000's own version
 ///   of this same pair of rows.
-/// * [`PivExtension::GetSlotKeyStatus`] — [`Verdict::KnownSupported`] at the
+/// * [`PivExtension::GetSlotKeyStatus`] — `Verdict::KnownSupported` at the
 ///   universal `[]` version: GET PIV PROPERTIES
 ///   (`keyroost_transport::PivSession::hid_crescendo_slot_algorithm`, via
 ///   [`crate::fingerprint::parse_hid_crescendo_slot_key_algorithms`]) names
 ///   every slot that actually has a key loaded — independent of this same
 ///   fingerprint's [`PivExtension::GetMetadata`] row above
-///   ([`Verdict::KnownUnsupportedSince`]): the two questions (does GET
+///   (`Verdict::KnownUnsupportedSince`): the two questions (does GET
 ///   METADATA work; can this fingerprint report slot key status at all)
 ///   have separate, independently confirmed answers here, unlike every
 ///   fingerprint with no entry for this extension, where they're the same
@@ -2243,11 +2243,11 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   it reports slot key status through some *other* channel, independently
 ///   confirmed and gated on its own terms — entirely unrelated to whatever
 ///   [`PivExtension::GetMetadata`] says for that same fingerprint.
-/// * [`PivExtension::PinManagementAuth`] — [`Verdict::KnownSupported`] at
+/// * [`PivExtension::PinManagementAuth`] — `Verdict::KnownSupported` at
 ///   the universal `[]` version: every unit in this family unlocks
 ///   management functionality directly via PIN VERIFY, with no [`PivQuirk`]
 ///   needed (unlike YubiKey) — PIN VERIFY *is* the unlock, full stop.
-/// * [`PivExtension::Reset`] — [`Verdict::KnownUnsupportedSince`] at the
+/// * [`PivExtension::Reset`] — `Verdict::KnownUnsupportedSince` at the
 ///   universal `[]` version, on the same standing-pattern reasoning as
 ///   [`PivExtension::GetMetadata`] above, and a card-wide reset alternative
 ///   already exists for it
@@ -2256,12 +2256,12 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   [`PivQuirk::ResetNeedsManagementAuth`], set on
 ///   [`HID_CRESCENDO_C2300_APPLET_QUIRKS`], and [`PivExtension::ResetGlobal`] below for
 ///   that same mechanism's own known-support data).
-/// * [`PivExtension::SetPinPukRetries`] — [`Verdict::KnownUnsupportedSince`]
+/// * [`PivExtension::SetPinPukRetries`] — `Verdict::KnownUnsupportedSince`
 ///   at the universal `[]` version, on the same standing-pattern reasoning
 ///   as [`PivExtension::Reset`] above. See
-///   [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc for a caveat specific to
+///   `HID_CRESCENDO_C4000_APPLET_VERDICTS`'s doc for a caveat specific to
 ///   that family's row.
-/// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownSupported`] at the
+/// * [`PivExtension::ResetGlobal`] — `Verdict::KnownSupported` at the
 ///   universal `[]` version: RESET CARD against the ACA instance
 ///   (`INS 0x38`,
 ///   <https://docs.hidglobal.com/crescendo/api/low-level/reset-card.htm>) is
@@ -2275,7 +2275,7 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   one "never mimics a Yubico extension APDU" absence to reason from)
 ///   there is no equivalently general basis here to extend a *presence*
 ///   claim to a model this data doesn't name.
-/// * [`PivExtension::SetManagementKey`] — [`Verdict::KnownSupported`] at the
+/// * [`PivExtension::SetManagementKey`] — `Verdict::KnownSupported` at the
 ///   universal `[]` version, same "positive claim needs no minimum applet
 ///   version" shape as [`PivExtension::DeleteKey`] above: a unit whose GET
 ///   PIV PROPERTIES read doesn't name `0x9B` as a real slot object has no
@@ -2291,7 +2291,7 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   belongs to the GET PIV PROPERTIES / XAUTH mechanism itself, present
 ///   across the whole product line, not to two specifically named models.
 /// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] —
-///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version, on the
+///   `Verdict::KnownUnsupportedSince` at the universal `[]` version, on the
 ///   same standing-pattern reasoning as [`PivExtension::MoveKey`] above: this
 ///   family has never attempted to mimic a Yubico extension APDU, and GET PIV
 ///   PROPERTIES / INJECT PKI KEY carry no PIN/touch-policy fields of their
@@ -2303,17 +2303,17 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   2048-bit RSA keys, 256-bit EC or 384-bit EC keys" and lists exactly
 ///   those three in its cryptographic-mechanism-identifier table — a closed
 ///   enumeration, not a handful of examples — so RSA-2048/ECC P-256/ECC
-///   P-384 are [`Verdict::KnownSupported`] — joining the
+///   P-384 are `Verdict::KnownSupported` — joining the
 ///   [`PivExtension::DeleteKey`]/[`PivExtension::GetSlotKeyStatus`]/
 ///   [`PivExtension::PinManagementAuth`]/[`PivExtension::ResetGlobal`]/
 ///   [`PivExtension::SetManagementKey`] row above, same verdict — and every
 ///   other [`crate::KeyAlg`] (RSA-1024/3072/4096, ECC P-521, Ed25519, X25519)
-///   is [`Verdict::KnownUnsupportedSince`] — joining the
+///   is `Verdict::KnownUnsupportedSince` — joining the
 ///   [`PivExtension::MoveKey`]/[`PivExtension::Attest`]/
 ///   [`PivExtension::GetMetadata`]/[`PivExtension::Reset`]/
 ///   [`PivExtension::SetPinPukRetries`]/[`PivExtension::SlotPinPolicy`]/
 ///   [`PivExtension::SlotTouchPolicy`] row — both at the universal `[]`
-///   version. See [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc for C4000's
+///   version. See `HID_CRESCENDO_C4000_APPLET_VERDICTS`'s doc for C4000's
 ///   own, wider closed list from its own reference. Not shared with
 ///   [`HID_CRESCENDO_GENERIC_APPLET_VERDICTS`]: the two named families'
 ///   closed lists differ from each other (C4000's includes RSA-3072/4096,
@@ -2380,7 +2380,7 @@ const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
 const HID_CRESCENDO_C2300_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
 /// HID Crescendo C2300's applet-axis quirks. This fingerprint doesn't
-/// support [`PivExtension::Reset`] at all (see [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s
+/// support [`PivExtension::Reset`] at all (see `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
 /// Reset row) — [`PivQuirk::ResetNeedsManagementAuth`] here describes its
 /// *replacement* mechanism instead (RESET CARD against the ACA instance,
 /// [`PivExtension::ResetGlobal`] — see that same const's ResetGlobal row),
@@ -2392,7 +2392,7 @@ const HID_CRESCENDO_C2300_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 /// step reads it back from this table rather than a separately hard-coded
 /// constant. Shared verbatim with [`HID_CRESCENDO_C4000_APPLET_QUIRKS`]/
 /// [`HID_CRESCENDO_GENERIC_APPLET_QUIRKS`] below — all three sub-fingerprints
-/// get this row, same as [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s Reset row
+/// get this row, same as `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s Reset row
 /// — see its doc for why `Generic` is included alongside the two named
 /// models. (Unlike this quirk, that same const's ResetGlobal row
 /// deliberately does NOT extend to `Generic` — see that doc for why the two
@@ -2412,7 +2412,7 @@ const HID_CRESCENDO_C2300_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// HID Crescendo C4000's applet-axis known-support table — same shape and
-/// reasoning throughout as [`HID_CRESCENDO_C2300_APPLET_VERDICTS`] (see its
+/// reasoning throughout as `HID_CRESCENDO_C2300_APPLET_VERDICTS` (see its
 /// doc for the per-extension detail), with two differences:
 ///
 /// * [`PivExtension::Attest`]/[`PivExtension::GetMetadata`] here are
@@ -2439,8 +2439,8 @@ const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   (<https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm>) is
 ///   C4000's own page, distinct from (but equivalent to) C2300's.
 /// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] — same
-///   [`Verdict::KnownUnsupportedSince`] row as
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s — see its doc.
+///   `Verdict::KnownUnsupportedSince` row as
+///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s — see its doc.
 /// * [`PivExtension::SlotKeyAlgorithm`] — unlike every row above, this one
 ///   *is* confirmed from C4000's own dedicated reference rather than assumed
 ///   from C2300's:
@@ -2449,22 +2449,22 @@ const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   (2048, 3072, or 4096 bits) or elliptic curve (EC) keys (256 or 384
 ///   bits)" and lists exactly those five in its
 ///   cryptographic-mechanism-identifier table — a closed enumeration, so
-///   RSA-2048/3072/4096 and ECC P-256/P-384 are [`Verdict::KnownSupported`] —
+///   RSA-2048/3072/4096 and ECC P-256/P-384 are `Verdict::KnownSupported` —
 ///   joining the [`PivExtension::DeleteKey`]/[`PivExtension::GetSlotKeyStatus`]/
 ///   [`PivExtension::PinManagementAuth`]/[`PivExtension::ResetGlobal`]/
 ///   [`PivExtension::SetManagementKey`] row below, same verdict — and
-///   RSA-1024/ECC P-521/Ed25519/X25519 are [`Verdict::KnownUnsupportedSince`]
+///   RSA-1024/ECC P-521/Ed25519/X25519 are `Verdict::KnownUnsupportedSince`
 ///   — joining the [`PivExtension::MoveKey`]/[`PivExtension::Attest`]/
 ///   [`PivExtension::GetMetadata`]/[`PivExtension::Reset`]/
 ///   [`PivExtension::SetPinPukRetries`]/[`PivExtension::SlotPinPolicy`]/
 ///   [`PivExtension::SlotTouchPolicy`] row — both at the universal `[]`
 ///   version. The reference's own EC bit-length list caps out at 384, so
 ///   P-521 is as absent from it as Ed25519/X25519 are. Wider than
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s own row (which excludes
+///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s own row (which excludes
 ///   RSA-3072/4096 too) — the two families' closed lists genuinely differ,
 ///   which is also why this fingerprint isn't shared with
 ///   [`HID_CRESCENDO_GENERIC_APPLET_VERDICTS`]. See
-///   [`slot_key_algorithm_apdu_id_override`]'s doc for the *wire-byte*
+///   `slot_key_algorithm_apdu_id_override`'s doc for the *wire-byte*
 ///   question this same reference also answers — RSA-4096 is `0x04` here,
 ///   not [`crate::KeyAlg::id`]'s `0x16` — a separate axis from this
 ///   known-support gate.
@@ -2551,40 +2551,40 @@ const HID_CRESCENDO_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::Merg
 /// * [`PivExtension::MoveKey`], [`PivExtension::Reset`],
 ///   [`PivExtension::SetPinPukRetries`], [`PivExtension::SlotPinPolicy`],
 ///   [`PivExtension::SlotTouchPolicy`] — share one row:
-///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version, shared
-///   with [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]/[`HID_CRESCENDO_C4000_APPLET_VERDICTS`]:
+///   `Verdict::KnownUnsupportedSince` at the universal `[]` version, shared
+///   with `HID_CRESCENDO_C2300_APPLET_VERDICTS`/`HID_CRESCENDO_C4000_APPLET_VERDICTS`:
 ///   the reasoning ("never implements a Yubico extension APDU, always ships
 ///   its own") is about the vendor's pattern across the whole product line,
 ///   not about a specific tested model, the same broadening
 ///   `keyroost_piv::fingerprint`'s ACA AID doc applies to the
 ///   transport-level XAUTH fallback.
 /// * [`PivExtension::GetSlotKeyStatus`]/[`PivExtension::SetManagementKey`] —
-///   share one row: both [`Verdict::KnownSupported`] at the universal `[]`
+///   share one row: both `Verdict::KnownSupported` at the universal `[]`
 ///   version, shared with the two named models for the same
 ///   vendor-wide-pattern reasoning: each is a property of a mechanism
 ///   present, in some form, across the whole product line (GET PIV
 ///   PROPERTIES for the former, GET PIV PROPERTIES plus PUT XAUTH KEY for the
-///   latter — see [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc), not a claim
+///   latter — see `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc), not a claim
 ///   tied to two specifically named, individually tested models the way
 ///   [`PivExtension::DeleteKey`] below is.
 /// * No entries for [`PivExtension::DeleteKey`] (the C2300/C4000 presence
 ///   claim isn't general enough to extend here — see
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc), [`PivExtension::Attest`],
+///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc), [`PivExtension::Attest`],
 ///   [`PivExtension::GetMetadata`], [`PivExtension::PinManagementAuth`], or
 ///   [`PivExtension::ResetGlobal`] (see that extension's bullet on
-///   [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc for why a presence claim
+///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc for why a presence claim
 ///   doesn't reach `Generic`), or [`PivExtension::SlotKeyAlgorithm`] (C2300's
 ///   and C4000's own GENERATE KEY PAIR references document two genuinely
 ///   different closed algorithm lists — see
-///   [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s doc — so there's no single
-///   list to extend to an unclassified unit; [`slot_key_algorithm_apdu_id_override`]'s
+///   `HID_CRESCENDO_C4000_APPLET_VERDICTS`'s doc — so there's no single
+///   list to extend to an unclassified unit; `slot_key_algorithm_apdu_id_override`'s
 ///   *wire-byte* answer still applies to `Generic`, though — see its doc for
 ///   why that's a different axis this reasoning doesn't touch).
 const HID_CRESCENDO_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     // `PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::{Aes192,Aes256})`
     // joins this row: HID Crescendo's ACA XAUTH key rejects both outright —
     // they're outside XAUTH's closed algorithm set, the same
-    // closed-enumeration reasoning [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s
+    // closed-enumeration reasoning `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
     // own `PivExtension::SlotKeyAlgorithm` rows use — same universal `[]`
     // `Verdict::KnownUnsupportedSince`.
     ExtensionVerdicts {
@@ -2647,7 +2647,7 @@ const GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// [`AppletFingerprint::Generic`]'s applet-axis known-support table — a
 /// single entry pairing [`PivExtension::ResetGlobal`] with
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm),
-/// both [`Verdict::KnownUnsupportedSince`] at the universal `[]` version.
+/// both `Verdict::KnownUnsupportedSince` at the universal `[]` version.
 /// Every non-HID-Crescendo fingerprint's table carries this same
 /// [`PivExtension::ResetGlobal`] entry — deliberately explicit rather than
 /// left absent (which would resolve [`FeatureGate::Unverified`], same as any
@@ -2658,14 +2658,14 @@ const GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// convention) attempt HID's ACA RESET CARD mechanism first instead, fail
 /// (there's no such applet on that card), and never fall through to the
 /// mechanism that would have worked. An explicit
-/// [`Verdict::KnownUnsupportedSince`] here closes that: every fingerprint
+/// `Verdict::KnownUnsupportedSince` here closes that: every fingerprint
 /// that isn't HID Crescendo is a flat "no" on this axis, not "no data yet".
-/// This is why [`YUBIKEY_APPLET_VERDICTS`], [`TOKEN2_APPLET_VERDICTS`],
+/// This is why [`YUBIKEY_APPLET_VERDICTS`], `TOKEN2_APPLET_VERDICTS`,
 /// [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`], [`THETIS_APPLET_VERDICTS`], and
 /// both `ArekinathPivApplet` tables above each also carry their own explicit
 /// [`PivExtension::ResetGlobal`] entry instead of being left absent, and why
 /// [`AUTHENTREND_ATKEY_APPLET_VERDICTS`], [`IDPRIME_APPLET_VERDICTS`],
-/// [`TRUSSED_NITROKEY_APPLET_VERDICTS`], [`UTRUST_GENERIC_APPLET_VERDICTS`],
+/// `TRUSSED_NITROKEY_APPLET_VERDICTS`, [`UTRUST_GENERIC_APPLET_VERDICTS`],
 /// and [`UTRUST_GOV_APPLET_VERDICTS`] below are each a single-entry table
 /// with exactly this same row. [`FEITIAN_APPLET_VERDICTS`] and
 /// [`OPENFIPS201_GENERIC_APPLET_VERDICTS`] each carry this same row too,
@@ -2710,7 +2710,7 @@ const GENERIC_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const AUTHENTREND_ATKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Authentrend's ATkey's applet-axis known-support table — see
-/// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
+/// `GENERIC_APPLET_VERDICTS`'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry, and why
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins that same entry instead of getting one of its own.
@@ -2729,25 +2729,25 @@ const AUTHENTREND_ATKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRel
 /// [`MgmtAlgChoice::Aes192`]/[`MgmtAlgChoice::Aes256`] join the same row too:
 /// all four are accepted as the management key's algorithm on the same unit
 /// — distinct from [`MgmtAlgChoice::Delete`] right above, which stays its
-/// own separate [`Verdict::KnownUnsupportedSince`] row regardless (the
+/// own separate `Verdict::KnownUnsupportedSince` row regardless (the
 /// management key is mandatory on this fingerprint, never removable, same
 /// as every other non-HID-Crescendo one). Every extension and algorithm on
-/// this row gets a [`Verdict::KnownSupported`] verdict keyed to `[6]`, not
+/// this row gets a `Verdict::KnownSupported` verdict keyed to `[6]`, not
 /// the exact tested version `[6, 0, 1]`: only one v6.0.1 unit was actually
 /// probed, but the whole v6 lineup is assumed to share this support, so the
 /// verdict is deliberately floored at the major version rather than the
 /// precise build — a deviation, spelled out here rather than left implicit,
 /// from this module's usual "key the verdict to exactly what was tested"
-/// discipline. Per [`Verdict::KnownSupported`]'s own no-regression-forward
+/// discipline. Per `Verdict::KnownSupported`'s own no-regression-forward
 /// assumption, no claim is made about any version before `[6]`.
 /// [`crate::KeyAlg::Rsa3072`]/[`crate::KeyAlg::Rsa4096`]/
 /// [`crate::KeyAlg::EccP521`]/[`crate::KeyAlg::Ed25519`]/
 /// [`crate::KeyAlg::X25519`] were rejected on the same unit, so they instead
-/// get a [`Verdict::KnownUnsupported`] row at the exact tested version,
+/// get a `Verdict::KnownUnsupported` row at the exact tested version,
 /// `[6, 0, 1]` — kept there rather than widened to `[6]` the same way,
 /// since nothing here assumes the rest of the v6 lineup shares an
 /// *absence*: the ordinary "observed absence" verdict, not
-/// [`Verdict::KnownUnsupportedSince`], so a later applet version is left
+/// `Verdict::KnownUnsupportedSince`, so a later applet version is left
 /// free to soften back to [`FeatureGate::Unverified`] rather than being
 /// asserted unsupported forever.
 const AUTHENTREND_ATKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
@@ -2819,7 +2819,7 @@ const AUTHENTREND_ATKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Feitian's applet-axis known-support table — see
-/// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
+/// `GENERIC_APPLET_VERDICTS`'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry. [`PivExtension::ResetGlobal`]
 /// itself: Feitian's own SK Manager tool
 /// (<https://fido.ftsafe.com/feitian-sk-manager-tool-user-manual/>, the same
@@ -2831,7 +2831,7 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// The [`PivExtension::SetManagementKey`]/[`PivExtension::SetPinPukRetries`]/
 /// [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`]/
 /// [`PivExtension::GetMetadata`] rows below are hardware-observed
-/// [`Verdict::KnownUnsupported`] at applet version `[0]` on a live unit —
+/// `Verdict::KnownUnsupported` at applet version `[0]` on a live unit —
 /// none of Yubico's vendor-extension APDUs these five represent are accepted.
 /// [`PivExtension::SetManagementKey`] specifically shares
 /// [`PivExtension::ResetGlobal`]'s reasoning above: the same SK Manager tool
@@ -2841,7 +2841,7 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// today independent of the device's own capability.
 ///
 /// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] join the
-/// same hardware-observed [`Verdict::KnownUnsupported`] group at applet
+/// same hardware-observed `Verdict::KnownUnsupported` group at applet
 /// version `[0]`: the live unit's GENERATE ASYMMETRIC KEYPAIR rejects both
 /// the `0xAA` and `0xAB` tags. [`PivExtension::PinManagementAuth`] joins the
 /// same row on the same live unit: PIN VERIFY doesn't unlock the standard
@@ -2849,14 +2849,14 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins the [`PivExtension::ResetGlobal`] row instead of getting an entry of
-/// its own — see [`GENERIC_APPLET_VERDICTS`]'s doc for why.
+/// its own — see `GENERIC_APPLET_VERDICTS`'s doc for why.
 ///
 /// [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa3072`]/[`KeyAlg::Rsa4096`]/
 /// [`KeyAlg::EccP521`]/[`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` join the same
-/// [`Verdict::KnownUnsupported`] `[0]` row above — same live unit's GENERATE
+/// `Verdict::KnownUnsupported` `[0]` row above — same live unit's GENERATE
 /// ASYMMETRIC KEYPAIR rejects all five. The separate row below,
 /// [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`]/[`KeyAlg::EccP256`]/
-/// [`KeyAlg::EccP384`], is [`Verdict::KnownSupported`] instead — the same unit
+/// [`KeyAlg::EccP384`], is `Verdict::KnownSupported` instead — the same unit
 /// accepts all four — so it can't join that row; both stay pinned to the
 /// exact tested version `[0]` rather than widened to a major version the way
 /// [`AUTHENTREND_ATKEY_APPLET_VERDICTS`] does — only a v0 unit has been
@@ -2926,14 +2926,14 @@ const FEITIAN_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// Gemalto/Thales IDPrime's applet-axis known-support table — see
-/// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
+/// `GENERIC_APPLET_VERDICTS`'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry, and why
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins that same entry instead of getting one of its own.
 ///
 /// [`PivExtension::SetManagementKey`]/[`PivExtension::SetPinPukRetries`]/
 /// [`PivExtension::MoveKey`]/[`PivExtension::DeleteKey`] join the same row,
-/// same universal `[]` [`Verdict::KnownUnsupportedSince`]: IDPrime doesn't
+/// same universal `[]` `Verdict::KnownUnsupportedSince`: IDPrime doesn't
 /// mimic any of Yubico's vendor-extension APDUs these four represent — it's
 /// built on its own applet with its own proprietary commands for
 /// key/PIN/PUK/management-key administration instead — so keyroost has no
@@ -2949,19 +2949,19 @@ const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// their own row rather than joining the one above: unlike MOVE KEY/DELETE
 /// KEY/RESET/SET MANAGEMENT KEY/SET PIN PUK RETRIES (Yubico's own vendor
 /// extension APDUs, which this vendor has no track record of mimicking and
-/// so get the stronger [`Verdict::KnownUnsupportedSince`]), pin/touch policy
+/// so get the stronger `Verdict::KnownUnsupportedSince`), pin/touch policy
 /// are standard SP 800-73-4 tags (`0xAA`/`0xAB` on GENERATE ASYMMETRIC
 /// KEYPAIR) — a future IDPrime firmware plausibly could add them, so this is
-/// plain [`Verdict::KnownUnsupported`] instead, softening to
+/// plain `Verdict::KnownUnsupported` instead, softening to
 /// [`FeatureGate::Unverified`] rather than staying blocked forever.
 /// [`PivExtension::PinManagementAuth`] joins the same row on the same
 /// reasoning: PIN VERIFY on this fingerprint doesn't unlock the standard
 /// [`crate::OBJECT_PIN_PROTECTED_DATA`] object the indirect mechanism reads
 /// (see that extension's own doc), but the object itself is standard SP
 /// 800-73-4, not a Yubico vendor extension, so a future IDPrime firmware
-/// plausibly could populate it — plain [`Verdict::KnownUnsupported`], not
+/// plausibly could populate it — plain `Verdict::KnownUnsupported`, not
 /// the stronger `Since`. Seeded at
-/// the universal `[]` floor with no bracketing [`Verdict::KnownSupported`]
+/// the universal `[]` floor with no bracketing `Verdict::KnownSupported`
 /// entry above it (unlike e.g. [`YUBIKEY_APPLET_VERDICTS`]'s `Attest` row) —
 /// per [`resolve_in`]'s bracketing rule, that means only a query that
 /// reports version `[]` itself resolves [`FeatureGate::Unsupported`]; any
@@ -2972,7 +2972,7 @@ const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 ///
 /// [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa2048`]`)` gets a row of
 /// its own rather than joining either row above: hardware-observed
-/// [`Verdict::KnownSupported`] at the same universal `[]` floor — the live
+/// `Verdict::KnownSupported` at the same universal `[]` floor — the live
 /// unit's GENERATE ASYMMETRIC KEYPAIR accepts RSA-2048 — which is neither of
 /// the two verdicts already seeded here. No other algorithm has been probed
 /// on this fingerprint yet, so nothing else is claimed either way.
@@ -3027,7 +3027,7 @@ const IDPRIME_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 ///   mutual-auth step 2 answers with the encrypted host challenge under tag
 ///   `0x80` instead of `0x82`; see that variant's own doc.
 /// * [`PivQuirk::Default9bManagementKey`] — the unit's factory-default `0x9B`
-///   key is the same 16-byte AES-128 pattern [`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]
+///   key is the same 16-byte AES-128 pattern `IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`
 ///   already names for uTrust Gov; see [`PivQuirk::Default9bManagementKey`]'s
 ///   doc for why that constant is reused here rather than duplicated.
 const IDPRIME_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
@@ -3046,10 +3046,10 @@ const IDPRIME_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const TRUSSED_NITROKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// The Trussed-based Nitrokey's (`Trussed::NitroKey`) applet-axis
-/// known-support table — see [`GENERIC_APPLET_VERDICTS`]'s doc for why this
+/// known-support table — see `GENERIC_APPLET_VERDICTS`'s doc for why this
 /// fingerprint gets an explicit [`PivExtension::ResetGlobal`] entry, same
 /// single-row shape as every other non-HID-Crescendo fingerprint's
-/// applet-axis table: a lone [`Verdict::KnownUnsupportedSince`] verdict at
+/// applet-axis table: a lone `Verdict::KnownUnsupportedSince` verdict at
 /// the universal `[]` version. This row is deliberately repeated on
 /// [`TRUSSED_NITROKEY_FIRMWARE_VERDICTS`] too — see that const's own doc for
 /// why carrying the same flat "no" on both axes is intentional, not
@@ -3080,7 +3080,7 @@ const TRUSSED_NITROKEY_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRela
 ///
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins the [`PivExtension::ResetGlobal`] row below instead of getting an
-/// entry of its own — see [`GENERIC_APPLET_VERDICTS`]'s doc for why. The four
+/// entry of its own — see `GENERIC_APPLET_VERDICTS`'s doc for why. The four
 /// real algorithms are instead gated on the firmware axis, in
 /// [`TRUSSED_NITROKEY_FIRMWARE_VERDICTS`] — see its own doc.
 const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
@@ -3101,12 +3101,12 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 /// applet-version keyed: the applet version this fingerprint reports is a
 /// hard-coded dummy ("6.6.6", identical on every unit) rather than a real
 /// one, so the firmware version is the only axis actually capable of
-/// resolving a verdict here — see [`TRUSSED_NITROKEY_APPLET_VERDICTS`]'s doc
+/// resolving a verdict here — see `TRUSSED_NITROKEY_APPLET_VERDICTS`'s doc
 /// for where that dummy value comes from.
 ///
-/// * [`PivExtension::ResetGlobal`] — [`Verdict::KnownUnsupportedSince`] at
+/// * [`PivExtension::ResetGlobal`] — `Verdict::KnownUnsupportedSince` at
 ///   the universal `[]` version, deliberately repeated from
-///   [`TRUSSED_NITROKEY_APPLET_VERDICTS`]'s own row rather than left off this
+///   `TRUSSED_NITROKEY_APPLET_VERDICTS`'s own row rather than left off this
 ///   table: both axes carry the same flat "no" independently, so a caller
 ///   that only has a firmware version to report (say, the applet version
 ///   never answered) still sees the known-unsupported verdict rather than
@@ -3116,7 +3116,7 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   coverage rather than relying on the applet axis alone.
 /// * [`PivExtension::SetManagementKey`], [`PivExtension::Reset`],
 ///   [`PivExtension::GetMetadata`], [`PivExtension::PinManagementAuth`] —
-///   [`Verdict::KnownSupported`] at firmware `[1, 8]`: the Trussed
+///   `Verdict::KnownSupported` at firmware `[1, 8]`: the Trussed
 ///   `piv-authenticator` source confirms the first three
 ///   (<https://github.com/trussed-dev/piv-authenticator>), corroborated by a
 ///   live unit at firmware 1.8.3 accepting all four, PIN VERIFY unlocking
@@ -3124,32 +3124,32 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 /// * [`PivExtension::SetPinPukRetries`], [`PivExtension::MoveKey`],
 ///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`],
 ///   [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
-///   [`Verdict::KnownUnsupported`] pinned to exactly the version keyroost has
+///   `Verdict::KnownUnsupported` pinned to exactly the version keyroost has
 ///   evidence for, firmware 1.8.3 (`[1, 8, 3]`): a live unit there rejects
 ///   all six, corroborated for the two policy rows by the Trussed
 ///   `piv-authenticator` source itself
 ///   (<https://github.com/trussed-dev/piv-authenticator>), which implements
 ///   no `0xAA`/`0xAB` handling on GENERATE ASYMMETRIC KEYPAIR. Per
-///   [`Verdict::KnownUnsupported`]'s backward-extension rule this is assumed
+///   `Verdict::KnownUnsupported`'s backward-extension rule this is assumed
 ///   to also hold at every earlier, untested version — including 1.8 itself —
 ///   without a separate `[1, 8]` entry on these rows; the single `[1, 8, 3]`
 ///   verdict already covers both. A firmware newer than 1.8.3 with no verdict
 ///   of its own softens to [`FeatureGate::Unverified`] rather than staying
 ///   `Unsupported`, since a later firmware may have added any of these six —
-///   unlike [`PivExtension::ResetGlobal`]'s [`Verdict::KnownUnsupportedSince`]
+///   unlike [`PivExtension::ResetGlobal`]'s `Verdict::KnownUnsupportedSince`
 ///   row above, which has a standing reason (this vendor's own architecture)
 ///   to expect it never comes back.
 /// * [`PivExtension::SlotKeyAlgorithm`] — RSA-2048, RSA-4096, and ECC P-256
 ///   are supported on every firmware keyroost has evidence for, pre-1.8.2 and
-///   1.8.2-and-later alike: one [`Verdict::KnownSupported`] row at the
+///   1.8.2-and-later alike: one `Verdict::KnownSupported` row at the
 ///   universal `[]` version, no known-unsupported floor to gate below. RSA-4096
 ///   is grouped in here even though its *wire byte* changes at the same 1.8.2
-///   boundary — see [`slot_key_algorithm_apdu_id_override`]'s own doc — since
+///   boundary — see `slot_key_algorithm_apdu_id_override`'s own doc — since
 ///   that's a separate axis from whether the algorithm is supported at all,
-///   same distinction [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]'s own
+///   same distinction `HID_CRESCENDO_C4000_APPLET_VERDICTS`'s own
 ///   [`PivExtension::SlotKeyAlgorithm`] doc draws. RSA-3072 and ECC P-384 are
-///   new at 1.8.2: the same two-tier [`Verdict::KnownUnsupported`]-then-
-///   [`Verdict::KnownSupported`] shape as this table's own
+///   new at 1.8.2: the same two-tier `Verdict::KnownUnsupported`-then-
+///   `Verdict::KnownSupported` shape as this table's own
 ///   [`PivExtension::SetManagementKey`]/[`PivExtension::Reset`]/
 ///   [`PivExtension::GetMetadata`]/[`PivExtension::PinManagementAuth`] row
 ///   above, pinned to `[1, 8, 2]` rather than that row's `[1, 8]` — this
@@ -3158,8 +3158,8 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   P-521, and Ed25519/X25519 are absent from the Trussed `piv-authenticator`
 ///   source's own supported-algorithm set at every firmware generation
 ///   examined, so they join [`PivExtension::ResetGlobal`]'s row above — same
-///   [`Verdict::KnownUnsupportedSince`] at the universal `[]` version — the
-///   same closed-enumeration reasoning [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s
+///   `Verdict::KnownUnsupportedSince` at the universal `[]` version — the
+///   same closed-enumeration reasoning `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
 ///   own row uses.
 const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
@@ -3265,7 +3265,7 @@ const TRUSSED_NITROKEY_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
 const OPENFIPS201_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 
 /// `OpenFips201::Generic`'s applet-axis known-support table — see
-/// [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
+/// `GENERIC_APPLET_VERDICTS`'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry. Distinct from
 /// [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`] above, which additionally carries
 /// MOVE KEY/DELETE KEY data of its own — that sub-fingerprint rejects them
@@ -3273,10 +3273,10 @@ const OPENFIPS201_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 /// them at all, see that const's own doc.
 ///
 /// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] also get
-/// an explicit [`Verdict::KnownUnsupportedSince`] row at the universal `[]`
+/// an explicit `Verdict::KnownUnsupportedSince` row at the universal `[]`
 /// version: upstream OpenFIPS201 has not been observed to mimic any Yubico
 /// extension, the same standing-vendor-pattern reasoning
-/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc uses. [`PivExtension::Reset`]
+/// `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc uses. [`PivExtension::Reset`]
 /// joins that same row too — unlike [`SWISSBIT_ISHIELD2_APPLET_VERDICTS`]'s
 /// own `Reset` row, this generic OpenFIPS201 fingerprint hasn't been observed
 /// to accept Yubico's `INS 0xFB` RESET either, so keyroost has no working
@@ -3359,7 +3359,7 @@ const OPENFIPS201_GENERIC_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
 /// `OpenFips201::Generic`'s applet-axis quirks — empty: no quirks known for a
 /// generic OpenFIPS201 implementation yet. Distinct from
-/// [`SWISSBIT_ISHIELD2_APPLET_QUIRKS`] above, which is a specific
+/// `SWISSBIT_ISHIELD2_APPLET_QUIRKS` above, which is a specific
 /// OpenFIPS201-based product with its own observed quirks.
 const OPENFIPS201_GENERIC_APPLET_QUIRKS: &[VersionQuirks] = &[];
 
@@ -3372,7 +3372,7 @@ const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxe
 
 /// Identiv/Hirsch's uTrust Generic (the general-purpose FIDO2 Security Keys
 /// line — [`UTrustVariant::Generic`])'s applet-axis known-support table —
-/// see [`GENERIC_APPLET_VERDICTS`]'s doc for why this fingerprint gets an
+/// see `GENERIC_APPLET_VERDICTS`'s doc for why this fingerprint gets an
 /// explicit [`PivExtension::ResetGlobal`] entry, and why
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins that same entry instead of getting one of its own.
@@ -3382,7 +3382,7 @@ const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxe
 /// [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`]/
 /// [`PivExtension::PinManagementAuth`]/[`PivExtension::SlotPinPolicy`]/
 /// [`PivExtension::SlotTouchPolicy`] rows below are hardware-observed
-/// [`Verdict::KnownUnsupported`] on a live unit, same as the quirk this
+/// `Verdict::KnownUnsupported` on a live unit, same as the quirk this
 /// fingerprint mimics ([`UTRUST_GENERIC_APPLET_QUIRKS`]'s YubiKey-shaped
 /// default management key) would suggest. The observed device has no
 /// supported mechanism to report either an applet or a firmware version —
@@ -3393,12 +3393,12 @@ const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxe
 /// [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa3072`]/[`KeyAlg::Rsa4096`]/
 /// [`KeyAlg::EccP256`]/[`KeyAlg::EccP384`]/[`KeyAlg::EccP521`]/
 /// [`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` join the row above on the same
-/// [`Verdict::KnownUnsupported`] `[]` verdict — the same live unit's GENERATE
+/// `Verdict::KnownUnsupported` `[]` verdict — the same live unit's GENERATE
 /// ASYMMETRIC KEYPAIR rejects all seven; unlike
 /// [`FEITIAN_APPLET_VERDICTS`]'s otherwise-similar split, this fingerprint
 /// rejects ECC entirely, not just the P-521/Ed25519/X25519 tail. The separate
 /// row below, [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`], is
-/// [`Verdict::KnownSupported`] instead — the same unit accepts both — so it
+/// `Verdict::KnownSupported` instead — the same unit accepts both — so it
 /// can't join that row; same universal `[]` sentinel as the rows above, for
 /// the same reason.
 const UTRUST_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
@@ -3471,7 +3471,7 @@ const UTRUST_GOV_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// its doc) — reserved for when it can be told apart from
 /// [`UTrustVariant::Generic`] on the wire — but it still carries the same
 /// universal [`PivExtension::ResetGlobal`] entry every non-HID-Crescendo
-/// fingerprint gets; see [`GENERIC_APPLET_VERDICTS`]'s doc for why, and for
+/// fingerprint gets; see `GENERIC_APPLET_VERDICTS`'s doc for why, and for
 /// why [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins that same entry instead of getting one of its own.
 ///
@@ -3480,7 +3480,7 @@ const UTRUST_GOV_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`] rows
 /// below **are a guess, not a hardware observation** — unlike
 /// [`UTRUST_GENERIC_APPLET_VERDICTS`]'s identically-shaped
-/// [`Verdict::KnownUnsupported`] rows at the same `version: &[]` sentinel,
+/// `Verdict::KnownUnsupported` rows at the same `version: &[]` sentinel,
 /// which *are* observed on a live unit. No Gov-fingerprinted device has ever
 /// been probed for any of these six extensions — `classify` can't even
 /// produce this fingerprint yet, per the doc above. The guess mirrors
@@ -3488,7 +3488,7 @@ const UTRUST_GOV_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// Yubico-shaped vendor extensions when it doesn't even mimic the
 /// Yubico-shaped default management key [`UTRUST_GENERIC_APPLET_QUIRKS`]
 /// does; see [`UTrustVariant::Gov`]'s doc for why Gov's default differs
-/// ([`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]). Treat this row as a placeholder to
+/// (`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`). Treat this row as a placeholder to
 /// replace with a real verdict the first time a Gov unit is actually probed,
 /// not as evidence in its own right. Seeded ahead of Gov being reachable from
 /// `classify` at all, same as [`UTRUST_GOV_APPLET_QUIRKS`] already is.
@@ -3523,7 +3523,7 @@ const UTRUST_GOV_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
 const UTRUST_GOV_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
 /// Identiv/Hirsch's uTrust Gov's applet-axis quirks: its own vendor-specific
-/// default management key ([`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]), *not* the
+/// default management key (`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`), *not* the
 /// YubiKey-mimicking one [`UTRUST_GENERIC_APPLET_QUIRKS`] uses — see
 /// [`UTrustVariant::Gov`]'s doc. No version-gated quirk observed on this
 /// fingerprint. Currently unreachable from `classify` regardless (nothing on
@@ -3579,7 +3579,7 @@ impl FeatureGate {
 /// **Both axes unset, one exception:** when `applet_version` and
 /// `firmware_version` are *both* `None`, each is substituted with
 /// `Some(&[])` before anything below runs. A verdict pinned at the universal
-/// `version: &[]` sentinel (e.g. [`GENERIC_APPLET_VERDICTS`]'s
+/// `version: &[]` sentinel (e.g. `GENERIC_APPLET_VERDICTS`'s
 /// [`PivExtension::ResetGlobal`] row) means "applies at any version, known or
 /// not", so a caller that couldn't read a version off the device on *either*
 /// axis should still see it rather than getting a blanket
@@ -3593,8 +3593,8 @@ impl FeatureGate {
 /// resolves to [`FeatureGate::Unverified`] via step 1 below, unchanged from
 /// before.
 ///
-/// `applet_version` is queried against [`applet_verdicts`] and
-/// `firmware_version` against [`firmware_verdicts`], **with
+/// `applet_version` is queried against `applet_verdicts` and
+/// `firmware_version` against `firmware_verdicts`, **with
 /// identical per-axis lookup semantics**:
 ///
 /// 1. The version is `None` → that axis is [`FeatureGate::Unverified`]
@@ -3620,7 +3620,7 @@ impl FeatureGate {
 ///      (covers both an exact-version match and an earlier one) — the mirror
 ///      image of known-supported's forward extension, for a feature with a
 ///      standing reason to expect it never comes back (see
-///      [`Verdict::KnownUnsupportedSince`]'s doc);
+///      `Verdict::KnownUnsupportedSince`'s doc);
 ///    * known-unsupported, verdict version **equals** the reported version →
 ///      [`FeatureGate::Unsupported`];
 ///    * known-unsupported, verdict version **below** the reported version, and it is
@@ -3631,8 +3631,8 @@ impl FeatureGate {
 ///      known-unsupported knowledge brackets this version, so it is treated as
 ///      authoritative: [`FeatureGate::Unsupported`].
 ///
-/// The two per-axis outcomes are then combined by [`merge_gates`], per
-/// `fingerprint`'s own [`AxisMergeMode`] (looked up via [`axis_merge_mode`]):
+/// The two per-axis outcomes are then combined by `merge_gates`, per
+/// `fingerprint`'s own [`AxisMergeMode`] (looked up via `axis_merge_mode`):
 /// see that enum's doc for what each of its four modes does. Every
 /// fingerprint is seeded on [`AxisMergeMode::MergeRelaxed`] today, whose
 /// rule is: either axis reporting a real verdict
@@ -3658,7 +3658,7 @@ impl FeatureGate {
 /// entry, so "no entry here" genuinely means "ask [`PivExtension::GetMetadata`]
 /// instead", not "no data, assume unverified". A fingerprint that *does*
 /// have an entry (today: HID Crescendo, which provides this a different way —
-/// see [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s doc) is resolved through the ordinary per-axis
+/// see `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc) is resolved through the ordinary per-axis
 /// machinery below, exactly like every other extension, and never
 /// consults [`PivExtension::GetMetadata`] at all.
 #[must_use]
@@ -3696,8 +3696,8 @@ pub fn resolve(
 
 /// [`AxisMergeMode::MergeStrict`]'s rule: [`FeatureGate::Unsupported`] wins
 /// outright; otherwise [`FeatureGate::Supported`] wins; otherwise
-/// [`FeatureGate::Unverified`]. Named to pair with [`combine_relaxed`]/
-/// [`combine_preferring`] — this was keyroost's only cross-axis rule before
+/// [`FeatureGate::Unverified`]. Named to pair with `combine_relaxed`/
+/// `combine_preferring` — this was keyroost's only cross-axis rule before
 /// [`AxisMergeMode`] existed.
 #[must_use]
 fn combine_strict(a: FeatureGate, b: FeatureGate) -> FeatureGate {
@@ -3711,10 +3711,10 @@ fn combine_strict(a: FeatureGate, b: FeatureGate) -> FeatureGate {
 /// [`AxisMergeMode::MergeRelaxed`]'s rule: a real verdict
 /// ([`FeatureGate::Supported`]/[`FeatureGate::Unsupported`]) wins over
 /// [`FeatureGate::Unverified`] on the other side — same as
-/// [`combine_strict`] in every case but one — but two real, *conflicting*
+/// `combine_strict` in every case but one — but two real, *conflicting*
 /// verdicts (one `Supported`, the other `Unsupported`) soften to
 /// [`FeatureGate::Unverified`] instead of letting `Unsupported` win outright
-/// the way [`combine_strict`] does.
+/// the way `combine_strict` does.
 #[must_use]
 fn combine_relaxed(a: FeatureGate, b: FeatureGate) -> FeatureGate {
     match (a, b) {
@@ -3729,10 +3729,10 @@ fn combine_relaxed(a: FeatureGate, b: FeatureGate) -> FeatureGate {
 /// The shared tie-break rule behind [`AxisMergeMode::AppletWins`]/
 /// [`AxisMergeMode::FirmwareWins`]: a real verdict wins over
 /// [`FeatureGate::Unverified`] on the other side — same as
-/// [`combine_relaxed`] — but when `a` and `b` are both real verdicts that
+/// `combine_relaxed` — but when `a` and `b` are both real verdicts that
 /// genuinely conflict, `preferred` (the selected axis's own gate — `a` for
 /// `AppletWins`, `b` for `FirmwareWins`) wins outright instead of softening
-/// to [`FeatureGate::Unverified`] the way [`combine_relaxed`] would.
+/// to [`FeatureGate::Unverified`] the way `combine_relaxed` would.
 #[must_use]
 fn combine_preferring(a: FeatureGate, b: FeatureGate, preferred: FeatureGate) -> FeatureGate {
     match (a, b) {
@@ -3763,7 +3763,7 @@ fn merge_gates(
 }
 
 /// [`resolve`]'s per-axis lookup, given the (fingerprint, extension) pair's
-/// verdicts already looked up via [`applet_verdicts`]/[`firmware_verdicts`] —
+/// verdicts already looked up via `applet_verdicts`/`firmware_verdicts` —
 /// `None` when there were none. Taking the verdicts directly, rather than a
 /// table plus the keys to look them up with, also lets a test supply its own
 /// synthetic verdicts without wiring a row into the const tables.
@@ -3846,8 +3846,8 @@ fn resolve_in(verdicts: Option<&[VersionVerdict]>, version: Option<&[u8]>) -> Fe
 /// and the only byte it actually diverges from [`KeyAlg::id`] on is RSA-4096
 /// (`0x04` here, `0x16` there); every other algorithm it names already
 /// agrees with the default. Applying the same table to every variant here is
-/// a wider claim than [`HID_CRESCENDO_C4000_APPLET_VERDICTS`]/
-/// [`HID_CRESCENDO_C2300_APPLET_VERDICTS`]'s own [`PivExtension::SlotKeyAlgorithm`]
+/// a wider claim than `HID_CRESCENDO_C4000_APPLET_VERDICTS`/
+/// `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s own [`PivExtension::SlotKeyAlgorithm`]
 /// rows make (those stay narrower, per-family, and don't extend to
 /// `Generic`) — a different axis from this override: an algorithm's support
 /// gate says nothing about which byte names it once encountered, and vice
@@ -3911,13 +3911,13 @@ fn slot_key_algorithm_apdu_id_override(
 
 /// The wire algorithm-identifier byte to send for `key_alg` on `fingerprint`
 /// (reporting `firmware_version`, if known) in a GENERATE ASYMMETRIC KEYPAIR /
-/// GENERAL AUTHENTICATE APDU: [`slot_key_algorithm_apdu_id_override`]'s entry
+/// GENERAL AUTHENTICATE APDU: `slot_key_algorithm_apdu_id_override`'s entry
 /// for this triple if it has one, or [`KeyAlg::id`]'s Yubico-default byte
 /// otherwise. A caller building such an APDU should always go through this
 /// rather than [`KeyAlg::id`] directly — see that method's doc.
 /// `firmware_version` only ever changes the answer for
 /// `Trussed(`[`TrussedVariant::NitroKey`]`)`'s RSA-4096 entry — see
-/// [`slot_key_algorithm_apdu_id_override`]'s own doc — so passing `None` for
+/// `slot_key_algorithm_apdu_id_override`'s own doc — so passing `None` for
 /// any other fingerprint is equivalent to omitting a firmware version this
 /// fingerprint doesn't key anything on.
 #[must_use]
@@ -3934,11 +3934,11 @@ pub fn slot_key_algorithm_apdu_id(
 /// wire algorithm-identifier byte (GET METADATA tag `0x01`, or a GENERATE
 /// ASYMMETRIC KEYPAIR / GENERAL AUTHENTICATE reply that echoes one) back to a
 /// [`KeyAlg`], preferring whichever algorithm this fingerprint's own
-/// [`slot_key_algorithm_apdu_id_override`] says `id` actually means over
+/// `slot_key_algorithm_apdu_id_override` says `id` actually means over
 /// [`KeyAlg::from_id`]'s Yubico-default table. Tries every [`KeyAlg::ALL`]
 /// variant, in declaration order, through [`slot_key_algorithm_apdu_id`] and
 /// returns the first one whose resolved byte matches `id` — see
-/// [`slot_key_algorithm_apdu_id_override`]'s own `Trussed`/`NitroKey` doc for
+/// `slot_key_algorithm_apdu_id_override`'s own `Trussed`/`NitroKey` doc for
 /// why that ordering is load-bearing on pre-1.8.2 firmware, not incidental —
 /// falling back to [`KeyAlg::from_id`] when none does, which also covers
 /// every fingerprint with no override data at all (every candidate then
@@ -3974,19 +3974,19 @@ fn latest_quirks<'a>(quirks: &'a [VersionQuirks], version: &[u8]) -> Option<&'a 
 /// "Both axes unset" doc — when `applet_version` and `firmware_version` are
 /// *both* `None`, each is substituted with `Some(&[])` before anything below
 /// runs, so a quirk seeded at the universal `version: &[]` sentinel (e.g.
-/// [`YUBIKEY_APPLET_QUIRKS`]'s [`PivQuirk::Default9bManagementKey`] row)
+/// `YUBIKEY_APPLET_QUIRKS`'s [`PivQuirk::Default9bManagementKey`] row)
 /// still applies to a fingerprint with no supported mechanism to query a
 /// version at all, rather than silently resolving no quirks whatsoever. When
 /// exactly one axis has data, the other is left as a bare `None` and
 /// contributes nothing on its own, exactly as step 1/2 below already say.
 ///
-/// 1. If `applet_version` is available, take `fingerprint`'s [`applet_quirks`]
+/// 1. If `applet_version` is available, take `fingerprint`'s `applet_quirks`
 ///    entry with the highest version `<=` `applet_version` (if any).
 /// 2. If `firmware_version` is available, take `fingerprint`'s
-///    [`firmware_quirks`] entry with the highest version `<=`
+///    `firmware_quirks` entry with the highest version `<=`
 ///    `firmware_version` (if any).
-/// 3. Merge the two per [`merge_quirk_sets`], per `fingerprint`'s own
-///    [`AxisMergeMode`] (looked up via [`axis_merge_mode`]) — see that
+/// 3. Merge the two per `merge_quirk_sets`, per `fingerprint`'s own
+///    [`AxisMergeMode`] (looked up via `axis_merge_mode`) — see that
 ///    enum's doc for what each of its four modes does on this axis. Every
 ///    fingerprint is seeded on [`AxisMergeMode::MergeRelaxed`] today, whose
 ///    rule for quirks — shared with [`AxisMergeMode::MergeStrict`] — is a
@@ -4019,7 +4019,7 @@ pub fn resolve_quirks(
 /// test can supply its own without wiring one into the const tables — same
 /// role [`resolve_in`] plays for [`resolve`]. Always unions whatever each
 /// axis's [`latest_quirks`] entry contributes — the [`AxisMergeMode::MergeRelaxed`]/
-/// [`AxisMergeMode::MergeStrict`] rule, and [`merge_quirk_sets`]'s fallback
+/// [`AxisMergeMode::MergeStrict`] rule, and `merge_quirk_sets`'s fallback
 /// for [`AxisMergeMode::AppletWins`]/[`AxisMergeMode::FirmwareWins`] whenever
 /// they don't have both axes' versions to pick an exclusive winner from.
 fn resolve_quirks_in(
@@ -4043,14 +4043,14 @@ fn resolve_quirks_in(
 }
 
 /// Dispatch to the right cross-axis quirk-merging rule for `mode` — the
-/// quirks counterpart of [`merge_gates`]. [`AxisMergeMode::MergeRelaxed`]/
+/// quirks counterpart of `merge_gates`. [`AxisMergeMode::MergeRelaxed`]/
 /// [`AxisMergeMode::MergeStrict`] both fall through to [`resolve_quirks_in`]'s
 /// plain union — quirks have no known-support notion to make those two modes
-/// diverge on this axis, unlike [`merge_gates`]. [`AxisMergeMode::AppletWins`]/
+/// diverge on this axis, unlike `merge_gates`. [`AxisMergeMode::AppletWins`]/
 /// [`AxisMergeMode::FirmwareWins`] only pick an exclusive winner when *both*
 /// `applet_version` and `firmware_version` were reported — quirks have no
 /// `FeatureGate`-shaped notion of "conflict" to tie-break on the way
-/// [`combine_preferring`] does for verdicts, so with only one axis (or
+/// `combine_preferring` does for verdicts, so with only one axis (or
 /// neither) reporting a version, this falls back to the same union
 /// [`AxisMergeMode::MergeRelaxed`]/[`AxisMergeMode::MergeStrict`] always use.
 #[must_use]

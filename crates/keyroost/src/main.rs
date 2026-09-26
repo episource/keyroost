@@ -1421,9 +1421,9 @@ fn piv_factory_reset_message(e: TransportError) -> String {
 /// when `reset_global_gate` — a *different* extension,
 /// `PivExtension::ResetGlobal`, a device-wide reset directive that takes PIV
 /// down with it alongside at least one other applet — resolves
-/// [`FeatureGate::Supported`] (an *unverified* alternative isn't something to
+/// [`keyroost_piv::compat::FeatureGate::Supported`] (an *unverified* alternative isn't something to
 /// steer a user toward) AND `reset_gate` (`PivExtension::Reset`, the
-/// PIV-only path) is anything other than [`FeatureGate::Supported`] (a
+/// PIV-only path) is anything other than [`keyroost_piv::compat::FeatureGate::Supported`] (a
 /// known-good PIV-only path has nothing to redirect away from — this is the
 /// "leave as-is" case).
 fn piv_reset_global_alternative_available(
@@ -1437,7 +1437,7 @@ fn piv_reset_global_alternative_available(
 /// Whether the Generate Key modal's "Policy other than `default` requires
 /// YubiKey or compatible token." caveat still needs to be shown below the
 /// PIN/touch policy combos: true unless *both* gates are confirmed
-/// [`FeatureGate::Supported`] — at that point the caveat is stale noise on a
+/// [`keyroost_piv::compat::FeatureGate::Supported`] — at that point the caveat is stale noise on a
 /// device already known to handle non-default policies, and the per-row
 /// warning marker / disabled-combo hover above already cover the
 /// unverified/unsupported cases on their own.
@@ -1958,7 +1958,7 @@ impl PivCredKind {
     /// True for a flow that already collects a PIN of its own further down in
     /// the modal — `SelfSign`'s signing PIN, `SetRetries`' current PIN — for a
     /// reason unrelated to management auth. PIV has exactly one application
-    /// PIN, so when [`PivState::use_pin`] is set on one of these,
+    /// PIN, so when `use_pin` is set on one of these,
     /// `piv_modal_mgmt_field` doesn't render a second PIN box asking for the
     /// same value twice: the dedicated field's PIN is reused directly for
     /// management auth too, in [`App::piv_current_mgmt_auth`].
@@ -2071,7 +2071,7 @@ struct PivState {
     /// set-retries / management-key change. Cleared after use. Doubles as
     /// the PIN input when [`Self::mgmt_auth_mode`] is
     /// [`PivMgmtAuthMode::Pin`] and the flow has no dedicated PIN field of
-    /// its own (see [`piv_cred_kind_shares_pin_field`]) — the same field,
+    /// its own (see [`PivCredKind::shares_pin_field`]) — the same field,
     /// its label and hint swapped, rather than a second box. Only actually
     /// read when [`Self::mgmt_auth_mode`] is [`PivMgmtAuthMode::Manual`] or
     /// [`PivMgmtAuthMode::Pin`] — see that type's doc.
@@ -3199,7 +3199,7 @@ enum PivCache {
     /// there's no reason to distrust it just because nothing asked to.
     Reuse,
     /// Ignore whatever's cached and open via a plain
-    /// [`keyroost_transport::PivSession::open`] — a real SELECT, a real
+    /// [`keyroost_transport::PivSession::with_transaction`] — a real SELECT, a real
     /// fingerprint probe, no shortcuts, same as if this device had never
     /// been seen this app run. The result still gets stored back into
     /// `piv_session_state` afterward like any other read, so this doesn't

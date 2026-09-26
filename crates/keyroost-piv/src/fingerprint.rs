@@ -569,7 +569,7 @@ pub const HID_CRESCENDO_ACA_PIN_AFTER_RESET: &[u8] = b"00000000";
 /// A `0x51` block missing subtag `0x48` or `0x43` entirely (as opposed to
 /// one that has `0x43` but reports no key loaded) is likewise skipped
 /// rather than aborting the whole parse — the same "keep whatever parsed
-/// cleanly" spirit as [`compact_tlv`]. Never `None` — an unparseable
+/// cleanly" spirit as `compact_tlv`. Never `None` — an unparseable
 /// response, or one with no usable `0x51` block, is an empty `Vec`, same as
 /// a well-formed response simply naming no occupied slot.
 #[must_use]
@@ -940,7 +940,7 @@ const TOKEN2_SERIAL_PREFIX_GENERATION: &[(&str, &[u8])] = &[
 /// `GET SERIAL` extension answers with, since that truncation strips exactly
 /// the prefix this function keys on), by matching the leading 5 digits of
 /// `serial`'s decimal representation against
-/// [`TOKEN2_SERIAL_PREFIX_GENERATION`].
+/// `TOKEN2_SERIAL_PREFIX_GENERATION`.
 ///
 /// The returned bytes are **not** anything Token2's firmware reports
 /// itself — they're a fixed encoding this crate assigns to the vendor's own
@@ -954,7 +954,7 @@ const TOKEN2_SERIAL_PREFIX_GENERATION: &[(&str, &[u8])] = &[
 ///
 /// `None` when `serial`'s decimal form is shorter than 5 digits, or its
 /// prefix isn't in the table — a pre-R3.3 unit (see
-/// [`TOKEN2_SERIAL_PREFIX_GENERATION`]'s doc for why those are absent by
+/// `TOKEN2_SERIAL_PREFIX_GENERATION`'s doc for why those are absent by
 /// construction) or a future revision this table hasn't been updated for.
 #[must_use]
 pub fn token2_firmware_from_serial(serial: u128) -> Option<&'static [u8]> {
@@ -1341,7 +1341,7 @@ fn bytes_as_chars(raw: &[u8]) -> String {
 ///   literally `"YubiKey"`).
 /// * any other category: the entire historical-byte block.
 ///
-/// Both are decoded via [`bytes_as_chars`]. `None` when there are no
+/// Both are decoded via `bytes_as_chars`. `None` when there are no
 /// historical bytes, or (for the TLV categories) no tag-5 object.
 #[must_use]
 pub fn atr_identity(historical: &[u8]) -> Option<String> {
