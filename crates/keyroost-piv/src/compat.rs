@@ -2843,11 +2843,24 @@ const FEITIAN_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] join the
 /// same hardware-observed [`Verdict::KnownUnsupported`] group at applet
 /// version `[0]`: the live unit's GENERATE ASYMMETRIC KEYPAIR rejects both
-/// the `0xAA` and `0xAB` tags.
+/// the `0xAA` and `0xAB` tags. [`PivExtension::PinManagementAuth`] joins the
+/// same row on the same live unit: PIN VERIFY doesn't unlock the standard
+/// [`crate::OBJECT_PIN_PROTECTED_DATA`] object the indirect mechanism reads.
 ///
 /// [`PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)`](PivExtension::ManagementKeyAlgorithm)
 /// joins the [`PivExtension::ResetGlobal`] row instead of getting an entry of
 /// its own — see [`GENERIC_APPLET_VERDICTS`]'s doc for why.
+///
+/// [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa3072`]/[`KeyAlg::Rsa4096`]/
+/// [`KeyAlg::EccP521`]/[`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` join the same
+/// [`Verdict::KnownUnsupported`] `[0]` row above — same live unit's GENERATE
+/// ASYMMETRIC KEYPAIR rejects all five. The separate row below,
+/// [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`]/[`KeyAlg::EccP256`]/
+/// [`KeyAlg::EccP384`], is [`Verdict::KnownSupported`] instead — the same unit
+/// accepts all four — so it can't join that row; both stay pinned to the
+/// exact tested version `[0]` rather than widened to a major version the way
+/// [`AUTHENTREND_ATKEY_APPLET_VERDICTS`] does — only a v0 unit has been
+/// probed here, so no claim is made about any other version either way.
 const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
         extensions: &[
@@ -2868,10 +2881,28 @@ const FEITIAN_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::GetMetadata,
             PivExtension::SlotPinPolicy,
             PivExtension::SlotTouchPolicy,
+            PivExtension::PinManagementAuth,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
             version: &[0],
             verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[0],
+            verdict: Verdict::KnownSupported,
         }],
     },
 ];
@@ -3348,15 +3379,28 @@ const UTRUST_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxe
 ///
 /// The [`PivExtension::DeleteKey`]/[`PivExtension::MoveKey`]/
 /// [`PivExtension::SetPinPukRetries`]/[`PivExtension::Reset`]/
-/// [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`] rows
-/// below are hardware-observed [`Verdict::KnownUnsupported`] on a live unit,
-/// same as the quirk this fingerprint mimics
-/// ([`UTRUST_GENERIC_APPLET_QUIRKS`]'s YubiKey-shaped default management
-/// key) would suggest. The observed device has no supported mechanism to
-/// report either an applet or a firmware version — neither GET VERSION nor
-/// GET PIV PROPERTIES answered — so, per `resolve`'s "Both axes unset"
-/// fallback (see its doc), these rows are pinned at the universal
-/// `version: &[]` sentinel rather than a real version number.
+/// [`PivExtension::GetMetadata`]/[`PivExtension::SetManagementKey`]/
+/// [`PivExtension::PinManagementAuth`]/[`PivExtension::SlotPinPolicy`]/
+/// [`PivExtension::SlotTouchPolicy`] rows below are hardware-observed
+/// [`Verdict::KnownUnsupported`] on a live unit, same as the quirk this
+/// fingerprint mimics ([`UTRUST_GENERIC_APPLET_QUIRKS`]'s YubiKey-shaped
+/// default management key) would suggest. The observed device has no
+/// supported mechanism to report either an applet or a firmware version —
+/// neither GET VERSION nor GET PIV PROPERTIES answered — so, per `resolve`'s
+/// "Both axes unset" fallback (see its doc), these rows are pinned at the
+/// universal `version: &[]` sentinel rather than a real version number.
+///
+/// [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa3072`]/[`KeyAlg::Rsa4096`]/
+/// [`KeyAlg::EccP256`]/[`KeyAlg::EccP384`]/[`KeyAlg::EccP521`]/
+/// [`KeyAlg::Ed25519`]/[`KeyAlg::X25519`]`)` join the row above on the same
+/// [`Verdict::KnownUnsupported`] `[]` verdict — the same live unit's GENERATE
+/// ASYMMETRIC KEYPAIR rejects all seven; unlike
+/// [`FEITIAN_APPLET_VERDICTS`]'s otherwise-similar split, this fingerprint
+/// rejects ECC entirely, not just the P-521/Ed25519/X25519 tail. The separate
+/// row below, [`KeyAlg::Rsa1024`]/[`KeyAlg::Rsa2048`], is
+/// [`Verdict::KnownSupported`] instead — the same unit accepts both — so it
+/// can't join that row; same universal `[]` sentinel as the rows above, for
+/// the same reason.
 const UTRUST_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
         extensions: &[
@@ -3366,6 +3410,16 @@ const UTRUST_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::Reset,
             PivExtension::GetMetadata,
             PivExtension::SetManagementKey,
+            PivExtension::PinManagementAuth,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa3072),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa4096),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP256),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
@@ -3380,6 +3434,16 @@ const UTRUST_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa1024),
+            PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
         }],
     },
 ];
@@ -6154,10 +6218,17 @@ mod tests {
 
     #[test]
     fn feitian_slot_pin_and_touch_policy_unsupported_at_v0() {
-        for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+        // `PivExtension::PinManagementAuth` joins the same row/verdict — see
+        // `FEITIAN_APPLET_VERDICTS`'s doc.
+        for ext in [
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::PinManagementAuth,
+        ] {
             assert_eq!(
                 resolve(ext, AppletFingerprint::Feitian, Some(&[0]), None),
-                FeatureGate::Unsupported
+                FeatureGate::Unsupported,
+                "{ext:?}"
             );
         }
     }
@@ -6694,6 +6765,97 @@ mod tests {
                 ),
                 FeatureGate::Unverified,
                 "{ext:?} at a reported version well above v[0]"
+            );
+        }
+    }
+
+    #[test]
+    fn feitian_algorithm_support_at_v0_covers_rsa1024_rsa2048_eccp256_eccp384_only() {
+        // Hardware-observed on the same live v0 unit as
+        // `feitian_yubico_extensions_are_known_unsupported_at_v0` — see
+        // `FEITIAN_APPLET_VERDICTS`'s doc.
+        let fp = AppletFingerprint::Feitian;
+        for alg in [
+            KeyAlg::Rsa1024,
+            KeyAlg::Rsa2048,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, Some(&[0]), None),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        for alg in [
+            KeyAlg::Rsa3072,
+            KeyAlg::Rsa4096,
+            KeyAlg::EccP521,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, Some(&[0]), None),
+                FeatureGate::Unsupported,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utrust_generic_pin_management_auth_is_known_unsupported() {
+        // Hardware-observed on the same live Generic unit as
+        // `utrust_generic_and_gov_yubico_extensions_are_known_unsupported` —
+        // see `UTRUST_GENERIC_APPLET_VERDICTS`'s doc. Unlike that shared test,
+        // this row isn't seeded on `UTrustVariant::Gov` yet, so it's checked
+        // on `Generic` alone. `PivExtension::SlotPinPolicy`/
+        // `PivExtension::SlotTouchPolicy` join the same row/verdict — see
+        // `UTRUST_GENERIC_APPLET_VERDICTS`'s doc.
+        for ext in [
+            PivExtension::PinManagementAuth,
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+        ] {
+            assert_eq!(
+                resolve(
+                    ext,
+                    AppletFingerprint::UTrust(UTrustVariant::Generic),
+                    None,
+                    None,
+                ),
+                FeatureGate::Unsupported,
+                "{ext:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utrust_generic_algorithm_support_covers_rsa1024_and_rsa2048_only() {
+        // Hardware-observed at the universal `[]` sentinel — this device
+        // can't report a version at all — see `UTRUST_GENERIC_APPLET_VERDICTS`'s
+        // doc. Unlike Feitian above, ECC is rejected entirely, not just the
+        // P-521/Ed25519/X25519 tail.
+        let fp = AppletFingerprint::UTrust(UTrustVariant::Generic);
+        for alg in [KeyAlg::Rsa1024, KeyAlg::Rsa2048] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        for alg in [
+            KeyAlg::Rsa3072,
+            KeyAlg::Rsa4096,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+            KeyAlg::EccP521,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, None, None),
+                FeatureGate::Unsupported,
+                "{alg:?}"
             );
         }
     }
