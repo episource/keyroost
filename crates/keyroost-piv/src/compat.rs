@@ -562,13 +562,18 @@ pub enum PivQuirk {
     ///   path reads this entry back to restore XAUTH key 1 after RESET CARD,
     ///   rather than hard-coding the constant a second time.
     /// * Identiv/Hirsch uTrust Gov's own vendor-specific value (16 bytes,
-    ///   [`UTRUST_GOV_DEFAULT_MGMT_KEY`]) — distinct from the YubiKey-mimicking
-    ///   value its sibling `UTrust::Generic` ships instead; see
-    ///   [`UTrustVariant::Gov`]'s doc for the source.
+    ///   [`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]) — distinct from the
+    ///   YubiKey-mimicking value its sibling `UTrust::Generic` ships instead;
+    ///   see [`UTrustVariant::Gov`]'s doc for the source. Also confirmed on
+    ///   IdPrime hardware (a live unit's factory-default `0x9B` key,
+    ///   algorithm AES-128 — hence the 16-byte length matching this value
+    ///   rather than [`YUBIKEY_DEFAULT_MGMT_KEY`]'s 24) — hence the constant's
+    ///   name naming both fingerprints rather than just the one it was
+    ///   originally seeded for.
     ///
     /// Most seeded values happen to be 24 bytes, but that's a fact about
     /// what's been observed so far, not a constraint this variant enforces —
-    /// [`UTRUST_GOV_DEFAULT_MGMT_KEY`] above is already only 16, and a future
+    /// [`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`] above is already only 16, and a future
     /// row for an AES-256 default must not need this type to change either.
     Default9bManagementKey(&'static [u8]),
     /// This fingerprint (at the version the entry covers) is known to take
@@ -622,6 +627,25 @@ pub enum PivQuirk {
     /// single-value scope and the same caller obligation (disable/refuse just
     /// `Cached`, leave `default`/`never`/`always` alone).
     SlotTouchPolicyCachedNotSupported,
+    /// The card-to-host half of management-key mutual authentication (`0x9B`
+    /// GENERAL AUTHENTICATE step 2 — see
+    /// `keyroost_transport::PivSession::authenticate_management`) answers
+    /// with the encrypted host challenge under the wrong tag on this device.
+    /// SP 800-73-4 calls for `0x82`; observed hardware (IdPrime PIV Applet)
+    /// instead echoes `0x80` — the witness tag from step 1 — while carrying
+    /// the correct encrypted value underneath it. Hardware-observed via the
+    /// trace this quirk was added from, not inferred from spec reading.
+    ///
+    /// A caller that finds this quirk set (via [`resolve_quirks`]) must
+    /// parse that response permissively — [`crate::parse_general_auth_permissive`]
+    /// instead of [`crate::parse_general_auth`] with a hardcoded `0x82` —
+    /// accepting whichever tag the reply's single TLV element actually
+    /// carries. Only safe when the reply holds exactly one TLV element: a
+    /// response with more than one tag has no unambiguous "this one is the
+    /// challenge response" answer, so [`crate::parse_general_auth_permissive`]
+    /// still refuses to parse a multi-tag reply rather than guessing which
+    /// tag is meant.
+    HostChallengeResponsePermissiveTag,
 }
 
 impl PivQuirk {
@@ -818,7 +842,7 @@ const FEITIAN_DEFAULT_MGMT_KEY: &[u8] = &[
 /// the `0x01..=0x08` pattern repeated twice rather than three times), so
 /// `UTrust::Gov` does *not* mimic the YubiKey default the way `UTrust::Generic`
 /// does — <https://hirschsecure.atlassian.net/wiki/spaces/FIDO/pages/4395401218/PIV>.
-const UTRUST_GOV_DEFAULT_MGMT_KEY: &[u8] = &[
+const IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY: &[u8] = &[
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 ];
 
@@ -2890,29 +2914,98 @@ const IDPRIME_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// observed to accept Yubico's `INS 0xFB` RESET either, PIV-scoped or
 /// otherwise, so keyroost has no working reset mechanism for this
 /// fingerprint at all yet.
-const IDPRIME_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdicts {
-    extensions: &[
-        PivExtension::ResetGlobal,
-        PivExtension::Reset,
-        PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
-        PivExtension::SetManagementKey,
-        PivExtension::SetPinPukRetries,
-        PivExtension::MoveKey,
-        PivExtension::DeleteKey,
-    ],
-    verdicts: &[VersionVerdict {
-        version: &[],
-        verdict: Verdict::KnownUnsupportedSince,
-    }],
-}];
+/// [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] get
+/// their own row rather than joining the one above: unlike MOVE KEY/DELETE
+/// KEY/RESET/SET MANAGEMENT KEY/SET PIN PUK RETRIES (Yubico's own vendor
+/// extension APDUs, which this vendor has no track record of mimicking and
+/// so get the stronger [`Verdict::KnownUnsupportedSince`]), pin/touch policy
+/// are standard SP 800-73-4 tags (`0xAA`/`0xAB` on GENERATE ASYMMETRIC
+/// KEYPAIR) — a future IDPrime firmware plausibly could add them, so this is
+/// plain [`Verdict::KnownUnsupported`] instead, softening to
+/// [`FeatureGate::Unverified`] rather than staying blocked forever.
+/// [`PivExtension::PinManagementAuth`] joins the same row on the same
+/// reasoning: PIN VERIFY on this fingerprint doesn't unlock the standard
+/// [`crate::OBJECT_PIN_PROTECTED_DATA`] object the indirect mechanism reads
+/// (see that extension's own doc), but the object itself is standard SP
+/// 800-73-4, not a Yubico vendor extension, so a future IDPrime firmware
+/// plausibly could populate it — plain [`Verdict::KnownUnsupported`], not
+/// the stronger `Since`. Seeded at
+/// the universal `[]` floor with no bracketing [`Verdict::KnownSupported`]
+/// entry above it (unlike e.g. [`YUBIKEY_APPLET_VERDICTS`]'s `Attest` row) —
+/// per [`resolve_in`]'s bracketing rule, that means only a query that
+/// reports version `[]` itself resolves [`FeatureGate::Unsupported`]; any
+/// actually-reported (non-empty) version softens straight to
+/// [`FeatureGate::Unverified`], same as no data at all. Narrow this to a real
+/// tested floor — or add a bracketing entry — once a version-tagged report
+/// comes in.
+///
+/// [`PivExtension::SlotKeyAlgorithm`]`(`[`KeyAlg::Rsa2048`]`)` gets a row of
+/// its own rather than joining either row above: hardware-observed
+/// [`Verdict::KnownSupported`] at the same universal `[]` floor — the live
+/// unit's GENERATE ASYMMETRIC KEYPAIR accepts RSA-2048 — which is neither of
+/// the two verdicts already seeded here. No other algorithm has been probed
+/// on this fingerprint yet, so nothing else is claimed either way.
+const IDPRIME_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ResetGlobal,
+            PivExtension::Reset,
+            PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+            PivExtension::SetManagementKey,
+            PivExtension::SetPinPukRetries,
+            PivExtension::MoveKey,
+            PivExtension::DeleteKey,
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupportedSince,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::PinManagementAuth,
+        ],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    ExtensionVerdicts {
+        extensions: &[PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048)],
+        verdicts: &[VersionVerdict {
+            version: &[],
+            verdict: Verdict::KnownSupported,
+        }],
+    },
+];
 
 /// See [`YUBIKEY_FIRMWARE_VERDICTS`]'s doc — empty.
 const IDPRIME_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
-/// Gemalto/Thales IDPrime's applet-axis quirks — empty: no quirks known for
-/// this fingerprint yet, unlike most other fingerprints in this module,
-/// which at least mimic a known default management key.
-const IDPRIME_APPLET_QUIRKS: &[VersionQuirks] = &[];
+/// Gemalto/Thales IDPrime's applet-axis quirks, both hardware-observed on a
+/// live unit and both seeded at the universal `[]` floor rather than a
+/// specific applet version — neither observation carried a version read, so
+/// there's no narrower bound to give either yet; narrow this once a
+/// version-tagged report comes in, the same way every other `version: &[]`
+/// entry in this module is a "least specific true statement" placeholder, not
+/// a claim that older/newer versions are unaffected:
+///
+/// * [`PivQuirk::HostChallengeResponsePermissiveTag`] — management-key
+///   mutual-auth step 2 answers with the encrypted host challenge under tag
+///   `0x80` instead of `0x82`; see that variant's own doc.
+/// * [`PivQuirk::Default9bManagementKey`] — the unit's factory-default `0x9B`
+///   key is the same 16-byte AES-128 pattern [`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]
+///   already names for uTrust Gov; see [`PivQuirk::Default9bManagementKey`]'s
+///   doc for why that constant is reused here rather than duplicated.
+const IDPRIME_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
+    version: &[],
+    quirks: &[
+        PivQuirk::HostChallengeResponsePermissiveTag,
+        PivQuirk::Default9bManagementKey(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY),
+    ],
+}];
 
 /// See [`YUBIKEY_FIRMWARE_QUIRKS`]'s doc — empty.
 const IDPRIME_FIRMWARE_QUIRKS: &[VersionQuirks] = &[];
@@ -3331,7 +3424,7 @@ const UTRUST_GOV_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeRelaxed;
 /// Yubico-shaped vendor extensions when it doesn't even mimic the
 /// Yubico-shaped default management key [`UTRUST_GENERIC_APPLET_QUIRKS`]
 /// does; see [`UTrustVariant::Gov`]'s doc for why Gov's default differs
-/// ([`UTRUST_GOV_DEFAULT_MGMT_KEY`]). Treat this row as a placeholder to
+/// ([`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]). Treat this row as a placeholder to
 /// replace with a real verdict the first time a Gov unit is actually probed,
 /// not as evidence in its own right. Seeded ahead of Gov being reachable from
 /// `classify` at all, same as [`UTRUST_GOV_APPLET_QUIRKS`] already is.
@@ -3366,7 +3459,7 @@ const UTRUST_GOV_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
 const UTRUST_GOV_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 
 /// Identiv/Hirsch's uTrust Gov's applet-axis quirks: its own vendor-specific
-/// default management key ([`UTRUST_GOV_DEFAULT_MGMT_KEY`]), *not* the
+/// default management key ([`IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY`]), *not* the
 /// YubiKey-mimicking one [`UTRUST_GENERIC_APPLET_QUIRKS`] uses — see
 /// [`UTrustVariant::Gov`]'s doc. No version-gated quirk observed on this
 /// fingerprint. Currently unreachable from `classify` regardless (nothing on
@@ -3375,7 +3468,7 @@ const UTRUST_GOV_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[];
 const UTRUST_GOV_APPLET_QUIRKS: &[VersionQuirks] = &[VersionQuirks {
     version: &[],
     quirks: &[PivQuirk::Default9bManagementKey(
-        UTRUST_GOV_DEFAULT_MGMT_KEY,
+        IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY,
     )],
 }];
 
@@ -4884,13 +4977,43 @@ mod tests {
 
     #[test]
     fn no_data_on_either_axis_resolves_to_no_quirks() {
-        // IdPrime carries no quirk row at all — unlike YubiKey or either
-        // UTrust variant, each with its own default management key — see
-        // `default_9b_management_key_seeded_fingerprints` and
-        // `utrust_gov_has_its_own_default_management_key_not_the_yubikey_one`.
+        // OpenFips201::Generic carries no quirk row at all on either axis —
+        // unlike YubiKey or either UTrust variant, each with its own default
+        // management key (see `default_9b_management_key_seeded_fingerprints`
+        // and `utrust_gov_has_its_own_default_management_key_not_the_yubikey_one`),
+        // or IdPrime, which now carries
+        // `PivQuirk::HostChallengeResponsePermissiveTag` (see
+        // `idprime_has_the_host_challenge_response_permissive_tag_quirk`).
+        assert_eq!(
+            resolve_quirks(
+                AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                Some(&[5, 7]),
+                Some(&[5, 7])
+            ),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn idprime_has_the_host_challenge_response_permissive_tag_quirk() {
+        // Hardware-observed on a live unit's management-key GENERAL
+        // AUTHENTICATE trace — see `IDPRIME_APPLET_QUIRKS`'s doc. Seeded at
+        // the universal `[]` floor alongside `Default9bManagementKey` (see
+        // `idprime_shares_utrust_govs_default_management_key`), so both apply
+        // regardless of reported version (including no version at all).
+        assert_eq!(
+            resolve_quirks(AppletFingerprint::IdPrime, None, None),
+            BTreeSet::from([
+                PivQuirk::HostChallengeResponsePermissiveTag,
+                PivQuirk::Default9bManagementKey(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY),
+            ])
+        );
         assert_eq!(
             resolve_quirks(AppletFingerprint::IdPrime, Some(&[5, 7]), Some(&[5, 7])),
-            BTreeSet::new()
+            BTreeSet::from([
+                PivQuirk::HostChallengeResponsePermissiveTag,
+                PivQuirk::Default9bManagementKey(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY),
+            ])
         );
     }
 
@@ -4959,12 +5082,20 @@ mod tests {
 
     #[test]
     fn unknown_fingerprint_has_no_quirks() {
-        // IdPrime, again — see `no_data_on_either_axis_resolves_to_no_quirks`
-        // for why `Generic` no longer fits this test: it now carries its own
+        // OpenFips201::Generic, again, at a different version — see
+        // `no_data_on_either_axis_resolves_to_no_quirks` for why plain
+        // `Generic` no longer fits this test: it now carries its own
         // `Default9bManagementKey` row (see
-        // `default_9b_management_key_seeded_fingerprints`).
+        // `default_9b_management_key_seeded_fingerprints`) — and why IdPrime
+        // no longer fits it either: it now carries
+        // `PivQuirk::HostChallengeResponsePermissiveTag` (see
+        // `idprime_has_the_host_challenge_response_permissive_tag_quirk`).
         assert_eq!(
-            resolve_quirks(AppletFingerprint::IdPrime, Some(&[1, 0]), Some(&[1, 0])),
+            resolve_quirks(
+                AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                Some(&[1, 0]),
+                Some(&[1, 0])
+            ),
             BTreeSet::new()
         );
     }
@@ -5276,7 +5407,24 @@ mod tests {
                 Some(&[0]),
                 None
             )),
-            Some(UTRUST_GOV_DEFAULT_MGMT_KEY)
+            Some(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY)
+        );
+    }
+
+    #[test]
+    fn idprime_shares_utrust_govs_default_management_key() {
+        // Hardware-observed on a live unit: IdPrime's factory-default `0x9B`
+        // key is the exact same 16-byte AES-128 pattern as `UTrust::Gov`'s
+        // (see `utrust_gov_has_its_own_default_management_key_not_the_yubikey_one`
+        // right above) — `IDPRIME_APPLET_QUIRKS` reuses that same constant
+        // rather than duplicating the byte pattern under a second name.
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(
+                AppletFingerprint::IdPrime,
+                Some(&[0]),
+                None
+            )),
+            Some(IDPRIME_AND_UTRUST_GOV_DEFAULT_MGMT_KEY)
         );
     }
 
@@ -5301,16 +5449,17 @@ mod tests {
 
     #[test]
     fn default_9b_management_key_absent_without_a_seeded_row() {
-        for fp in [
-            AppletFingerprint::IdPrime,
-            AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
-        ] {
-            assert_eq!(
-                default_9b_management_key(&resolve_quirks(fp, Some(&[0]), None)),
-                None,
-                "{fp:?}"
-            );
-        }
+        // IdPrime no longer belongs here — it now carries its own
+        // `Default9bManagementKey` row (see
+        // `idprime_shares_utrust_govs_default_management_key`).
+        assert_eq!(
+            default_9b_management_key(&resolve_quirks(
+                AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                Some(&[0]),
+                None
+            )),
+            None
+        );
     }
 
     #[test]
@@ -5327,13 +5476,23 @@ mod tests {
 
     #[test]
     fn default_9b_management_key_absent_without_a_reported_version_when_genuinely_unseeded() {
-        // Unlike YubiKey above, IdPrime carries no quirk row at all on
-        // either axis (see `no_data_on_either_axis_resolves_to_no_quirks`),
+        // Unlike YubiKey above, OpenFips201::Generic carries no quirk row at
+        // all on either axis (see `no_data_on_either_axis_resolves_to_no_quirks`),
         // so there's no `[]`-seeded row for the substitution to find even
         // once it applies — this still resolves no quirks, the "genuinely no
-        // data" case the substitution doesn't paper over.
+        // data" case the substitution doesn't paper over. IdPrime no longer
+        // fits this test: it now carries its own `[]`-seeded
+        // `PivQuirk::HostChallengeResponsePermissiveTag` row (see
+        // `idprime_has_the_host_challenge_response_permissive_tag_quirk`), so
+        // its quirk set isn't empty any more — `default_9b_management_key`
+        // still correctly reads `None` off it, just not for "no data at all"
+        // reasons.
         assert_eq!(
-            default_9b_management_key(&resolve_quirks(AppletFingerprint::IdPrime, None, None)),
+            default_9b_management_key(&resolve_quirks(
+                AppletFingerprint::OpenFips201(OpenFips201Variant::Generic),
+                None,
+                None
+            )),
             None
         );
     }
@@ -6580,6 +6739,82 @@ mod tests {
                     "{fp:?} {ext:?} with no reported version"
                 );
             }
+        }
+    }
+
+    // --- IdPrime: SlotPinPolicy/SlotTouchPolicy/PinManagementAuth are --------
+    // --- KnownUnsupported at the unbracketed `[]` floor — softens to --------
+    // --- Unverified off the exact match --------------------------------------
+
+    #[test]
+    fn idprime_slot_pin_touch_policy_known_unsupported_only_at_the_exact_floor() {
+        // See `IDPRIME_APPLET_VERDICTS`'s doc for the bracketing distinction
+        // this exercises: `Verdict::KnownUnsupported` with nothing above it
+        // on the row only blocks a query that resolves to version `[]` — the
+        // exact floor, or (per `resolve`'s "both axes unset" substitution)
+        // no reported version on either axis at all. An actually-reported,
+        // non-`[]` version softens straight to `Unverified` instead.
+        for ext in [
+            PivExtension::SlotPinPolicy,
+            PivExtension::SlotTouchPolicy,
+            PivExtension::PinManagementAuth,
+        ] {
+            assert_eq!(
+                resolve(ext, AppletFingerprint::IdPrime, Some(&[]), None),
+                FeatureGate::Unsupported,
+                "{ext:?} at the exact `[]` floor"
+            );
+            assert_eq!(
+                resolve(ext, AppletFingerprint::IdPrime, Some(&[5, 7]), None),
+                FeatureGate::Unverified,
+                "{ext:?} at an actually-reported version, unbracketed"
+            );
+            assert_eq!(
+                resolve(ext, AppletFingerprint::IdPrime, None, None),
+                FeatureGate::Unsupported,
+                "{ext:?} with no reported version on either axis — substitutes `[]`"
+            );
+        }
+    }
+
+    #[test]
+    fn idprime_slot_key_algorithm_rsa2048_is_known_supported() {
+        // Hardware-observed on the same live unit as the pin/touch-policy
+        // row above — see `IDPRIME_APPLET_VERDICTS`'s doc. Seeded at the
+        // universal `[]` floor, so `Verdict::KnownSupported`'s forward
+        // no-regression assumption makes this resolve `Supported` at `[]`
+        // itself and at every later version too, unlike the
+        // `KnownUnsupported` row right above it. No other algorithm has been
+        // probed on this fingerprint, so it stays `Unverified`.
+        let fp = AppletFingerprint::IdPrime;
+        for version in [&[][..], &[5, 7][..]] {
+            assert_eq!(
+                resolve(
+                    PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+                    fp,
+                    Some(version),
+                    None
+                ),
+                FeatureGate::Supported,
+                "Rsa2048 at {version:?}"
+            );
+        }
+        assert_eq!(
+            resolve(
+                PivExtension::SlotKeyAlgorithm(KeyAlg::Rsa2048),
+                fp,
+                None,
+                None
+            ),
+            FeatureGate::Supported,
+            "Rsa2048 with no reported version on either axis — substitutes `[]`"
+        );
+        for alg in [KeyAlg::Rsa1024, KeyAlg::EccP256, KeyAlg::EccP384] {
+            assert_eq!(
+                resolve(PivExtension::SlotKeyAlgorithm(alg), fp, Some(&[]), None),
+                FeatureGate::Unverified,
+                "{alg:?} hasn't been probed on this fingerprint"
+            );
         }
     }
 

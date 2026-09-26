@@ -2945,7 +2945,22 @@ impl<'tx> PivSession<'tx> {
         // card to us, completing mutual auth). Constant-time out of principle —
         // both sides are fresh per attempt, so the timing leaks nothing useful,
         // but secret-adjacent comparisons shouldn't short-circuit.
-        let z2 = piv::parse_general_auth(&resp2, 0x82).map_err(TransportError::PivParse)?;
+        //
+        // Hardware-observed (IdPrime PIV Applet): this step's reply carries
+        // the correct encrypted challenge, but under tag 0x80 (the witness
+        // tag from step 1) instead of 0x82 — see
+        // `keyroost_piv::compat::PivQuirk::HostChallengeResponsePermissiveTag`'s
+        // doc. On a fingerprint carrying that quirk, accept whichever single
+        // tag the reply's sole TLV element actually uses rather than
+        // requiring 0x82.
+        let z2 = if self
+            .quirks()
+            .contains(&keyroost_piv::compat::PivQuirk::HostChallengeResponsePermissiveTag)
+        {
+            piv::parse_general_auth_permissive(&resp2).map_err(TransportError::PivParse)?
+        } else {
+            piv::parse_general_auth(&resp2, 0x82).map_err(TransportError::PivParse)?
+        };
         let expected = Zeroizing::new(block_crypt(alg, key, &challenge, CryptOp::Encrypt)?);
         if !ct_eq(z2, &expected) {
             return Err(TransportError::PivManagementAuthFailed);
