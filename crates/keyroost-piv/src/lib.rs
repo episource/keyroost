@@ -1268,7 +1268,7 @@ const MAX_EXPIRATION_YEAR: i64 = 9999;
 
 /// Latest Unix seconds any expiration this crate encodes — a CHUID's
 /// `YYYYMMDD` or an X.509 `not_after` — can represent without producing a
-/// 5-digit year: the last second of [`MAX_EXPIRATION_YEAR`]-12-31. Shared by
+/// 5-digit year: the last second of `MAX_EXPIRATION_YEAR`-12-31. Shared by
 /// `x509::der_time`'s own clamp (so a CHUID and a certificate's validity
 /// period saturate at the identical instant) and by a caller composing
 /// several validity units together (e.g. `--years`/`--months`/`--days`
@@ -1359,7 +1359,7 @@ pub fn max_valid_years(now_unix_secs: u64) -> u32 {
 /// year isn't a leap year), the day clamps back to the 28th — the same
 /// "same date, N years later" rule every mainstream date library applies to
 /// a leap day. The result is clamped to the last second of
-/// [`MAX_EXPIRATION_YEAR`]-12-31, same ceiling and same shape as
+/// `MAX_EXPIRATION_YEAR`-12-31, same ceiling and same shape as
 /// `x509::der_time`'s own clamp, so a certificate's `not_after` computed
 /// this way saturates identically regardless of unit.
 #[must_use]
@@ -1429,7 +1429,7 @@ pub fn max_valid_months(now_unix_secs: u64) -> u32 {
 /// February never reaches the 31st), the day clamps down to that month's
 /// last day, the same rule [`add_calendar_years`] applies to a Feb 29 whose
 /// target year isn't a leap year. Clamped to the last second of
-/// [`MAX_EXPIRATION_YEAR`]-12-31, same ceiling and shape as
+/// `MAX_EXPIRATION_YEAR`-12-31, same ceiling and shape as
 /// [`add_calendar_years`]'s own clamp.
 #[must_use]
 pub fn add_calendar_months(now_unix_secs: u64, months: u32) -> i64 {
@@ -1999,7 +1999,7 @@ const MAX_DECIMAL_SERIAL: u128 = (1 << 80) - 1;
 
 /// Format a PIV serial for a text terminal: decimal with the hex form
 /// parenthesized, matching every serial observed so far, HID Crescendo's own
-/// on-card printed decimal serial included — see [`MAX_DECIMAL_SERIAL`].
+/// on-card printed decimal serial included — see `MAX_DECIMAL_SERIAL`.
 /// Past that, the decimal expansion is unwieldy and no vendor prints a
 /// serial that large in decimal, so those display as hex alone, with no
 /// parenthetical.
@@ -2012,7 +2012,7 @@ pub fn format_serial_long(serial: u128) -> String {
 }
 
 /// Format a PIV serial for a compact UI label: decimal for a serial that
-/// fits [`MAX_DECIMAL_SERIAL`], hex for one that doesn't — see
+/// fits `MAX_DECIMAL_SERIAL`, hex for one that doesn't — see
 /// [`format_serial_long`] for why.
 pub fn format_serial_short(serial: u128) -> String {
     if serial > MAX_DECIMAL_SERIAL {

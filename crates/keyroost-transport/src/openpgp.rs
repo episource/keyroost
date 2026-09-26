@@ -57,7 +57,7 @@ impl OpenPgpStatus {
     /// quirk its PIV applet has: each nibble of the raw value is a decimal
     /// digit of the number printed on the device. When the AID's manufacturer
     /// ID marks the card as Token2 ([`pgp::MANUFACTURER_ID_TOKEN2`]), the raw
-    /// value is run through [`crate::decode_bcd_serial`] to recover the real
+    /// value is run through `crate::decode_bcd_serial` to recover the real
     /// serial; every other vendor's serial is a plain integer and passes
     /// through untouched.
     #[must_use]

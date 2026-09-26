@@ -45,9 +45,9 @@ mod gzip;
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, random_management_key, CertUnreadable, CurrentMgmtAuth,
-    FactoryResetOutcome, FactoryResetPlan, PinProtectMaintenance, PivResetPreview, PivSession,
-    PivSessionState, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
+    random_chuid_guid, random_management_key, CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome,
+    FactoryResetPlan, PinProtectMaintenance, PivResetPreview, PivSession, PivSessionState,
+    PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
 };
 
 mod token2otp;
@@ -131,7 +131,7 @@ pub enum TransportError {
     /// object — deleting the management key outright has no equivalent on
     /// any other applet (a standard PIV management key is mandatory and can
     /// only be replaced). A caller that only offers this option when
-    /// [`PivSession::fingerprint`] already says so should never actually see
+    /// `PivSession::fingerprint` already says so should never actually see
     /// this.
     PivManagementKeyDeleteUnsupported,
     /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the

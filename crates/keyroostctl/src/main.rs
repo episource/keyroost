@@ -8085,7 +8085,7 @@ fn resolve_piv_reader(reader: Option<&str>) -> Result<String, Box<dyn std::error
     Ok(name)
 }
 
-/// Authenticate the management key on an already-open [`PivSession`] against
+/// Authenticate the management key on an already-open [`keyroost_transport::PivSession`] against
 /// the card's own algorithm — with a friendly wrong-length message *before*
 /// the card sees anything, instead of a bare transport error afterwards.
 ///
@@ -8145,8 +8145,8 @@ fn authenticate_piv(
 ///   --force to run anyway.`; with `force`, downgrade that to the same kind of
 ///   warning and run.
 ///
-/// For [`PivExtension::Reset`] specifically, the known-unsupported refusal
-/// also checks [`PivExtension::ResetGlobal`] — the device-wide reset
+/// For [`keyroost_piv::compat::PivExtension::Reset`] specifically, the known-unsupported refusal
+/// also checks [`keyroost_piv::compat::PivExtension::ResetGlobal`] — the device-wide reset
 /// directive that takes PIV down with it alongside at least one other applet
 /// — and, if that resolves `Supported` or `Unverified`, appends a sentence
 /// pointing at `keyroostctl factory-reset` as the working alternative. This
@@ -8199,7 +8199,7 @@ fn guard_piv_feature(
 /// working alternative — `None` when `ResetGlobal` is itself known-unsupported,
 /// leaving nothing to redirect to.
 ///
-/// Runs its own fingerprint probe (same cost as [`PivSession::feature_gate`]
+/// Runs its own fingerprint probe (same cost as [`keyroost_transport::PivSession::feature_gate`]
 /// itself), so this is one more SELECT round trip — acceptable here since it
 /// only runs on the road to an error, never on a path that would otherwise
 /// succeed.
@@ -8231,7 +8231,7 @@ fn reset_global_alternative_hint(
 /// touch policy in general but rejects the specific `cached` value
 /// ([`keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported`]).
 /// Mirrors [`guard_piv_feature`]'s tone and `--force` override, but keys off a
-/// quirk rather than a [`FeatureGate`], since this is about one option within
+/// quirk rather than a [`keyroost_piv::compat::FeatureGate`], since this is about one option within
 /// an otherwise-supported extension, not the extension as a whole:
 ///
 /// * `value_selected` is `false` (some other value was picked) → no-op,

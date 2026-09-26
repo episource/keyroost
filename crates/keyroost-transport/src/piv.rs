@@ -142,7 +142,7 @@ pub struct PivStatus {
     /// (currently: HID Crescendo, via its GET PIV PROPERTIES response's own
     /// "Applet Version Block" — that fingerprint never answers the Yubico
     /// extension at all), that one is used instead. `None` when neither
-    /// source answers. [`Self::feature_gate`] (via [`keyroost_piv::compat`])
+    /// source answers. [`PivSession::feature_gate`] (via [`keyroost_piv::compat`])
     /// compares this directly as a byte slice rather than requiring an exact
     /// 3-byte shape. See [`keyroost_piv::format_version_bytes`] for display
     /// formatting.
@@ -165,14 +165,14 @@ pub struct PivStatus {
     /// fixed encoding of the hardware generation (`[3, 3]`/`[3, 4]`) its
     /// serial prefix identifies, read via the same on-device OTP-applet
     /// probe that supplies [`Self::serial`] for this fingerprint (see
-    /// [`PivSession::probe_token2_otp_serial`]) — nothing Token2's firmware
+    /// `PivSession::probe_token2_otp_serial`) — nothing Token2's firmware
     /// itself ever puts on the wire.
     pub version_firmware: Option<Vec<u8>>,
     /// Device serial number. Ordinarily the Yubico GET SERIAL extension
     /// (widened to `u128` — see [`keyroost_piv::parse_serial`]); when a
     /// specific fingerprint's own probe supplies a serial instead — a
     /// Nitrokey's admin application, or a HID Crescendo unit's GlobalPlatform
-    /// CPLC read (see [`PivSession::probe_hid_crescendo_cplc_serial`]) —
+    /// CPLC read (see `PivSession::probe_hid_crescendo_cplc_serial`) —
     /// that one is used and GET SERIAL is skipped entirely: a Nitrokey
     /// answers that Yubico extension too, but with a number that isn't its
     /// real serial, and HID Crescendo doesn't answer it at all. `None` when
@@ -335,11 +335,11 @@ struct AppletFingerprintResult {
 /// [`PivSession::authenticate_management_via_pin`] call already established,
 /// same as every other admin write in this module. The one exception is a
 /// HID Crescendo unit whose "management key" isn't a real PIV object at all
-/// (see [`PivSession::hid_crescendo_reports_management_key`]): there,
+/// (see `PivSession::hid_crescendo_reports_management_key`): there,
 /// installing or deleting a key happens on a *different* applet instance
 /// (the ACA), which needs its own unlock run fresh rather than assumed to
 /// still be in force — see
-/// [`PivSession::hid_crescendo_aca_put_xauth_key_op`].
+/// `PivSession::hid_crescendo_aca_put_xauth_key_op`.
 #[derive(Debug, Clone, Copy)]
 pub enum CurrentMgmtAuth<'a> {
     /// The current management key, for the standard round or ACA XAUTH's
@@ -359,7 +359,7 @@ pub enum PinProtectMaintenance {
     NotApplicable,
     /// The maintenance step ran. The Admin Data bookkeeping bit
     /// (`keyroost_piv::OBJECT_ADMIN_DATA`) is always best-effort — see
-    /// [`PivSession::update_admin_data_pin_protected_flag`]'s doc — and
+    /// `PivSession::update_admin_data_pin_protected_flag`'s doc — and
     /// never surfaces here; `printed_data` is the outcome of the
     /// substantive write/clear against
     /// `keyroost_piv::OBJECT_PIN_PROTECTED_DATA`, the object
@@ -404,8 +404,8 @@ pub enum FactoryResetPlan {
     /// instead, in which case [`PivResetPreview::Global`] wins before this
     /// variant is even reached.
     Unsupported,
-    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]: RESET
-    /// needs an authenticated management-key session on this fingerprint,
+    /// RESET needs an authenticated management-key session on this
+    /// fingerprint ([`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]),
     /// not the PIN/PUK-blocked precondition [`PivSession::factory_reset`]
     /// otherwise automates. It authenticates with the
     /// `current` credential its caller supplied, then sends RESET —
@@ -472,7 +472,7 @@ pub enum FactoryResetOutcome {
     /// itself ([`FactoryResetPlan`]'s shapes) — nothing outside PIV was
     /// touched. See [`Self::WipedGlobal`] for the device-wide counterpart.
     Wiped,
-    /// [`PivSession::hid_crescendo_aca_reset_card`]-specific: the device-wide
+    /// `PivSession::hid_crescendo_aca_reset_card`-specific: the device-wide
     /// `PivExtension::ResetGlobal` mechanism ran cleanly — RESET CARD
     /// succeeded and XAUTH key 1 was restored to HID's documented
     /// factory-delivery value. This took at least one other applet down with
@@ -480,7 +480,7 @@ pub enum FactoryResetOutcome {
     /// not just PIV (`keyroost_resolve`'s `PIV_GLOBAL_RESET_LABEL`) — unlike
     /// [`Self::Wiped`], which is confined to PIV alone.
     WipedGlobal,
-    /// [`PivSession::hid_crescendo_aca_reset_card`]-specific: RESET CARD
+    /// `PivSession::hid_crescendo_aca_reset_card`-specific: RESET CARD
     /// succeeded — the device IS wiped — but restoring XAUTH key 1 to HID's
     /// documented factory-delivery value afterward failed. XAUTH key 1 is
     /// left cleared (RESET CARD's own effect) rather than at the factory
@@ -490,7 +490,7 @@ pub enum FactoryResetOutcome {
     WipedKeyRestoreFailed,
 }
 
-/// What [`PivSession::hid_crescendo_aca_put_xauth_key_op`] should do to XAUTH
+/// What `PivSession::hid_crescendo_aca_put_xauth_key_op` should do to XAUTH
 /// key 1 once unlocked — install a new key ([`Self::Set`], from
 /// [`PivSession::set_management_key`]) or delete it outright ([`Self::Delete`],
 /// from [`PivSession::delete_management_key_hid_crescendo`]). Private: an
@@ -525,14 +525,14 @@ pub struct PivSessionState {
     /// generation, ATR) this state was captured against — checked first and
     /// unconditionally by [`PivSession::with_cached_transaction`], before anything else:
     /// every other field here is only meaningful once this is confirmed
-    /// unchanged. See [`PcscIdentity`] for what each of its three parts
+    /// unchanged. See `PcscIdentity` for what each of its three parts
     /// checks and why.
     pcsc_identity: PcscIdentity,
     /// Raw response body of the most recent SELECT (full or short AID) —
     /// the FCI a spec-compliant card returns since both builders request it
     /// via a case-4 `Le`. Feeds [`keyroost_piv::fingerprint::select_identity`]
     /// during fingerprint resolution. No longer part of
-    /// [`PivSession::with_cached_transaction`]'s reuse decision — see [`PcscIdentity`]'s
+    /// [`PivSession::with_cached_transaction`]'s reuse decision — see `PcscIdentity`'s
     /// doc for why comparing it stopped earning its keep — so a value
     /// carried over from a cache hit is trusted as-is, unconfirmed against
     /// this connection's own card, until whatever real SELECT
@@ -561,7 +561,7 @@ pub struct PivSessionState {
     identity: Option<AppletFingerprintResult>,
     /// Algorithm + public key of any slot this lineage has resolved, keyed
     /// by key reference, from either of two provenances — see
-    /// [`PubkeyCache`] for the full lifecycle and why they're not kept
+    /// `PubkeyCache` for the full lifecycle and why they're not kept
     /// distinguishable once stored:
     ///
     /// * self-known: `generate_key` (the key it just minted) or
@@ -591,13 +591,13 @@ pub struct PivSessionState {
     /// ([`PivSession::resolve_slot_from_device`], sharing the one round trip
     /// `pubkey_cache` resolves from) or the ATTEST-certificate fallback for
     /// cards whose GET METADATA (supported or not) never reports one at all
-    /// — see [`PolicyCache`] for the full lifecycle. [`PivSession::slot_policy`]
+    /// — see `PolicyCache` for the full lifecycle. [`PivSession::slot_policy`]
     /// is the sole writer, and always leaves this resolved one way or the
     /// other, so a card needing the ATTEST fallback doesn't pay for another
     /// APDU plus a certificate parse on every single `status_detailed` call.
     policy_cache: PolicyCache,
     /// DER certificates read from each slot's data object, keyed by key
-    /// reference — see [`CertCache`]. A slot's certificate only changes on
+    /// reference — see `CertCache`. A slot's certificate only changes on
     /// an explicit [`PivSession::import_certificate`]/
     /// [`PivSession::clear_certificate`] (or a `generate_key` that clears
     /// the old one first), all of which keep this cache in step, so a plain
@@ -643,7 +643,7 @@ pub struct PivSessionState {
     /// exists purely to avoid re-issuing that read for each of those; a
     /// failed read caches as an empty `Vec`, same "resolved, with or without
     /// data" convention as `identity`. The CPLC serial
-    /// [`PivSession::probe_hid_crescendo_cplc_serial`] reads doesn't need a
+    /// `PivSession::probe_hid_crescendo_cplc_serial` reads doesn't need a
     /// second entry here: it's called directly from
     /// [`PivSession::applet_fingerprint`]'s `HidCrescendo` arms, so its
     /// result already rides along in the [`AppletFingerprintResult`]
@@ -659,7 +659,7 @@ impl PivSessionState {
     /// just-generated key's PEM again after reconnecting to the same card)
     /// doesn't need a live session just to read it back. Flattens away the
     /// "never asked" vs. "asked, confirmed empty" distinction the cache
-    /// itself tracks (see [`PubkeyCache`]) — both look like "nothing to
+    /// itself tracks (see `PubkeyCache`) — both look like "nothing to
     /// show" from here.
     pub fn cached_pubkey(&self, slot: Slot) -> Option<(KeyAlg, &PublicKey)> {
         self.pubkey_cache
@@ -788,7 +788,7 @@ pub struct PivSession<'tx> {
     /// `select_response`/`identity` restored from a cache hit without this
     /// connection itself having sent the APDU that produced them. Starts
     /// `false` on every fresh [`Self::from_transaction`]; set only by the
-    /// outcome of an actual [`Self::select`] call. [`Self::ensure_selected`]
+    /// outcome of an actual [`Self::select`] call. `Self::ensure_selected`
     /// is the sole reader — every real PIV command reaches the card through
     /// [`Self::transmit_full`], which checks this first and issues the
     /// actual SELECT lazily, once, the first time it's `false`.
@@ -892,11 +892,11 @@ impl PubkeyCache {
 /// key reference — the single per-slot source of "what's `slot`'s current
 /// policy", from whichever channel resolves it: a GET METADATA reply's own
 /// `policy` field (decoded by [`PivSession::resolve_slot_from_device`], the
-/// same call [`PubkeyCache`] shares its one round trip with), or — only once
+/// same call `PubkeyCache` shares its one round trip with), or — only once
 /// that channel has nothing to say — the ATTEST certificate's key-policy
 /// extension. `Option<(PinPolicy, TouchPolicy)>` values, not a bare pair, so
 /// "resolved: neither channel reports a policy for this slot" is itself a
-/// cacheable fact, same reason [`PubkeyCache`]/[`CertCache`] use the same
+/// cacheable fact, same reason `PubkeyCache`/`CertCache` use the same
 /// shape: without it, a card whose GET METADATA never carries policy at all
 /// (pre-5.3 firmware, non-Yubico PIV) would re-pay for a full ATTEST APDU
 /// plus a certificate parse on every single `status_detailed`/`slot_policy`
@@ -917,7 +917,7 @@ impl PubkeyCache {
 /// * `delete_key` leaves nothing to fall back to (`evict`),
 /// * `move_key` relocates the key material, so its entry follows (`migrate`),
 /// * `reset` wipes every slot — via `PivSessionState::default`, same as
-///   [`PubkeyCache`], not a dedicated method here.
+///   `PubkeyCache`, not a dedicated method here.
 #[derive(Clone, Default)]
 struct PolicyCache(HashMap<u8, Option<(PinPolicy, TouchPolicy)>>);
 
@@ -955,7 +955,7 @@ impl PolicyCache {
 }
 
 /// The in-session certificate cache behind [`PivSession::cert_object`],
-/// keyed by PIV key reference — same shape as [`PubkeyCache`], for the
+/// keyed by PIV key reference — same shape as `PubkeyCache`, for the
 /// same reason: a slot's certificate object only changes via an explicit
 /// write this crate already intercepts.
 ///
@@ -1004,14 +1004,14 @@ enum AppletCacheKey {
 }
 
 /// Session-lifetime cache for applet-specific byte blobs that don't fit
-/// `PivSession`'s other dedicated caches ([`PubkeyCache`], `identity`) — see
+/// `PivSession`'s other dedicated caches (`PubkeyCache`, `identity`) — see
 /// [`AppletCacheKey`] for what's stored today. A dict keyed by enum rather
 /// than one `Option<Vec<u8>>` `PivSession` field per value: today's sole
 /// entry happens to be HID Crescendo-specific, but nothing here is — the
 /// next applet-specific quirk that needs a "resolve once, reuse for the rest
 /// of the session" slot gets a new [`AppletCacheKey`] variant, not a new
 /// struct field. A value that isn't a byte blob (see
-/// [`PivSession::probe_hid_crescendo_cplc_serial`]'s doc for why a serial
+/// `PivSession::probe_hid_crescendo_cplc_serial`'s doc for why a serial
 /// doesn't belong here) has nowhere to fit until one actually needs this
 /// treatment — no speculative value-type abstraction ahead of that.
 #[derive(Clone, Default)]
@@ -1129,7 +1129,7 @@ fn decode_serial_if_bcd(
 /// stuck and never reflecting the slot's actual key state, and the public key
 /// goes with it: a raw key blob is meaningless without a trustworthy
 /// algorithm to interpret it against (RSA vs. EC changes how those bytes are
-/// structured, e.g. in [`metadata_key_material`]). Separately, strip `md`'s
+/// structured, e.g. in `metadata_key_material`). Separately, strip `md`'s
 /// PIN/touch policy (tag `0x02`) when `quirks` contains
 /// [`keyroost_piv::compat::PivQuirk::InsF7MetadataPinTouchPolicyInvalid`] — same
 /// "always ignore, never trust a lucky-looking value" treatment, kept as its
@@ -1171,7 +1171,7 @@ fn pcsc_reading_usable(state: Option<State>) -> bool {
 /// held) and `fresh` (a reading just taken): both present and numerically
 /// equal. `None` on either side — never resolved before, or this reading's
 /// query failed — can't prove anything, so it doesn't count as unchanged.
-/// See [`PcscIdentity::matches`] for the rule this feeds into, and
+/// See `PcscIdentity::matches` for the rule this feeds into, and
 /// [`PcscIdentity::event_count`]'s doc for why the counter, not the
 /// `CHANGED` flag bit, is what's compared here.
 fn pcsc_event_count_unchanged(cached: Option<u32>, fresh: Option<u32>) -> bool {
@@ -1182,12 +1182,12 @@ fn pcsc_event_count_unchanged(cached: Option<u32>, fresh: Option<u32>) -> bool {
 /// its independent checks must agree, or the cache is not trusted —
 /// `pcsc_trustworthy` (is this fresh PC/SC reading even usable, via
 /// [`pcsc_reading_usable`]) and `pcsc_identity_matches` (reader name, event
-/// counter, and ATR all agree, via [`PcscIdentity::matches`]). Kept separate
+/// counter, and ATR all agree, via `PcscIdentity::matches`). Kept separate
 /// from those so the *combining* rule (currently a flat AND, but the one
 /// place that could change if a future check needed different weighting) is
 /// pinned by a test independent of how each individual check is computed. A
 /// raw SELECT-response diff used to be a third input here — see
-/// [`PcscIdentity`]'s doc for why it was dropped.
+/// `PcscIdentity`'s doc for why it was dropped.
 fn piv_session_cache_reusable(pcsc_trustworthy: bool, pcsc_identity_matches: bool) -> bool {
     pcsc_trustworthy && pcsc_identity_matches
 }
@@ -1279,7 +1279,7 @@ impl<'tx> PivSession<'tx> {
     /// plain `let mut session = Self::from_transaction(...);` at the top of
     /// [`Self::with_cached_transaction_traced`] does the same. That one,
     /// though, only when its own cheap PC/SC-layer check doesn't pan out —
-    /// otherwise it leaves SELECT for [`Self::ensure_selected`] to issue
+    /// otherwise it leaves SELECT for `Self::ensure_selected` to issue
     /// lazily, on whatever real PIV command actually needs it first (still
     /// inside the very same transaction — that guard was already begun
     /// before this call, regardless of which path the caller takes next).
@@ -1343,7 +1343,7 @@ impl<'tx> PivSession<'tx> {
     /// exchanged; a caller that wants to tell a genuine card read apart from
     /// a fully cache-served one (for logging, say) reads this right after
     /// making its calls, before anything later might trigger the lazy SELECT
-    /// [`Self::ensure_selected`] issues. Once true, it stays true for the
+    /// `Self::ensure_selected` issues. Once true, it stays true for the
     /// life of the session — there's no way to "un-select" PIV, so a caller
     /// checking this after a mixed session (some fields cached, one not)
     /// correctly sees a real read happened, not a cache hit.
@@ -1358,7 +1358,7 @@ impl<'tx> PivSession<'tx> {
     /// One cheap check gates reuse of `cached`, proxying "is this reconnect
     /// still talking to the same physical card, on the same reader, that
     /// `cached` was captured from": **PC/SC-layer identity** — reader name,
-    /// insertion/removal counter, and ATR, via [`PcscIdentity::matches`] on
+    /// insertion/removal counter, and ATR, via `PcscIdentity::matches` on
     /// `cached.pcsc_identity` against a fresh reading
     /// (`Context::get_status_change` with zero timeout for the first two —
     /// no APDU, no connection — plus this call's own connect for the ATR).
@@ -1381,7 +1381,7 @@ impl<'tx> PivSession<'tx> {
     /// its `select_response`/`identity`/every other read cache — is trusted
     /// as-is, unconfirmed against this connection's own card, and the real
     /// SELECT PIV this session eventually needs is left for
-    /// [`Self::ensure_selected`] to issue lazily, immediately before
+    /// `Self::ensure_selected` to issue lazily, immediately before
     /// whatever the first genuine PIV command this session runs turns out to
     /// be. A caller whose `f` only reads already-cached state (or does
     /// nothing at all with the session) never pays for that SELECT.
@@ -1479,9 +1479,9 @@ impl<'tx> PivSession<'tx> {
     /// [`PivSessionState::default`] — dropping `pubkey_cache`,
     /// `select_response`, `identity`, `applet_cache`, every other read cache
     /// (`policy_cache`, `cert_cache`, `chuid_cache`, `pin_retries_cache`),
-    /// and the [`PcscIdentity`] validation anchor (`pcsc_identity`) all at
+    /// and the `PcscIdentity` validation anchor (`pcsc_identity`) all at
     /// once — then re-`SELECT`s PIV and resolves the
-    /// fingerprint fresh (via [`Self::fingerprint`], caching it in
+    /// fingerprint fresh (via `Self::fingerprint`, caching it in
     /// `state.identity` the same as any
     /// other first resolution): genuinely starting over, the applet's
     /// identity included, rather than carrying forward what an earlier
@@ -1499,9 +1499,9 @@ impl<'tx> PivSession<'tx> {
     /// thing, not a standing inefficiency.
     ///
     /// That one resolution already covers a `HidCrescendo` fingerprint's own
-    /// serial: [`Self::applet_fingerprint`]'s `HidCrescendo` arms call
-    /// [`Self::probe_hid_crescendo_cplc_serial`] themselves, exactly the way
-    /// the Nitrokey arm calls [`Self::probe_nitrokey_admin`], so there's no
+    /// serial: `Self::applet_fingerprint`'s `HidCrescendo` arms call
+    /// `Self::probe_hid_crescendo_cplc_serial` themselves, exactly the way
+    /// the Nitrokey arm calls `Self::probe_nitrokey_admin`, so there's no
     /// separate decision to make here — every other fingerprint's serial
     /// comes from Yubico's own GET SERIAL extension instead (see
     /// [`Self::status`]).
@@ -1529,7 +1529,7 @@ impl<'tx> PivSession<'tx> {
     /// GlobalPlatform CPLC
     /// ([`keyroost_piv::fingerprint::GLOBAL_PLATFORM_ISD_AID`]/
     /// [`keyroost_piv::fingerprint::GLOBAL_PLATFORM_GET_CPLC`]) — called
-    /// directly from [`Self::applet_fingerprint`]'s `HidCrescendo` arms, once
+    /// directly from `Self::applet_fingerprint`'s `HidCrescendo` arms, once
     /// classification already says this session's applet is one, so this
     /// never runs blind against a device with no reason to answer it. Its
     /// result becomes part of the [`AppletFingerprintResult`] that
@@ -1539,7 +1539,7 @@ impl<'tx> PivSession<'tx> {
     ///
     /// Same self-contained shape as every other mid-session identification
     /// probe in this file (Feitian, Swissbit, IdPrime, Nitrokey's admin
-    /// app — see e.g. [`Self::probe_feitian_rid`]/[`Self::probe_nitrokey_admin`]):
+    /// app — see e.g. [`Self::probe_feitian_rid`]/`Self::probe_nitrokey_admin`):
     /// SELECTs a second applet, reads what it needs, then unconditionally
     /// re-SELECTs PIV before returning, so the caller gets the session back
     /// exactly as any caller of [`Self::status`]/[`Self::status_detailed`]
@@ -1585,12 +1585,12 @@ impl<'tx> PivSession<'tx> {
     /// `keyroost_token2otp::parse_serial`), the OTP applet's reply is the
     /// serial itself in plain ASCII decimal — `parse_otp_serial` parses that
     /// text directly rather than hex-decoding it. Called directly from
-    /// [`Self::applet_fingerprint`]'s arm matching `Token2` or `Thetis`, once
+    /// `Self::applet_fingerprint`'s arm matching `Token2` or `Thetis`, once
     /// classification already narrowed the fingerprint to one of those, so
     /// this never runs blind against a device with no reason to answer it.
     ///
     /// Same self-contained shape as every other mid-session identification
-    /// probe in this file (see e.g. [`Self::probe_hid_crescendo_cplc_serial`]):
+    /// probe in this file (see e.g. `Self::probe_hid_crescendo_cplc_serial`):
     /// SELECTs a second applet, reads what it needs, then unconditionally
     /// re-SELECTs PIV before returning, so the caller gets the session back
     /// exactly as any caller of [`Self::status`]/[`Self::status_detailed`]
@@ -1652,10 +1652,10 @@ impl<'tx> PivSession<'tx> {
 
     /// Issues the actual SELECT APDU(s) unconditionally — a caller that only
     /// wants this to run once per connection goes through
-    /// [`Self::ensure_selected`] instead. Sets `applet_selected` to match the
+    /// `Self::ensure_selected` instead. Sets `applet_selected` to match the
     /// outcome: `true` on a confirmed PIV select, `false` on anything else
     /// (no applet, or a transport failure), so a failed attempt here can't
-    /// leave a later [`Self::ensure_selected`] wrongly convinced there's
+    /// leave a later `Self::ensure_selected` wrongly convinced there's
     /// nothing left to do.
     fn select(&mut self) -> Result<(), TransportError> {
         // Try the full, spec-mandated AID first — some PIV implementations
@@ -1704,7 +1704,7 @@ impl<'tx> PivSession<'tx> {
     /// The connected card's raw ATR (contact) or PC/SC-synthesised
     /// pseudo-ATR (contactless), via `SCardStatus`. Empty on any transport
     /// failure — this backs a best-effort fingerprinting read (see
-    /// [`Self::applet_fingerprint`]), not a precondition for anything else, so
+    /// `Self::applet_fingerprint`), not a precondition for anything else, so
     /// there is no error variant to plumb through.
     fn atr(&self) -> Vec<u8> {
         let mut names = [0u8; 256];
@@ -1724,9 +1724,9 @@ impl<'tx> PivSession<'tx> {
     /// entirely when it would just get a fake answer (observed: a Nitrokey
     /// answers that extension too, with a serial that isn't its real one; HID
     /// Crescendo simply doesn't answer it at all — every `HidCrescendo`
-    /// variant's arm below calls [`Self::probe_hid_crescendo_cplc_serial`]
+    /// variant's arm below calls `Self::probe_hid_crescendo_cplc_serial`
     /// directly, once classification already says the fingerprint is one,
-    /// same as the Nitrokey arm calling [`Self::probe_nitrokey_admin`]; the
+    /// same as the Nitrokey arm calling `Self::probe_nitrokey_admin`; the
     /// result becomes part of this method's own cached result, so later
     /// callers — `Self::status`, `Self::status_detailed` — get it for free
     /// from that cache rather than re-probing. The rest — from the ATR read
@@ -1743,7 +1743,7 @@ impl<'tx> PivSession<'tx> {
     /// `Generic`. Once the fingerprint itself is resolved, at most one
     /// further, fingerprint-specific step produces `applet_name`/version/
     /// serial: a Nitrokey (`Trussed(NitroKey)`) gets
-    /// [`Self::probe_nitrokey_admin`] for its firmware, hardware variant, and
+    /// `Self::probe_nitrokey_admin` for its firmware, hardware variant, and
     /// serial; a YubiKey names itself from its own `GET VERSION` reply; HID
     /// Crescendo (C2300 and C4000) names itself from its SELECT response's
     /// Application Label (already read above as `select_identity`) and,
@@ -2008,7 +2008,7 @@ impl<'tx> PivSession<'tx> {
     /// SELECT [`keyroost_piv::fingerprint::FEITIAN_RID`] and report whether the
     /// card accepted it, then unconditionally re-SELECT PIV afterward. Only
     /// called when nothing else already fingerprinted the applet — see the
-    /// call site in [`Self::applet_fingerprint`] — since a Feitian RID match
+    /// call site in `Self::applet_fingerprint` — since a Feitian RID match
     /// is the lowest-priority, catch-all criterion and every other one is
     /// cheaper to check first.
     fn probe_feitian_rid(&mut self) -> bool {
@@ -2027,7 +2027,7 @@ impl<'tx> PivSession<'tx> {
     /// (mirrors [`Self::probe_feitian_rid`], against a full AID rather than a
     /// bare RID). Only called when nothing else, not even Feitian's own
     /// probe, already fingerprinted the applet — see the call site in
-    /// [`Self::applet_fingerprint`].
+    /// `Self::applet_fingerprint`.
     fn probe_idprime_aid(&mut self) -> bool {
         let selectable = matches!(
             self.transmit_full_raw(&piv::select_by_aid(&keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID)),
@@ -2078,7 +2078,7 @@ impl<'tx> PivSession<'tx> {
     /// `id` and `version` are folded straight into the returned
     /// [`AppletFingerprintResult`] unchanged — this probe doesn't produce
     /// either of them itself (`id` is already known to be `Trussed(NitroKey)`
-    /// by the time [`Self::applet_fingerprint`] calls this; `version` is
+    /// by the time `Self::applet_fingerprint` calls this; `version` is
     /// Yubico's own GET VERSION reply, which a Nitrokey answers same as any
     /// other applet) — so the caller doesn't have to unpack a probe-shaped
     /// tuple and re-wrap it into the struct itself.
@@ -2209,9 +2209,9 @@ impl<'tx> PivSession<'tx> {
     /// On a *later* call — another slot method reusing what this one just
     /// resolved, a tab reselect, or a whole new session on the same card via
     /// [`Self::with_cached_transaction`] — even that one read each may not happen at
-    /// all: [`Self::read_certificate`]/[`Self::cached_slot_key`]/
-    /// [`Self::slot_policy`] each check [`CertCache`]/[`PubkeyCache`]/
-    /// [`PolicyCache`] first, so a slot whose key and certificate haven't
+    /// all: [`Self::read_certificate`]/`Self::cached_slot_key`/
+    /// [`Self::slot_policy`] each check `CertCache`/`PubkeyCache`/
+    /// `PolicyCache` first, so a slot whose key and certificate haven't
     /// changed since costs no APDU here whatsoever.
     ///
     /// Algorithm and policy fall back exactly as [`Self::slot_key_algorithm`]
@@ -2297,7 +2297,7 @@ impl<'tx> PivSession<'tx> {
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
     /// Widened to `u128` — see [`keyroost_piv::parse_serial`] for why the
     /// reply isn't always the standard 4-byte `u32`. Called at most once per
-    /// lineage, from [`Self::applet_fingerprint`]'s `YubiKey` and generic
+    /// lineage, from `Self::applet_fingerprint`'s `YubiKey` and generic
     /// catch-all arms only — every fingerprint with its own dedicated serial
     /// probe (Token2, Thetis, Nitrokey, HID Crescendo) never calls this at
     /// all. Resolving it during fingerprinting rather than lazily in
@@ -2319,7 +2319,7 @@ impl<'tx> PivSession<'tx> {
     /// `63 Cx` → `Some(x)`, `6983` (blocked) → `Some(0)`, `9000` (already
     /// verified) / anything else → `None`.
     ///
-    /// Cached in [`PivSessionState::pin_retries_cache`] for the rest of this
+    /// Cached in `PivSessionState::pin_retries_cache` for the rest of this
     /// lineage once a real status word comes back — a transport-level
     /// failure (the early `?` below) is never cached, same as every other
     /// cache here. [`Self::verify_pin`]/[`Self::change_pin`]/
@@ -2346,13 +2346,13 @@ impl<'tx> PivSession<'tx> {
 
     /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] plus
     /// its reported applet/firmware version bytes, resolved together once —
-    /// via [`Self::version`] and [`Self::applet_fingerprint`], the same
+    /// via [`Self::version`] and `Self::applet_fingerprint`, the same
     /// sources [`Self::status`] and [`Self::status_detailed`] use — and
-    /// cached in [`Self::identity`] (the field) for the rest of the session;
+    /// cached in `Self::identity` (the field) for the rest of the session;
     /// see that field's doc for why caching this particular resolution is
-    /// safe. [`Self::fingerprint`], [`Self::quirks`], and
+    /// safe. `Self::fingerprint`, [`Self::quirks`], and
     /// [`Self::extension_gate`] are thin accessors over this. The caching
-    /// itself lives in [`Self::applet_fingerprint`] now (shared with
+    /// itself lives in `Self::applet_fingerprint` now (shared with
     /// [`Self::status`]/[`Self::status_detailed`]/[`Self::feature_gate`],
     /// which need its `name`/`serial` fields too) — this is just the
     /// narrower view over the same cached value.
@@ -2371,18 +2371,18 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] — see
-    /// [`Self::identity`]. Used by [`Self::hid_crescendo_slot_algorithm`] to
+    /// `Self::identity`. Used by `Self::hid_crescendo_slot_algorithm` to
     /// find which HID Crescendo sub-variant (if any) it's talking to.
     fn fingerprint(&mut self) -> keyroost_piv::fingerprint::AppletFingerprint {
         self.identity().fingerprint
     }
 
     /// The [`keyroost_piv::compat::PivQuirk`]s active for this session's
-    /// applet — see [`Self::identity`]. [`Self::metadata`] consumes this
+    /// applet — see `Self::identity`. [`Self::metadata`] consumes this
     /// internally; `keyroostctl`'s `piv reset` also calls it directly (it's
     /// `pub` for that) to decide whether to print
     /// [`keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT`] before
-    /// running RESET. Cached via [`Self::identity`], so calling it costs no
+    /// running RESET. Cached via `Self::identity`, so calling it costs no
     /// extra round trip once the fingerprint has already been probed this
     /// session.
     pub fn quirks(&mut self) -> BTreeSet<keyroost_piv::compat::PivQuirk> {
@@ -2401,7 +2401,7 @@ impl<'tx> PivSession<'tx> {
     /// The [`keyroost_piv::compat::FeatureGate`] for one of this session's
     /// *internally* consumed [`keyroost_piv::compat::PivExtension`]s
     /// ([`keyroost_piv::compat::PivExtension::GetMetadata`]/[`Attest`] —
-    /// see [`Self::metadata`]/[`Self::attest`]) — see [`Self::identity`] for
+    /// see [`Self::metadata`]/[`Self::attest`]) — see `Self::identity` for
     /// where the fingerprint/version data comes from. Distinct from the
     /// public [`Self::feature_gate`], which resolves the same way but always
     /// live (never cached) for the UI-facing extensions
@@ -2432,9 +2432,9 @@ impl<'tx> PivSession<'tx> {
     /// fingerprint's own override if it has one, or [`KeyAlg::id`]'s
     /// Yubico-default byte otherwise. See
     /// [`keyroost_piv::compat::slot_key_algorithm_apdu_id`] — passed this
-    /// session's firmware version too, via [`Self::identity`], since that
+    /// session's firmware version too, via `Self::identity`, since that
     /// function's `Trussed`/`NitroKey` entry is gated by it. Cached via
-    /// [`Self::identity`], so this costs no extra round trip once the
+    /// `Self::identity`, so this costs no extra round trip once the
     /// fingerprint has already been probed this session.
     fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
         let SessionIdentity {
@@ -2475,10 +2475,10 @@ impl<'tx> PivSession<'tx> {
     /// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`]
     /// below, which needs the reply in hand to know what to strip from it.
     ///
-    /// Runs [`clear_metadata_if_quirky`] over the parsed reply before
+    /// Runs `clear_metadata_if_quirky` over the parsed reply before
     /// returning it — see that function's doc for what it strips and why.
     /// This is the sole place that needs to know about either check: every
-    /// caller — direct, or through [`Self::resolve_slot_from_device`]'s
+    /// caller — direct, or through `Self::resolve_slot_from_device`'s
     /// decode — already treats a missing algorithm/public key as "fall back
     /// to another source", which is exactly the right behavior on a device
     /// where GET METADATA can't be trusted, or isn't there at all.
@@ -2488,7 +2488,7 @@ impl<'tx> PivSession<'tx> {
     /// on essentially every VERIFY/CHANGE REFERENCE DATA/SET MANAGEMENT KEY
     /// call, so this crate never caches *this* method's raw result — a
     /// caller with an actual [`Slot`] in hand decodes and caches the *final*
-    /// facts it actually needs ([`Self::resolve_slot_from_device`] for
+    /// facts it actually needs (`Self::resolve_slot_from_device` for
     /// algorithm/key/policy) rather than the reply itself; see that
     /// method's doc for why.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
@@ -2510,21 +2510,21 @@ impl<'tx> PivSession<'tx> {
     /// an intermediate [`Metadata`] value:
     ///
     /// * whenever the reply carries a `policy` tag, decodes and writes
-    ///   [`PolicyCache`] directly — sharing this one round trip with
+    ///   `PolicyCache` directly — sharing this one round trip with
     ///   whatever else needed it, so a slot wanting both algorithm/key *and*
     ///   policy (`status_detailed`'s per-slot loop) never pays for it twice.
     ///   Deliberately never writes a *negative* answer there: an absent tag
     ///   means "try the ATTEST fallback next", a decision [`Self::slot_policy`]
     ///   — not this method — gets to make once it's tried that too;
     /// * returns the decoded `(algorithm, key)` when the reply names both
-    ///   (via [`metadata_key_material`]), `None` otherwise. Callers write
-    ///   that into [`PubkeyCache`] however fits their own read policy — see
-    ///   [`Self::cached_slot_key`] (cache-preferring) and
-    ///   [`Self::confirmed_slot_key`] (always re-confirms live).
+    ///   (via `metadata_key_material`), `None` otherwise. Callers write
+    ///   that into `PubkeyCache` however fits their own read policy — see
+    ///   `Self::cached_slot_key` (cache-preferring) and
+    ///   `Self::confirmed_slot_key` (always re-confirms live).
     ///
     /// Never itself consults or writes `pubkey_cache`/`policy_cache`'s
     /// "already resolved" state — that's each caller's own job, precisely
-    /// so [`Self::slot_key_status_algorithm`] can use this same decode path
+    /// so `Self::slot_key_status_algorithm` can use this same decode path
     /// for its algorithm-only reply without going anywhere near
     /// `pubkey_cache` at all (see that method's doc for why it must not).
     fn resolve_slot_from_device(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
@@ -2543,15 +2543,15 @@ impl<'tx> PivSession<'tx> {
             .and_then(|(alg, raw)| public_key_from_metadata(raw).ok().map(|key| (alg, key)))
     }
 
-    /// `slot`'s algorithm + public key from [`PubkeyCache`] if this lineage
+    /// `slot`'s algorithm + public key from `PubkeyCache` if this lineage
     /// has already resolved it (by either provenance — see that type's
-    /// doc), else one live [`Self::resolve_slot_from_device`] read, cached
+    /// doc), else one live `Self::resolve_slot_from_device` read, cached
     /// for next time either way (including a confirmed-empty slot, so a
     /// slot that's genuinely empty — the common case — doesn't cost another
     /// APDU on the next tab reselect). Backs the display/status paths that
     /// call repeatedly and can tolerate a value that's a moment stale:
     /// [`Self::status_detailed`], [`Self::slot_key_algorithm`],
-    /// [`Self::slot_has_key`]. [`Self::confirmed_slot_key`] is the
+    /// [`Self::slot_has_key`]. `Self::confirmed_slot_key` is the
     /// always-fresh counterpart for the two callers that can't.
     fn cached_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
         let key_ref = slot.key_ref();
@@ -2564,7 +2564,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// `slot`'s algorithm + public key, always re-confirmed live against the
-    /// device first — bypassing whatever [`PubkeyCache`] already holds —
+    /// device first — bypassing whatever `PubkeyCache` already holds —
     /// and preferring what the device reports whenever it reports anything.
     /// Backs [`Self::slot_key`], the shared source [`Self::generate_csr`]/
     /// [`Self::self_signed_certificate`] use: both mint an SPKI that then
@@ -2601,16 +2601,16 @@ impl<'tx> PivSession<'tx> {
     /// yields an empty read, since keyroost has no confirmed request shape
     /// for an unidentified HID Crescendo model), cached once per session —
     /// see [`Self::hid_crescendo_properties_raw`] (the field) for why this
-    /// is the single fetch both [`Self::hid_crescendo_slot_key_algorithms`] (the
+    /// is the single fetch both `Self::hid_crescendo_slot_key_algorithms` (the
     /// per-slot algorithm list) and [`Self::hid_crescendo_version`] (this
-    /// applet's own version, consulted by [`Self::applet_fingerprint`])
+    /// applet's own version, consulted by `Self::applet_fingerprint`)
     /// derive from, rather than each issuing its own read.
     ///
     /// `variant` is a parameter rather than resolved internally via
-    /// [`Self::fingerprint`] on purpose: [`Self::applet_fingerprint`] (via
-    /// [`Self::identity`]) is what determines the fingerprint in the first
+    /// `Self::fingerprint` on purpose: `Self::applet_fingerprint` (via
+    /// `Self::identity`) is what determines the fingerprint in the first
     /// place, and its own HID Crescendo branch is a caller of this method —
-    /// calling back into [`Self::fingerprint`]/[`Self::identity`] from here
+    /// calling back into `Self::fingerprint`/`Self::identity` from here
     /// would recurse into a resolution that hasn't finished yet. Every
     /// caller already has the variant in hand from its own match on
     /// [`keyroost_piv::fingerprint::AppletFingerprint`].
@@ -2674,8 +2674,8 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// This applet's own version, from the same HID Crescendo GET PIV
-    /// PROPERTIES read [`Self::hid_crescendo_slot_key_algorithms`] uses — see
-    /// [`Self::hid_crescendo_properties_raw`]. [`Self::applet_fingerprint`]
+    /// PROPERTIES read `Self::hid_crescendo_slot_key_algorithms` uses — see
+    /// [`Self::hid_crescendo_properties_raw`]. `Self::applet_fingerprint`
     /// feeds this into the "firmware version" axis
     /// [`keyroost_piv::compat::resolve`]/[`keyroost_piv::compat::resolve_quirks`]
     /// compare against [`keyroost_piv::compat::PivExtension::GetMetadata`]/
@@ -2715,7 +2715,7 @@ impl<'tx> PivSession<'tx> {
     /// [`keyroost_piv::compat::FeatureGate::Unsupported`] (see
     /// [`Self::metadata`]'s doc — today only confirmed for C2300, but C4000
     /// exposes the same GET PIV PROPERTIES data too), so this reads the
-    /// vendor's own data object instead via [`Self::hid_crescendo_slot_key_algorithms`].
+    /// vendor's own data object instead via `Self::hid_crescendo_slot_key_algorithms`.
     /// `None` on any other fingerprint (nothing to try), or when the read
     /// doesn't name `slot`'s key at all.
     ///
@@ -2847,7 +2847,7 @@ impl<'tx> PivSession<'tx> {
     ///    minority of HID Crescendo units that *do* expose the management
     ///    key (`0x9B`) as a real slot object (HID's own Crescendo Manager
     ///    documentation: <https://docs.hidglobal.com/crescendo-manager/CM/about-cm.htm>
-    ///    — see [`Self::hid_crescendo_reports_management_key`]): the
+    ///    — see `Self::hid_crescendo_reports_management_key`): the
     ///    GENERAL AUTHENTICATE witness/challenge round below, unchanged
     ///    from before this method knew HID Crescendo existed.
     /// 2. **HID Crescendo ACA XAUTH** — every other HID Crescendo unit (the
@@ -2856,7 +2856,7 @@ impl<'tx> PivSession<'tx> {
     ///    live C2300 unit: `SW = 6D 00` to a standard GENERAL AUTHENTICATE on
     ///    `0x9B`), so the standard round has nothing to authenticate
     ///    against. Delegates to
-    ///    [`Self::authenticate_management_hid_crescendo_aca`] — see its doc
+    ///    `Self::authenticate_management_hid_crescendo_aca` — see its doc
     ///    for the sequence and for why switching back to PIV at the end
     ///    doesn't throw the resulting authentication away the way it would
     ///    for the standard mechanism.
@@ -2971,7 +2971,7 @@ impl<'tx> PivSession<'tx> {
     /// The vendor fallback [`Self::authenticate_management`] uses for a HID
     /// Crescendo unit whose GET PIV PROPERTIES read doesn't name the PIV
     /// management key (`0x9B`) as a real slot object (see
-    /// [`Self::hid_crescendo_reports_management_key`]) — HID's External
+    /// `Self::hid_crescendo_reports_management_key`) — HID's External
     /// Authentication sequence against the ACA (Access Control Applet)
     /// instance's XAUTH key 1:
     /// <https://docs.hidglobal.com/crescendo/api/low-level/external-auth-xauth.htm>.
@@ -3024,10 +3024,10 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Steps 2–3 of the External Authentication sequence
-    /// [`Self::authenticate_management_hid_crescendo_aca`]'s doc describes:
+    /// `Self::authenticate_management_hid_crescendo_aca`'s doc describes:
     /// GET CHALLENGE, then EXTERNAL AUTHENTICATE with `key` block-encrypting
     /// that challenge. Factored out (unlike that method) so
-    /// [`Self::hid_crescendo_aca_put_xauth_key_op`] can run the same
+    /// `Self::hid_crescendo_aca_put_xauth_key_op` can run the same
     /// unlock immediately before PUT XAUTH KEY *without* an intervening
     /// re-SELECT back to PIV and forward to ACA again — the caller is
     /// responsible for having already SELECTed
@@ -3075,7 +3075,7 @@ impl<'tx> PivSession<'tx> {
     /// over-length PIN can never silently verify (and store) something other
     /// than what the user typed, and no retry counter is consumed.
     ///
-    /// Invalidates [`PivSessionState::pin_retries_cache`] once the card has
+    /// Invalidates `PivSessionState::pin_retries_cache` once the card has
     /// actually answered — success resets the counter, a wrong PIN
     /// decrements it, so either way a cached count from before this call is
     /// stale. Left untouched on a transport-level failure (the early `?`
@@ -3097,7 +3097,7 @@ impl<'tx> PivSession<'tx> {
     /// [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_AID`] — sending the
     /// standard reference while ACA is selected is not this command, and
     /// sending this one while PIV is selected wouldn't be either.
-    /// [`Self::hid_crescendo_aca_put_xauth_key_op`]'s `Pin` branch is the
+    /// `Self::hid_crescendo_aca_put_xauth_key_op`'s `Pin` branch is the
     /// sole caller.
     fn verify_pin_hid_crescendo_aca(&mut self, pin: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
@@ -3119,7 +3119,7 @@ impl<'tx> PivSession<'tx> {
     /// [`Self::authenticate_management`] with it, exactly as if the user had
     /// typed that key directly.
     ///
-    /// Branches on [`Self::fingerprint`] directly — HID Crescendo or not —
+    /// Branches on `Self::fingerprint` directly — HID Crescendo or not —
     /// rather than on a *version*-scoped confirmation of which specific
     /// applet build actually needs the indirect read: a device whose
     /// version this crate couldn't read, or hasn't seen before, or any
@@ -3194,7 +3194,7 @@ impl<'tx> PivSession<'tx> {
 
     /// Change the PIV PIN. A wrong `old` PIN consumes a try and reports the
     /// remaining count. Both PINs must be 6–8 bytes. Invalidates
-    /// [`PivSessionState::pin_retries_cache`] the same way, and for the same
+    /// `PivSessionState::pin_retries_cache` the same way, and for the same
     /// reason, [`Self::verify_pin`] does.
     pub fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
@@ -3220,9 +3220,9 @@ impl<'tx> PivSession<'tx> {
     /// Unblock a blocked PIN using the PUK, setting a new PIN. A wrong PUK
     /// consumes a try and reports the remaining count; a successful unblock
     /// resets the *PIN's* counter too (it's the PUK's own counter that isn't
-    /// tracked here — see [`PivSessionState::pin_retries_cache`]'s doc for
+    /// tracked here — see `PivSessionState::pin_retries_cache`'s doc for
     /// why this crate never caches that one). Both must be 6–8 bytes.
-    /// Invalidates [`PivSessionState::pin_retries_cache`] the same way, and
+    /// Invalidates `PivSessionState::pin_retries_cache` the same way, and
     /// for the same reason, [`Self::verify_pin`] does.
     pub fn unblock_pin(&mut self, puk: &[u8], new_pin: &[u8]) -> Result<(), TransportError> {
         let apdu = Zeroizing::new(
@@ -3235,7 +3235,7 @@ impl<'tx> PivSession<'tx> {
 
     /// Set the PIN and PUK retry counts (resetting both to their defaults).
     /// Requires prior management-key auth **and** a verified PIN. Invalidates
-    /// [`PivSessionState::pin_retries_cache`]: this resets the PIN counter to
+    /// `PivSessionState::pin_retries_cache`: this resets the PIN counter to
     /// its (possibly new) default, same as a successful [`Self::verify_pin`]
     /// would, just without presenting a PIN to do it.
     pub fn set_pin_retries(&mut self, pin_tries: u8, puk_tries: u8) -> Result<(), TransportError> {
@@ -3249,11 +3249,11 @@ impl<'tx> PivSession<'tx> {
     /// management-key auth ([`Self::authenticate_management`] /
     /// [`Self::authenticate_management_via_pin`]) — **except** on a HID
     /// Crescendo unit whose GET PIV PROPERTIES read doesn't name `0x9B` as a
-    /// real slot object (see [`Self::hid_crescendo_reports_management_key`]):
+    /// real slot object (see `Self::hid_crescendo_reports_management_key`):
     /// there, the "management key" is the ACA's XAUTH key 1, not a real PIV
     /// object, changed with HID's own PUT XAUTH KEY command instead of the
     /// standard SET MANAGEMENT KEY extension — see
-    /// [`Self::hid_crescendo_aca_put_xauth_key_op`] for that path, which
+    /// `Self::hid_crescendo_aca_put_xauth_key_op` for that path, which
     /// takes `current` to run its own self-contained unlock rather than
     /// relying on a prior call's access condition still being in force.
     /// Every other fingerprint ignores `current` entirely.
@@ -3284,20 +3284,20 @@ impl<'tx> PivSession<'tx> {
 
     /// Delete HID Crescendo's ACA XAUTH key 1 outright, rather than
     /// replacing it — the "Delete" option in the management-key rotation UI,
-    /// offered only when [`Self::fingerprint`] resolves to
+    /// offered only when `Self::fingerprint` resolves to
     /// [`keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo`] with no
     /// real `0x9B` slot object (see
-    /// [`Self::hid_crescendo_reports_management_key`]) — every other applet
+    /// `Self::hid_crescendo_reports_management_key`) — every other applet
     /// has no equivalent operation, since a standard PIV management key is
     /// mandatory and can only be *replaced*, never removed. Returns
     /// [`TransportError::PivManagementKeyDeleteUnsupported`] if `self` isn't
     /// that specific device; a caller that only offers this option when
-    /// [`Self::fingerprint`] already says so should never actually hit that
+    /// `Self::fingerprint` already says so should never actually hit that
     /// error unless the card was swapped mid-flow.
     ///
     /// Runs the same select/unlock/reselect sequence
-    /// [`Self::hid_crescendo_aca_put_xauth_key_op`] documents, with
-    /// [`HidCrescendoXauthKeyOp::Delete`] in place of `Set`.
+    /// `Self::hid_crescendo_aca_put_xauth_key_op` documents, with
+    /// `HidCrescendoXauthKeyOp::Delete` in place of `Set`.
     pub fn delete_management_key_hid_crescendo(
         &mut self,
         current: CurrentMgmtAuth<'_>,
@@ -3381,7 +3381,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Erase Yubico's PIN-protected management-key object
-    /// ([`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`]) — [`Self::write_pin_protected_management_key`]'s
+    /// ([`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`]) — `Self::write_pin_protected_management_key`'s
     /// undo, written back with a zero-length value, the same "PUT DATA with
     /// an empty `0x53`" convention [`keyroost_piv::clear_certificate`]
     /// already uses to wipe an optional PIV data object. Unconditional: run
@@ -3402,14 +3402,14 @@ impl<'tx> PivSession<'tx> {
     /// piv access change-management-key --protect`'s equivalent):
     ///
     /// - `allow_pin_unlock = false`: best-effort clear the Admin Data
-    ///   PIN-protected bit ([`Self::update_admin_data_pin_protected_flag`]);
+    ///   PIN-protected bit (`Self::update_admin_data_pin_protected_flag`);
     ///   left alone if it was never configured. Then erase
     ///   [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] itself
-    ///   ([`Self::clear_pin_protected_management_key`]) — a key this
+    ///   (`Self::clear_pin_protected_management_key`) — a key this
     ///   caller is deliberately marking as no longer PIN-unlockable
     ///   shouldn't keep sitting recoverable-via-PIN on the card.
     /// - `allow_pin_unlock = true`: set the bit, then
-    ///   [`Self::write_pin_protected_management_key`] with the new `key`,
+    ///   `Self::write_pin_protected_management_key` with the new `key`,
     ///   so [`Self::authenticate_management_via_pin`] can retrieve it after
     ///   a bare PIN VERIFY.
     ///
@@ -3418,7 +3418,7 @@ impl<'tx> PivSession<'tx> {
     /// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`]'s own content, not the
     /// bit, that actually decides whether the PIN can unlock management.
     /// Both branches above try to keep the two in step, but
-    /// [`Self::update_admin_data_pin_protected_flag`] is best-effort — a
+    /// `Self::update_admin_data_pin_protected_flag` is best-effort — a
     /// device with no Admin Data object at all (see that method's own doc)
     /// simply keeps whatever it never had, while
     /// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`] itself still gets
@@ -3481,7 +3481,7 @@ impl<'tx> PivSession<'tx> {
     /// The vendor fallback [`Self::set_management_key`]/
     /// [`Self::delete_management_key_hid_crescendo`] use for a HID Crescendo
     /// unit that doesn't model the PIV management key (`0x9B`) as a real slot
-    /// object (see [`Self::hid_crescendo_reports_management_key`]): PUT XAUTH
+    /// object (see `Self::hid_crescendo_reports_management_key`): PUT XAUTH
     /// KEY against the ACA (Access Control Applet) instance's XAUTH key 1,
     /// per the user-provided sequence:
     ///
@@ -3492,7 +3492,7 @@ impl<'tx> PivSession<'tx> {
     ///    uses the standard PIV application-PIN reference rather than the
     ///    one ACA's own VERIFY PIN answers at — or
     ///    [`Self::aca_xauth_unlock`] (the same GET CHALLENGE / EXTERNAL
-    ///    AUTHENTICATE round [`Self::authenticate_management_hid_crescendo_aca`]
+    ///    AUTHENTICATE round `Self::authenticate_management_hid_crescendo_aca`
     ///    runs) for [`CurrentMgmtAuth::Key`] — this method's own unlock,
     ///    run fresh rather than assumed still in force from an earlier
     ///    [`Self::authenticate_management`] /
@@ -3507,11 +3507,11 @@ impl<'tx> PivSession<'tx> {
     ///    algorithms ACA XAUTH supports —
     ///    [`TransportError::PivBadKeyLength`] for anything else, same error
     ///    the length mismatch in [`Self::set_management_key`] already uses.
-    ///    [`HidCrescendoXauthKeyOp::Delete`] runs
+    ///    `HidCrescendoXauthKeyOp::Delete` runs
     ///    [`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]
     ///    instead, unconditionally.
     /// 4. Unconditionally re-SELECT PIV, success or failure — same
-    ///    discipline as [`Self::authenticate_management_hid_crescendo_aca`]
+    ///    discipline as `Self::authenticate_management_hid_crescendo_aca`
     ///    and every other temporary-SELECT probe in this file.
     fn hid_crescendo_aca_put_xauth_key_op(
         &mut self,
@@ -3551,7 +3551,7 @@ impl<'tx> PivSession<'tx> {
     /// HID Crescendo's device-wide reset — the mechanism behind
     /// [`keyroost_piv::compat::PivExtension::ResetGlobal`]: SELECT the ACA
     /// instance, authenticate with `pre_reset_mgmt_auth` (PIN or XAUTH key — the same
-    /// choice [`Self::hid_crescendo_aca_put_xauth_key_op`] takes, run fresh
+    /// choice `Self::hid_crescendo_aca_put_xauth_key_op` takes, run fresh
     /// here for the same reason that method's doc gives), send RESET CARD
     /// ([`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_RESET_CARD`]), then
     /// restore XAUTH key 1 to HID's documented factory-delivery value —
@@ -3583,12 +3583,12 @@ impl<'tx> PivSession<'tx> {
     /// Only the restore step's failure is soft. Every earlier failure — the
     /// SELECT, the authentication, or RESET CARD itself (`SW = 69 82`,
     /// mapped by [`ok_or_write`] to [`TransportError::PivSecurityNotSatisfied`],
-    /// same status word and same mapping [`Self::hid_crescendo_aca_put_xauth_key_op`]
+    /// same status word and same mapping `Self::hid_crescendo_aca_put_xauth_key_op`
     /// relies on) — means the device was never touched, and propagates as a
     /// normal `Err`.
     ///
     /// Always re-SELECTs PIV afterward, whatever the outcome — same
-    /// discipline as [`Self::hid_crescendo_aca_put_xauth_key_op`] and every
+    /// discipline as `Self::hid_crescendo_aca_put_xauth_key_op` and every
     /// other temporary-SELECT probe in this file.
     ///
     /// Private: [`Self::factory_reset`] is the one public entry point for
@@ -3711,7 +3711,7 @@ impl<'tx> PivSession<'tx> {
     /// method's doc comment for why this deliberately doesn't do that on its
     /// own.
     ///
-    /// Also evicts any [`PolicyCache`] entry already cached for `slot` — it
+    /// Also evicts any `PolicyCache` entry already cached for `slot` — it
     /// describes the *old* key, if this slot held one — before reseeding it
     /// with whatever [`Self::slot_policy`] reads back afterward: not with
     /// `pin_policy`/`touch_policy` themselves (a request, not a result: this
@@ -3779,7 +3779,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Seed this session's key-material cache for `slot` with `(alg, key)`
-    /// directly, without a card round-trip — the same [`PubkeyCache`]
+    /// directly, without a card round-trip — the same `PubkeyCache`
     /// [`Self::generate_key`] populates, and the same one [`Self::slot_key`]/
     /// [`Self::slot_key_algorithm`] read when the device hasn't (yet, or
     /// ever) reported anything better.
@@ -3796,7 +3796,7 @@ impl<'tx> PivSession<'tx> {
     /// needs it (`generate_csr`, `self_signed_certificate`, or checking
     /// `slot_key_algorithm` for display). Not verified against the card in
     /// any way when written — but [`Self::slot_key`] (via
-    /// [`Self::confirmed_slot_key`]) always re-confirms live before trusting
+    /// `Self::confirmed_slot_key`) always re-confirms live before trusting
     /// it for a signing operation, so a caller handing over the wrong slot's
     /// key gets caught there whenever the device has any channel to check
     /// against; only a genuinely metadata-less card leaves this exactly as
@@ -3825,7 +3825,7 @@ impl<'tx> PivSession<'tx> {
     ///    for this fingerprint means its own live, device-reported channel
     ///    (GET METADATA's `algorithm` field, or HID Crescendo's GET PIV
     ///    PROPERTIES) can still name the slot's algorithm even without full
-    ///    key material — see [`Self::slot_key_status_algorithm`]. An RSA slot
+    ///    key material — see `Self::slot_key_status_algorithm`. An RSA slot
     ///    receiving an ECC certificate (or any other algorithm mismatch)
     ///    fails here even though the exact key bytes were never compared —
     ///    see [`TransportError::PivImportCertificateAlgorithmMismatch`].
@@ -3953,10 +3953,10 @@ impl<'tx> PivSession<'tx> {
     /// alone (no public key required, unlike [`Self::slot_key`]/
     /// `metadata_key_material`) for any Yubico-compatible fingerprint, or HID
     /// Crescendo's own GET PIV PROPERTIES read
-    /// ([`Self::hid_crescendo_slot_algorithm`]) for that family. Deliberately
+    /// (`Self::hid_crescendo_slot_algorithm`) for that family. Deliberately
     /// *not* [`Self::slot_key_algorithm`], and deliberately calling
-    /// [`Self::metadata`] directly rather than going through [`PubkeyCache`]
-    /// (via [`Self::cached_slot_key`]/[`Self::confirmed_slot_key`]) at all:
+    /// [`Self::metadata`] directly rather than going through `PubkeyCache`
+    /// (via `Self::cached_slot_key`/`Self::confirmed_slot_key`) at all:
     /// this must never fall back to — or get confused with — the
     /// self-known slice of that cache (not device-reported — a caller of
     /// [`Self::reject_certificate_key_mismatch`] already tried the full
@@ -3994,7 +3994,7 @@ impl<'tx> PivSession<'tx> {
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
     ///
-    /// Invalidates [`PivSessionState::chuid_cache`] back to "unresolved" on
+    /// Invalidates `PivSessionState::chuid_cache` back to "unresolved" on
     /// success, so the next [`Self::read_chuid`] — this session or, via
     /// `with_cached_transaction`, a later one on the same card — sees the value just
     /// written instead of whatever was cached before it.
@@ -4016,7 +4016,7 @@ impl<'tx> PivSession<'tx> {
     /// or doesn't parse as a CHUID. No PIN required — CHUID is a public data
     /// object, like a certificate.
     ///
-    /// Cached in [`PivSessionState::chuid_cache`] for the rest of this
+    /// Cached in `PivSessionState::chuid_cache` for the rest of this
     /// lineage — [`Self::new_chuid`] is the only thing that invalidates it.
     /// A transport- or parse-level failure (either `?` below) is never
     /// cached, same as every other cache here.
@@ -4066,8 +4066,8 @@ impl<'tx> PivSession<'tx> {
     ///   ([`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`]/
     ///   [`hid_crescendo_c4000_delete_key`](keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key)),
     ///   which needs the slot's *current* algorithm
-    ///   ([`Self::hid_crescendo_slot_algorithm`], from the same GET PIV
-    ///   PROPERTIES read [`Self::hid_crescendo_slot_key_algorithms`] uses) —
+    ///   (`Self::hid_crescendo_slot_algorithm`, from the same GET PIV
+    ///   PROPERTIES read `Self::hid_crescendo_slot_key_algorithms` uses) —
     ///   [`TransportError::PivDeleteKeyAlgorithmUnknown`] if that read never
     ///   named this slot at all.
     /// * [`Generic`](keyroost_piv::fingerprint::HidCrescendoVariant::Generic)
@@ -4135,7 +4135,7 @@ impl<'tx> PivSession<'tx> {
     /// recognizes surfaces as the same [`TransportError::PivDeleteKeyAlgorithmUnknown`]
     /// the caller already checked for before either sequence runs — that
     /// function's `None` cases ([`KeyAlg::Ed25519`]/[`KeyAlg::X25519`])
-    /// can't actually be reached from [`Self::hid_crescendo_slot_algorithm`]
+    /// can't actually be reached from `Self::hid_crescendo_slot_algorithm`
     /// in practice (see its doc), so this is unreachable defensiveness, not
     /// a real path.
     fn delete_key_hid_crescendo_c2300(
@@ -4172,10 +4172,10 @@ impl<'tx> PivSession<'tx> {
     /// erroring the call (a real card doesn't produce one; `slot_status` and
     /// `status_detailed` derive occupancy straight from this).
     ///
-    /// A thin wrapper over [`Self::cert_object`] — see that method's doc for
+    /// A thin wrapper over `Self::cert_object` — see that method's doc for
     /// the caching behaviour — that turns an unreadable certificate into
     /// [`TransportError::PivCertUnreadable`] instead of the tri-state
-    /// `Result` [`Self::cert_object`] returns.
+    /// `Result` `Self::cert_object` returns.
     pub fn read_certificate(&mut self, slot: Slot) -> Result<Option<Vec<u8>>, TransportError> {
         self.cert_object(slot)?
             .map_err(|reason| TransportError::PivCertUnreadable { slot, reason })
@@ -4186,7 +4186,7 @@ impl<'tx> PivSession<'tx> {
     /// that is there can be read. Status views use this directly so one
     /// unreadable slot is reported, not fatal to the whole snapshot.
     ///
-    /// Cached in [`CertCache`] for the rest of this lineage — see that
+    /// Cached in `CertCache` for the rest of this lineage — see that
     /// type's doc for the full invalidation lifecycle. A transport-level
     /// failure (the `?` below) is never cached, same as every other cache
     /// here: only an actual answer from the card, `9000` or not, counts as
@@ -4243,13 +4243,13 @@ impl<'tx> PivSession<'tx> {
 
     /// Read `slot`'s PIN/touch policy for display:
     ///
-    /// 1. [`PolicyCache`] — already resolved this lineage, by either of the
+    /// 1. `PolicyCache` — already resolved this lineage, by either of the
     ///    two channels below, this session or an earlier one carried in via
     ///    [`Self::with_cached_transaction`]. Skips both remaining steps for a value
     ///    that's fixed for the life of the slot's current key.
-    /// 2. GET METADATA's own `policy` field, via [`Self::cached_slot_key`] —
+    /// 2. GET METADATA's own `policy` field, via `Self::cached_slot_key` —
     ///    shares that method's one live round trip (and its own
-    ///    [`PubkeyCache`] cache check) rather than issuing a second GET
+    ///    `PubkeyCache` cache check) rather than issuing a second GET
     ///    METADATA, so a slot [`Self::status_detailed`] just resolved the
     ///    algorithm for costs nothing extra here.
     /// 3. The ATTEST certificate's Yubico key-policy extension
@@ -4259,7 +4259,7 @@ impl<'tx> PivSession<'tx> {
     ///    refusal is handled the same as everything else here, not specially.
     ///
     /// Whatever step 2 or 3 settles on — including "neither channel names
-    /// one" — is written to [`PolicyCache`] before returning, so a slot that
+    /// one" — is written to `PolicyCache` before returning, so a slot that
     /// genuinely has no reportable policy doesn't pay for both APDUs again
     /// on the next call.
     ///
@@ -4301,10 +4301,10 @@ impl<'tx> PivSession<'tx> {
     /// Read `slot`'s key algorithm for display, compatible with any PIV
     /// token — not just a YubiKey new enough for GET METADATA (5.3+):
     ///
-    /// 1. [`Self::cached_slot_key`] — GET METADATA's algorithm when it names
+    /// 1. `Self::cached_slot_key` — GET METADATA's algorithm when it names
     ///    one (authoritative), else this session's self-known key cache
     ///    (populated by [`Self::generate_key`], or seeded explicitly via
-    ///    [`Self::remember_pubkey`]) — either way, [`PubkeyCache`]. This is
+    ///    [`Self::remember_pubkey`]) — either way, `PubkeyCache`. This is
     ///    what makes a freshly generated key show up immediately on
     ///    metadata-less firmware: there's no certificate yet for step 3 to
     ///    read (self-sign/import hasn't run), and GET METADATA's silence on
@@ -4314,7 +4314,7 @@ impl<'tx> PivSession<'tx> {
     ///    to `remember_pubkey` first if it wants this step to see anything.
     /// 2. HID Crescendo C2300's live substitute for GET METADATA, which that
     ///    fingerprint never answers at all — see
-    ///    [`Self::hid_crescendo_slot_algorithm`]'s doc.
+    ///    `Self::hid_crescendo_slot_algorithm`'s doc.
     /// 3. Otherwise, fall back to the slot's certificate (a standard PIV data
     ///    object every card serves) and parse the algorithm out of its
     ///    SubjectPublicKeyInfo directly.
@@ -4323,7 +4323,7 @@ impl<'tx> PivSession<'tx> {
     /// needs the actual public key bytes, only the algorithm, so the
     /// certificate fallback is enough; `slot_key`'s callers (CSR/self-sign)
     /// need the raw key material and always re-confirm it live instead of
-    /// trusting this cache (see [`Self::confirmed_slot_key`]).
+    /// trusting this cache (see `Self::confirmed_slot_key`).
     pub fn slot_key_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
         if let Some((alg, _)) = self.cached_slot_key(slot) {
             return Some(alg);
@@ -4457,14 +4457,14 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// The algorithm and public key of the key stored in `slot`, via
-    /// [`Self::confirmed_slot_key`]: always re-confirmed live against GET
+    /// `Self::confirmed_slot_key`: always re-confirmed live against GET
     /// METADATA first (firmware 5.3+, when the card actually names both
-    /// algorithm and public key — [`metadata_key_material`] is the gate for
+    /// algorithm and public key — `metadata_key_material` is the gate for
     /// "does this reply actually name the key", since some implementations,
     /// e.g. Nitrokey's `piv-authenticator`, answer `SW_OK` with an empty body
     /// for slots they haven't wired reporting up for yet, functionally
     /// identical to "no GET METADATA support" here), falling back to
-    /// whatever [`PubkeyCache`] already holds only when the device answers
+    /// whatever `PubkeyCache` already holds only when the device answers
     /// nothing new — self-known, from a prior [`Self::generate_key`] on
     /// `slot` in *this* session, or a caller explicitly carrying key
     /// material forward via [`Self::remember_pubkey`]. That's what lets
@@ -4602,7 +4602,7 @@ impl<'tx> PivSession<'tx> {
     /// the on-demand occupancy check (not part of [`status`]'s snapshot, which
     /// stays 4 GET DATA calls rather than 24 by never touching retired slots).
     ///
-    /// Derives occupancy from [`Self::cached_slot_key`] — cache-preferring,
+    /// Derives occupancy from `Self::cached_slot_key` — cache-preferring,
     /// same as `status_detailed`'s own use, since this backs a UI dimming
     /// check as often as it backs [`Self::move_key`]'s destination-occupied
     /// precondition — which folds a transient/comms error into the same
@@ -4616,8 +4616,8 @@ impl<'tx> PivSession<'tx> {
     /// key reference whether or not a key was ever generated there, with an
     /// empty or key-less body for the ones that weren't. That reply is
     /// indistinguishable from "no key" and would otherwise mark every retired
-    /// slot present — so [`Self::resolve_slot_from_device`] gates on
-    /// [`metadata_key_material`], the same "does this reply actually name the
+    /// slot present — so `Self::resolve_slot_from_device` gates on
+    /// `metadata_key_material`, the same "does this reply actually name the
     /// key" check [`Self::slot_key`] uses, rather than on the GET METADATA
     /// status word alone.
     ///
@@ -4721,7 +4721,7 @@ impl<'tx> PivSession<'tx> {
         // already succeeded above, so a caller must still hear that as
         // success — the same "the real operation is done, a courtesy
         // follow-up failing is a separate concern" split
-        // [`Self::hid_crescendo_aca_reset_card`]'s `WipedKeyRestoreFailed`
+        // `Self::hid_crescendo_aca_reset_card`'s `WipedKeyRestoreFailed`
         // makes explicit for its own follow-up step. A refresh failure here
         // leaves the session in a state any later call will fail loudly on
         // its own, so nothing is silently swallowed forever.
@@ -4732,9 +4732,10 @@ impl<'tx> PivSession<'tx> {
     /// The raw [`keyroost_piv::compat::PivExtension::ResetGlobal`] gate for
     /// this session's applet — exposed on its own because nothing else here
     /// already surfaces it standalone: [`Self::plan_factory_reset`] resolves
-    /// only [`PivExtension::Reset`], and [`Self::global_reset_available`]
+    /// only [`keyroost_piv::compat::PivExtension::Reset`], and
+    /// [`Self::global_reset_available`]
     /// folds this gate together with `Reset`'s (via OR) and the
-    /// [`PivQuirk::ResetNeedsManagementAuth`] quirk (via AND) into one
+    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`] quirk (via AND) into one
     /// `bool`, losing this gate's own value along the way. A caller that
     /// needs to tell "`Reset` is `Unsupported` AND `ResetGlobal` is also
     /// `Unsupported`" apart from "`Reset` is `Unsupported` but `ResetGlobal`
@@ -4743,7 +4744,7 @@ impl<'tx> PivSession<'tx> {
     /// only proves the first half).
     ///
     /// Read-only, same cost as [`Self::plan_factory_reset`]: no APDU beyond
-    /// [`Self::identity`]'s fingerprint probe, cached after the first call
+    /// `Self::identity`'s fingerprint probe, cached after the first call
     /// this session.
     #[must_use]
     pub fn reset_global_gate(&mut self) -> keyroost_piv::compat::FeatureGate {
@@ -4761,7 +4762,7 @@ impl<'tx> PivSession<'tx> {
     /// unverified when that's all this gate can confirm.
     ///
     /// Read-only, same cost as [`Self::reset_global_gate`]: no APDU beyond
-    /// [`Self::identity`]'s fingerprint probe, cached after the first call
+    /// `Self::identity`'s fingerprint probe, cached after the first call
     /// this session.
     #[must_use]
     pub fn pin_management_auth_gate(&mut self) -> keyroost_piv::compat::FeatureGate {
@@ -4771,7 +4772,7 @@ impl<'tx> PivSession<'tx> {
     /// Resolve [`FactoryResetPlan`] for this session's applet — the PIV-only
     /// shape, from [`keyroost_piv::compat::PivExtension::Reset`] alone.
     /// Read-only: costs no PIN/PUK attempt, and no APDU at all beyond
-    /// [`Self::identity`]'s fingerprint probe (itself cached after the first
+    /// `Self::identity`'s fingerprint probe (itself cached after the first
     /// call this session).
     ///
     /// Most callers want [`Self::preview_factory_reset`] instead, which
@@ -4804,7 +4805,7 @@ impl<'tx> PivSession<'tx> {
     /// [`Self::plan_factory_reset`]'s PIV-only shape otherwise — the exact
     /// order [`Self::factory_reset`] itself dispatches on. Read-only, same
     /// cost as [`Self::plan_factory_reset`]: no APDU beyond
-    /// [`Self::identity`]'s fingerprint probe, cached after the first call
+    /// `Self::identity`'s fingerprint probe, cached after the first call
     /// this session.
     ///
     /// "First" because it can't predict [`Self::factory_reset`]'s one
@@ -4829,9 +4830,9 @@ impl<'tx> PivSession<'tx> {
         }
     }
 
-    /// Whether either reset extension — [`PivExtension::Reset`] or
-    /// [`PivExtension::ResetGlobal`] — resolves anything other than
-    /// [`FeatureGate::Unsupported`] (i.e. `Supported` *or* `Unverified` on
+    /// Whether either reset extension — [`keyroost_piv::compat::PivExtension::Reset`] or
+    /// [`keyroost_piv::compat::PivExtension::ResetGlobal`] — resolves anything other than
+    /// [`keyroost_piv::compat::FeatureGate::Unsupported`] (i.e. `Supported` *or* `Unverified` on
     /// at least one of the two) **and** this fingerprint carries
     /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]. `false`
     /// otherwise.
@@ -4852,11 +4853,11 @@ impl<'tx> PivSession<'tx> {
     /// too, alongside `ResetGlobal`, for the same "don't require `Supported`
     /// specifically" reasoning — either extension being anything but a
     /// confirmed dead end is enough to justify collecting a credential the
-    /// quirk says is needed; [`Self::hid_crescendo_aca_reset_card`] itself
+    /// quirk says is needed; `Self::hid_crescendo_aca_reset_card` itself
     /// still decides whether the attempt actually succeeds.
     ///
     /// Read-only, same cost profile as [`Self::plan_factory_reset`]: no APDU
-    /// beyond [`Self::identity`]'s fingerprint probe, cached after the first
+    /// beyond `Self::identity`'s fingerprint probe, cached after the first
     /// call this session — resolving both gates plus the quirk costs exactly
     /// one fingerprint, not three.
     ///
@@ -4904,7 +4905,7 @@ impl<'tx> PivSession<'tx> {
     /// which one this fingerprint actually wants. Public so `keyroostctl
     /// piv reset` can run the exact same round in front of a *plain*
     /// [`Self::reset`] — unlike [`Self::factory_reset`], it must never reach
-    /// for the device-wide [`PivExtension::ResetGlobal`] mechanism, so it
+    /// for the device-wide [`keyroost_piv::compat::PivExtension::ResetGlobal`] mechanism, so it
     /// authenticates here and sends [`Self::reset`] itself rather than
     /// calling [`Self::factory_reset`].
     pub fn authenticate_management_current(
@@ -4940,7 +4941,7 @@ impl<'tx> PivSession<'tx> {
     ///    step 2 instead of returning [`TransportError::PivResetGlobalFailed`]
     ///    outright: an unverified gate's claim that the mechanism applies here
     ///    was never confirmed, so the failure could just as easily be "wrong
-    ///    guess" as "real fault", and [`Self::hid_crescendo_aca_reset_card`]
+    ///    guess" as "real fault", and `Self::hid_crescendo_aca_reset_card`
     ///    only ever fails before it has touched anything (see that method's
     ///    doc), so nothing is lost by trying something else. A `Supported`
     ///    gate skips this: a confirmed-good mechanism failing means something
@@ -5222,7 +5223,7 @@ impl<'tx> PivSession<'tx> {
 
     /// Transmit one APDU and reassemble a response the card splits across
     /// `61xx` continuations (GET RESPONSE), returning `(payload, sw)`.
-    /// Lazily issues a real SELECT PIV first via [`Self::ensure_selected`] if
+    /// Lazily issues a real SELECT PIV first via `Self::ensure_selected` if
     /// this connection hasn't sent one yet — every genuine PIV command in
     /// this file reaches the card through here. Anything that needs to talk
     /// to a *different* applet (an AID-hopping fingerprint probe, HID
@@ -5364,7 +5365,7 @@ fn uses_extended_length(apdu: &[u8]) -> bool {
 /// A short, human-readable name for one of the AIDs/RIDs this crate SELECTs
 /// — the standard PIV applet itself (either AID form [`Self::select`] tries),
 /// this crate's own fingerprinting probes, and the GlobalPlatform Issuer
-/// Security Domain [`PivSession::probe_hid_crescendo_cplc_serial`] SELECTs up
+/// Security Domain `PivSession::probe_hid_crescendo_cplc_serial` SELECTs up
 /// front to read CPLC — for [`describe_apdu`]'s trace label. E.g. `"Feitian
 /// RID"` for [`keyroost_piv::fingerprint::FEITIAN_RID`]. `None` for anything
 /// else this crate doesn't recognize.
@@ -5627,7 +5628,7 @@ fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
 /// actually carries both — the single gate [`PivSession::slot_key`] uses to
 /// decide whether a metadata reply is usable or whether to fall back to the
 /// session's pubkey cache. Split out as a pure, card-free function (same seam
-/// style as [`PubkeyCache`]) so the "is this metadata usable" rule is
+/// style as `PubkeyCache`) so the "is this metadata usable" rule is
 /// unit-testable without a card: some PIV implementations answer GET METADATA
 /// with `SW_OK` but an empty or partial body for slots they haven't wired
 /// reporting up for yet (observed on Nitrokey's `piv-authenticator`, whose
@@ -7257,7 +7258,7 @@ mod open_cached_validity_rules {
     }
 }
 
-/// [`PcscIdentity::matches`]'s field-by-field rules, pinned without a card —
+/// `PcscIdentity::matches`'s field-by-field rules, pinned without a card —
 /// see [`open_cached_validity_rules`] for the lower-level pieces
 /// (`pcsc_event_count_unchanged`) this builds on.
 #[cfg(test)]
