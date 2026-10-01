@@ -49,6 +49,30 @@ pub use piv::{
     PivStatusDetailed,
 };
 
+/// Fuzzing-only entry points for the compressed-certificate reader. Not
+/// public API: `#[doc(hidden)]`, no stability promise, and no production
+/// caller — the same `pub` + `#[doc(hidden)]` pattern
+/// `keyroost_winwebauthn::parse_detail_path` uses so the out-of-tree
+/// `fuzz/` workspace (target `piv_cert_gzip`) can reach crate-private
+/// decoders of card-supplied bytes.
+#[doc(hidden)]
+pub mod fuzzing {
+    /// Fuzzing only: the crate-private inflate cap (64 KiB).
+    pub const MAX_CERT_DECOMPRESSED: usize = crate::gzip::MAX_CERT_DECOMPRESSED;
+
+    /// Fuzzing only: the crate-private gzip reader behind compressed PIV
+    /// certificate objects.
+    pub fn gunzip_capped(data: &[u8]) -> Result<Vec<u8>, crate::CertUnreadable> {
+        crate::gzip::gunzip_capped(data)
+    }
+
+    /// Fuzzing only: the crate-private GET DATA certificate-object decoder
+    /// (`53 { 70 <cert> 71 <CertInfo> }`, inflating when CertInfo says gzip).
+    pub fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, crate::CertUnreadable> {
+        crate::piv::cert_object_der(body)
+    }
+}
+
 mod token2otp;
 pub use token2otp::{
     otp_type_str, ButtonPrompt, HidOtpTransport, OtpTransportError, PcScOtpTransport,

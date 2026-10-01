@@ -1850,7 +1850,7 @@ fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
 /// read-only status calls). `Err` when there IS a certificate, flagged
 /// compressed, that won't inflate — reported as unreadable, never as empty.
 /// Pure, so the byte cases stay unit-tested.
-fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
+pub(crate) fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
     let Some((der, gzip)) = piv::unwrap_data_object(body)
         .ok()
         .and_then(piv::cert_object_parts)

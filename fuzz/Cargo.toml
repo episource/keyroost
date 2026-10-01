@@ -30,6 +30,10 @@ keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
 # winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
 # compiles/runs on Linux — the audit's KEY-020 surface, fuzzed here.
 keyroost-winwebauthn = { path = "../crates/keyroost-winwebauthn" }
+# For the piv_cert_gzip target: the compressed-certificate reader is
+# crate-private, reached through the `#[doc(hidden)]` `fuzzing` module.
+# Links libpcsclite (via `pcsc`) but never opens a reader.
+keyroost-transport = { path = "../crates/keyroost-transport" }
 
 [workspace]
 
@@ -141,6 +145,13 @@ bench = false
 [[bin]]
 name = "piv_x509_parse"
 path = "fuzz_targets/piv_x509_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "piv_cert_gzip"
+path = "fuzz_targets/piv_cert_gzip.rs"
 test = false
 doc = false
 bench = false

@@ -122,8 +122,8 @@ What keyroost does **not** defend against:
   neither fetches nor runs it. No build script in this workspace generates
   code, downloads anything, or reads outside its own package.
 - **Continuously fuzzed and dependency-audited.** The parsers named in the
-  threat model are covered by sixteen `cargo-fuzz` targets
-  (`fuzz/fuzz_targets/`), fifteen of them run on a weekly schedule; a RUSTSEC scan
+  threat model are covered by seventeen `cargo-fuzz` targets
+  (`fuzz/fuzz_targets/`), all of which run on a weekly schedule; a RUSTSEC scan
   (`cargo audit`) runs weekly and on every change to a manifest or the
   lockfile, and Dependabot proposes monthly updates for both the cargo and
   the GitHub-Actions dependency sets. The fuzz harness is its own workspace
