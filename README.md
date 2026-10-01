@@ -290,7 +290,8 @@ an open industry standard.
   — client-PIN, OTP payload encryption, and PIV management-key auth (also 3DES).
 - **RSA** with **PKCS#1** ([RFC 8017](https://www.rfc-editor.org/rfc/rfc8017)) and
   **PKCS#8** ([RFC 5208](https://www.rfc-editor.org/rfc/rfc5208)) key
-  serialization, PEM/DER (X.509 / ASN.1 DER) — host-side OpenPGP key import.
+  serialization, PEM/DER (X.509 / ASN.1 DER) — host-side OpenPGP key import, and
+  host-side verification in the PIV slot self-test (`keyroost-pivtest`).
 - **CBOR** ([RFC 8949](https://www.rfc-editor.org/rfc/rfc8949), canonical
   encoding) — the CTAP2 message format.
 - **base32** ([RFC 4648](https://www.rfc-editor.org/rfc/rfc4648)) and the
@@ -314,8 +315,11 @@ an open industry standard.
   checked against standard test vectors, and standard algorithms come from the
   audited RustCrypto crates.
 - **Secrets stay yours.** PINs and passwords come from stdin or env vars, never
-  argv; the tool never prints or persists them.
-- **Single static binary per OS** — no scripts, no Python, no Qt.
+  argv. Molto2 seeds and customer keys also accept argv for convenience (with a
+  warning), and each has an env/stdin variant. The tool never prints or persists
+  them.
+- **A single self-contained binary per OS** — it dynamically links only the system
+  C library and the PC/SC client; no scripts, no Python, no Qt.
 - **Toward native installs everywhere.** The longer-term goal is first-class
   distribution through each platform's mainstream channels. Available today:
   Homebrew, AUR, Flatpak, AppImage, and winget, plus the pre-built release
@@ -697,7 +701,7 @@ The Molto2 wire protocol is documented in [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
 about the device rather than any one implementation. The sibling single-profile
 programmable token (OTPC / miniOTP / C30x) is documented the same way in
 [`docs/PROTOCOL-token2prog.md`](docs/PROTOCOL-token2prog.md). The FIDO2, OATH,
-and OpenPGP layers follow their respective public standards.
+OpenPGP and PIV layers follow their respective public standards.
 
 ## Contact
 

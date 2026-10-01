@@ -4,18 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Migration notes — breaking changes — keyroost</title>
-<meta name="description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers — the v0.7.5 --name → --device rename and the v0.6.0 command regrouping.">
+<meta name="description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyroost">
 <meta property="og:title" content="Migration notes — breaking changes — keyroost">
-<meta property="og:description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers — the v0.7.5 --name → --device rename and the v0.6.0 command regrouping.">
+<meta property="og:description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers.">
 <meta property="og:url" content="https://framefilter.github.io/keyroost/migration.html">
 <meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Migration notes — breaking changes — keyroost">
-<meta name="twitter:description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers — the v0.7.5 --name → --device rename and the v0.6.0 command regrouping.">
+<meta name="twitter:description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers.">
 <meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 
 <link rel="icon" type="image/png" href="assets/keyroost-logo.png">
@@ -65,7 +65,8 @@
     <p>Nothing changes for scripts or the CLI. <code>piv status --json</code>
       gains a <code>cert_unreadable</code> field, present only for a slot whose
       compressed certificate cannot be read. One published-library removal,
-      and one behaviour change for library consumers reading certificates.</p>
+      and two behaviour changes for library consumers reading and importing
+      certificates.</p>
     <h3>Library (crates.io) API changes</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">
@@ -79,11 +80,19 @@
       <tr><td><code>keyroost-transport</code></td>
         <td><code>PivSession::read_certificate</code> now returns the
           certificate decompressed when the card stores it gzip-compressed
-          (it used to return the compressed bytes). A compressed certificate
-          that cannot be read returns the new
-          <code>TransportError::PivCertUnreadable</code> instead of
-          <code>Ok(None)</code>; <code>PivSlotStatus</code> reports it in its
-          new <code>cert_unreadable</code> field.</td></tr>
+          (it used to return <code>Ok(Some(..))</code> holding the
+          still-compressed bytes). A compressed certificate that cannot be
+          read now returns the new
+          <code>TransportError::PivCertUnreadable</code>;
+          <code>PivSlotStatus</code> reports it in its new
+          <code>cert_unreadable</code> field.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>PivSession::import_certificate</code> retries an oversized
+          certificate with command chaining. A card refusal is now
+          <code>TransportError::PivCertTooLarge</code> (<code>SW 6700</code>) or
+          <code>TransportError::PivCardFull</code> (<code>SW 6A84</code>)
+          instead of a generic write error. Not a compile break:
+          <code>TransportError</code> is <code>#[non_exhaustive]</code>.</td></tr>
     </table>
     </div>
   </section>

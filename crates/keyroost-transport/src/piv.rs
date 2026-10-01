@@ -1028,12 +1028,12 @@ impl PivSession {
         Ok(())
     }
 
-    /// Read the DER-encoded certificate stored in `slot`, or `None` when the
-    /// slot has none — `6A82` (no object), an empty `53 00` template, or a
-    /// body that isn't a `0x53` data object at all. A read-only public
-    /// object: no PIN, and a malformed body is reported as absent rather than
-    /// erroring the call (a real card doesn't produce one; `slot_status` and
-    /// `status_detailed` derive occupancy straight from this).
+    /// Read the DER-encoded certificate stored in `slot`. A read-only public
+    /// object: no PIN. An absent or empty object — `6A82` (no object), an
+    /// empty `53 00` template, or a body that isn't a `0x53` data object at
+    /// all — is `Ok(None)`. A certificate stored gzip-compressed is returned
+    /// decompressed. One that cannot be read (damaged, or over the 64 KiB
+    /// cap) returns `Err(TransportError::PivCertUnreadable)`.
     pub fn read_certificate(&mut self, slot: Slot) -> Result<Option<Vec<u8>>, TransportError> {
         self.cert_object(slot)?
             .map_err(|reason| TransportError::PivCertUnreadable { slot, reason })

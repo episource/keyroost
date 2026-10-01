@@ -46,7 +46,7 @@ keyroostctl --list-readers
 
 **If it fails:**
 - *"PC/SC service is unavailable"* — start the service (`sudo systemctl start pcscd` on Linux). On macOS this shouldn't happen.
-- *No reader matching "TOKEN2"* but other readers shown — paste the full output. We can widen the matcher.
+- *"no Token2 Molto2 reader found"* but other readers shown — keyroost looks for a reader whose name contains "molto". Paste the full output. We can widen the matcher.
 - *Empty list* — confirm with `pcsc_scan` (Linux) that PC/SC sees any reader at all. If not, it's a system-level USB / udev problem, not a keyroost one.
 
 **Faster than any of the above:** `keyroostctl doctor` checks the PC/SC service,
@@ -154,9 +154,9 @@ drop `--dry-run` and let it write.
 keyroost
 ```
 
-Click Connect → confirm device info appears in the top bar → enter the
-customer key (or leave blank for the default) → click Authenticate → select a
-slot → fill in a title and base32 secret → click Write profile.
+keyroost scans for devices on its own. Select the Molto2 in the device list →
+enter the customer key (or leave blank for the default) → click Authenticate →
+select a slot → fill in a title and base32 secret → click Write to slot.
 
 The log panel at the bottom should show green "ok" lines for each step.
 

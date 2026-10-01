@@ -300,7 +300,9 @@ flatpak remote-add --if-not-exists --user keyroost https://framefilter.github.io
 flatpak install --user keyroost io.github.framefilter.keyroost</code></pre>
     <p><strong>AppImage</strong> needs no installation — download
       <code>keyroost-x86_64.AppImage</code> from the latest release, make it executable, and
-      run it. (It uses the host's pcsc-lite, so install that first — see the note below.)</p>
+      run it. (It uses the host's pcsc-lite when installed and falls back to a bundled copy
+      otherwise, so it always starts; the smart-card features still need the host's pcscd —
+      see the note below.)</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Linux prerequisites</div>
       <p>The smart-card features (OATH, OpenPGP, PIV, Molto2) need the host's

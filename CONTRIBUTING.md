@@ -36,6 +36,8 @@ Run the same gates CI does:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+python3 packaging/assemble-changelog.py --check
 ```
 
 MSRV is Rust 1.85 for the workspace (1.92 for the `keyroost` GUI crate).

@@ -126,7 +126,8 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       * Findings are fixed on the prep branch, so the release ships
         accurate docs. Parallel agents (Learn pages / README / meta-docs)
         keep the pass tractable.
-- [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
+- [ ] Full gates: clippy `-D warnings`, fmt, workspace tests, and
+      `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`.
 - [ ] Land on main: push the prep branch directly —
       `git push origin <branch>:main` (the require-PR rule's admin bypass
       covers the maintainer; no rebase, no commit signing — the release is
@@ -147,8 +148,11 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       (`v*` tags are admin-only by ruleset.)
 - [ ] Two workflows start on the tag: `release.yml` (platform archives +
       GitHub Release) and `linux-bundles.yml` (AppImage + flatpak).
-      **Approve both release-publish gates promptly and together** — the
-      bundle attach steps wait for the Release that release.yml creates.
+      release.yml has no approval gate. linux-bundles.yml gates the
+      AppImage and Flatpak build jobs behind `release-publish`, then
+      `flatpak-publish` once the Flatpak build finishes. **Approve those
+      gates promptly** — the bundle attach steps wait for the Release that
+      release.yml creates.
       The retry window is 10 minutes (v0.7.6 lost the old 2-minute window
       by 16 seconds); if it still expires, re-run the failed job once the
       Release exists — attach is idempotent (`--clobber`).

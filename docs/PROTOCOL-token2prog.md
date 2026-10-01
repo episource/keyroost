@@ -9,8 +9,8 @@ configurator.
 > tests whose expected values were produced by an independent third-party SM4
 > implementation, itself validated against the GM/T 0002 SM4 known-answer test.
 
-It is a close relative of the [Molto2 protocol](PROTOCOL.md): the same NFC
-Type-4 / ISO 7816 transport, the same SM4 cipher, and the same ISO/IEC 9797-1
+It is a close relative of the [Molto2 protocol](PROTOCOL.md): the same ISO
+7816 APDU framing over PC/SC (no applet SELECT), the same SM4 cipher, and the same ISO/IEC 9797-1
 MAC. The differences are called out explicitly below.
 
 ## Transport

@@ -108,8 +108,9 @@
         administrative changes: generating keys, importing certificates, and changing retry
         counts. Cards ship with a well-known factory default
         (<code>010203…0708</code>, repeated to fill the key), so anyone can administer a
-        fresh card. If you rely on PIV day-to-day, change it — keyroost can rotate it to a
-        random value you keep somewhere safe (a password manager). Lose a changed key and
+        fresh card. If you rely on PIV day-to-day, change it — keyroost can change it to a
+        new key you supply (generate a random one and keep it somewhere safe, such as a
+        password manager). Lose a changed key and
         no admin changes are possible until a full applet reset.</p>
     </div>
   </section>
@@ -142,6 +143,15 @@ keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
       same step (with the same <code>--algorithm</code>, <code>--pin-policy</code> and
       <code>--touch-policy</code> options as <code>generate-key</code>), which spares
       cards without GET METADATA the save-pubkey / load-pubkey detour.</p>
+    <span id="certificates"></span>
+    <p><strong>Certificates.</strong> keyroost reads certificates stored gzip-compressed (the
+      PIV standard's CertInfo <code>0x01</code> form) and verifies their checksum. A damaged
+      one, or one that would decompress past 64&nbsp;KiB, shows as present but unreadable:
+      in <code>piv status</code>'s text, as <code>cert_unreadable</code> in
+      <code>--json</code>, and as &ldquo;unreadable cert&rdquo; in the app. Importing a
+      certificate too large for the slot fails with a clear &ldquo;too large&rdquo; message,
+      or &ldquo;no room left&rdquo; when the card is full, and leaves the slot's existing
+      certificate unchanged.</p>
     <span id="delete"></span>
     <p><strong>Clearing a slot.</strong> <code>delete-cert</code> removes only the slot's
       X.509 certificate object and leaves the private key in place — standard PIV, so it
@@ -186,7 +196,8 @@ keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
       <code>Decrypt: passed</code>, <code>Sign: FAILED — …</code>,
       <code>Key Agree: skipped — not supported for …</code> — and exits non-zero if any
       operation failed. With <code>--json</code> it emits
-      <code>{ slot, algorithm, ok, operations: [ { operation, result } … ] }</code> instead.
+      <code>{ slot, algorithm, ok, operations: [ { operation, result, detail? } … ] }</code>
+      instead, with <code>detail</code> present only when the result is <code>failed</code>.
       A slot with no certificate, or a key type keyroost can't verify, is an error — nothing
       is tested.</p>
     <span id="new-chuid"></span>

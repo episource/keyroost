@@ -69,7 +69,9 @@
       <span class="kr-mark mono">k</span>
       <p>Some of these are <strong>one-way</strong>: a higher minimum PIN length can't be
         lowered again, and enterprise attestation can't be turned off, without a full reset
-        of the key. keyroost asks for explicit confirmation before applying those.</p>
+        of the key. The desktop app asks for explicit confirmation before applying those; on
+        the CLI, <code>fido set-min-pin</code> and <code>fido enterprise-attestation</code>
+        apply immediately.</p>
     </div>
   </section>
 
@@ -98,7 +100,8 @@
       interaction must set a new PIN, without otherwise changing the minimum length. Useful
       before handing a key to someone else.</p>
     <p><strong>Enable enterprise attestation.</strong> Lets the key provide a vendor
-      attestation that uniquely identifies the model, for enterprise registration policies.
+      attestation that can uniquely identify the individual key, for enterprise registration
+      policies.
       This is typically one-way. keyroost only shows this control on keys that advertise
       support (the <code>ep</code> <code>getInfo</code> option); on keys that already have it
       enabled, the control shows its state instead of an action.</p>

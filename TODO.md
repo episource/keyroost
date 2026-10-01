@@ -8,18 +8,10 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.11.0 — a small, fast release.** Already on `main`: the
-compressed-PIV-certificate fix for
-[#147](https://github.com/framefilter/keyroost/issues/147)
-([#148](https://github.com/framefilter/keyroost/pull/148), with `piv test`
-restored to checking the certificate's key in
-[#149](https://github.com/framefilter/keyroost/pull/149)); #147 is folded in
-here rather than shipped as a 0.10.1 patch, and is closed once 0.11.0 ships.
-The v0.11.0 cleanups ride on the `release-prep/v0.11.0` branch; once it
-merges, what remains is the packaging probe and the playbook. PIV fingerprinting
-([#128](https://github.com/framefilter/keyroost/pull/128)) goes in **only if
-it is ready when the cleanups are** — it does not hold the release; otherwise
-it anchors the next one.
+Current work: nothing release-bound. v0.11.0 shipped with compressed PIV
+certificate reading (#147), clear errors for oversized certificate imports
+(#151) and an AppImage that starts without a host libpcsclite (#157). PIV
+fingerprinting (#128) anchors the next release once its author is ready.
 
 ---
 
@@ -42,7 +34,7 @@ Being worked on right now — check with whoever holds it before starting.
   flatpak broke at release time because a source was pruned). Full sequence:
   `packaging/RELEASING.md`, which is the playbook for the whole release.
 
-**Not in v0.11.0:**
+**Later:**
 
 - **Responsive layout at high zoom / narrow window.** At ~200% zoom in a
   partial-screen window, horizontal rows overflow and overlap (top-bar Reset vs
@@ -76,7 +68,7 @@ Being worked on right now — check with whoever holds it before starting.
   ([#128](https://github.com/framefilter/keyroost/pull/128), episource, draft)**
   — resolves [#113](https://github.com/framefilter/keyroost/issues/113) and
   [#125](https://github.com/framefilter/keyroost/issues/125). Waiting on the
-  author. When it is ready: rebase onto `main` (expect conflicts with #148/#149
+  author. When it is ready: rebase onto `main` (expect conflicts with #148/#149/#151
   in the PIV files), re-review against `packaging/REVIEWING.md` (check the
   agreed fixes: per-session fingerprint cache, serial as a JSON string), and
   verify on YubiKey 5.7, Nitrokey 3, Token2 and Solo 2.
@@ -177,8 +169,8 @@ plan's two-key manual steps were never executed):
   guaranteed to match the host's `pcscd`, for every distribution channel, not
   just the AppImage), and when it is absent keyroost still launches with
   FIDO/USB-HID working and the PC/SC panes showing "PC/SC unavailable".
-  Removes the known limitation documented in
-  `packaging/appimage/build-appimage.sh`. The `pcsc` crate links at build time —
+  Would also let the AppImage drop its bundled-libpcsclite fallback
+  (`build-appimage.sh` step 3b). The `pcsc` crate links at build time —
   check whether it exposes a dynamic-load path or whether we wrap libpcsclite in
   a thin FFI loader ourselves. Design first; verify on a host with and without
   the library.

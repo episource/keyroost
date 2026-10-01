@@ -22,10 +22,9 @@ behaviour of the Token2 device itself; none of it is copyrighted by anyone.
   *and* the PIN+/FIDO2+ FIDO keys — so VID alone does not identify a Molto2)
 - **Product ID:** `0x0300` (Molto2 / Molto2v2) — confirmed by Token2 (issue #25)
   as always and only the Molto2. There is no single "FIDO PID": Token2's FIDO
-  line uses many PIDs under the same VID — `0x0013`–`0x0016` (PIN+ Mini),
-  `0x0023`–`0x0026` (PIN+ Series / FIDO2 Security Key), `0x0203`–`0x0206`
-  (Bio3 Dual) — plus `0x0022` (the T2F2 / PIN+ key as it appears in the vendor's
-  reference udev rule) and `0x0430` for the MFA NFC reader. Classify with
+  line uses many PIDs under the same VID — `0x0010`–`0x0016` (PIN+ Mini),
+  `0x0020`–`0x0026` (PIN+ Series / FIDO2 Security Key) and `0x0200`–`0x0206`
+  (Bio3 Dual). `0x0430` is the MFA NFC reader, not a FIDO key. Classify with
   `keyroost_proto::token2_product` / `is_molto2_usb` rather than testing against
   any one PID; a Token2 PID that isn't in that table means "not provably a
   Molto2", not "FIDO".
@@ -36,7 +35,7 @@ behaviour of the Token2 device itself; none of it is copyrighted by anyone.
   `TOKEN2 FIDO2 Security Key 00 00`), so any brand-level match mis-flags them
   as a Molto2 (issue #21). The only reliable signal is the product word: use
   `keyroost_proto::is_molto2_reader`, which matches **`Molto2`** and nothing
-  else — every other Token2 device is a FIDO key.
+  else — every other Token2 device is a FIDO key or the NFC reader.
 - On Linux the device requires an entry in libccid's `Info.plist` so that
   pcscd picks it up; recent libccid versions ship that entry pre-configured.
 
@@ -173,8 +172,9 @@ NOT a precondition — reproduced twice with no auth at all):
 | `0xD4` | `01` | profile | plaintext TLV (see below) | Write profile config / sync time |
 | `0xD7` | `00` | `00` | SM4-ECB(`00 \|\| sha1(new_key)[..16] \|\| 0x80 \|\| 14×00`) | Rotate customer key (physical confirm) |
 
-Seed payloads accept 1..=63 raw bytes; the host pads with `0x80` then zeros to
-a 16-byte boundary before SM4 encryption.
+Seed payloads accept 1..=63 raw bytes. Before SM4 encryption the host pads
+them to a 16-byte boundary with `0x80` then zeros. A seed that is already a
+multiple of 16 bytes is sent without padding.
 
 Title payloads accept 1..=12 UTF-8 bytes; the host applies the same padding so
 the encrypted body is always exactly 16 bytes.
@@ -270,5 +270,6 @@ Contributions adding hardware traces / probing results are welcome — the hidde
 `keyroostctl molto probe` subcommand sweeps the plain class (CLA `0x80`), and
 with `--authed` the secure class too, classifying each status word. It skips the
 INS bytes known to mutate the device (`0xC5`, `0xD5`, `0xD4`, `0xD7`, `0xCE`,
-`0x56`, `0xD8`) unless `--include-destructive` is passed, requires `--yes`, and
-takes `--slot` for the P2 profile index (default 99).
+`0x56`, `0xD8`, `0xE6`) unless `--include-destructive` is passed, and requires
+`--yes`. The plain sweep always sends P2=`00`; `--slot` sets the P2 profile
+index (default 99) for the `--authed` scans only.

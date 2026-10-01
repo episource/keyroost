@@ -96,9 +96,10 @@
 
   <section class="kr-section" id="customer-key">
     <h2>The customer key</h2>
-    <p>Writes to the Molto2 are authenticated with a device <strong>customer key</strong> —
-      a secret that gates programming so that not just anyone with physical access can
-      reprogram your token. Sensitive commands are wrapped in an SM4-CBC MAC keyed by it.</p>
+    <p>Writes that program the Molto2 (seed, title, settings, key rotation) are
+      authenticated with a device <strong>customer key</strong> — a secret that gates
+      programming. Those commands are wrapped in an SM4-CBC MAC keyed by it. Deleting a
+      slot's seed is accepted without the key.</p>
     <ul>
       <li>keyroost can <strong>rotate the customer key</strong> to a value you control.</li>
       <li>Treat it like any other key secret: if you lose it you may be unable to reprogram
@@ -120,7 +121,7 @@
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
       <p>Read slot occupancy and titles; program a slot from an <code>otpauth://</code> URI;
-        set a slot's title or delete it; bulk-import from Aegis / 2FAS / an
+        set a slot's title or delete its seed (the title stays); bulk-import from Aegis / 2FAS / an
         <code>otpauth://</code> list; sync the host clock; rotate the customer key; and
         factory-reset — over a pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC)
         with no external crypto dependencies.</p>

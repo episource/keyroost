@@ -53,8 +53,9 @@ What keyroost defends against:
   allows — PINs, CTAP session secrets and per-credential largeBlob keys,
   RSA key components, imported TOTP seeds, and the decrypted-vault /
   QR-payload buffers they pass through (buffer reallocations and
-  library-internal copies remain out of reach); secrets are accepted via
-  env/stdin rather than argv.
+  library-internal copies remain out of reach). PINs and passwords are
+  accepted via env/stdin only; Molto2 seeds and customer keys also accept
+  argv for convenience, with a warning, and each has an env/stdin variant.
 
 What keyroost does **not** defend against:
 
@@ -122,7 +123,7 @@ What keyroost does **not** defend against:
   code, downloads anything, or reads outside its own package.
 - **Continuously fuzzed and dependency-audited.** The parsers named in the
   threat model are covered by sixteen `cargo-fuzz` targets
-  (`fuzz/fuzz_targets/`) run on a weekly schedule; a RUSTSEC scan
+  (`fuzz/fuzz_targets/`), fifteen of them run on a weekly schedule; a RUSTSEC scan
   (`cargo audit`) runs weekly and on every change to a manifest or the
   lockfile, and Dependabot proposes monthly updates for both the cargo and
   the GitHub-Actions dependency sets. The fuzz harness is its own workspace

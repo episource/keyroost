@@ -79,7 +79,7 @@ untested because an earlier row already answered the question.
 ### YubiKey 5 (`1050:0407`, fw 5.7.1; two units on the bench)
 | Candidate | Stable re-plug? | Unique per unit? | Read-only? | Privacy cost | Verdict |
 |---|---|---|---|---|---|
-| USB iSerial (E1) | n/a | n/a | yes | cross-interface correlatable | **not available** — most YubiKeys publish no `iSerialNumber`; the serial is only reachable over CCID (`keyroost-hid`) |
+| USB iSerial (E1) | n/a | n/a | yes | cross-interface correlatable | **not available** — most YubiKeys publish no `iSerialNumber`; the serial is only reachable over CCID (`keyroost_resolve::ccid_serial_for`) |
 | HID uniq (E2) | not tested | not tested | yes | none | not pursued — E4 answered it first |
 | AAGUID (E3) | yes | NO | yes | none | reject (model-level) — confirmed; the GUI treats AAGUID as a static *model* table |
 | OTP/CCID serial (E4) | yes | yes — two units told apart on hardware during the correlation work | yes | high (anti-tracking) — mitigated by local-only, opt-in storage | **adopted as the fallback** (`ccid_serial_for`) |

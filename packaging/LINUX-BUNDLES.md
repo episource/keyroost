@@ -63,11 +63,11 @@ bundles automatically.
    - **Grant CI write access:** create a **fine-grained PAT** scoped to *only*
      `framefilter/keyroost-flatpak` with **Contents: Read and write**, and add it
      to **this** repo as the secret **`FLATPAK_REPO_TOKEN`**.
-   - **Place the static descriptors** in the **root** of `keyroost-flatpak`: copy
-     `packaging/flatpak/keyroost.flatpakrepo` there (as `keyroost.flatpakrepo`) and
-     the icon SVG (as `keyroost-icon.svg`), so the one-click remote URL and its
-     icon resolve. The release workflow overlays the OSTree tree alongside these on
-     each tag and does **not** delete them.
+   - **Place the icon** in the **root** of `keyroost-flatpak`: copy the icon SVG
+     there (as `keyroost-icon.svg`) so the one-click remote's icon resolves. The
+     workflow republishes `keyroost.flatpakrepo` from `packaging/flatpak/` on
+     every run, so it needs no hand copy. The workflow overlays the OSTree tree
+     alongside these and does **not** delete the icon.
 
    When `FLATPAK_REPO_TOKEN` is absent the OSTree-publish step **skips cleanly**:
    the `.flatpak` bundle is still attached to the release, only the auto-update
@@ -273,12 +273,10 @@ inside the sandbox. Two pieces solve this:
 1. **Bundle the pcsc-lite *client* library** as its own build module *before*
    the cargo module, so the build/link finds `libpcsclite.so` and the runtime
    loads it. Ship the `.so` (and headers for the build) — **not** the `pcscd`
-   daemon. The draft manifest builds pcsc-lite with
-   `--disable-libsystemd --disable-polkit` and (ideally)
-   `--enable-libudev=no`, producing just the client lib + `libpcscspy` we don't
-   need. *(TODO for maintainer: confirm the exact `./configure` flags that yield
-   a client-only build on the pinned pcsc-lite version — the upstream flag names
-   have drifted across pcsc-lite 1.9/2.x; pin a known version and verify.)*
+   daemon. The manifest builds pcsc-lite with meson
+   (`-Dlibsystemd=false -Dpolkit=false -Dlibudev=false -Dusb=false
+   -Dserial=false`), producing just the client lib + `libpcscspy` we don't
+   need.
 2. **Expose the host pcscd socket** via finish-args. `--socket=pcsc` is a
    first-class Flatpak socket (confirmed in the Flatpak command reference: the
    `--socket=` value list includes `pcsc`). It bind-mounts the host's pcscd
@@ -324,10 +322,9 @@ Flatpak requires three exported assets, all keyed to the app-id:
   Required for the app to appear correctly and for
   `flatpak build-update-repo --update-appstream` to index it.
 - An **icon** at `…/share/icons/hicolor/<size>/apps/io.github.framefilter.keyroost.png`
-  (or `scalable/apps/…svg`). **keyroost has no icon asset in the repo today**
-  (`find` for `*.png`/`*.svg` outside test fixtures returns nothing). The draft
-  references `io.github.framefilter.keyroost.svg`; the maintainer must supply a
-  real icon — see decisions list. This same icon is reused by the AppImage.
+  (or `scalable/apps/…svg`). The icon set lives in `packaging/icons/`
+  (`io.github.framefilter.keyroost.svg` plus hicolor PNGs). This same icon is
+  reused by the AppImage.
 
 Drafts for the desktop file and metainfo are in `packaging/flatpak/`.
 
@@ -427,13 +424,14 @@ verified against the version you ship.)*
 See `packaging/appimage/build-appimage.sh`. Outline:
 
 ```bash
-cargo build --release -p keyroost           # build the GUI binary (glibc)
+cargo build --release -p keyroost --features keyroost/qr   # GUI binary (glibc)
 # stage AppDir, copy binary + desktop + icon, let linuxdeploy bundle libs:
 linuxdeploy --appdir AppDir \
     --executable target/release/keyroost \
     --desktop-file packaging/flatpak/io.github.framefilter.keyroost.desktop \
-    --icon-file <icon.png> \
-    --output appimage
+    --icon-file <icon.png>
+# move libpcsclite into usr/lib/pcsc-fallback/, wrap AppRun, then package:
+linuxdeploy-plugin-appimage --appdir AppDir
 ```
 
 (The desktop file + icon are **reused from the Flatpak drafts** — same app-id,
@@ -441,11 +439,9 @@ same metadata.)
 
 ### Publish mechanism
 
-Attach `keyroost-x86_64.AppImage` (+ its `.zsync` for delta updates, optional)
-as a **GitHub Release asset**, alongside the existing tarballs. `release.yml`
-already publishes release assets; a future step *could* add the AppImage, but
-**this draft does not modify `release.yml`** — the script is run manually for
-now. Note Token2 already ships an AppImage of their OEM edition, so the format
+Attach `keyroost-x86_64.AppImage` (+ its `.zsync` for delta updates) as a
+**GitHub Release asset**, alongside the existing tarballs. `linux-bundles.yml`
+runs the script on each tag and attaches both files to the release. Note Token2 already ships an AppImage of their OEM edition, so the format
 is proven for this app.
 
 ### Known limitations
@@ -454,7 +450,8 @@ is proven for this app.
   e.g. an older Ubuntu LTS) or the AppImage only runs on systems with glibc ≥
   the build machine's. This is the classic AppImage portability footgun.
 - FUSE dependency on the user's machine (see above).
-- No auto-update unless you add `.zsync` + an AppImageUpdate-compatible URL.
+- Updates go through AppImageUpdate: the build embeds gh-releases zsync update
+  info and ships the `.zsync` file.
 - GUI-only by design; CLI users get the musl binary or `cargo install`.
 
 ---
@@ -551,9 +548,9 @@ musl cross toolchain, then build libpcsclite there. See
 | | Flatpak (self-host) | AppImage | musl static |
 |---|---|---|---|
 | Binary | GUI (+CLI optional) | GUI | **CLI only** |
-| PC/SC | bundle client lib + `--socket=pcsc` to host pcscd | host pcscd (bundle client lib) | static musl libpcsclite (**unverified**) or FIDO-only |
+| PC/SC | bundle client lib + `--socket=pcsc` to host pcscd | host libpcsclite + pcscd; bundled client only as fallback | static musl libpcsclite (**unverified**) or FIDO-only |
 | FIDO HID | `--device=all` + `/run/udev:ro` | host hidraw + host udev rules | host hidraw + host udev rules |
-| Auto-update | yes (OSTree repo) | optional (.zsync) | no |
+| Auto-update | yes (OSTree repo) | yes (.zsync) | no |
 | Host needs pcscd | yes | yes | yes |
 | glibc portability | n/a (runtime) | build on old glibc | fully static (no glibc) |
 | Verified on hardware | **no** | **no** | **no** |
@@ -597,8 +594,8 @@ musl cross toolchain, then build libpcsclite there. See
     bumping the runtime.
 11. **Flatpak `--device=all` breadth.** *Open.* Acceptable, or narrow once
     hardware testing shows what's actually required?
-12. **Bundle vs rely-on-host for `libpcsclite`** in the AppImage (recommend
-    bundle) and the pcsc-lite version to pin everywhere.
+12. **DECIDED (#47):** use the host libpcsclite; a bundled copy in
+    `usr/lib/pcsc-fallback/` is used only when the host has none.
 
 ## Claims to double-check (could not fully web-verify)
 
