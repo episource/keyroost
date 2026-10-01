@@ -8,6 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.11.0] - 2026-09-30
 
+### Changed
+- **Reset commands no longer guess which key to wipe.** With several matching
+  keys connected and no selector, `molto reset`, `oath reset`,
+  `openpgp reset` and `piv reset` now stop with an error that names
+  `--device` and lists the candidates, instead of acting on the first one
+  found (`molto reset`) or asking for `--reader`. Passing both `--reader` and
+  `--device` to these commands, or to `fido reset`, is now an error instead of
+  `--reader` silently winning. A single connected key still works without
+  flags. Scripts that passed both flags, or relied on the first-found key,
+  need to pass one selector.
+- **`fido set-min-pin` and `fido enterprise-attestation` require `--yes`.**
+  Both changes can only be undone by resetting the key, which wipes its
+  credentials. Without `--yes` they refuse and send nothing to the key,
+  matching the typed confirmation the app already asks for. Scripts that
+  run them need to add `--yes`.
+
 ### Fixed
 - **PIV reads now handle gzip-compressed certificates.** A PIV certificate
   object may hold its certificate gzip-compressed (the CertInfo byte
