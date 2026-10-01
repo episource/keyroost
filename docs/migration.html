@@ -60,6 +60,34 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-11-0">
+    <h2>v0.11.0</h2>
+    <p>Nothing changes for scripts or the CLI. <code>piv status --json</code>
+      gains a <code>cert_unreadable</code> field, present only for a slot whose
+      compressed certificate cannot be read. One published-library removal,
+      and one behaviour change for library consumers reading certificates.</p>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>PivSession::management_key_algorithm</code> is removed; it had
+          no callers since v0.10.0. Use
+          <code>PivSession::resolve_management_key_algorithm</code> (given the
+          key length) or <code>PivSession::reported_management_key_algorithm</code>
+          (what the card reports, if anything).</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>PivSession::read_certificate</code> now returns the
+          certificate decompressed when the card stores it gzip-compressed
+          (it used to return the compressed bytes). A compressed certificate
+          that cannot be read returns the new
+          <code>TransportError::PivCertUnreadable</code> instead of
+          <code>Ok(None)</code>; <code>PivSlotStatus</code> reports it in its
+          new <code>cert_unreadable</code> field.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-10-0">
     <h2>v0.10.0</h2>
     <p>Nothing changes for scripts or the CLI &mdash; the new commands

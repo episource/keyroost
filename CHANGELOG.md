@@ -6,6 +6,44 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-30
+
+### Fixed
+- **PIV reads now handle gzip-compressed certificates.** A PIV certificate
+  object may hold its certificate gzip-compressed (the CertInfo byte
+  `71 01 01`, part of the PIV standard); the tool that writes the certificate
+  chooses this, and tools such as ykman do so on request. keyroost was
+  handing the compressed bytes straight to the X.509 parser, which rejected
+  them with "DER length field is implausibly large." `piv test` failed on
+  such a slot before it even reached the PIN, and `export-cert` and the
+  status pane's Subject-DN read had the same latent gap. keyroost now honours
+  the CertInfo flag and inflates the certificate on read (size-capped), so
+  `piv test`, `export-cert`, and the status pane read such a certificate
+  correctly. The gzip checksum and length are verified on read, so a
+  corrupted compressed certificate is reported as damaged rather than passed
+  on. A compressed certificate whose data is damaged, or that would
+  decompress past a 64 KiB cap, is reported as present but unreadable, with
+  the reason: `export-cert` and `piv test` fail with that message rather than
+  writing or parsing the raw bytes, and `piv status` (text, and `--json` via
+  a new `cert_unreadable` field) and the GUI show the slot as holding an
+  unreadable certificate, not as empty.
+  Reported by @n0xena. ([#147])
+- **PIV certificate imports that are too large now say so.** Importing a
+  certificate of about 3 KB or more could fail with a raw PC/SC error
+  ("An attempt was made to end a non-existent transaction") before the card
+  answered, so the command-chaining fallback never ran. keyroost now retries
+  such an import with command chaining. A certificate that fits (for
+  example 3048 bytes on a YubiKey 5.7) imports. One the card refuses gets
+  "the certificate (N bytes) is too large for <slot>", or "the card has no
+  room left" when its storage is full. A refused import leaves the slot's
+  existing certificate unchanged. ([#151])
+- **The AppImage starts on systems without the PC/SC library.** It used to
+  refuse to launch when `libpcsclite.so.1` wasn't installed. It now still
+  prefers the system's own library (needed to match the system's `pcscd`),
+  and otherwise falls back to a bundled copy: keyroost starts, FIDO works,
+  and the smart-card features report unavailable until `pcscd` is
+  installed. ([#157])
+
 ## [0.10.0] - 2026-09-20
 
 ### Added
@@ -1086,7 +1124,11 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#127]: https://github.com/framefilter/keyroost/issues/127
 [#130]: https://github.com/framefilter/keyroost/issues/130
 [#131]: https://github.com/framefilter/keyroost/issues/131
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.10.0...HEAD
+[#147]: https://github.com/framefilter/keyroost/issues/147
+[#151]: https://github.com/framefilter/keyroost/issues/151
+[#157]: https://github.com/framefilter/keyroost/issues/157
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/framefilter/keyroost/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/framefilter/keyroost/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/framefilter/keyroost/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
