@@ -8907,6 +8907,7 @@ const DESTRUCTIVE_INS: &[u8] = &[
     0xCE, // answer challenge (consumes an auth attempt)
     0x56, // factory reset
     0xD8, // lock / unlock screen
+    0xE6, // delete seed (keyless: P2=00 would wipe profile #0)
 ];
 
 fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slot: u8) {
@@ -10651,6 +10652,25 @@ mod cli_tests {
     fn fido_pin_retries_json_serializes() {
         let p = json_out::FidoPinRetriesJson { pin_retries: 8 };
         assert_json_has_keys(&p, &["pin_retries"]);
+    }
+
+    #[test]
+    fn probe_skips_every_molto_write_instruction() {
+        // The probe's plain sweep sends each INS with P2=00, so any write the
+        // device accepts without a key would hit profile #0. Every builder in
+        // keyroost-proto that changes the token must be on the skip list.
+        let writes = [keyroost_proto::commands::delete_seed(0)];
+        for cmd in writes {
+            let ins = cmd.apdu[1];
+            assert!(
+                DESTRUCTIVE_INS.contains(&ins),
+                "probe would send {} (INS {ins:02X}) in its sweep",
+                cmd.label
+            );
+        }
+        for ins in [0xC5u8, 0xD5, 0xD4, 0xD7, 0xCE, 0x56, 0xD8, 0xE6] {
+            assert!(DESTRUCTIVE_INS.contains(&ins), "INS {ins:02X} not skipped");
+        }
     }
 
     #[test]
