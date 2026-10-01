@@ -37,6 +37,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "the certificate (N bytes) is too large for <slot>", or "the card has no
   room left" when its storage is full. A refused import leaves the slot's
   existing certificate unchanged. ([#151])
+- **`molto probe` no longer sends the keyless seed-delete instruction.** The
+  hidden research command `keyroostctl molto probe --yes` sweeps the Molto2's
+  instructions while skipping the ones that change the token, but its skip
+  list missed `0xE6` (delete seed), which the token accepts without the
+  customer key, so a probe could erase the seed in profile 0. It is now
+  skipped like the other write instructions.
 - **The AppImage starts on systems without the PC/SC library.** It used to
   refuse to launch when `libpcsclite.so.1` wasn't installed. It now still
   prefers the system's own library (needed to match the system's `pcscd`),
