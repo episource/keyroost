@@ -2893,8 +2893,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Open a Molto2 session, honoring the global `--device` selector: when set, open
 /// the named device's reader (failing closed if it resolves to none), otherwise
-/// fall back to the first Molto2 reader found. Every `run_molto` path routes
-/// through here so no Molto operation can silently hit an unselected token.
+/// fall back to the first Molto2 reader found. Every non-destructive `run_molto`
+/// path routes through here; `molto reset` instead goes through [`reset_reader`],
+/// which refuses to pick among several tokens rather than taking the first.
 fn open_molto_session() -> Result<Session, Box<dyn std::error::Error>> {
     match reader_from_name()? {
         Some(reader) => Ok(Session::open_named(&reader)?),
@@ -3098,7 +3099,24 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
     // (read-only) device info before the --yes gate so even the refusal names
     // exactly which device would be wiped.
     if let MoltoCmd::Reset { yes } = cmd {
-        let mut session = open_molto_session()?;
+        // Unlike the other Molto commands, a wipe never falls back to the
+        // first Molto2 reader found: with several tokens and no --device it
+        // refuses instead of guessing.
+        let reader = reset_reader(
+            || {
+                let readers: Vec<String> = Session::list_readers()?
+                    .into_iter()
+                    .filter(|r| keyroost_proto::is_molto2_reader(r))
+                    .collect();
+                if readers.is_empty() {
+                    return Err(TransportError::NoMolto2Reader.into());
+                }
+                Ok(readers)
+            },
+            None,
+            "Molto2",
+        )?;
+        let mut session = Session::open_named(&reader)?;
         session.set_debug(debug);
         let info = session.read_info()?;
         print_info(&info);
@@ -4180,6 +4198,46 @@ fn resolve_reader(
     }
 }
 
+/// Pick the reader a per-applet reset wipes, with the same no-guessing posture
+/// as `factory-reset`: `--reader` and `--device` together are refused (they may
+/// name different keys), several candidates with neither selector are refused
+/// with a pointer to `--device`, and a lone key still works without flags.
+/// `device_reader` is the reader the global `--device` resolved to. Pure over
+/// the reader list so it is unit-testable without hardware.
+fn resolve_reset_reader(
+    readers: Vec<String>,
+    explicit: Option<&str>,
+    device_reader: Option<&str>,
+    kind: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    reader_device_conflict(explicit, device_reader)?;
+    if explicit.is_none() && device_reader.is_none() && readers.len() > 1 {
+        return Err(format!(
+            "{} {kind} keys connected; refusing to guess which one to reset. \
+             Select one with `--device <name>` (or `--reader <substring>`): {}",
+            readers.len(),
+            readers.join("; ")
+        )
+        .into());
+    }
+    resolve_reader(readers, explicit.or(device_reader), kind)
+}
+
+/// Resolve the reader a per-applet reset acts on from the live system: reject
+/// `--reader` + `--device` before touching anything, resolve `--device` to its
+/// reader, then apply [`resolve_reset_reader`] to the applet's readers.
+fn reset_reader(
+    list_readers: impl FnOnce() -> Result<Vec<String>, Box<dyn std::error::Error>>,
+    explicit: Option<&str>,
+    kind: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
+    reader_device_conflict(explicit, name)?;
+    let readers = list_readers()?;
+    let by_name = reader_from_name()?;
+    resolve_reset_reader(readers, explicit, by_name.as_deref(), kind)
+}
+
 /// Open an announced OATH session on the resolved reader, unlocking it if the
 /// applet is password-protected. A protected applet without a supplied password
 /// is a clear error rather than a confusing downstream `6982`.
@@ -5001,8 +5059,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // Deliberately NOT open_oath(): reset must work on a
             // password-protected applet whose password is lost — that's its
             // entire purpose — so no unlock is attempted.
-            let by_name = reader_from_name()?;
-            let name = resolve_oath_reader(reader.as_deref().or(by_name.as_deref()))?;
+            let name = reset_reader(
+                || Ok(keyroost_transport::OathSession::list_oath_readers()?),
+                reader.as_deref(),
+                "OATH",
+            )?;
             eprintln!("\u{2192} OATH on {}", sanitize_terminal(&name));
             let mut session = keyroost_transport::OathSession::open(&name)?;
             session.set_debug(debug);
@@ -5958,7 +6019,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // Resolve and identify the target *before* the --yes gate, so the
             // refusal (and the consent the flag implies) names the exact card —
             // the same posture as `factory-reset` and `piv reset`.
-            let mut session = open_openpgp(reader.as_deref(), debug)?;
+            let name = reset_reader(
+                || Ok(keyroost_transport::OpenPgpSession::list_openpgp_readers()?),
+                reader.as_deref(),
+                "OpenPGP",
+            )?;
+            let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
             let ident = match status.serial() {
                 Some(serial) => format!("serial {}", serial),
@@ -6776,7 +6842,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         PivCmd::Reset { reader, yes } => {
-            let mut s = open_piv(reader.as_deref(), debug)?;
+            let name = reset_reader(
+                || Ok(keyroost_transport::PivSession::list_piv_readers()?),
+                reader.as_deref(),
+                "PIV",
+            )?;
+            let mut s = open_piv_at(&name, debug)?;
             let st = s.status()?;
             let serial = st
                 .serial
@@ -6872,8 +6943,16 @@ fn open_openpgp(
     let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "OpenPGP")?;
-    eprintln!("\u{2192} OpenPGP on {}", sanitize_terminal(&name));
-    let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
+    open_openpgp_at(&name, debug)
+}
+
+/// Open the OpenPGP session on an already-resolved reader, announcing it.
+fn open_openpgp_at(
+    name: &str,
+    debug: bool,
+) -> Result<keyroost_transport::OpenPgpSession, Box<dyn std::error::Error>> {
+    eprintln!("\u{2192} OpenPGP on {}", sanitize_terminal(name));
+    let mut session = keyroost_transport::OpenPgpSession::open(name)?;
     session.set_debug(debug);
     Ok(session)
 }
@@ -6886,8 +6965,16 @@ fn open_piv(
     let readers = keyroost_transport::PivSession::list_piv_readers()?;
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
-    eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
-    let mut session = keyroost_transport::PivSession::open(&name)?;
+    open_piv_at(&name, debug)
+}
+
+/// Open the PIV session on an already-resolved reader, announcing it.
+fn open_piv_at(
+    name: &str,
+    debug: bool,
+) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
+    eprintln!("\u{2192} PIV on {}", sanitize_terminal(name));
+    let mut session = keyroost_transport::PivSession::open(name)?;
     session.set_debug(debug);
     Ok(session)
 }
@@ -7279,6 +7366,12 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 )
                 .into());
             }
+            // --path + --device is refused in resolve_fido_path; refuse
+            // --reader + --device the same way instead of letting --reader win.
+            reader_device_conflict(
+                reader.as_deref(),
+                SELECTED_KEY_NAME.get().and_then(|o| o.as_deref()),
+            )?;
             match reader {
                 Some(substr) => run_fido_reset_reader(substr)?,
                 None => run_fido_reset(path.as_deref())?,
@@ -9447,6 +9540,110 @@ mod cli_tests {
         assert!(reader_device_conflict(Some("Alcor 00"), None).is_ok());
         assert!(reader_device_conflict(None, Some("work-key")).is_ok());
         assert!(reader_device_conflict(None, None).is_ok());
+    }
+
+    fn two_piv_readers() -> Vec<String> {
+        vec![
+            "Yubico YubiKey OTP+FIDO+CCID 00 00".to_string(),
+            "Nitrokey Nitrokey 3 01 00".to_string(),
+        ]
+    }
+
+    #[test]
+    fn reset_reader_refuses_contradictory_reader_and_device() {
+        // Same contract as factory-reset: --reader and --device together may
+        // name two different keys, so a wipe refuses instead of letting
+        // --reader silently win.
+        let err = resolve_reset_reader(
+            two_piv_readers(),
+            Some("Yubico"),
+            Some("Nitrokey Nitrokey 3 01 00"),
+            "PIV",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--reader") && err.contains("--device"),
+            "{err}"
+        );
+        // Even with one reader, the contradiction is still refused.
+        assert!(resolve_reset_reader(
+            vec!["Yubico YubiKey 00 00".into()],
+            Some("Yubico"),
+            Some("Yubico YubiKey 00 00"),
+            "OATH",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn reset_reader_refuses_to_guess_among_several_keys() {
+        // No selector and several candidates: refuse, point at --device, and
+        // list the candidates so the user can tell them apart.
+        let err = resolve_reset_reader(two_piv_readers(), None, None, "PIV")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--device"), "{err}");
+        assert!(err.contains("Yubico YubiKey OTP+FIDO+CCID 00 00"), "{err}");
+        assert!(err.contains("Nitrokey Nitrokey 3 01 00"), "{err}");
+    }
+
+    #[test]
+    fn reset_reader_uses_a_lone_key_without_flags() {
+        assert_eq!(
+            resolve_reset_reader(vec!["Yubico YubiKey 00 00".into()], None, None, "OATH").unwrap(),
+            "Yubico YubiKey 00 00"
+        );
+        // No key at all is still an error, not a pick.
+        assert!(resolve_reset_reader(Vec::new(), None, None, "OATH").is_err());
+    }
+
+    #[test]
+    fn reset_reader_honours_a_single_selector_among_several_keys() {
+        // --device (resolved to its reader) picks exactly that key…
+        assert_eq!(
+            resolve_reset_reader(
+                two_piv_readers(),
+                None,
+                Some("Nitrokey Nitrokey 3 01 00"),
+                "PIV"
+            )
+            .unwrap(),
+            "Nitrokey Nitrokey 3 01 00"
+        );
+        // …and so does an explicit --reader substring on its own.
+        assert_eq!(
+            resolve_reset_reader(two_piv_readers(), Some("yubico"), None, "PIV").unwrap(),
+            "Yubico YubiKey OTP+FIDO+CCID 00 00"
+        );
+        // A --device whose reader is not among this applet's readers fails
+        // closed instead of falling back to another key.
+        assert!(resolve_reset_reader(
+            two_piv_readers(),
+            None,
+            Some("TOKEN2 Molto2 (AAAA) 00 00"),
+            "PIV"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn molto_reset_never_takes_the_first_molto_found() {
+        // Two Molto2 tokens and no --device: the old path opened whichever
+        // reader PC/SC listed first. Now it refuses and names --device.
+        let readers = vec![
+            "TOKEN2 Molto2 (AAAA) 00 00".to_string(),
+            "TOKEN2 Molto2 (BBBB) 01 00".to_string(),
+        ];
+        let err = resolve_reset_reader(readers.clone(), None, None, "Molto2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--device"), "{err}");
+        assert_eq!(
+            resolve_reset_reader(readers, None, Some("TOKEN2 Molto2 (BBBB) 01 00"), "Molto2")
+                .unwrap(),
+            "TOKEN2 Molto2 (BBBB) 01 00"
+        );
     }
 
     #[test]

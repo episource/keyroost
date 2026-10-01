@@ -123,16 +123,14 @@
     <h2>How keyroost treats resets</h2>
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
-      <p>Every wipe needs an explicit <code>--yes</code>. How a reset picks its key depends
-        on the command. <code>factory-reset</code> uses the only key connected; with several
-        it <strong>refuses</strong> until you name one with <code>--device</code>, and it
-        rejects <code>--reader</code> and <code>--device</code> together. The per-applet
-        resets (<code>piv reset</code>, <code>oath reset</code>, <code>openpgp reset</code>)
-        need <code>--reader</code> or <code>--device</code> when several keys expose that
-        applet; if you give both, <code>--reader</code> wins. <code>molto reset</code> acts on
-        the first Molto2 found unless you give <code>--device</code>, and the token's own
-        button press confirms it. <code>fido reset</code> with several keys asks you to pick
-        one. Reset support spans the FIDO2, OATH, OpenPGP,
+      <p>A reset never guesses which key it is aimed at. With one key connected it uses
+        that key. With several, <code>factory-reset</code> and the <code>molto</code>,
+        <code>oath</code>, <code>openpgp</code>, and <code>piv</code> resets
+        <strong>refuse</strong> until you name one with <code>--device</code>, and
+        <code>fido reset</code> asks you to pick one from a list. Resets reject
+        <code>--reader</code> and <code>--device</code> together, since those can name
+        different keys. Every wipe also needs an explicit <code>--yes</code>. Reset
+        support spans the FIDO2, OATH, OpenPGP,
         PIV, Token2 on-device OTP, and Molto2 applets; read-only inspection
         (<code>list</code>, <code>fido info</code>, <code>piv status</code>) never changes
         anything and never needs a PIN.</p>
