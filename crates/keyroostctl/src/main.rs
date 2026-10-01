@@ -2062,6 +2062,8 @@ enum FidoCmd {
     },
     /// Raise the minimum PIN length. The value can only be increased, never
     /// lowered (a reset is required to lower it), and may force a PIN change.
+    /// ONE-WAY: requires `--yes`. To only force a PIN change, use
+    /// `force-pin-change` instead.
     SetMinPin {
         /// New minimum PIN length (in code points). Must be >= the current one.
         #[arg(long, value_name = "N")]
@@ -2069,6 +2071,9 @@ enum FidoCmd {
         /// Also require the user to change the PIN on next use.
         #[arg(long)]
         force_change: bool,
+        /// Confirm the change (required): only a reset lowers the minimum again.
+        #[arg(long)]
+        yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
@@ -2086,8 +2091,11 @@ enum FidoCmd {
         path: Option<std::path::PathBuf>,
     },
     /// Enable enterprise attestation. This is typically one-way: disabling it
-    /// again requires a device reset.
+    /// again requires a device reset. Requires `--yes`.
     EnterpriseAttestation {
+        /// Confirm the change (required): only a reset turns it off again.
+        #[arg(long)]
+        yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
@@ -7395,10 +7403,20 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         FidoCmd::SetMinPin {
             length,
             force_change,
+            yes,
             pin_env,
             pin_stdin,
             path,
         } => {
+            if !*yes {
+                return Err(format!(
+                    "refusing to raise the minimum PIN length to {length} without --yes \
+                     (it can only be lowered again by resetting the key, which wipes its \
+                     credentials){}",
+                    fido_target_hint(path.as_deref())
+                )
+                .into());
+            }
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let length = *length;
             let force_change = *force_change;
@@ -7430,10 +7448,19 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             Ok(())
         }
         FidoCmd::EnterpriseAttestation {
+            yes,
             pin_env,
             pin_stdin,
             path,
         } => {
+            if !*yes {
+                return Err(format!(
+                    "refusing to enable enterprise attestation without --yes (it can only \
+                     be turned off again by resetting the key, which wipes its credentials){}",
+                    fido_target_hint(path.as_deref())
+                )
+                .into());
+            }
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             with_configurator(path.as_deref(), &pin, |cfg| {
                 cfg.enable_enterprise_attestation()?;
@@ -9322,6 +9349,91 @@ mod cli_tests {
                 cmd: OathCmd::Reset { yes, .. },
             }) => assert!(!yes),
             _ => panic!("expected oath reset"),
+        }
+    }
+
+    #[test]
+    fn fido_one_way_settings_require_explicit_yes() {
+        // Raising the minimum PIN length and enabling enterprise attestation
+        // cannot be undone without a reset, so both take the same --yes as the
+        // other irreversible commands. --yes must land in the confirm field and
+        // omitting it must decode to false.
+        match parse(&[
+            "keyroostctl",
+            "fido",
+            "set-min-pin",
+            "--length",
+            "8",
+            "--yes",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Fido {
+                cmd: FidoCmd::SetMinPin { yes, length, .. },
+            }) => assert!(yes && length == 8),
+            _ => panic!("expected fido set-min-pin"),
+        }
+        match parse(&["keyroostctl", "fido", "set-min-pin", "--length", "8"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Fido {
+                cmd: FidoCmd::SetMinPin { yes, .. },
+            }) => assert!(!yes),
+            _ => panic!("expected fido set-min-pin"),
+        }
+        match parse(&["keyroostctl", "fido", "enterprise-attestation", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Fido {
+                cmd: FidoCmd::EnterpriseAttestation { yes, .. },
+            }) => assert!(yes),
+            _ => panic!("expected fido enterprise-attestation"),
+        }
+        match parse(&["keyroostctl", "fido", "enterprise-attestation"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Fido {
+                cmd: FidoCmd::EnterpriseAttestation { yes, .. },
+            }) => assert!(!yes),
+            _ => panic!("expected fido enterprise-attestation"),
+        }
+    }
+
+    #[test]
+    fn fido_one_way_settings_refuse_without_yes_before_any_io() {
+        // Without --yes the handler must refuse before it reads a PIN or opens
+        // the device. The PIN source here is an unset variable and the path does
+        // not exist, so reaching either would yield a different error than the
+        // --yes refusal; an explicit --path also keeps the target hint from
+        // enumerating devices.
+        let path = Some(std::path::PathBuf::from(
+            "/nonexistent/keyroost-test-hidraw",
+        ));
+        let pin_env = Some("KEYROOST_TEST_UNSET_PIN_VAR".to_string());
+        let cases = [
+            FidoCmd::SetMinPin {
+                length: 8,
+                force_change: false,
+                yes: false,
+                pin_env: pin_env.clone(),
+                pin_stdin: false,
+                path: path.clone(),
+            },
+            FidoCmd::EnterpriseAttestation {
+                yes: false,
+                pin_env,
+                pin_stdin: false,
+                path,
+            },
+        ];
+        for cmd in &cases {
+            let err = run_fido(cmd, false).unwrap_err().to_string();
+            assert!(err.contains("without --yes"), "unexpected error: {err}");
+            assert!(err.contains("/nonexistent/keyroost-test-hidraw"), "{err}");
         }
     }
 
