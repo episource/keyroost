@@ -823,6 +823,175 @@ impl CliTouchPolicy {
     }
 }
 
+/// X.509 key usages selectable with `--key-usage`.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CliKeyUsage {
+    /// The usages the PIV standard prescribes for the slot. Valid on its own
+    /// or next to exactly those usages; needs a slot the standard defines a
+    /// usage for.
+    Default,
+    /// Write no keyUsage extension — same as omitting `--key-usage`. Can't be
+    /// combined with other values, except `default` for a slot whose PIV
+    /// default is itself undefined.
+    Undefined,
+    DigitalSignature,
+    NonRepudiation,
+    KeyEncipherment,
+    DataEncipherment,
+    KeyAgreement,
+    KeyCertSign,
+    CrlSign,
+    EncipherOnly,
+    DecipherOnly,
+}
+
+impl CliKeyUsage {
+    fn bit(self) -> Option<keyroost_piv::x509::KeyUsage> {
+        use keyroost_piv::x509::KeyUsage as K;
+        Some(match self {
+            CliKeyUsage::Default | CliKeyUsage::Undefined => return None,
+            CliKeyUsage::DigitalSignature => K::DIGITAL_SIGNATURE,
+            CliKeyUsage::NonRepudiation => K::NON_REPUDIATION,
+            CliKeyUsage::KeyEncipherment => K::KEY_ENCIPHERMENT,
+            CliKeyUsage::DataEncipherment => K::DATA_ENCIPHERMENT,
+            CliKeyUsage::KeyAgreement => K::KEY_AGREEMENT,
+            CliKeyUsage::KeyCertSign => K::KEY_CERT_SIGN,
+            CliKeyUsage::CrlSign => K::CRL_SIGN,
+            CliKeyUsage::EncipherOnly => K::ENCIPHER_ONLY,
+            CliKeyUsage::DecipherOnly => K::DECIPHER_ONLY,
+        })
+    }
+}
+
+#[derive(clap::Args)]
+struct KeyUsageArgs {
+    /// Write an X.509 keyUsage extension with these usages (comma-separated
+    /// or repeated). `default` selects the PIV standard's usages for the slot
+    /// and may only be combined with exactly the usages that form that
+    /// default. `undefined` writes no extension. Without this option no
+    /// keyUsage extension is written.
+    #[arg(
+        long = "key-usage",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "USAGE"
+    )]
+    key_usage: Vec<CliKeyUsage>,
+}
+
+/// Check the `--key-usage` values that need no card access: `undefined`
+/// stands alone, `default` only accompanies exactly the usages that form the
+/// default for `slot`, and the explicit usages form a valid RFC 5280
+/// combination. `alg` is the slot key's algorithm if already known; a default
+/// that can't be determined yet is left for [`resolve_key_usage`] to judge.
+fn check_key_usage_args(
+    args: &[CliKeyUsage],
+    slot: keyroost_piv::Slot,
+    alg: Option<keyroost_piv::KeyAlg>,
+) -> Result<(), String> {
+    let is_marker = |u: &CliKeyUsage| matches!(u, CliKeyUsage::Default | CliKeyUsage::Undefined);
+    if args.contains(&CliKeyUsage::Undefined) && args.iter().any(|u| !is_marker(u)) {
+        return Err("--key-usage undefined can't be combined with other key usages".into());
+    }
+    let explicit = args
+        .iter()
+        .filter_map(|u| u.bit())
+        .fold(keyroost_piv::x509::KeyUsage::EMPTY, |a, b| a.union(b));
+    if args.contains(&CliKeyUsage::Default) && !explicit.is_empty() {
+        if let Some(default) = keyroost_piv::x509::piv_default_key_usage(slot, alg) {
+            if explicit != default {
+                return Err(format!(
+                    "--key-usage default can only be combined with exactly the usages that \
+                     form the PIV default for {}",
+                    slot.label()
+                ));
+            }
+        }
+    }
+    if explicit != keyroost_piv::x509::KeyUsage::EMPTY && !explicit.is_valid() {
+        return Err(
+            "invalid --key-usage combination: encipher-only and decipher-only need \
+                    key-agreement and exclude each other"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The slot key's algorithm if `--generate-key`/`--load-pubkey` already name
+/// it, so `--key-usage` can be checked before touching the card.
+fn early_key_alg(
+    keygen: &InlineKeyGen,
+    load_pubkey: Option<&std::path::Path>,
+) -> Result<Option<keyroost_piv::KeyAlg>, Box<dyn std::error::Error>> {
+    if keygen.generate_key {
+        Ok(Some(keygen.algorithm.to_alg()))
+    } else if let Some(path) = load_pubkey {
+        Ok(Some(load_pubkey_material(path)?.0))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolve `--key-usage` for `slot` holding a key of algorithm `alg`.
+/// `None` means no extension. Usages the key type can't back are accepted
+/// with a warning on stderr.
+fn resolve_key_usage(
+    args: &[CliKeyUsage],
+    slot: keyroost_piv::Slot,
+    alg: Option<keyroost_piv::KeyAlg>,
+) -> Result<Option<keyroost_piv::x509::KeyUsage>, String> {
+    check_key_usage_args(args, slot, alg)?;
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.contains(&CliKeyUsage::Undefined) {
+        // Alone it simply means "no extension". Next to `default` it is only
+        // consistent if the slot's PIV default is itself "undefined" — which
+        // we can only say when the standard has no answer for reasons other
+        // than a key type we don't know.
+        let default_is_undefined = args.contains(&CliKeyUsage::Default)
+            && keyroost_piv::x509::piv_default_key_usage(slot, alg).is_none()
+            && !(matches!(
+                slot,
+                keyroost_piv::Slot::KeyManagement | keyroost_piv::Slot::Retired(_)
+            ) && alg.is_none());
+        if args.contains(&CliKeyUsage::Default) && !default_is_undefined {
+            return Err(format!(
+                "--key-usage undefined can't be combined with default: the PIV default for {} \
+                 is not \"undefined\"",
+                slot.label()
+            ));
+        }
+        return Ok(None);
+    }
+    if args.contains(&CliKeyUsage::Default) {
+        return keyroost_piv::x509::piv_default_key_usage(slot, alg)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "no PIV-defined key usage for {} (with this key type); name the usages \
+                     explicitly instead of `default`",
+                    slot.label()
+                )
+            });
+    }
+    let ku = args
+        .iter()
+        .filter_map(|u| u.bit())
+        .fold(keyroost_piv::x509::KeyUsage::EMPTY, |a, b| a.union(b));
+    if let Some(alg) = alg {
+        if !keyroost_piv::x509::supported_key_usages(alg).contains(ku) {
+            eprintln!(
+                "warning: some requested key usages are incompatible with {} keys; \
+                 a CA or verifier may reject the certificate.",
+                alg.label()
+            );
+        }
+    }
+    Ok(Some(ku))
+}
+
 /// Whether `piv import-cert` / `piv self-sign` store the certificate
 /// compressed. Neither flag: compress only if the card refuses the
 /// certificate as too large.
@@ -1221,6 +1390,8 @@ enum PivCmd {
         mgmt_key_default: bool,
         #[command(flatten)]
         keygen: InlineKeyGen,
+        #[command(flatten)]
+        key_usage: KeyUsageArgs,
     },
     /// Create a self-signed certificate for the key in a slot, signed on the
     /// card, and store it in that slot (the slot then works in PIV-aware
@@ -1277,6 +1448,8 @@ enum PivCmd {
         keygen: InlineKeyGen,
         #[command(flatten)]
         compression: CertCompressArgs,
+        #[command(flatten)]
+        key_usage: KeyUsageArgs,
     },
     /// Exercise a slot's private key end to end: for every operation the key's
     /// algorithm supports (decrypt for RSA, key-agree for ECDH curves, sign
@@ -7740,7 +7913,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_stdin,
             mgmt_key_default,
             keygen,
+            key_usage,
         } => {
+            check_key_usage_args(
+                &key_usage.key_usage,
+                slot.to_slot(),
+                early_key_alg(keygen, load_pubkey.as_deref())?,
+            )?;
             // Know whether the target key can sign before spending the PIN
             // or the management key on a request that's doomed anyway — the
             // algorithm is knowable from `--algorithm`/`--load-pubkey` with
@@ -7780,7 +7959,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
                     eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
-                    let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes(), None)?;
+                    let ku = resolve_key_usage(
+                        &key_usage.key_usage,
+                        slot.to_slot(),
+                        s.slot_key(slot.to_slot()).ok().map(|(a, _)| a),
+                    )?;
+                    let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes(), ku)?;
                     match file {
                         Some(path) => {
                             std::fs::write(path, pem.as_bytes())
@@ -7814,9 +7998,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             load_pubkey,
             keygen,
             compression,
+            key_usage,
         } => {
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
+            check_key_usage_args(
+                &key_usage.key_usage,
+                slot.to_slot(),
+                early_key_alg(keygen, load_pubkey.as_deref())?,
+            )?;
             // Know whether the target key can sign before spending the PIN
             // or the management key on a certificate that's doomed anyway.
             let name = resolve_piv_reader(reader.as_deref())?;
@@ -7851,6 +8041,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
                     let now = unix_now();
                     let choice = compression.choice();
+                    let ku = resolve_key_usage(
+                        &key_usage.key_usage,
+                        slot.to_slot(),
+                        s.slot_key(slot.to_slot()).ok().map(|(a, _)| a),
+                    )?;
                     let (der, stored) = s
                         .self_signed_certificate(
                             slot.to_slot(),
@@ -7859,7 +8054,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             valid_for.end_unix_secs(u64::from(now)),
                             pin.as_bytes(),
                             choice,
-                            None,
+                            ku,
                         )
                         .map_err(|e| cert_import_error(e, choice))?;
                     print_cert_stored(
@@ -12808,6 +13003,108 @@ mod cli_tests {
     /// key-agreement-only algorithm keyroost supports — is rejected with a
     /// message naming the key type, mirroring
     /// `keyroost_piv::x509::signature_hash`'s own verdict exactly.
+    #[test]
+    fn key_usage_default_only_with_its_exact_set() {
+        use keyroost_piv::{x509::KeyUsage as K, KeyAlg, Slot};
+        assert_eq!(resolve_key_usage(&[], Slot::Signature, None), Ok(None));
+        assert_eq!(
+            resolve_key_usage(&[CliKeyUsage::Default], Slot::Signature, None),
+            Ok(Some(K::DIGITAL_SIGNATURE.union(K::NON_REPUDIATION)))
+        );
+        assert_eq!(
+            resolve_key_usage(
+                &[CliKeyUsage::Default],
+                Slot::KeyManagement,
+                Some(KeyAlg::EccP256)
+            ),
+            Ok(Some(K::KEY_AGREEMENT))
+        );
+        assert!(resolve_key_usage(
+            &[CliKeyUsage::Default, CliKeyUsage::KeyAgreement],
+            Slot::Signature,
+            None
+        )
+        .is_err());
+        // No PIV definition for this slot/key: `default` is an error, not "none".
+        assert!(resolve_key_usage(&[CliKeyUsage::Default], Slot::KeyManagement, None).is_err());
+        // Explicit values combine; an invalid combination is rejected.
+        assert_eq!(
+            resolve_key_usage(
+                &[CliKeyUsage::DigitalSignature, CliKeyUsage::NonRepudiation],
+                Slot::Authentication,
+                None
+            ),
+            Ok(Some(K::DIGITAL_SIGNATURE.union(K::NON_REPUDIATION)))
+        );
+        assert!(check_key_usage_args(&[CliKeyUsage::EncipherOnly], Slot::Signature, None).is_err());
+        // `default` may accompany exactly the default set, in any order.
+        let sign = [
+            CliKeyUsage::NonRepudiation,
+            CliKeyUsage::Default,
+            CliKeyUsage::DigitalSignature,
+        ];
+        assert_eq!(
+            resolve_key_usage(&sign, Slot::Signature, None),
+            Ok(Some(K::DIGITAL_SIGNATURE.union(K::NON_REPUDIATION)))
+        );
+        // A subset, a superset or a different set is rejected.
+        for bad in [
+            &[CliKeyUsage::Default, CliKeyUsage::DigitalSignature][..],
+            &[
+                CliKeyUsage::Default,
+                CliKeyUsage::DigitalSignature,
+                CliKeyUsage::NonRepudiation,
+                CliKeyUsage::CrlSign,
+            ][..],
+            &[CliKeyUsage::Default, CliKeyUsage::KeyAgreement][..],
+        ] {
+            assert!(resolve_key_usage(bad, Slot::Signature, None).is_err());
+        }
+    }
+
+    #[test]
+    fn key_usage_undefined_means_no_extension() {
+        use keyroost_piv::Slot;
+        let r = |a: &[CliKeyUsage]| resolve_key_usage(a, Slot::Authentication, None);
+        assert_eq!(r(&[CliKeyUsage::Undefined]), Ok(None));
+        assert!(r(&[CliKeyUsage::Undefined, CliKeyUsage::CrlSign]).is_err());
+        assert!(r(&[CliKeyUsage::CrlSign, CliKeyUsage::Undefined]).is_err());
+        // 9A's PIV default is digitalSignature, so undefined != default there.
+        assert!(r(&[CliKeyUsage::Default, CliKeyUsage::Undefined]).is_err());
+    }
+
+    #[test]
+    fn key_usage_flag_parses_lists_and_repeats() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "keyroostctl",
+                "piv",
+                "self-sign",
+                "--slot",
+                "9a",
+                "--subject",
+                "CN=x",
+            ];
+            args.extend_from_slice(extra);
+            match parse(&args).map(|c| c.command) {
+                Ok(Some(Cmd::Piv {
+                    cmd: PivCmd::SelfSign { key_usage, .. },
+                })) => Some(key_usage.key_usage.len()),
+                _ => None,
+            }
+        };
+        assert_eq!(parse(&[]), Some(0));
+        assert_eq!(
+            parse(&["--key-usage", "digital-signature,key-agreement"]),
+            Some(2)
+        );
+        assert_eq!(
+            parse(&["--key-usage", "default", "--key-usage", "crl-sign"]),
+            Some(2)
+        );
+        assert_eq!(parse(&["--key-usage", "bogus"]), None);
+    }
+
     #[test]
     fn guard_signable_alg_rejects_only_x25519() {
         use keyroost_piv::KeyAlg;
