@@ -7780,7 +7780,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
                     eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
-                    let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes())?;
+                    let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes(), None)?;
                     match file {
                         Some(path) => {
                             std::fs::write(path, pem.as_bytes())
@@ -7859,6 +7859,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             valid_for.end_unix_secs(u64::from(now)),
                             pin.as_bytes(),
                             choice,
+                            None,
                         )
                         .map_err(|e| cert_import_error(e, choice))?;
                     print_cert_stored(

@@ -2235,6 +2235,13 @@ struct PivState {
     cert_valid_years: u32,
     cert_valid_months: u32,
     cert_valid_days: u32,
+    /// Requested X.509 `keyUsage` for the certificate / CSR per device:slot
+    /// (empty means "Undefined": no extension written), with the key
+    /// algorithm it was last reconciled against (see [`reconcile_key_usage`]).
+    cert_key_usage: std::collections::HashMap<
+        (Option<DeviceId>, PivSlotSel),
+        (keyroost_piv::x509::KeyUsage, Option<keyroost_piv::KeyAlg>),
+    >,
     sign_pin: String,
     csr_path: String,
     /// New CHUID: validity, same three-field shape and default as
@@ -2335,6 +2342,7 @@ impl Default for PivState {
             cert_valid_years: 1,
             cert_valid_months: 0,
             cert_valid_days: 0,
+            cert_key_usage: std::collections::HashMap::new(),
             sign_pin: String::new(),
             csr_path: String::new(),
             chuid_valid_years: 1,
@@ -2353,7 +2361,7 @@ impl Default for PivState {
 }
 
 /// PIV key-slot selector for the GUI controls.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 enum PivSlotSel {
     #[default]
     Auth,
@@ -8995,6 +9003,55 @@ impl App {
         })
     }
 
+    /// The `keyUsage` chosen in the certificate section; `None` for
+    /// "Undefined" (no extension).
+    fn piv_requested_key_usage(&self) -> Option<keyroost_piv::x509::KeyUsage> {
+        let key = (self.selected_device.clone(), self.piv.selected_slot);
+        let ku = match self.piv.cert_key_usage.get(&key) {
+            Some((ku, _)) => *ku,
+            None => keyroost_piv::x509::piv_default_key_usage(
+                self.piv.selected_slot.to_slot(),
+                self.piv_selected_test_target().0,
+            )
+            .unwrap_or(keyroost_piv::x509::KeyUsage::EMPTY),
+        };
+        Some(ku).filter(|k| !k.is_empty())
+    }
+
+    /// The selected device:slot's key usage, created from the PIV default on
+    /// first sight and reconciled with the slot key's current algorithm (an
+    /// algorithm that is merely unknown right now changes nothing). Returns
+    /// the usage, the algorithm in force, and the slot's PIV default.
+    fn piv_sync_key_usage(
+        &mut self,
+    ) -> (
+        keyroost_piv::x509::KeyUsage,
+        Option<keyroost_piv::KeyAlg>,
+        keyroost_piv::x509::KeyUsage,
+    ) {
+        let slot_sel = self.piv.selected_slot;
+        let slot = slot_sel.to_slot();
+        let seen = self.piv_selected_test_target().0;
+        let key = (self.selected_device.clone(), slot_sel);
+        let (ku, alg) = match self.piv.cert_key_usage.get(&key) {
+            None => (
+                keyroost_piv::x509::piv_default_key_usage(slot, seen)
+                    .unwrap_or(keyroost_piv::x509::KeyUsage::EMPTY),
+                seen,
+            ),
+            Some((ku, old)) => match seen {
+                Some(new) if *old != Some(new) => {
+                    (reconcile_key_usage(slot, *ku, *old, new), Some(new))
+                }
+                _ => (*ku, *old),
+            },
+        };
+        self.piv.cert_key_usage.insert(key, (ku, alg));
+        let default = keyroost_piv::x509::piv_default_key_usage(slot, alg)
+            .unwrap_or(keyroost_piv::x509::KeyUsage::EMPTY);
+        (ku, alg, default)
+    }
+
     /// Create a self-signed certificate for the selected slot's key and store
     /// it in the slot (management key authorizes the import, PIN the signing).
     fn piv_self_sign(&mut self) {
@@ -9025,6 +9082,7 @@ impl App {
             self.piv.cert_valid_days
         };
         let choice = self.piv.cert_compression;
+        let key_usage = self.piv_requested_key_usage();
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
         // `with_cached_transaction` restores whatever the session's pubkey cache already
@@ -9048,6 +9106,7 @@ impl App {
                             keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
                             pin.as_bytes(),
                             choice.to_compression(),
+                            key_usage,
                         )?;
                         let status = s.status()?;
                         Ok((status, s.state(), stored))
@@ -9083,6 +9142,7 @@ impl App {
         let path = self.piv.csr_path.trim().to_owned();
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
+        let key_usage = self.piv_requested_key_usage();
         self.piv.notice = None;
         let for_device = self.selected_device.clone();
         // See `piv_self_sign`: `with_cached_transaction` restores whatever the session's
@@ -9096,7 +9156,7 @@ impl App {
                     &name,
                     cached_state,
                     |s| -> Result<_, TransportError> {
-                        let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
+                        let pem = s.generate_csr(slot, &subject, pin.as_bytes(), key_usage)?;
                         std::fs::write(&path, pem.as_bytes()).map_err(|_| {
                             TransportError::MalformedResponse("cannot write destination file")
                         })?;
@@ -10065,6 +10125,149 @@ fn piv_valid_for_fields(
             .range(0..=keyroost_piv::max_valid_days(u64::from(now)))
             .suffix(" d"),
     );
+}
+
+/// Every X.509 `keyUsage` bit with its menu label and hover description, in
+/// RFC 5280 order.
+const KEY_USAGE_CHOICES: [(keyroost_piv::x509::KeyUsage, &str, &str); 9] = {
+    use keyroost_piv::x509::KeyUsage as K;
+    [
+        (
+            K::DIGITAL_SIGNATURE,
+            "Digital signature",
+            "Verify digital signatures that are not certificate or CRL signatures \
+             and not non-repudiation signatures (e.g. authentication, TLS client auth).",
+        ),
+        (
+            K::NON_REPUDIATION,
+            "Non-repudiation",
+            "Also called content commitment: verify signatures that bind the signer \
+             to the signed content (document signing).",
+        ),
+        (
+            K::KEY_ENCIPHERMENT,
+            "Key encipherment",
+            "Encrypt (wrap) other keys for transport, e.g. RSA key transport.",
+        ),
+        (
+            K::DATA_ENCIPHERMENT,
+            "Data encipherment",
+            "Directly encrypt raw user data with the public key.",
+        ),
+        (
+            K::KEY_AGREEMENT,
+            "Key agreement",
+            "Derive shared secrets with the key (ECDH).",
+        ),
+        (
+            K::KEY_CERT_SIGN,
+            "Certificate signing",
+            "Sign other certificates (CA key).",
+        ),
+        (
+            K::CRL_SIGN,
+            "CRL signing",
+            "Sign certificate revocation lists.",
+        ),
+        (
+            K::ENCIPHER_ONLY,
+            "Encipher only",
+            "With key agreement: the derived key may only be used to encrypt. \
+             Selecting it also selects key agreement; exclusive with decipher only.",
+        ),
+        (
+            K::DECIPHER_ONLY,
+            "Decipher only",
+            "With key agreement: the derived key may only be used to decrypt. \
+             Selecting it also selects key agreement; exclusive with encipher only.",
+        ),
+    ]
+};
+
+/// Switch one `keyUsage` bit on or off while keeping the set valid per
+/// RFC 5280 (`encipherOnly`/`decipherOnly` need `keyAgreement` and exclude
+/// each other).
+fn toggle_key_usage(
+    cur: keyroost_piv::x509::KeyUsage,
+    bit: keyroost_piv::x509::KeyUsage,
+    on: bool,
+) -> keyroost_piv::x509::KeyUsage {
+    use keyroost_piv::x509::KeyUsage as K;
+    let mut ku = cur.with(bit, on);
+    if on && bit == K::ENCIPHER_ONLY {
+        ku = ku
+            .with(K::KEY_AGREEMENT, true)
+            .with(K::DECIPHER_ONLY, false);
+    } else if on && bit == K::DECIPHER_ONLY {
+        ku = ku
+            .with(K::KEY_AGREEMENT, true)
+            .with(K::ENCIPHER_ONLY, false);
+    } else if !on && bit == K::KEY_AGREEMENT {
+        ku = ku
+            .with(K::ENCIPHER_ONLY, false)
+            .with(K::DECIPHER_ONLY, false);
+    }
+    ku
+}
+
+/// Carry a remembered `keyUsage` over to a slot key of algorithm `new`. A
+/// selection that was just the slot's PIV default follows the default for the
+/// new algorithm. Otherwise the choice is kept, except that `keyEncipherment`
+/// and `keyAgreement` swap when the new key supports only the other one, and
+/// bits the new key can't back are dropped.
+fn reconcile_key_usage(
+    slot: keyroost_piv::Slot,
+    ku: keyroost_piv::x509::KeyUsage,
+    old: Option<keyroost_piv::KeyAlg>,
+    new: keyroost_piv::KeyAlg,
+) -> keyroost_piv::x509::KeyUsage {
+    use keyroost_piv::x509::{piv_default_key_usage, supported_key_usages, KeyUsage as K};
+    let default_for = |a| piv_default_key_usage(slot, a).unwrap_or(K::EMPTY);
+    if ku == default_for(old) {
+        return default_for(Some(new));
+    }
+    let supported = supported_key_usages(new);
+    let mut ku = ku;
+    for (bit, other) in [
+        (K::KEY_ENCIPHERMENT, K::KEY_AGREEMENT),
+        (K::KEY_AGREEMENT, K::KEY_ENCIPHERMENT),
+    ] {
+        if ku.contains(bit) && !supported.contains(bit) && supported.contains(other) {
+            ku = ku.with(bit, false).with(other, true);
+        }
+    }
+    let mut kept = K::EMPTY;
+    for (bit, _, _) in KEY_USAGE_CHOICES {
+        kept = kept.with(bit, ku.contains(bit) && supported.contains(bit));
+    }
+    if !kept.contains(K::KEY_AGREEMENT) {
+        kept = kept
+            .with(K::ENCIPHER_ONLY, false)
+            .with(K::DECIPHER_ONLY, false);
+    }
+    kept
+}
+
+/// Combo-box caption for a `keyUsage` selection.
+/// A selection equal to the slot's PIV default is led by "Default".
+fn key_usage_summary(
+    ku: keyroost_piv::x509::KeyUsage,
+    default: keyroost_piv::x509::KeyUsage,
+) -> String {
+    if ku.is_empty() {
+        return "Undefined".to_owned();
+    }
+    let list = KEY_USAGE_CHOICES
+        .iter()
+        .filter(|(b, _, _)| ku.contains(*b))
+        .map(|(_, l, _)| *l)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ku == default {
+        format!("Default ({list})")
+    } else {
+        list
+    }
 }
 
 /// A key/value detail row for the device-metadata card: a muted fixed-width
@@ -18084,6 +18287,75 @@ impl App {
                         &mut self.piv.cert_valid_days,
                     );
                 });
+                // Key usage: remembered per device:slot, initialised from the PIV
+                // standard's value for the slot.
+                let (mut ku, usage_alg, usage_default) = self.piv_sync_key_usage();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    // Same 96px label column as the rows above, so the combo's
+                    // left edge lines up with the years field.
+                    ui.add_sized(
+                        [96.0, 22.0],
+                        egui::Label::new(
+                            egui::RichText::new("Key usage")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        ),
+                    );
+                    let combo = egui::ComboBox::from_id_salt("piv-cert-key-usage")
+                        .selected_text(key_usage_summary(ku, usage_default))
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(ku == usage_default, "Default")
+                                .on_hover_text(
+                                    "Select the usages the PIV standard defines for this \
+                                     slot (for none, same as Undefined). Selected \
+                                     automatically whenever exactly those usages are \
+                                     selected; it only affects this menu, not the \
+                                     certificate.",
+                                )
+                                .clicked()
+                            {
+                                ku = usage_default;
+                            }
+                            if ui
+                                .selectable_label(ku.is_empty(), "Undefined")
+                                .on_hover_text(
+                                    "Write no keyUsage extension to the certificate. \
+                                     Cannot be combined with other usages.",
+                                )
+                                .clicked()
+                            {
+                                ku = keyroost_piv::x509::KeyUsage::EMPTY;
+                            }
+                            for (bit, label, hint) in KEY_USAGE_CHOICES {
+                                let on = ku.contains(bit);
+                                let usable = usage_alg.is_none_or(|a| {
+                                    keyroost_piv::x509::supported_key_usages(a).contains(bit)
+                                });
+                                let r = ui
+                                    .add_enabled(usable, egui::Button::selectable(on, label))
+                                    .on_hover_text(hint)
+                                    .on_disabled_hover_text(format!(
+                                        "{hint}\n\nNot supported by this slot's key type."
+                                    ));
+                                if r.clicked() {
+                                    ku = toggle_key_usage(ku, bit, !on);
+                                }
+                            }
+                        });
+                    combo.response.on_hover_text(
+                        "Key usage is optional: left at Undefined, no key usage extension \
+                         is written. It starts out set to the PIV standard's value for the \
+                         slot (Undefined where the standard defines none), and you can \
+                         select multiple usages.",
+                    );
+                    self.piv.cert_key_usage.insert(
+                        (self.selected_device.clone(), self.piv.selected_slot),
+                        (ku, usage_alg),
+                    );
+                });
 
                 ui.add_space(12.0);
                 // --- Import / Export cert: both buttons on one right-aligned row,
@@ -23463,6 +23735,66 @@ mod piv_relax_tests {
         assert_eq!(
             piv_relax(PivExtension::MoveKey, FeatureGate::Supported),
             FeatureGate::Supported
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_usage_tests {
+    use super::*;
+    use keyroost_piv::x509::KeyUsage as K;
+
+    #[test]
+    fn enciphering_only_bits_pull_in_key_agreement_and_exclude_each_other() {
+        let ku = toggle_key_usage(K::EMPTY, K::ENCIPHER_ONLY, true);
+        assert!(ku.contains(K::KEY_AGREEMENT) && ku.contains(K::ENCIPHER_ONLY));
+        let ku = toggle_key_usage(ku, K::DECIPHER_ONLY, true);
+        assert!(ku.contains(K::DECIPHER_ONLY) && !ku.contains(K::ENCIPHER_ONLY));
+        let ku = toggle_key_usage(ku, K::KEY_AGREEMENT, false);
+        assert!(ku.is_empty());
+        assert_eq!(key_usage_summary(ku, K::DIGITAL_SIGNATURE), "Undefined");
+        assert_eq!(
+            key_usage_summary(K::DIGITAL_SIGNATURE, K::DIGITAL_SIGNATURE),
+            "Default (Digital signature)"
+        );
+        assert_eq!(
+            key_usage_summary(K::DIGITAL_SIGNATURE, K::EMPTY),
+            "Digital signature"
+        );
+    }
+
+    #[test]
+    fn remembered_usage_follows_the_key_algorithm() {
+        use keyroost_piv::{KeyAlg, Slot};
+        let km = Slot::KeyManagement;
+        // A hand-picked set containing keyEncipherment swaps to keyAgreement
+        // on an ECC key, keeping the rest, and back again.
+        let picked = K::KEY_ENCIPHERMENT
+            .union(K::DIGITAL_SIGNATURE)
+            .union(K::DATA_ENCIPHERMENT);
+        let ecc = reconcile_key_usage(km, picked, Some(KeyAlg::Rsa2048), KeyAlg::EccP256);
+        assert_eq!(ecc, K::KEY_AGREEMENT.union(K::DIGITAL_SIGNATURE));
+        let rsa = reconcile_key_usage(km, ecc, Some(KeyAlg::EccP256), KeyAlg::Rsa2048);
+        assert_eq!(rsa, K::KEY_ENCIPHERMENT.union(K::DIGITAL_SIGNATURE));
+        // The plain slot default just follows the new algorithm's default.
+        assert_eq!(
+            reconcile_key_usage(
+                km,
+                K::KEY_ENCIPHERMENT,
+                Some(KeyAlg::Rsa2048),
+                KeyAlg::EccP256
+            ),
+            K::KEY_AGREEMENT
+        );
+        // An explicit Undefined survives a known-algorithm change.
+        assert_eq!(
+            reconcile_key_usage(
+                Slot::Authentication,
+                K::EMPTY,
+                Some(KeyAlg::Rsa2048),
+                KeyAlg::EccP256
+            ),
+            K::EMPTY
         );
     }
 }
