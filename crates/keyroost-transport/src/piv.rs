@@ -1682,6 +1682,35 @@ impl<'tx> PivSession<'tx> {
         serial
     }
 
+    /// Read a Swissbit iShield 2's serial from the Swissbit Management
+    /// Application ([`keyroost_piv::fingerprint::SWISSBIT_MANAGEMENT_AID`]):
+    /// SELECT it (the few bytes it answers with are per-token constants and
+    /// ignored), then `GET SERIAL`
+    /// ([`keyroost_piv::fingerprint::SWISSBIT_GET_SERIAL`]), an unsigned
+    /// big-endian 64-bit integer. Fallback for the `OpenFips201::SwissbitIShield2`
+    /// arm of `Self::applet_fingerprint` when the Yubico `GET SERIAL`
+    /// extension gives no proper answer. Always re-SELECTs PIV afterward,
+    /// like every other probe here. `None` when the applet doesn't SELECT,
+    /// the command is refused, or the reply isn't exactly 8 bytes.
+    fn probe_swissbit_management_serial(&mut self) -> Option<u128> {
+        use keyroost_piv::fingerprint;
+
+        let selected = matches!(
+            self.transmit_full_raw(&piv::select_by_aid(&fingerprint::SWISSBIT_MANAGEMENT_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let serial = if selected {
+            self.transmit_full_raw(&fingerprint::SWISSBIT_GET_SERIAL)
+                .ok()
+                .filter(|(data, sw)| *sw == piv::SW_OK && data.len() == 8)
+                .and_then(|(data, _)| piv::parse_serial(&data).ok())
+        } else {
+            None
+        };
+        let _ = self.select();
+        serial
+    }
+
     /// Names of connected readers whose PIV applet answers `SELECT` with `9000`.
     pub fn list_piv_readers() -> Result<Vec<String>, TransportError> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
@@ -2046,6 +2075,23 @@ impl<'tx> PivSession<'tx> {
                 version_firmware: None,
                 serial: self.probe_token2_otp_serial(),
             },
+            // A Swissbit iShield 2 normally answers the Yubico GET SERIAL
+            // extension with its real serial; when it doesn't give a proper
+            // answer, fall back to the Swissbit Management Application's own
+            // GET SERIAL.
+            fingerprint::AppletFingerprint::OpenFips201(
+                fingerprint::OpenFips201Variant::SwissbitIShield2,
+            ) => {
+                let serial = decode_serial_if_bcd(id, version.as_deref(), None, self.serial())
+                    .or_else(|| self.probe_swissbit_management_serial());
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: String::new(),
+                    version,
+                    version_firmware: None,
+                    serial,
+                }
+            }
             // Unclassified/generic PIV applet — plenty of non-Yubico
             // implementations answer this extension too (see
             // `PivStatus::version`'s own doc), and there's no dedicated
@@ -5584,6 +5630,7 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         _ if aid == fingerprint::GLOBAL_PLATFORM_ISD_AID => {
             Some("GlobalPlatform Issuer Security Domain")
         }
+        _ if aid == fingerprint::SWISSBIT_MANAGEMENT_AID => Some("Swissbit Management Application"),
         _ if aid == keyroost_token2otp::OTP_APPLET_AID => Some("Token2 OTP applet"),
         _ => None,
     }
@@ -5731,6 +5778,13 @@ fn describe_apdu(apdu: &[u8]) -> String {
         // unit's full serial, after that probe has already SELECTed the OTP
         // applet.
         None if ins == 0x33 => "GET_INFO (Token2 OTP applet)".to_string(),
+        // Swissbit Management Application's own `GET SERIAL` (INS 0x28) —
+        // the fallback `PivSession::probe_swissbit_management_serial` sends
+        // once its AID is selected. Named with the applet so it isn't read
+        // as Yubico's GET SERIAL extension (INS 0xF8).
+        None if apdu == piv::fingerprint::SWISSBIT_GET_SERIAL => {
+            "GET SERIAL (Swissbit Management Application)".to_string()
+        }
         None => format!("INS {ins:#04X}"),
     }
 }
@@ -6433,6 +6487,22 @@ mod tests {
             describe_apdu(&keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()),
             "PUT XAUTH KEY (HID ACA, delete)"
         );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_swissbit_management_app() {
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::SWISSBIT_MANAGEMENT_AID
+            )),
+            "SELECT (Swissbit Management Application)"
+        );
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::SWISSBIT_GET_SERIAL),
+            "GET SERIAL (Swissbit Management Application)"
+        );
+        // A lookalike with a different P1 stays unnamed.
+        assert_eq!(describe_apdu(&[0x00, 0x28, 0x01, 0x00]), "INS 0x28");
     }
 
     #[test]

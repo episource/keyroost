@@ -81,6 +81,20 @@ pub const NITROKEY_GET_VERSION_STRING: [u8; 5] = [0x00, 0x61, 0x01, 0x00, 0x00];
 /// and passes the result to [`classify`] as `swissbit_rid_selectable`.
 pub const SWISSBIT_RID: [u8; 5] = [0xD2, 0x76, 0x00, 0x01, 0x62];
 
+/// Swissbit Management Application AID (`D2 76 00 01 62 4B 65 79 01`) — the
+/// RID plus Swissbit's own PIX. SELECTing it answers with a few bytes
+/// (3 on an iShield 2, 2 on an iShield 1) that are constant per token but
+/// differ between tokens, so the content is ignored. Only used as the
+/// fallback serial source for [`OpenFips201Variant::SwissbitIShield2`] when
+/// the PIV applet's own Yubico `GET SERIAL` extension gives no usable answer.
+pub const SWISSBIT_MANAGEMENT_AID: [u8; 9] = [0xD2, 0x76, 0x00, 0x01, 0x62, 0x4B, 0x65, 0x79, 0x01];
+
+/// Swissbit Management Application `GET SERIAL` (`INS 0x28`), a bare case-1
+/// APDU answering with the serial as an unsigned big-endian 64-bit integer
+/// (exactly 8 bytes), decoded by [`crate::parse_serial`]. Only meaningful once
+/// [`SWISSBIT_MANAGEMENT_AID`] is selected.
+pub const SWISSBIT_GET_SERIAL: [u8; 4] = [0x00, 0x28, 0x00, 0x00];
+
 /// HID Crescendo C2300's GET PIV PROPERTIES data object tag — read like any
 /// other PIV data object, via [`crate::get_data`] (which frames it as `5C 03
 /// FF FF 7F`), per HID's own C2300 low-level API reference:
