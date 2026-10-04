@@ -10249,7 +10249,7 @@ fn reconcile_key_usage(
 }
 
 /// Combo-box caption for a `keyUsage` selection.
-/// A selection equal to the slot's PIV default is led by "Default".
+/// A selection equal to the slot's PIV default is led by "Slot default".
 fn key_usage_summary(
     ku: keyroost_piv::x509::KeyUsage,
     default: keyroost_piv::x509::KeyUsage,
@@ -10264,7 +10264,7 @@ fn key_usage_summary(
         .collect::<Vec<_>>()
         .join(", ");
     if ku == default {
-        format!("Default ({list})")
+        format!("Slot default ({list})")
     } else {
         list
     }
@@ -18307,7 +18307,7 @@ impl App {
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(ku == usage_default, "Default")
+                                .selectable_label(ku == usage_default, "Slot default")
                                 .on_hover_text(
                                     "Select the usages the PIV standard defines for this \
                                      slot (for none, same as Undefined). Selected \
@@ -18334,12 +18334,22 @@ impl App {
                                 let usable = usage_alg.is_none_or(|a| {
                                     keyroost_piv::x509::supported_key_usages(a).contains(bit)
                                 });
-                                let r = ui
-                                    .add_enabled(usable, egui::Button::selectable(on, label))
-                                    .on_hover_text(hint)
-                                    .on_disabled_hover_text(format!(
-                                        "{hint}\n\nNot supported by this slot's key type."
-                                    ));
+                                // Unsupported usages stay selectable but are flagged
+                                // in the pane's warning colour.
+                                let r = if usable {
+                                    ui.add(egui::Button::selectable(on, label))
+                                        .on_hover_text(hint)
+                                } else {
+                                    ui.add(egui::Button::selectable(
+                                        on,
+                                        egui::RichText::new(format!("\u{26A0} {label}"))
+                                            .color(p.warn),
+                                    ))
+                                    .on_hover_text(format!(
+                                        "{hint}\n\n\u{26A0} Incompatible with this slot's key type; a \
+                                         certificate asserting it may be rejected."
+                                    ))
+                                };
                                 if r.clicked() {
                                     ku = toggle_key_usage(ku, bit, !on);
                                 }
@@ -18351,6 +18361,33 @@ impl App {
                          slot (Undefined where the standard defines none), and you can \
                          select multiple usages.",
                     );
+                    // Selected usages this slot's key can't back: flag them next
+                    // to the box, and list them on hover.
+                    let incompatible: Vec<&str> = usage_alg
+                        .map(|alg| {
+                            let ok = keyroost_piv::x509::supported_key_usages(alg);
+                            KEY_USAGE_CHOICES
+                                .iter()
+                                .filter(|(b, _, _)| ku.contains(*b) && !ok.contains(*b))
+                                .map(|(_, l, _)| *l)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !incompatible.is_empty() {
+                        ui.label(
+                            egui::RichText::new("\u{26A0}")
+                                .font(theme::f_reg(14.0))
+                                .color(p.warn),
+                        )
+                        .on_hover_text(format!(
+                            "Incompatible with this slot's key type ({}): {}.\n\nkeyroost still \
+                             creates the certificate, but a certificate authority (or \
+                             whatever later checks the certificate) may reject it or \
+                             change the requested usages.",
+                            usage_alg.map_or("", |a| a.label()),
+                            incompatible.join(", ")
+                        ));
+                    }
                     self.piv.cert_key_usage.insert(
                         (self.selected_device.clone(), self.piv.selected_slot),
                         (ku, usage_alg),
@@ -23755,7 +23792,7 @@ mod key_usage_tests {
         assert_eq!(key_usage_summary(ku, K::DIGITAL_SIGNATURE), "Undefined");
         assert_eq!(
             key_usage_summary(K::DIGITAL_SIGNATURE, K::DIGITAL_SIGNATURE),
-            "Default (Digital signature)"
+            "Slot default (Digital signature)"
         );
         assert_eq!(
             key_usage_summary(K::DIGITAL_SIGNATURE, K::EMPTY),
