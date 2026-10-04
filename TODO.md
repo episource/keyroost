@@ -36,12 +36,58 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Later:**
 
-- **Responsive layout at high zoom / narrow window.** At ~200% zoom in a
-  partial-screen window, horizontal rows overflow and overlap (top-bar Reset vs
-  the brand; section-header right-actions over the left text). Fullscreen is
-  fine. Fix: elide the left text in those header rows (`Label::truncate`) so the
-  right action always has room, and tidy/wrap the top-bar cluster. Cheap partial
-  fix: raise the minimum window width. Low-priority polish. (S–M)
+- **AppImage-only republish.** Add an `appimage_only` input to
+  `linux-bundles.yml`, mirroring `flatpak_only`. Republishing just the
+  AppImage today rebuilds the Flatpak too and relies on rejecting its publish
+  gate by hand; rejecting the wrong gate would double-publish the Flatpak.
+  (A full split into separate AppImage and Flatpak workflows is only worth it
+  if AppImage-specific work keeps growing.) (S)
+
+- **AppImage portability check in CI.** Fail the AppImage job when the
+  binary needs a glibc newer than the build image's (2.35 on Ubuntu 22.04,
+  via `objdump -T`), or when the AppImage doesn't start in a stripped-down
+  environment (no libpcsclite, no libxkbcommon, no pcscd socket), so
+  AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
+  the packaging probe, not after a release. (S–M)
+
+- **v0.12.0 goal: a holistic GUI design pass.** The interface has grown
+  enough features that the deliberately flat layout no longer fits. Seen in
+  AppImageHub's catalog screenshot (AppImage/appimage.github.io#9258): at an
+  ~800px-wide screen, below the 900px minimum, the top bar's left group
+  (version, "N connected") is drawn under the right group (accent dots,
+  Text size, icons); at ~200% zoom, section-header actions overlap their
+  titles too. Rows never give way, they overlap (`top_bar`,
+  crates/keyroost/src/main.rs). Scope:
+  * decide where a menu or overflow (dropdown) belongs — e.g. appearance
+    settings (accent, text size, colorblind, theme) — while keeping the main
+    flows flat;
+  * every horizontal row degrades gracefully: drop or collapse
+    lower-priority items, truncate long labels, never overlap;
+  * design first (brainstorm the layout before code), keep CLI/GUI parity,
+    and verify with screenshots on the virtual display at 800/900/1180px
+    widths and 100%/200% zoom, plus a real Wayland session;
+  * then refresh the screenshots: the Learn site's `docs/assets/screenshots/`
+    and the AppStream `<screenshots>` in the metainfo (used by software
+    centers and AppImage catalogs; PNG preferred, several views), so they
+    show the new design after the next release.
+  (M–L)
+
+- **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — brainstorm first.**
+  On Windows as administrator, two Token2 PIN+ keys show as four entries:
+  each once from PC/SC (with serial) and once from FIDO HID (no serial).
+  Linux matches a HID node to its reader by USB bus/address; hidapi on
+  Windows and macOS reports no topology, so `keyroost-resolve` only matches
+  when there is a single candidate and deliberately refuses to guess among
+  several (`crates/keyroost-resolve/src/device.rs`). macOS likely shows the
+  same without admin (unverified). Directions, maintainer's preferences:
+  * **preferred where possible:** match by an identity the device reports on
+    both sides (e.g. the serial over HID via vendor commands — Token2's OTP
+    GET_INFO gives it); cross-vendor implications unknown (YubiKey etc.);
+  * **acceptable:** ask Windows which USB device each HID interface and
+    smart-card reader belong to (e.g. reader device instance → parent /
+    container ID), with all `unsafe` confined to the Windows-only crates; a
+    macOS IOKit equivalent only if unavoidable (maintainer is less keen).
+  Hold a dedicated brainstorm session before any code. (M–L)
 
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
