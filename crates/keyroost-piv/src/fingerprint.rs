@@ -85,7 +85,8 @@ pub const SWISSBIT_RID: [u8; 5] = [0xD2, 0x76, 0x00, 0x01, 0x62];
 /// RID plus Swissbit's own PIX. SELECTing it answers with a few bytes
 /// (3 on an iShield 2, 2 on an iShield 1) that are constant per token but
 /// differ between tokens, so the content is ignored. Only used as the
-/// fallback serial source for [`OpenFips201Variant::SwissbitIShield2`] when
+/// fallback serial source for [`OpenFips201Variant::SwissbitIShield2`] and
+/// [`ArekinathVariant::SwissbitIShield1`] when
 /// the PIV applet's own Yubico `GET SERIAL` extension gives no usable answer.
 pub const SWISSBIT_MANAGEMENT_AID: [u8; 9] = [0xD2, 0x76, 0x00, 0x01, 0x62, 0x4B, 0x65, 0x79, 0x01];
 
@@ -94,6 +95,32 @@ pub const SWISSBIT_MANAGEMENT_AID: [u8; 9] = [0xD2, 0x76, 0x00, 0x01, 0x62, 0x4B
 /// (exactly 8 bytes), decoded by [`crate::parse_serial`]. Only meaningful once
 /// [`SWISSBIT_MANAGEMENT_AID`] is selected.
 pub const SWISSBIT_GET_SERIAL: [u8; 4] = [0x00, 0x28, 0x00, 0x00];
+
+/// Card Manager AID (`A0 00 00 01 51 00 00 00`) on a Swissbit iShield Key 1 —
+/// the 8-byte form, unlike the 7-byte [`GLOBAL_PLATFORM_ISD_AID`] HID
+/// Crescendo answers to. Hosts the two vendor commands below.
+pub const SWISSBIT_CARD_MANAGER_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x01, 0x51, 0x00, 0x00, 0x00];
+
+/// Swissbit Card Manager command (`CLA B1 INS 05 P1 42`, case 2) answering
+/// with the firmware version as ASCII. Supported by the iShield Key 1 only; only meaningful once [`SWISSBIT_CARD_MANAGER_AID`] is
+/// selected. Decode with [`parse_swissbit_text`].
+pub const SWISSBIT_GET_FIRMWARE_VERSION: [u8; 5] = [0xB1, 0x05, 0x42, 0x00, 0x00];
+
+/// Swissbit Card Manager command (`CLA B1 INS 05 P1 41`, case 2) answering
+/// with the device name as ASCII. Supported by the iShield Key 1 only;
+/// only meaningful once [`SWISSBIT_CARD_MANAGER_AID`] is selected. Decode
+/// with [`parse_swissbit_text`].
+pub const SWISSBIT_GET_DEVICE_NAME: [u8; 5] = [0xB1, 0x05, 0x41, 0x00, 0x00];
+
+/// Decode a Swissbit Card Manager ASCII reply ([`SWISSBIT_GET_FIRMWARE_VERSION`],
+/// [`SWISSBIT_GET_DEVICE_NAME`]): lossy UTF-8 with surrounding whitespace and
+/// NUL padding trimmed. `None` when nothing is left.
+#[must_use]
+pub fn parse_swissbit_text(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    let text = text.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    (!text.is_empty()).then(|| text.to_owned())
+}
 
 /// HID Crescendo C2300's GET PIV PROPERTIES data object tag — read like any
 /// other PIV data object, via [`crate::get_data`] (which frames it as `5C 03
@@ -1580,6 +1607,17 @@ mod tests {
     fn select_identity_absent_is_none() {
         let resp = [0x6F, 0x02, 0x84, 0x00];
         assert_eq!(select_identity(&resp), None);
+    }
+
+    #[test]
+    fn parse_swissbit_text_trims_padding_and_rejects_empty() {
+        assert_eq!(
+            parse_swissbit_text(b"iShield Key 2\0\0"),
+            Some("iShield Key 2".into())
+        );
+        assert_eq!(parse_swissbit_text(b" 1.1.2\r\n"), Some("1.1.2".into()));
+        assert_eq!(parse_swissbit_text(b""), None);
+        assert_eq!(parse_swissbit_text(b"\0\0 "), None);
     }
 
     // --- wants_swissbit_probe -----------------------------------------
