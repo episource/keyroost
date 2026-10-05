@@ -18313,7 +18313,13 @@ impl App {
                                 .color(p.txt2),
                         ),
                     );
-                    let combo = egui::ComboBox::from_id_salt("piv-cert-key-usage")
+                    // The caption wraps at the pane edge (leaving room for the warning
+                    // marker) instead of running off a narrow window.
+                    let combo = ui
+                        .scope(|ui| {
+                            ui.set_max_width((ui.available_width() - 28.0).max(120.0));
+                    egui::ComboBox::from_id_salt("piv-cert-key-usage")
+                        .wrap()
                         .selected_text(key_usage_summary(ext, usage_default))
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show_ui(ui, |ui| {
@@ -18385,7 +18391,9 @@ impl App {
                                     ext.critical &= !ext.usages.is_empty();
                                 }
                             }
-                        });
+                        })
+                        })
+                        .inner;
                     combo.response.on_hover_text(
                         "Key usage is optional: left at Undefined, no key usage extension \
                          is written. It starts out set to the PIV standard's value for the \
