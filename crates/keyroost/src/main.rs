@@ -2236,11 +2236,15 @@ struct PivState {
     cert_valid_months: u32,
     cert_valid_days: u32,
     /// Requested X.509 `keyUsage` for the certificate / CSR per device:slot
-    /// (empty means "Undefined": no extension written), with the key
-    /// algorithm it was last reconciled against (see [`reconcile_key_usage`]).
+    /// (no usages means "Undefined": no extension written, and never
+    /// critical), with the key algorithm it was last reconciled against (see
+    /// [`reconcile_key_usage`]).
     cert_key_usage: std::collections::HashMap<
         (Option<DeviceId>, PivSlotSel),
-        (keyroost_piv::x509::KeyUsage, Option<keyroost_piv::KeyAlg>),
+        (
+            keyroost_piv::x509::KeyUsageExt,
+            Option<keyroost_piv::KeyAlg>,
+        ),
     >,
     sign_pin: String,
     csr_path: String,
@@ -9003,53 +9007,51 @@ impl App {
         })
     }
 
-    /// The `keyUsage` chosen in the certificate section; `None` for
+    /// The `keyUsage` extension chosen in the certificate section; `None` for
     /// "Undefined" (no extension).
-    fn piv_requested_key_usage(&self) -> Option<keyroost_piv::x509::KeyUsage> {
+    fn piv_requested_key_usage(&self) -> Option<keyroost_piv::x509::KeyUsageExt> {
         let key = (self.selected_device.clone(), self.piv.selected_slot);
-        let ku = match self.piv.cert_key_usage.get(&key) {
-            Some((ku, _)) => *ku,
+        let ext = match self.piv.cert_key_usage.get(&key) {
+            Some((ext, _)) => *ext,
             None => keyroost_piv::x509::piv_default_key_usage(
                 self.piv.selected_slot.to_slot(),
                 self.piv_selected_test_target().0,
             )
-            .unwrap_or(keyroost_piv::x509::KeyUsage::EMPTY),
+            .unwrap_or_default(),
         };
-        Some(ku).filter(|k| !k.is_empty())
+        Some(ext).filter(|e| !e.usages.is_empty())
     }
 
     /// The selected device:slot's key usage, created from the PIV default on
     /// first sight and reconciled with the slot key's current algorithm (an
     /// algorithm that is merely unknown right now changes nothing). Returns
-    /// the usage, the algorithm in force, and the slot's PIV default.
+    /// the extension, the algorithm in force, and the slot's PIV default.
     fn piv_sync_key_usage(
         &mut self,
     ) -> (
-        keyroost_piv::x509::KeyUsage,
+        keyroost_piv::x509::KeyUsageExt,
         Option<keyroost_piv::KeyAlg>,
-        keyroost_piv::x509::KeyUsage,
+        keyroost_piv::x509::KeyUsageExt,
     ) {
         let slot_sel = self.piv.selected_slot;
         let slot = slot_sel.to_slot();
         let seen = self.piv_selected_test_target().0;
         let key = (self.selected_device.clone(), slot_sel);
-        let (ku, alg) = match self.piv.cert_key_usage.get(&key) {
+        let (ext, alg) = match self.piv.cert_key_usage.get(&key) {
             None => (
-                keyroost_piv::x509::piv_default_key_usage(slot, seen)
-                    .unwrap_or(keyroost_piv::x509::KeyUsage::EMPTY),
+                keyroost_piv::x509::piv_default_key_usage(slot, seen).unwrap_or_default(),
                 seen,
             ),
-            Some((ku, old)) => match seen {
+            Some((ext, old)) => match seen {
                 Some(new) if *old != Some(new) => {
-                    (reconcile_key_usage(slot, *ku, *old, new), Some(new))
+                    (reconcile_key_usage(slot, *ext, *old, new), Some(new))
                 }
-                _ => (*ku, *old),
+                _ => (*ext, *old),
             },
         };
-        self.piv.cert_key_usage.insert(key, (ku, alg));
-        let default = keyroost_piv::x509::piv_default_key_usage(slot, alg)
-            .unwrap_or(keyroost_piv::x509::KeyUsage::EMPTY);
-        (ku, alg, default)
+        self.piv.cert_key_usage.insert(key, (ext, alg));
+        let default = keyroost_piv::x509::piv_default_key_usage(slot, alg).unwrap_or_default();
+        (ext, alg, default)
     }
 
     /// Create a self-signed certificate for the selected slot's key and store
@@ -10210,24 +10212,27 @@ fn toggle_key_usage(
     ku
 }
 
-/// Carry a remembered `keyUsage` over to a slot key of algorithm `new`. A
-/// selection that was just the slot's PIV default follows the default for the
-/// new algorithm. Otherwise the choice is kept, except that `keyEncipherment`
-/// and `keyAgreement` swap when the new key supports only the other one, and
-/// bits the new key can't back are dropped.
+/// Carry a remembered `keyUsage` extension over to a slot key of algorithm
+/// `new`. A selection that was just the slot's PIV default follows the default
+/// for the new algorithm. Otherwise the choice is kept, except that
+/// `keyEncipherment` and `keyAgreement` swap when the new key supports only
+/// the other one, and bits the new key can't back are dropped (taking
+/// `critical` along if nothing is left).
 fn reconcile_key_usage(
     slot: keyroost_piv::Slot,
-    ku: keyroost_piv::x509::KeyUsage,
+    ext: keyroost_piv::x509::KeyUsageExt,
     old: Option<keyroost_piv::KeyAlg>,
     new: keyroost_piv::KeyAlg,
-) -> keyroost_piv::x509::KeyUsage {
-    use keyroost_piv::x509::{piv_default_key_usage, supported_key_usages, KeyUsage as K};
-    let default_for = |a| piv_default_key_usage(slot, a).unwrap_or(K::EMPTY);
-    if ku == default_for(old) {
+) -> keyroost_piv::x509::KeyUsageExt {
+    use keyroost_piv::x509::{
+        piv_default_key_usage, supported_key_usages, KeyUsage as K, KeyUsageExt,
+    };
+    let default_for = |a| piv_default_key_usage(slot, a).unwrap_or_default();
+    if ext == default_for(old) {
         return default_for(Some(new));
     }
     let supported = supported_key_usages(new);
-    let mut ku = ku;
+    let mut ku = ext.usages;
     for (bit, other) in [
         (K::KEY_ENCIPHERMENT, K::KEY_AGREEMENT),
         (K::KEY_AGREEMENT, K::KEY_ENCIPHERMENT),
@@ -10245,25 +10250,31 @@ fn reconcile_key_usage(
             .with(K::ENCIPHER_ONLY, false)
             .with(K::DECIPHER_ONLY, false);
     }
-    kept
+    KeyUsageExt {
+        usages: kept,
+        critical: ext.critical && !kept.is_empty(),
+    }
 }
 
 /// Combo-box caption for a `keyUsage` selection.
 /// A selection equal to the slot's PIV default is led by "Slot default".
 fn key_usage_summary(
-    ku: keyroost_piv::x509::KeyUsage,
-    default: keyroost_piv::x509::KeyUsage,
+    ext: keyroost_piv::x509::KeyUsageExt,
+    default: keyroost_piv::x509::KeyUsageExt,
 ) -> String {
-    if ku.is_empty() {
+    if ext.usages.is_empty() {
         return "Undefined".to_owned();
     }
-    let list = KEY_USAGE_CHOICES
+    let mut parts: Vec<&str> = KEY_USAGE_CHOICES
         .iter()
-        .filter(|(b, _, _)| ku.contains(*b))
+        .filter(|(b, _, _)| ext.usages.contains(*b))
         .map(|(_, l, _)| *l)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if ku == default {
+        .collect();
+    if ext.critical {
+        parts.push("critical");
+    }
+    let list = parts.join(", ");
+    if ext == default {
         format!("Slot default ({list})")
     } else {
         list
@@ -18289,7 +18300,7 @@ impl App {
                 });
                 // Key usage: remembered per device:slot, initialised from the PIV
                 // standard's value for the slot.
-                let (mut ku, usage_alg, usage_default) = self.piv_sync_key_usage();
+                let (mut ext, usage_alg, usage_default) = self.piv_sync_key_usage();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     // Same 96px label column as the rows above, so the combo's
@@ -18303,34 +18314,53 @@ impl App {
                         ),
                     );
                     let combo = egui::ComboBox::from_id_salt("piv-cert-key-usage")
-                        .selected_text(key_usage_summary(ku, usage_default))
+                        .selected_text(key_usage_summary(ext, usage_default))
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(ku == usage_default, "Slot default")
+                                .selectable_label(ext == usage_default, "Slot default")
                                 .on_hover_text(
-                                    "Select the usages the PIV standard defines for this \
-                                     slot (for none, same as Undefined). Selected \
-                                     automatically whenever exactly those usages are \
-                                     selected; it only affects this menu, not the \
-                                     certificate.",
+                                    "Select the key usage extension the PIV standard defines \
+                                     for this slot: its usages, marked critical (for none, \
+                                     same as Undefined). Selected automatically whenever \
+                                     exactly that is selected; it only affects this menu, \
+                                     not the certificate.",
                                 )
                                 .clicked()
                             {
-                                ku = usage_default;
+                                ext = usage_default;
                             }
                             if ui
-                                .selectable_label(ku.is_empty(), "Undefined")
+                                .selectable_label(ext.usages.is_empty(), "Undefined")
                                 .on_hover_text(
                                     "Write no keyUsage extension to the certificate. \
-                                     Cannot be combined with other usages.",
+                                     Cannot be combined with other usages or Critical.",
                                 )
                                 .clicked()
                             {
-                                ku = keyroost_piv::x509::KeyUsage::EMPTY;
+                                ext = keyroost_piv::x509::KeyUsageExt::default();
+                            }
+                            // Critical flag: only meaningful with at least one usage.
+                            if ui
+                                .add_enabled(
+                                    !ext.usages.is_empty(),
+                                    egui::Button::selectable(ext.critical, "Critical"),
+                                )
+                                .on_hover_text(
+                                    "Mark the keyUsage extension critical: software that \
+                                     doesn't understand or can't honour it must reject the \
+                                     certificate. Required by the PIV standard.",
+                                )
+                                .on_disabled_hover_text(
+                                    "Select at least one usage first. Undefined writes no \
+                                     extension, so there is nothing to mark critical.",
+                                )
+                                .clicked()
+                            {
+                                ext.critical = !ext.critical;
                             }
                             for (bit, label, hint) in KEY_USAGE_CHOICES {
-                                let on = ku.contains(bit);
+                                let on = ext.usages.contains(bit);
                                 let usable = usage_alg.is_none_or(|a| {
                                     keyroost_piv::x509::supported_key_usages(a).contains(bit)
                                 });
@@ -18351,7 +18381,8 @@ impl App {
                                     ))
                                 };
                                 if r.clicked() {
-                                    ku = toggle_key_usage(ku, bit, !on);
+                                    ext.usages = toggle_key_usage(ext.usages, bit, !on);
+                                    ext.critical &= !ext.usages.is_empty();
                                 }
                             }
                         });
@@ -18359,7 +18390,7 @@ impl App {
                         "Key usage is optional: left at Undefined, no key usage extension \
                          is written. It starts out set to the PIV standard's value for the \
                          slot (Undefined where the standard defines none), and you can \
-                         select multiple usages.",
+                         select multiple usages. Critical marks the extension critical.",
                     );
                     // Selected usages this slot's key can't back: flag them next
                     // to the box, and list them on hover.
@@ -18368,7 +18399,7 @@ impl App {
                             let ok = keyroost_piv::x509::supported_key_usages(alg);
                             KEY_USAGE_CHOICES
                                 .iter()
-                                .filter(|(b, _, _)| ku.contains(*b) && !ok.contains(*b))
+                                .filter(|(b, _, _)| ext.usages.contains(*b) && !ok.contains(*b))
                                 .map(|(_, l, _)| *l)
                                 .collect()
                         })
@@ -18390,7 +18421,7 @@ impl App {
                     }
                     self.piv.cert_key_usage.insert(
                         (self.selected_device.clone(), self.piv.selected_slot),
-                        (ku, usage_alg),
+                        (ext, usage_alg),
                     );
                 });
 
@@ -23779,7 +23810,11 @@ mod piv_relax_tests {
 #[cfg(test)]
 mod key_usage_tests {
     use super::*;
-    use keyroost_piv::x509::KeyUsage as K;
+    use keyroost_piv::x509::{KeyUsage as K, KeyUsageExt};
+
+    fn ext(usages: K, critical: bool) -> KeyUsageExt {
+        KeyUsageExt { usages, critical }
+    }
 
     #[test]
     fn enciphering_only_bits_pull_in_key_agreement_and_exclude_each_other() {
@@ -23789,14 +23824,24 @@ mod key_usage_tests {
         assert!(ku.contains(K::DECIPHER_ONLY) && !ku.contains(K::ENCIPHER_ONLY));
         let ku = toggle_key_usage(ku, K::KEY_AGREEMENT, false);
         assert!(ku.is_empty());
-        assert_eq!(key_usage_summary(ku, K::DIGITAL_SIGNATURE), "Undefined");
+    }
+
+    #[test]
+    fn summary_marks_critical_and_slot_default() {
+        let d = ext(K::DIGITAL_SIGNATURE, true);
+        assert_eq!(key_usage_summary(ext(K::EMPTY, false), d), "Undefined");
         assert_eq!(
-            key_usage_summary(K::DIGITAL_SIGNATURE, K::DIGITAL_SIGNATURE),
-            "Slot default (Digital signature)"
+            key_usage_summary(d, d),
+            "Slot default (Digital signature, critical)"
+        );
+        // Same usages but not critical is not the slot default.
+        assert_eq!(
+            key_usage_summary(ext(K::DIGITAL_SIGNATURE, false), d),
+            "Digital signature"
         );
         assert_eq!(
-            key_usage_summary(K::DIGITAL_SIGNATURE, K::EMPTY),
-            "Digital signature"
+            key_usage_summary(ext(K::DIGITAL_SIGNATURE, true), ext(K::EMPTY, false)),
+            "Digital signature, critical"
         );
     }
 
@@ -23805,33 +23850,50 @@ mod key_usage_tests {
         use keyroost_piv::{KeyAlg, Slot};
         let km = Slot::KeyManagement;
         // A hand-picked set containing keyEncipherment swaps to keyAgreement
-        // on an ECC key, keeping the rest, and back again.
-        let picked = K::KEY_ENCIPHERMENT
-            .union(K::DIGITAL_SIGNATURE)
-            .union(K::DATA_ENCIPHERMENT);
+        // on an ECC key, keeping the rest (and critical), and back again.
+        let picked = ext(
+            K::KEY_ENCIPHERMENT
+                .union(K::DIGITAL_SIGNATURE)
+                .union(K::DATA_ENCIPHERMENT),
+            false,
+        );
         let ecc = reconcile_key_usage(km, picked, Some(KeyAlg::Rsa2048), KeyAlg::EccP256);
-        assert_eq!(ecc, K::KEY_AGREEMENT.union(K::DIGITAL_SIGNATURE));
+        assert_eq!(
+            ecc,
+            ext(K::KEY_AGREEMENT.union(K::DIGITAL_SIGNATURE), false)
+        );
         let rsa = reconcile_key_usage(km, ecc, Some(KeyAlg::EccP256), KeyAlg::Rsa2048);
-        assert_eq!(rsa, K::KEY_ENCIPHERMENT.union(K::DIGITAL_SIGNATURE));
-        // The plain slot default just follows the new algorithm's default.
+        assert_eq!(
+            rsa,
+            ext(K::KEY_ENCIPHERMENT.union(K::DIGITAL_SIGNATURE), false)
+        );
+        let crit = reconcile_key_usage(
+            km,
+            ext(K::KEY_ENCIPHERMENT.union(K::DIGITAL_SIGNATURE), true),
+            Some(KeyAlg::Rsa2048),
+            KeyAlg::EccP256,
+        );
+        assert!(crit.critical);
+        // The plain slot default (critical included) follows the new
+        // algorithm's default.
         assert_eq!(
             reconcile_key_usage(
                 km,
-                K::KEY_ENCIPHERMENT,
+                ext(K::KEY_ENCIPHERMENT, true),
                 Some(KeyAlg::Rsa2048),
                 KeyAlg::EccP256
             ),
-            K::KEY_AGREEMENT
+            ext(K::KEY_AGREEMENT, true)
         );
         // An explicit Undefined survives a known-algorithm change.
         assert_eq!(
             reconcile_key_usage(
                 Slot::Authentication,
-                K::EMPTY,
+                ext(K::EMPTY, false),
                 Some(KeyAlg::Rsa2048),
                 KeyAlg::EccP256
             ),
-            K::EMPTY
+            ext(K::EMPTY, false)
         );
     }
 }

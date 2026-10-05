@@ -4645,7 +4645,7 @@ impl<'tx> PivSession<'tx> {
         slot: Slot,
         subject: &str,
         pin: &[u8],
-        key_usage: Option<piv::x509::KeyUsage>,
+        key_usage: Option<piv::x509::KeyUsageExt>,
     ) -> Result<String, TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
@@ -4676,7 +4676,7 @@ impl<'tx> PivSession<'tx> {
         not_after: i64,
         pin: &[u8],
         compression: CertCompression,
-        key_usage: Option<piv::x509::KeyUsage>,
+        key_usage: Option<piv::x509::KeyUsageExt>,
     ) -> Result<(Vec<u8>, CertImport), TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;

@@ -11,7 +11,7 @@
 //!
 //! Scope is deliberately narrow: subjects limited to the common attributes
 //! (CN/O/OU/C/L/ST), v3 certificates whose only possible extension is
-//! `keyUsage` (see [`KeyUsage`]; omitted by default), one signature
+//! `keyUsage` (see [`KeyUsageExt`]; omitted by default), one signature
 //! algorithm per key type (SHA-256 for RSA and P-256, SHA-384 for P-384,
 //! SHA-512 for P-521, pure Ed25519). X25519 cannot sign and is rejected.
 
@@ -306,8 +306,9 @@ impl KeyUsage {
         (!(eo || dc) || self.contains(KeyUsage::KEY_AGREEMENT)) && !(eo && dc)
     }
 
-    /// DER `Extension` for `keyUsage`, marked critical as RFC 5280 recommends.
-    fn extension_der(self) -> Result<Vec<u8>, X509Error> {
+    /// DER `Extension` for `keyUsage`; the `critical` BOOLEAN is only present
+    /// (as TRUE) when requested, DER omitting the FALSE default.
+    fn extension_der(self, critical: bool) -> Result<Vec<u8>, X509Error> {
         if !self.is_valid() {
             return Err(X509Error::BadKeyUsage);
         }
@@ -326,32 +327,47 @@ impl KeyUsage {
         let mut bits = vec![unused];
         bits.extend_from_slice(content);
         let bit_string = der_tlv(0x03, &bits);
-        Ok(der_seq(&[
-            &der_tlv(0x06, &[0x55, 0x1D, 0x0F]), // id-ce-keyUsage
-            &der_tlv(0x01, &[0xFF]),             // critical
-            &der_tlv(0x04, &bit_string),
-        ]))
+        let oid = der_tlv(0x06, &[0x55, 0x1D, 0x0F]); // id-ce-keyUsage
+        let value = der_tlv(0x04, &bit_string);
+        Ok(if critical {
+            der_seq(&[&oid, &der_tlv(0x01, &[0xFF]), &value])
+        } else {
+            der_seq(&[&oid, &value])
+        })
     }
 }
 
-/// The `keyUsage` the PIV standards (SP 800-78 / the Federal PKI Common
+/// A requested `keyUsage` extension: the usages plus whether the extension is
+/// marked critical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyUsageExt {
+    pub usages: KeyUsage,
+    pub critical: bool,
+}
+
+/// The `keyUsage` extension the PIV standards (SP 800-78 / the Federal PKI Common
 /// Policy certificate profiles) prescribe for a slot's certificate, or `None`
 /// where nothing is defined. `alg` is the slot key's algorithm when known: a
 /// key-management certificate asserts `keyEncipherment` for RSA and
 /// `keyAgreement` for elliptic-curve keys, so with an unknown algorithm there
-/// is no safe answer and `None` is returned.
+/// is no safe answer and `None` is returned. The PIV profiles mark the
+/// extension critical.
 #[must_use]
-pub fn piv_default_key_usage(slot: Slot, alg: Option<KeyAlg>) -> Option<KeyUsage> {
-    match slot {
-        Slot::Authentication | Slot::CardAuthentication => Some(KeyUsage::DIGITAL_SIGNATURE),
-        Slot::Signature => Some(KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION)),
+pub fn piv_default_key_usage(slot: Slot, alg: Option<KeyAlg>) -> Option<KeyUsageExt> {
+    let usages = match slot {
+        Slot::Authentication | Slot::CardAuthentication => KeyUsage::DIGITAL_SIGNATURE,
+        Slot::Signature => KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION),
         Slot::KeyManagement | Slot::Retired(_) => match alg? {
             KeyAlg::Rsa1024 | KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => {
-                Some(KeyUsage::KEY_ENCIPHERMENT)
+                KeyUsage::KEY_ENCIPHERMENT
             }
-            _ => Some(KeyUsage::KEY_AGREEMENT),
+            _ => KeyUsage::KEY_AGREEMENT,
         },
-    }
+    };
+    Some(KeyUsageExt {
+        usages,
+        critical: true,
+    })
 }
 
 /// The `keyUsage` bits a key of algorithm `alg` can meaningfully back:
@@ -377,8 +393,8 @@ pub fn supported_key_usages(alg: KeyAlg) -> KeyUsage {
 }
 
 /// `extensions`-wrapped `keyUsage`, as an `Extensions` SEQUENCE.
-fn extensions_der(ku: KeyUsage) -> Result<Vec<u8>, X509Error> {
-    Ok(der_seq(&[&ku.extension_der()?]))
+fn extensions_der(ku: KeyUsageExt) -> Result<Vec<u8>, X509Error> {
+    Ok(der_seq(&[&ku.usages.extension_der(ku.critical)?]))
 }
 
 /// PKCS#10 `CertificationRequestInfo`: version 0, subject, SPKI, and the
@@ -387,7 +403,7 @@ fn extensions_der(ku: KeyUsage) -> Result<Vec<u8>, X509Error> {
 pub fn csr_info(
     subject: &SubjectName,
     spki_der: &[u8],
-    key_usage: Option<KeyUsage>,
+    key_usage: Option<KeyUsageExt>,
 ) -> Result<Vec<u8>, X509Error> {
     let attributes = match key_usage {
         None => vec![0xA0, 0x00], // present but empty
@@ -422,7 +438,7 @@ pub fn tbs_certificate(
     not_before: i64,
     not_after: i64,
     spki_der: &[u8],
-    key_usage: Option<KeyUsage>,
+    key_usage: Option<KeyUsageExt>,
 ) -> Result<Vec<u8>, X509Error> {
     if not_after <= not_before {
         return Err(X509Error::BadValidity);
@@ -612,26 +628,35 @@ mod tests {
         );
     }
 
+    fn ext(usages: KeyUsage, critical: bool) -> KeyUsageExt {
+        KeyUsageExt { usages, critical }
+    }
+
     #[test]
     fn key_usage_extension_kat() {
-        // digitalSignature only: BIT STRING 03 02 07 80, critical.
+        // digitalSignature only, critical: BIT STRING 03 02 07 80.
         assert_eq!(
-            KeyUsage::DIGITAL_SIGNATURE.extension_der().unwrap(),
+            KeyUsage::DIGITAL_SIGNATURE.extension_der(true).unwrap(),
             vec![
                 0x30, 0x0E, 0x06, 0x03, 0x55, 0x1D, 0x0F, 0x01, 0x01, 0xFF, 0x04, 0x04, 0x03, 0x02,
                 0x07, 0x80
             ]
         );
+        // Not critical: the BOOLEAN is omitted (DER default FALSE).
+        assert_eq!(
+            KeyUsage::DIGITAL_SIGNATURE.extension_der(false).unwrap(),
+            vec![0x30, 0x0B, 0x06, 0x03, 0x55, 0x1D, 0x0F, 0x04, 0x04, 0x03, 0x02, 0x07, 0x80]
+        );
         // digitalSignature + nonRepudiation: 03 02 06 C0.
         let ku = KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION);
         assert_eq!(
-            &ku.extension_der().unwrap()[12..],
+            &ku.extension_der(true).unwrap()[12..],
             &[0x03, 0x02, 0x06, 0xC0]
         );
         // decipherOnly spills into a second byte: 03 03 07 08 80.
         let ku = KeyUsage::KEY_AGREEMENT.union(KeyUsage::DECIPHER_ONLY);
         assert_eq!(
-            &ku.extension_der().unwrap()[12..],
+            &ku.extension_der(true).unwrap()[12..],
             &[0x03, 0x03, 0x07, 0x08, 0x80]
         );
     }
@@ -651,7 +676,7 @@ mod tests {
             csr_info(
                 &SubjectName::parse("CN=T").unwrap(),
                 &[0x30, 0x00],
-                Some(KeyUsage::EMPTY)
+                Some(ext(KeyUsage::EMPTY, true))
             ),
             Err(X509Error::BadKeyUsage)
         );
@@ -661,43 +686,44 @@ mod tests {
     fn tbs_and_csr_carry_key_usage_only_when_asked() {
         let name = SubjectName::parse("CN=Test").unwrap();
         let spki = vec![0x30, 0x03, 0x02, 0x01, 0x05];
-        let ext = KeyUsage::DIGITAL_SIGNATURE.extension_der().unwrap();
-        let tbs = tbs_certificate(
-            &[1],
-            KeyAlg::EccP256,
-            &name,
-            0,
-            86_400,
-            &spki,
-            Some(KeyUsage::DIGITAL_SIGNATURE),
-        )
-        .unwrap();
-        // [3] { SEQUENCE { Extension } } closes the TBS.
-        let tail = der_tlv(0xA3, &der_seq(&[&ext]));
-        assert!(tbs.ends_with(&tail));
-        let cri = csr_info(&name, &spki, Some(KeyUsage::DIGITAL_SIGNATURE)).unwrap();
-        assert!(cri.windows(ext.len()).any(|w| w == ext.as_slice()));
-        assert!(cri
-            .windows(9)
-            .any(|w| w == [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x0E]));
+        for critical in [true, false] {
+            let req = ext(KeyUsage::DIGITAL_SIGNATURE, critical);
+            let ext_der = KeyUsage::DIGITAL_SIGNATURE.extension_der(critical).unwrap();
+            let tbs =
+                tbs_certificate(&[1], KeyAlg::EccP256, &name, 0, 86_400, &spki, Some(req)).unwrap();
+            // [3] { SEQUENCE { Extension } } closes the TBS.
+            let tail = der_tlv(0xA3, &der_seq(&[&ext_der]));
+            assert!(tbs.ends_with(&tail));
+            let cri = csr_info(&name, &spki, Some(req)).unwrap();
+            assert!(cri.windows(ext_der.len()).any(|w| w == ext_der.as_slice()));
+            assert!(cri
+                .windows(9)
+                .any(|w| w == [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x0E]));
+        }
     }
 
     #[test]
     fn piv_default_usages() {
-        let ds = Some(KeyUsage::DIGITAL_SIGNATURE);
-        assert_eq!(piv_default_key_usage(Slot::Authentication, None), ds);
-        assert_eq!(piv_default_key_usage(Slot::CardAuthentication, None), ds);
+        let d = |u| Some(ext(u, true)); // the PIV profiles mark keyUsage critical
+        assert_eq!(
+            piv_default_key_usage(Slot::Authentication, None),
+            d(KeyUsage::DIGITAL_SIGNATURE)
+        );
+        assert_eq!(
+            piv_default_key_usage(Slot::CardAuthentication, None),
+            d(KeyUsage::DIGITAL_SIGNATURE)
+        );
         assert_eq!(
             piv_default_key_usage(Slot::Signature, None),
-            Some(KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION))
+            d(KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION))
         );
         assert_eq!(
             piv_default_key_usage(Slot::KeyManagement, Some(KeyAlg::Rsa2048)),
-            Some(KeyUsage::KEY_ENCIPHERMENT)
+            d(KeyUsage::KEY_ENCIPHERMENT)
         );
         assert_eq!(
             piv_default_key_usage(Slot::Retired(1), Some(KeyAlg::EccP256)),
-            Some(KeyUsage::KEY_AGREEMENT)
+            d(KeyUsage::KEY_AGREEMENT)
         );
         assert_eq!(piv_default_key_usage(Slot::KeyManagement, None), None);
     }
