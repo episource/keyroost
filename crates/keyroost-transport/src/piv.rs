@@ -1923,7 +1923,8 @@ impl<'tx> PivSession<'tx> {
     /// device-reported/derived distinction between Token2 and Nitrokey's own
     /// values on this same axis. `serial` is resolved here too, by whichever
     /// source is right for the matched fingerprint (a dedicated probe, or —
-    /// `YubiKey` and the generic catch-all only — Yubico's GET SERIAL,
+    /// `YubiKey`, the generic catch-all and the Swissbit iShields (which fall
+    /// back to their Management Application) — Yubico's GET SERIAL,
     /// BCD-decoded when this fingerprint's quirks call for it): unlike
     /// `version`, there's no single shared call site that fits every arm, so
     /// each arm resolves its own rather than this method doing it once
@@ -2133,10 +2134,16 @@ impl<'tx> PivSession<'tx> {
                 version_firmware: None,
                 serial: self.probe_token2_otp_serial(),
             },
-            // A Swissbit iShield 1 or 2 normally answers the Yubico GET
-            // SERIAL extension with its real serial; when it doesn't give a
-            // proper answer, fall back to the Swissbit Management
-            // Application's own GET SERIAL.
+            // Try the Yubico GET SERIAL extension first, then fall back to
+            // the Swissbit Management Application's own GET SERIAL. The
+            // iShield 1 answers the Yubico command with its real serial. The
+            // iShield 2 firmwares seen so far (v1.0.4 / applet v1.0.0.0 and
+            // v1.1.2 / applet v1.4.1) recognise it too, and mimic other
+            // Yubico extensions, but answer GET SERIAL specifically with
+            // `SW 6982` (security status not satisfied). That looks like a
+            // firmware bug, so the Yubico read is kept first in case a later
+            // firmware fixes it, and the Management Application read covers
+            // the failure today.
             fingerprint::AppletFingerprint::OpenFips201(
                 fingerprint::OpenFips201Variant::SwissbitIShield2,
             )
@@ -2487,10 +2494,12 @@ impl<'tx> PivSession<'tx> {
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
     /// Widened to `u128` — see [`keyroost_piv::parse_serial`] for why the
     /// reply isn't always the standard 4-byte `u32`. Called at most once per
-    /// lineage, from `Self::applet_fingerprint`'s `YubiKey` and generic
-    /// catch-all arms only — every fingerprint with its own dedicated serial
-    /// probe (Token2, Thetis, Nitrokey, HID Crescendo) never calls this at
-    /// all. Resolving it during fingerprinting rather than lazily in
+    /// lineage, from `Self::applet_fingerprint`'s `YubiKey`, generic
+    /// catch-all and Swissbit iShield arms — every fingerprint with its own
+    /// dedicated serial probe (Token2, Thetis, Nitrokey, HID Crescendo) never
+    /// calls this at all. The iShield arms try this first and fall back to
+    /// the Swissbit Management Application's serial when it yields none (the
+    /// iShield 2 answers it with `SW 6982`). Resolving it during fingerprinting rather than lazily in
     /// [`Self::status`]/[`Self::status_detailed`] means it rides along in
     /// `identity`'s own unconditional cache — safe, because a card's serial
     /// cannot change while the physical card stays the same, exactly like
