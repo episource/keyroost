@@ -984,15 +984,26 @@ fn resolve_key_usage(
         return Ok(None);
     }
     if args.contains(&CliKeyUsage::Default) {
-        return keyroost_piv::x509::piv_default_key_usage(slot, alg)
-            .map(Some)
-            .ok_or_else(|| {
-                format!(
-                    "no PIV-defined key usage for {} (with this key type); name the usages \
-                     explicitly instead of `default`",
-                    slot.label()
-                )
-            });
+        return match keyroost_piv::x509::piv_default_key_usage(slot, alg) {
+            Some(default) => Ok(Some(default)),
+            // The key type is known and can back none of the slot's default
+            // usages (Ed25519 in 9D / retired): the default is "no extension".
+            None if keyroost_piv::x509::piv_default_degrades_to_undefined(slot, alg) => {
+                eprintln!(
+                    "warning: the slot default key usage for {} is undefined: {} keys \
+                     can't back the usages the PIV standard defines there; no keyUsage \
+                     extension will be added.",
+                    slot.label(),
+                    alg.map_or("these", |a| a.label())
+                );
+                Ok(None)
+            }
+            None => Err(format!(
+                "no PIV-defined key usage for {} (with this key type); name the usages \
+                 explicitly instead of `default`",
+                slot.label()
+            )),
+        };
     }
     let (usages, critical) = explicit_key_usage(args);
     if let Some(alg) = alg {
@@ -13039,6 +13050,19 @@ mod cli_tests {
         );
         // No PIV definition for this slot/key: `default` is an error, not "none".
         assert!(resolve_key_usage(&[U::Default], Slot::KeyManagement, None).is_err());
+        // Ed25519 can't back keyAgreement: the 9D / retired default is "no extension".
+        assert_eq!(
+            resolve_key_usage(&[U::Default], Slot::KeyManagement, Some(KeyAlg::Ed25519)),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve_key_usage(
+                &[U::Default, U::Critical],
+                Slot::Retired(2),
+                Some(KeyAlg::Ed25519)
+            ),
+            Ok(None)
+        );
         // `default` may accompany exactly the default set incl. critical, in any order.
         assert_eq!(
             resolve_key_usage(

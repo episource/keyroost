@@ -276,6 +276,11 @@ impl KeyUsage {
     }
 
     #[must_use]
+    pub const fn intersection(self, other: KeyUsage) -> KeyUsage {
+        KeyUsage(self.0 & other.0)
+    }
+
+    #[must_use]
     pub const fn contains(self, other: KeyUsage) -> bool {
         self.0 & other.0 == other.0
     }
@@ -350,11 +355,31 @@ pub struct KeyUsageExt {
 /// where nothing is defined. `alg` is the slot key's algorithm when known: a
 /// key-management certificate asserts `keyEncipherment` for RSA and
 /// `keyAgreement` for elliptic-curve keys, so with an unknown algorithm there
-/// is no safe answer and `None` is returned. The PIV profiles mark the
-/// extension critical.
+/// is no safe answer and `None` is returned. Usages the slot's key cannot back
+/// (see [`supported_key_usages`]) are dropped from the default — an Ed25519
+/// key in 9D loses `keyAgreement` — and if nothing is left, `None` is returned.
+/// The PIV profiles mark the extension critical.
 #[must_use]
 pub fn piv_default_key_usage(slot: Slot, alg: Option<KeyAlg>) -> Option<KeyUsageExt> {
-    let usages = match slot {
+    let usages = piv_standard_key_usage(slot, alg)?;
+    let usages = match alg {
+        Some(alg) => usages.intersection(supported_key_usages(alg)),
+        None => usages,
+    };
+    if usages.is_empty() {
+        return None;
+    }
+    Some(KeyUsageExt {
+        usages,
+        critical: true,
+    })
+}
+
+/// The usages the PIV standard prescribes for `slot`, before filtering by what
+/// the key can back; `None` where nothing is defined (or `alg` is needed but
+/// unknown).
+fn piv_standard_key_usage(slot: Slot, alg: Option<KeyAlg>) -> Option<KeyUsage> {
+    Some(match slot {
         Slot::Authentication | Slot::CardAuthentication => KeyUsage::DIGITAL_SIGNATURE,
         Slot::Signature => KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION),
         Slot::KeyManagement | Slot::Retired(_) => match alg? {
@@ -363,11 +388,18 @@ pub fn piv_default_key_usage(slot: Slot, alg: Option<KeyAlg>) -> Option<KeyUsage
             }
             _ => KeyUsage::KEY_AGREEMENT,
         },
-    };
-    Some(KeyUsageExt {
-        usages,
-        critical: true,
     })
+}
+
+/// Whether the slot's PIV default is "undefined" only because `alg` can't back
+/// any of the usages the standard prescribes (an Ed25519 key in 9D or a retired
+/// slot, which can't do key agreement). Callers warn about this: the default
+/// would normally have been a real extension.
+#[must_use]
+pub fn piv_default_degrades_to_undefined(slot: Slot, alg: Option<KeyAlg>) -> bool {
+    alg.is_some()
+        && piv_standard_key_usage(slot, alg).is_some()
+        && piv_default_key_usage(slot, alg).is_none()
 }
 
 /// The `keyUsage` bits a key of algorithm `alg` can meaningfully back:
@@ -726,6 +758,36 @@ mod tests {
             d(KeyUsage::KEY_AGREEMENT)
         );
         assert_eq!(piv_default_key_usage(Slot::KeyManagement, None), None);
+        // Ed25519 can't do key agreement: the default for 9D / retired is empty.
+        assert_eq!(
+            piv_default_key_usage(Slot::KeyManagement, Some(KeyAlg::Ed25519)),
+            None
+        );
+        assert_eq!(
+            piv_default_key_usage(Slot::Retired(3), Some(KeyAlg::Ed25519)),
+            None
+        );
+        assert!(piv_default_degrades_to_undefined(
+            Slot::KeyManagement,
+            Some(KeyAlg::Ed25519)
+        ));
+        assert!(!piv_default_degrades_to_undefined(
+            Slot::KeyManagement,
+            None
+        ));
+        assert!(!piv_default_degrades_to_undefined(
+            Slot::KeyManagement,
+            Some(KeyAlg::EccP256)
+        ));
+        assert!(!piv_default_degrades_to_undefined(
+            Slot::Signature,
+            Some(KeyAlg::Ed25519)
+        ));
+        // Other slots keep their signing defaults for Ed25519.
+        assert_eq!(
+            piv_default_key_usage(Slot::Signature, Some(KeyAlg::Ed25519)),
+            d(KeyUsage::DIGITAL_SIGNATURE.union(KeyUsage::NON_REPUDIATION))
+        );
     }
 
     #[test]

@@ -2246,6 +2246,10 @@ struct PivState {
             Option<keyroost_piv::KeyAlg>,
         ),
     >,
+    /// Device:slots whose Undefined was picked explicitly while the slot default
+    /// is itself undefined (degraded for the key type), so the two entries can
+    /// be told apart. Only consulted in that degraded case.
+    cert_key_usage_explicit_undefined: std::collections::HashSet<(Option<DeviceId>, PivSlotSel)>,
     sign_pin: String,
     csr_path: String,
     /// New CHUID: validity, same three-field shape and default as
@@ -2347,6 +2351,7 @@ impl Default for PivState {
             cert_valid_months: 0,
             cert_valid_days: 0,
             cert_key_usage: std::collections::HashMap::new(),
+            cert_key_usage_explicit_undefined: std::collections::HashSet::new(),
             sign_pin: String::new(),
             csr_path: String::new(),
             chuid_valid_years: 1,
@@ -10258,12 +10263,19 @@ fn reconcile_key_usage(
 
 /// Combo-box caption for a `keyUsage` selection.
 /// A selection equal to the slot's PIV default is led by "Slot default".
+/// `degraded`: the default is undefined only because the key can't back the
+/// standard's usages; it is still captioned "Slot default (undefined)".
 fn key_usage_summary(
     ext: keyroost_piv::x509::KeyUsageExt,
     default: keyroost_piv::x509::KeyUsageExt,
+    degraded: bool,
 ) -> String {
     if ext.usages.is_empty() {
-        return "Undefined".to_owned();
+        return if degraded && ext == default {
+            "Slot default (undefined)".to_owned()
+        } else {
+            "Undefined".to_owned()
+        };
     }
     let mut parts: Vec<&str> = KEY_USAGE_CHOICES
         .iter()
@@ -18301,6 +18313,23 @@ impl App {
                 // Key usage: remembered per device:slot, initialised from the PIV
                 // standard's value for the slot.
                 let (mut ext, usage_alg, usage_default) = self.piv_sync_key_usage();
+                let usage_slot_key = (self.selected_device.clone(), self.piv.selected_slot);
+                let usage_degraded = keyroost_piv::x509::piv_default_degrades_to_undefined(
+                    self.piv.selected_slot.to_slot(),
+                    usage_alg,
+                );
+                // Degraded default: Undefined is a separate pick from "Slot default".
+                let mut explicit_undefined = usage_degraded
+                    && ext.usages.is_empty()
+                    && self
+                        .piv
+                        .cert_key_usage_explicit_undefined
+                        .contains(&usage_slot_key);
+                let default_selected = if usage_degraded {
+                    ext == usage_default && !explicit_undefined
+                } else {
+                    ext == usage_default
+                };
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     // Same 96px label column as the rows above, so the combo's
@@ -18320,24 +18349,47 @@ impl App {
                             ui.set_max_width((ui.available_width() - 28.0).max(120.0));
                     egui::ComboBox::from_id_salt("piv-cert-key-usage")
                         .wrap()
-                        .selected_text(key_usage_summary(ext, usage_default))
+                        .selected_text(key_usage_summary(ext, usage_default, usage_degraded && !explicit_undefined))
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(ext == usage_default, "Slot default")
-                                .on_hover_text(
+                            let (default_label, default_hint) = if usage_degraded {
+                                (
+                                    egui::RichText::new("\u{26A0} Slot default (undefined)")
+                                        .color(p.warn),
+                                    format!(
+                                        "\u{26A0} The PIV standard's key usage for this slot \
+                                         (key agreement) can't be backed by {} keys, so the \
+                                         slot default degrades to Undefined: no keyUsage \
+                                         extension is written. Select usages explicitly to \
+                                         add one.",
+                                        usage_alg.map_or("this slot's", |a| a.label())
+                                    ),
+                                )
+                            } else {
+                                (
+                                    egui::RichText::new("Slot default"),
                                     "Select the key usage extension the PIV standard defines \
                                      for this slot: its usages, marked critical (for none, \
                                      same as Undefined). Selected automatically whenever \
                                      exactly that is selected; it only affects this menu, \
-                                     not the certificate.",
+                                     not the certificate."
+                                        .to_owned(),
                                 )
+                            };
+                            if ui
+                                .selectable_label(default_selected, default_label)
+                                .on_hover_text(default_hint)
                                 .clicked()
                             {
                                 ext = usage_default;
+                                explicit_undefined = false;
                             }
                             if ui
-                                .selectable_label(ext.usages.is_empty(), "Undefined")
+                                .selectable_label(
+                                    ext.usages.is_empty()
+                                        && !(usage_degraded && default_selected),
+                                    "Undefined",
+                                )
                                 .on_hover_text(
                                     "Write no keyUsage extension to the certificate. \
                                      Cannot be combined with other usages or Critical.",
@@ -18345,6 +18397,7 @@ impl App {
                                 .clicked()
                             {
                                 ext = keyroost_piv::x509::KeyUsageExt::default();
+                                explicit_undefined = usage_degraded;
                             }
                             // Critical flag: only meaningful with at least one usage.
                             if ui
@@ -18426,6 +18479,30 @@ impl App {
                             usage_alg.map_or("", |a| a.label()),
                             incompatible.join(", ")
                         ));
+                    }
+                    // Slot default selected but degraded to undefined: same marker.
+                    if usage_degraded && ext == usage_default && !explicit_undefined {
+                        ui.label(
+                            egui::RichText::new("\u{26A0}")
+                                .font(theme::f_reg(14.0))
+                                .color(p.warn),
+                        )
+                        .on_hover_text(format!(
+                            "The slot default is undefined here: the PIV standard's key \
+                             usage for this slot (key agreement) can't be backed by {} keys, \
+                             so no keyUsage extension is written. Select usages explicitly \
+                             to add one.",
+                            usage_alg.map_or("this slot's", |a| a.label())
+                        ));
+                    }
+                    if explicit_undefined && ext.usages.is_empty() {
+                        self.piv
+                            .cert_key_usage_explicit_undefined
+                            .insert(usage_slot_key.clone());
+                    } else {
+                        self.piv
+                            .cert_key_usage_explicit_undefined
+                            .remove(&usage_slot_key);
                     }
                     self.piv.cert_key_usage.insert(
                         (self.selected_device.clone(), self.piv.selected_slot),
@@ -23837,18 +23914,27 @@ mod key_usage_tests {
     #[test]
     fn summary_marks_critical_and_slot_default() {
         let d = ext(K::DIGITAL_SIGNATURE, true);
-        assert_eq!(key_usage_summary(ext(K::EMPTY, false), d), "Undefined");
         assert_eq!(
-            key_usage_summary(d, d),
+            key_usage_summary(ext(K::EMPTY, false), d, false),
+            "Undefined"
+        );
+        // A default degraded to undefined (Ed25519 in 9D) keeps its name.
+        let none = ext(K::EMPTY, false);
+        assert_eq!(
+            key_usage_summary(none, none, true),
+            "Slot default (undefined)"
+        );
+        assert_eq!(
+            key_usage_summary(d, d, false),
             "Slot default (Digital signature, critical)"
         );
         // Same usages but not critical is not the slot default.
         assert_eq!(
-            key_usage_summary(ext(K::DIGITAL_SIGNATURE, false), d),
+            key_usage_summary(ext(K::DIGITAL_SIGNATURE, false), d, false),
             "Digital signature"
         );
         assert_eq!(
-            key_usage_summary(ext(K::DIGITAL_SIGNATURE, true), ext(K::EMPTY, false)),
+            key_usage_summary(ext(K::DIGITAL_SIGNATURE, true), ext(K::EMPTY, false), false),
             "Digital signature, critical"
         );
     }
